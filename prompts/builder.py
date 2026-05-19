@@ -102,21 +102,36 @@ def variable_suffix(
     fps = [build_fp(b) for b in primary]
     cvd_5 = cumulative_delta(fps[-5:]) if len(fps) >= 5 else cumulative_delta(fps)
 
-    # Session CVD — delta from midnight UTC today (full-day running total)
+    # Session CVD — delta from instrument-specific session open (not midnight UTC)
     import time as _time
-    midnight_ts = int(_time.time()) // 86400 * 86400
     from pipeline.state_store import store as _store
+    from pipeline.features.vp_cache import (
+        _session_day_key as _sdk, _day_bounds as _db, _load as _cache_load
+    )
+    _cache = _cache_load()
+    _sess_utc: int = int((_cache.get(symbol, {}).get("session_start_utc") or 0))
+    _now_ts = int(_time.time())
+    _sess_day = _sdk(_now_ts, _sess_utc)
+    _sess_start, _ = _db(_sess_day, _sess_utc)
     session_bars = [b for b in _store().recent(symbol, primary_tf, 2000)
-                    if b.close_ts >= midnight_ts]
+                    if b.close_ts >= _sess_start]
     session_cvd = round(cumulative_delta([build_fp(b) for b in session_bars]), 4) if session_bars else 0.0
 
-    # Volume profiles — try cache first (pre-computed), fall back to live compute
-    cached_daily = vp_cache.get(symbol, "daily")
+    # Volume profiles — current session + prior day (PD) for reference levels
+    cached_daily  = vp_cache.get(symbol, "daily")
     cached_weekly = vp_cache.get(symbol, "weekly")
-    daily_vp = cached_daily if cached_daily else _vp_summary(vp_from_store(symbol, primary_tf, "daily"))
+    daily_vp  = cached_daily  if cached_daily  else _vp_summary(vp_from_store(symbol, primary_tf, "daily"))
     weekly_vp = cached_weekly if cached_weekly else _vp_summary(vp_from_store(symbol, primary_tf, "weekly"))
 
-    # VP history — last 5 daily POCs from cache, last 2 weekly from cache
+    # Prior Day VP — yesterday's completed session (always a fixed reference)
+    _hist = vp_cache.get_history(symbol, "daily", n=2)
+    prior_day_vp = None
+    if len(_hist) >= 2:
+        _pd = _hist[-2]   # second-most-recent = prior completed day
+        prior_day_vp = {k: _pd.get(k) for k in
+                        ["poc","vah","val","shape","hvn_zones","lvn_zones","naked_poc","bar_count"]}
+
+    # VP history — last 5 daily POCs + last 2 weekly summaries
     daily_poc_seq = vp_cache.poc_sequence(symbol, "daily", n=5)
     weekly_hist = [
         {"period_key": e["period_key"], "poc": e.get("poc"), "shape": e.get("shape"),
@@ -126,7 +141,7 @@ def variable_suffix(
 
     # Session + HTF bias
     latest_ts = primary[-1].close_ts
-    sess = current_session(latest_ts)
+    sess = current_session(latest_ts, symbol=symbol)
 
     from pipeline.state_store import store as _store
     daily_bars = _store().recent(symbol, "1d", 30) or []
@@ -147,6 +162,113 @@ def variable_suffix(
             for r in sym_rows
         ]
 
+    # --- New market structure features ---
+    current_price = primary[-1].ohlc.c
+
+    # Day type classifier
+    day_type_ctx: dict | None = None
+    try:
+        from pipeline.features.day_type import classify as _day_classify
+        from types import SimpleNamespace as _NS
+        _daily_vp_ns = _NS(**cached_daily) if cached_daily else None
+        _dt = _day_classify(session_bars, daily_vp=_daily_vp_ns)
+        day_type_ctx = {
+            "type": _dt.type,
+            "confidence": _dt.confidence,
+            "ib_expansion_pct": _dt.ib_expansion_pct,
+            "max_legs": _dt.max_legs,
+            "grid_mode": _dt.grid_mode,
+            "reason": _dt.reason,
+        }
+    except Exception:
+        pass
+
+    # Auction failure / LVN transit
+    auction_ctx: dict | None = None
+    try:
+        from pipeline.features.auction import detect as _auction_detect
+        _lvn_zones = (cached_daily or {}).get("lvn_zones", [])
+        _avg_bar_vol = sum(
+            sum(l.vol for l in b.bid_ladder) + sum(l.vol for l in b.ask_ladder)
+            for b in primary
+        ) / max(len(primary), 1)
+        _asig = _auction_detect(primary, _lvn_zones, session_avg_vol=_avg_bar_vol)
+        if _asig.type != "none":
+            auction_ctx = {
+                "type": _asig.type,
+                "zone_low": _asig.zone_low,
+                "zone_high": _asig.zone_high,
+                "confidence": _asig.confidence,
+                "avg_vol_ratio": _asig.avg_vol_ratio,
+                "reason": _asig.reason,
+            }
+    except Exception:
+        pass
+
+    # Delta divergence
+    divergence_ctx: dict | None = None
+    try:
+        from pipeline.features.delta_divergence import detect as _div_detect
+        _dsig = _div_detect(primary, n=5)
+        if _dsig.type != "none":
+            divergence_ctx = {
+                "type": _dsig.type,
+                "confidence": _dsig.confidence,
+                "price_change_pct": _dsig.price_change_pct,
+                "reason": _dsig.reason,
+            }
+    except Exception:
+        pass
+
+    # Wave phase + Fibonacci levels
+    wave_ctx: dict | None = None
+    try:
+        from pipeline.features.wave import classify as _wave_classify, target_tier as _tier
+        _wp = _wave_classify(primary, lookback=min(len(primary), 20))
+        if _wp.phase != "unknown":
+            _tier_name, _tier_price = _tier(_wp, current_price)
+            wave_ctx = {
+                "phase": _wp.phase,
+                "direction": _wp.direction,
+                "confidence": _wp.confidence,
+                "retrace_pct": _wp.retrace_pct,
+                "cvd_quality": _wp.cvd_quality,
+                "fib_retrace": _wp.fib_retrace,
+                "invalidation": _wp.invalidation,
+                "target_tier": _tier_name,
+                "target_price": _tier_price,
+                "reason": _wp.reason,
+            }
+    except Exception:
+        pass
+
+    # Sweep detection (uses cached swing points)
+    sweep_ctx: dict | None = None
+    try:
+        from pipeline.features.swing import get as _get_swing
+        from pipeline.features.sweep import detect as _sweep_detect
+        _sp = _get_swing(symbol)
+        if _sp and primary:
+            _sw = _sweep_detect(primary[-1], _sp, prev_bars=primary[:-1])
+            if _sw.type != "none":
+                sweep_ctx = {
+                    "type": _sw.type,
+                    "swept_level": _sw.swept_level,
+                    "level_label": _sw.level_label,
+                    "confidence": _sw.confidence,
+                    "reason": _sw.reason,
+                }
+    except Exception:
+        pass
+
+    # Big trade session memory
+    big_trade_ctx: dict | None = None
+    try:
+        from pipeline.features.big_trade import session_summary as _bt_summary
+        big_trade_ctx = _bt_summary(symbol, current_price)
+    except Exception:
+        pass
+
     payload: dict = {
         "symbol": symbol,
         "recent_decisions": recent_decisions,
@@ -166,10 +288,19 @@ def variable_suffix(
             for tf, b in (higher_tfs or {}).items()
         },
         "daily_vp": daily_vp,
+        "prior_day_vp": prior_day_vp,
         "weekly_vp": weekly_vp,
         "vp_context": {
             "daily_poc_last5": daily_poc_seq,
             "weekly_last2": weekly_hist,
+        },
+        "market_structure": {
+            "day_type": day_type_ctx,
+            "auction": auction_ctx,
+            "divergence": divergence_ctx,
+            "wave": wave_ctx,
+            "sweep": sweep_ctx,
+            "big_trade": big_trade_ctx,
         },
     }
     return json.dumps(payload)
