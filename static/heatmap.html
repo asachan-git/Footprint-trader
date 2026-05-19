@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>FootprintBiot — Liquidity Heatmap</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d0d0d; color: #ccc; font-family: monospace; font-size: 12px; overflow: hidden; }
+  #toolbar { display: flex; align-items: center; gap: 12px; padding: 6px 12px; background: #1a1a1a; border-bottom: 1px solid #333; }
+  #toolbar select, #toolbar input { background: #222; color: #ccc; border: 1px solid #444; padding: 3px 6px; border-radius: 3px; }
+  #toolbar button { background: #2a4a2a; color: #7f7; border: 1px solid #4a4; padding: 3px 10px; border-radius: 3px; cursor: pointer; }
+  #toolbar button:hover { background: #3a6a3a; }
+  #status { margin-left: auto; color: #666; font-size: 11px; }
+  #legend { display: flex; gap: 16px; padding: 4px 12px; background: #111; border-bottom: 1px solid #222; font-size: 11px; }
+  .leg-item { display: flex; align-items: center; gap: 5px; }
+  .leg-box { width: 14px; height: 14px; border-radius: 2px; }
+  #wrap { display: flex; height: calc(100vh - 64px); }
+  #price-axis { width: 70px; background: #111; overflow: hidden; position: relative; flex-shrink: 0; }
+  #canvas-wrap { flex: 1; overflow: hidden; position: relative; }
+  canvas { display: block; }
+  #info-panel { width: 220px; background: #111; border-left: 1px solid #222; padding: 10px; overflow-y: auto; font-size: 11px; flex-shrink: 0; }
+  #info-panel h3 { color: #aaa; margin-bottom: 8px; font-size: 12px; }
+  .info-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
+  .info-label { color: #666; }
+  .info-val { color: #ccc; }
+  .pos { color: #4f4; }
+  .neg { color: #f44; }
+  .neu { color: #aaa; }
+  .zone-row { background: #1a1a1a; padding: 3px 6px; border-radius: 3px; margin-bottom: 3px; font-size: 10px; }
+  .zone-poc { border-left: 3px solid #ff0; }
+  .zone-hvn { border-left: 3px solid #44f; }
+  .zone-lvn { border-left: 3px solid #fa0; }
+  .zone-vah { border-left: 3px solid #0ff; }
+  .zone-val { border-left: 3px solid #f0f; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <b style="color:#7af">FootprintBiot Heatmap</b>
+  <select id="sym-select">
+    <option value="BTCUSDT">BTCUSDT</option>
+    <option value="XAUTUSDT">XAUTUSDT</option>
+  </select>
+  <select id="min-select">
+    <option value="30">30 min</option>
+    <option value="60" selected>1 hour</option>
+    <option value="120">2 hours</option>
+    <option value="240">4 hours</option>
+  </select>
+  <label style="color:#888">Step:</label>
+  <input id="step-input" type="number" value="10" style="width:60px">
+  <button id="refresh-btn">Refresh</button>
+  <label style="color:#888"><input type="checkbox" id="auto-refresh" checked> Auto (15s)</label>
+  <span id="status">Loading…</span>
+</div>
+
+<div id="legend">
+  <div class="leg-item"><div class="leg-box" style="background:#2a6a2a"></div> Net Buy (ask &gt; bid)</div>
+  <div class="leg-item"><div class="leg-box" style="background:#6a2a2a"></div> Net Sell (bid &gt; ask)</div>
+  <div class="leg-item"><div class="leg-box" style="background:#333"></div> Balanced</div>
+  <div class="leg-item"><div class="leg-box" style="background:#ffff00; opacity:.7"></div> POC</div>
+  <div class="leg-item"><div class="leg-box" style="background:#4444ff; opacity:.5"></div> HVN</div>
+  <div class="leg-item"><div class="leg-box" style="background:#ffaa00; opacity:.5"></div> LVN</div>
+  <div class="leg-item"><div class="leg-box" style="background:#00ffff; opacity:.5"></div> VAH</div>
+  <div class="leg-item"><div class="leg-box" style="background:#ff00ff; opacity:.5"></div> VAL</div>
+  <div class="leg-item">● absorbed  ◆ pushed  ▲ exhausted</div>
+</div>
+
+<div id="wrap">
+  <canvas id="price-axis" width="70"></canvas>
+  <div id="canvas-wrap">
+    <canvas id="heatmap-canvas"></canvas>
+  </div>
+  <div id="info-panel">
+    <h3>VP Context</h3>
+    <div id="vp-info"></div>
+    <br>
+    <h3>Hover Cell</h3>
+    <div id="cell-info">—</div>
+    <br>
+    <h3>Markers (last 5)</h3>
+    <div id="marker-info"></div>
+  </div>
+</div>
+
+<script>
+const CELL_W = 12;   // pixels per bar (x)
+const CELL_H = 6;    // pixels per price level (y)
+let state = { bars: [], daily_vp: null, prior_vp: null, priceStep: 10 };
+let hoverBar = null, hoverPrice = null;
+let autoTimer = null;
+
+const canvas = document.getElementById('heatmap-canvas');
+const ctx = canvas.getContext('2d');
+const axisCanvas = document.getElementById('price-axis');
+const axisCtx = axisCanvas.getContext('2d');
+
+// ── fetch data ──────────────────────────────────────────────────────────────
+
+async function fetchData() {
+  const sym   = document.getElementById('sym-select').value;
+  const mins  = document.getElementById('min-select').value;
+  const step  = parseFloat(document.getElementById('step-input').value) || 10;
+  document.getElementById('status').textContent = 'Loading…';
+  try {
+    const r = await fetch(`/heatmap?symbol=${sym}&minutes=${mins}&price_step=${step}`);
+    const d = await r.json();
+    if (!d.ok) { document.getElementById('status').textContent = d.error; return; }
+    state = { bars: d.bars, daily_vp: d.daily_vp, prior_vp: d.prior_vp, priceStep: step };
+    render();
+    updateInfoPanel();
+    document.getElementById('status').textContent = `Updated ${new Date().toLocaleTimeString()} — ${d.bars.length} bars`;
+  } catch (e) {
+    document.getElementById('status').textContent = `Error: ${e.message}`;
+  }
+}
+
+// ── rendering ───────────────────────────────────────────────────────────────
+
+function render() {
+  const { bars } = state;
+  if (!bars.length) return;
+
+  // Compute price range across all bars
+  let minP = Infinity, maxP = -Infinity;
+  bars.forEach(bar => bar.cells.forEach(c => {
+    if (c.price < minP) minP = c.price;
+    if (c.price > maxP) maxP = c.price;
+  }));
+
+  // Also include VP levels
+  const vp = state.daily_vp || state.prior_vp;
+  if (vp) {
+    if (vp.vah && vp.vah > maxP) maxP = vp.vah;
+    if (vp.val && vp.val < minP) minP = vp.val;
+  }
+
+  const priceRange   = maxP - minP;
+  const numLevels    = Math.ceil(priceRange / state.priceStep) + 2;
+  const canvasH      = numLevels * CELL_H + 20;
+  const canvasW      = bars.length * CELL_W + 2;
+
+  canvas.width  = canvasW;
+  canvas.height = canvasH;
+  axisCanvas.width  = 70;
+  axisCanvas.height = canvasH;
+
+  ctx.fillStyle = '#0d0d0d';
+  ctx.fillRect(0, 0, canvasW, canvasH);
+
+  // Compute max volume for brightness scaling
+  let maxVol = 0;
+  bars.forEach(bar => bar.cells.forEach(c => { if (c.total > maxVol) maxVol = c.total; }));
+  if (maxVol === 0) maxVol = 1;
+
+  // Draw cells
+  bars.forEach((bar, bi) => {
+    const x = bi * CELL_W;
+    bar.cells.forEach(cell => {
+      const y = priceToY(cell.price, minP, maxP, canvasH);
+      drawCell(x, y, cell, maxVol);
+    });
+
+    // Draw POC line for this bar
+    if (bar.poc !== null && bar.poc !== undefined) {
+      const pocY = priceToY(bar.poc, minP, maxP, canvasH);
+      ctx.fillStyle = 'rgba(255,255,0,0.6)';
+      ctx.fillRect(x, pocY, CELL_W, 1);
+    }
+  });
+
+  // Draw VP horizontal bands
+  if (vp) {
+    drawHLine(vp.vah, minP, maxP, canvasH, canvasW, 'rgba(0,255,255,0.15)');
+    drawHLine(vp.val, minP, maxP, canvasH, canvasW, 'rgba(255,0,255,0.15)');
+    drawHLine(vp.poc, minP, maxP, canvasH, canvasW, 'rgba(255,255,0,0.20)');
+    if (vp.hvn_zones) vp.hvn_zones.forEach(z => drawBand(z.low, z.high, minP, maxP, canvasH, canvasW, 'rgba(68,68,255,0.10)'));
+    if (vp.lvn_zones) vp.lvn_zones.forEach(z => drawBand(z.low, z.high, minP, maxP, canvasH, canvasW, 'rgba(255,170,0,0.10)'));
+  }
+
+  // Draw big_trade markers
+  bars.forEach((bar, bi) => {
+    if (!bar.markers || !bar.markers.length) return;
+    const x = bi * CELL_W + CELL_W / 2;
+    bar.markers.forEach(m => {
+      const y = priceToY(m.price, minP, maxP, canvasH);
+      ctx.font = '8px monospace';
+      ctx.textAlign = 'center';
+      if (m.outcome === 'absorbed')  { ctx.fillStyle = '#ff4'; ctx.fillText('●', x, y); }
+      if (m.outcome === 'pushed')    { ctx.fillStyle = '#4af'; ctx.fillText('◆', x, y); }
+      if (m.outcome === 'exhausted') { ctx.fillStyle = '#f4a'; ctx.fillText('▲', x, y); }
+    });
+  });
+
+  // Draw time axis (bottom)
+  ctx.fillStyle = '#555';
+  ctx.font = '9px monospace';
+  ctx.textAlign = 'center';
+  bars.forEach((bar, bi) => {
+    if (bi % 15 === 0) {
+      const x = bi * CELL_W + CELL_W / 2;
+      const t = new Date(bar.ts * 1000);
+      ctx.fillText(`${t.getHours().toString().padStart(2,'0')}:${t.getMinutes().toString().padStart(2,'0')}`, x, canvasH - 3);
+    }
+  });
+
+  // Price axis
+  drawPriceAxis(minP, maxP, canvasH, vp);
+
+  // Scroll to show newest bars on right
+  const wrap = document.getElementById('canvas-wrap');
+  wrap.scrollLeft = canvasW;
+}
+
+function priceToY(price, minP, maxP, h) {
+  const ratio = (maxP - price) / (maxP - minP + 0.0001);
+  return Math.floor(ratio * (h - 20));
+}
+
+function drawCell(x, y, cell, maxVol) {
+  const intensity = Math.min(1, Math.pow(cell.total / maxVol, 0.5));
+  const delta_ratio = cell.total > 0 ? cell.delta / cell.total : 0;  // -1 to +1
+
+  let r, g, b;
+  if (delta_ratio > 0.05) {        // net buy
+    r = Math.floor(20  + 30 * intensity);
+    g = Math.floor(80  + 120 * intensity * delta_ratio);
+    b = Math.floor(20  + 20 * intensity);
+  } else if (delta_ratio < -0.05) { // net sell
+    r = Math.floor(80  + 120 * intensity * Math.abs(delta_ratio));
+    g = Math.floor(20  + 20 * intensity);
+    b = Math.floor(20  + 20 * intensity);
+  } else {                           // balanced
+    r = g = b = Math.floor(30 + 60 * intensity);
+  }
+
+  ctx.fillStyle = `rgb(${r},${g},${b})`;
+  ctx.fillRect(x, y, CELL_W - 1, CELL_H - 1);
+
+  // Overlay zone colors
+  if (cell.poc) { ctx.fillStyle = 'rgba(255,255,0,0.3)'; ctx.fillRect(x, y, CELL_W - 1, CELL_H - 1); }
+  if (cell.hvn) { ctx.fillStyle = 'rgba(68,68,255,0.2)'; ctx.fillRect(x, y, CELL_W - 1, CELL_H - 1); }
+  if (cell.lvn) { ctx.fillStyle = 'rgba(255,170,0,0.2)'; ctx.fillRect(x, y, CELL_W - 1, CELL_H - 1); }
+  if (cell.vah) { ctx.fillStyle = 'rgba(0,255,255,0.3)'; ctx.fillRect(x, y, CELL_W - 1, 1); }
+  if (cell.val) { ctx.fillStyle = 'rgba(255,0,255,0.3)'; ctx.fillRect(x, y, CELL_W - 1, 1); }
+}
+
+function drawHLine(price, minP, maxP, h, w, color) {
+  if (price == null) return;
+  const y = priceToY(price, minP, maxP, h);
+  ctx.fillStyle = color;
+  ctx.fillRect(0, y, w, 1);
+}
+
+function drawBand(lo, hi, minP, maxP, h, w, color) {
+  const y1 = priceToY(hi, minP, maxP, h);
+  const y2 = priceToY(lo, minP, maxP, h);
+  ctx.fillStyle = color;
+  ctx.fillRect(0, y1, w, Math.max(1, y2 - y1));
+}
+
+function drawPriceAxis(minP, maxP, h, vp) {
+  axisCtx.fillStyle = '#111';
+  axisCtx.fillRect(0, 0, 70, h);
+  axisCtx.fillStyle = '#555';
+  axisCtx.font = '9px monospace';
+  axisCtx.textAlign = 'right';
+
+  const step = state.priceStep;
+  let p = Math.ceil(minP / step) * step;
+  while (p <= maxP) {
+    const y = priceToY(p, minP, maxP, h);
+    const label = p >= 1000 ? p.toFixed(0) : p.toFixed(1);
+    axisCtx.fillStyle = '#555';
+    axisCtx.fillText(label, 65, y + 4);
+    p = Math.round((p + step) / step) * step;
+  }
+
+  // VP level labels
+  if (vp) {
+    const labels = [
+      { price: vp.vah, color: '#0ff', txt: 'VAH' },
+      { price: vp.val, color: '#f0f', txt: 'VAL' },
+      { price: vp.poc, color: '#ff0', txt: 'POC' },
+    ];
+    labels.forEach(({ price, color, txt }) => {
+      if (price == null) return;
+      const y = priceToY(price, minP, maxP, h);
+      axisCtx.fillStyle = color;
+      axisCtx.fillText(txt, 65, y + 4);
+    });
+  }
+}
+
+// ── info panel ──────────────────────────────────────────────────────────────
+
+function updateInfoPanel() {
+  const vp = state.daily_vp || state.prior_vp;
+  const el = document.getElementById('vp-info');
+  if (!vp) { el.innerHTML = '<span style="color:#555">No VP data</span>'; return; }
+
+  const pocs = (state.bars || []).map(b => b.poc).filter(Boolean);
+  const pocDrift = pocs.length >= 2 ?
+    (pocs[pocs.length-1] > pocs[0] ? '↑ rising' : pocs[pocs.length-1] < pocs[0] ? '↓ falling' : '→ flat') : '—';
+
+  el.innerHTML = `
+    <div class="info-row"><span class="info-label">POC</span><span class="info-val">${fmt(vp.poc)}</span></div>
+    <div class="info-row"><span class="info-label">VAH</span><span class="info-val" style="color:#0ff">${fmt(vp.vah)}</span></div>
+    <div class="info-row"><span class="info-label">VAL</span><span class="info-val" style="color:#f0f">${fmt(vp.val)}</span></div>
+    <div class="info-row"><span class="info-label">Shape</span><span class="info-val">${vp.shape || '—'}</span></div>
+    <div class="info-row"><span class="info-label">POC drift</span><span class="info-val">${pocDrift}</span></div>
+    ${state.prior_vp ? `<br><b style="color:#888">Prior Day</b>
+    <div class="info-row"><span class="info-label">POC</span><span class="info-val">${fmt(state.prior_vp.poc)}</span></div>
+    <div class="info-row"><span class="info-label">VAH</span><span class="info-val" style="color:#0ff">${fmt(state.prior_vp.vah)}</span></div>
+    <div class="info-row"><span class="info-label">VAL</span><span class="info-val" style="color:#f0f">${fmt(state.prior_vp.val)}</span></div>` : ''}
+  `;
+
+  // Markers summary
+  const allMarkers = (state.bars || []).flatMap(b => b.markers || [])
+    .sort((a, b) => b.ts - a.ts).slice(0, 5);
+  const mel = document.getElementById('marker-info');
+  mel.innerHTML = allMarkers.length ? allMarkers.map(m => `
+    <div class="zone-row">
+      <b style="color:${m.outcome==='absorbed'?'#ff4':m.outcome==='pushed'?'#4af':'#f4a'}">${m.outcome.toUpperCase()}</b>
+      ${m.side} @ ${fmt(m.price)}
+    </div>
+  `).join('') : '<span style="color:#555">No markers</span>';
+}
+
+function fmt(v) { return v != null ? Number(v).toFixed(2) : '—'; }
+
+// ── hover interaction ────────────────────────────────────────────────────────
+
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+
+  const bi = Math.floor(mx / CELL_W);
+  const bar = state.bars && state.bars[bi];
+  if (!bar) return;
+
+  // Find price from y
+  const { bars } = state;
+  let minP = Infinity, maxP = -Infinity;
+  bars.forEach(b => b.cells.forEach(c => {
+    if (c.price < minP) minP = c.price;
+    if (c.price > maxP) maxP = c.price;
+  }));
+  const ratio = my / (canvas.height - 20);
+  const price = maxP - ratio * (maxP - minP);
+  const snappedPrice = Math.round(price / state.priceStep) * state.priceStep;
+  const cell = bar.cells.find(c => Math.abs(c.price - snappedPrice) < state.priceStep);
+
+  const t = new Date(bar.ts * 1000);
+  const tStr = `${t.getHours().toString().padStart(2,'0')}:${t.getMinutes().toString().padStart(2,'0')}`;
+
+  document.getElementById('cell-info').innerHTML = cell ? `
+    <div class="info-row"><span class="info-label">Time</span><span>${tStr}</span></div>
+    <div class="info-row"><span class="info-label">Price</span><span>${cell.price.toFixed(2)}</span></div>
+    <div class="info-row"><span class="info-label">Total vol</span><span>${cell.total.toFixed(4)}</span></div>
+    <div class="info-row"><span class="info-label">Bid vol</span><span class="neg">${cell.bid.toFixed(4)}</span></div>
+    <div class="info-row"><span class="info-label">Ask vol</span><span class="pos">${cell.ask.toFixed(4)}</span></div>
+    <div class="info-row"><span class="info-label">Delta</span><span class="${cell.delta>0?'pos':cell.delta<0?'neg':'neu'}">${cell.delta>0?'+':''}${cell.delta.toFixed(4)}</span></div>
+    <div class="info-row"><span class="info-label">Bar Δ</span><span class="${bar.delta>0?'pos':bar.delta<0?'neg':'neu'}">${bar.delta>0?'+':''}${bar.delta.toFixed(2)}</span></div>
+    ${cell.poc?'<div class="zone-poc zone-row">POC</div>':''}
+    ${cell.hvn?'<div class="zone-hvn zone-row">HVN — reversal zone</div>':''}
+    ${cell.lvn?'<div class="zone-lvn zone-row">LVN — fast move zone</div>':''}
+    ${cell.vah?'<div class="zone-vah zone-row">VAH</div>':''}
+    ${cell.val?'<div class="zone-val zone-row">VAL</div>':''}
+  ` : `<div class="info-row"><span class="info-label">Time</span><span>${tStr}</span></div><div style="color:#555">No volume at this price</div>`;
+});
+
+// ── auto-refresh + controls ──────────────────────────────────────────────────
+
+function setAutoRefresh(on) {
+  if (autoTimer) clearInterval(autoTimer);
+  if (on) autoTimer = setInterval(fetchData, 15000);
+}
+
+document.getElementById('refresh-btn').addEventListener('click', fetchData);
+document.getElementById('auto-refresh').addEventListener('change', e => setAutoRefresh(e.target.checked));
+document.getElementById('sym-select').addEventListener('change', fetchData);
+document.getElementById('min-select').addEventListener('change', fetchData);
+document.getElementById('step-input').addEventListener('change', fetchData);
+
+setAutoRefresh(true);
+fetchData();
+</script>
+</body>
+</html>

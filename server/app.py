@@ -24,6 +24,7 @@ from .routes.label import bp as label_bp
 from .routes.stats import bp as stats_bp
 from .routes.footprint_view import bp as footprint_bp
 from .routes.decide_multi import bp as decide_multi_bp
+from .routes.heatmap import bp as heatmap_bp
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -50,7 +51,8 @@ def _precompute_vp(settings: dict) -> None:
 
 def create_app() -> Flask:
     load_dotenv(ROOT / ".env")
-    app = Flask(__name__)
+    static_dir = str(ROOT / "static")
+    app = Flask(__name__, static_folder=static_dir, static_url_path="/static")
     settings = load_settings()
     app.config["FB_SETTINGS"] = settings
     _precompute_vp(settings)
@@ -64,6 +66,7 @@ def create_app() -> Flask:
     app.register_blueprint(stats_bp)
     app.register_blueprint(footprint_bp)
     app.register_blueprint(decide_multi_bp)
+    app.register_blueprint(heatmap_bp)
     return app
 
 
