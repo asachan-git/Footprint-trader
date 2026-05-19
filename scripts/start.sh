@@ -39,6 +39,13 @@ cleanup() {
 }
 trap cleanup INT TERM
 
+# 0 — Rebuild real tick footprint history (runs in background, only downloads new days)
+echo "[start] refreshing tick footprint history (background)..."
+PYTHONPATH=. python3 scripts/rebuild_footprint_history.py --days 8 \
+  --symbol BTCUSDT --symbol XAUTUSDT \
+  > logs/rebuild_history.log 2>&1 &
+PIDS+=($!)
+
 # 1 — Flask
 echo "[start] Flask server..."
 PYTHONPATH=. python3 -m server.app > logs/flask.log 2>&1 &
@@ -145,6 +152,7 @@ echo "    Flask:           logs/flask.log"
 echo "    Bybit BTC:       logs/bybit_btc.log"
 echo "    Bybit XAUT:      logs/bybit_xaut.log"
 echo "    Multi-decide:    logs/decide_multi.log"
+echo "    History rebuild: logs/rebuild_history.log"
 [[ $EXNESS -eq 1 ]] && echo "    Exness:          logs/exness.log"
 echo ""
 echo "  Commands:"
