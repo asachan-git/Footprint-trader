@@ -32,21 +32,30 @@ bp = Blueprint("decide", __name__)
 LOG = logging.getLogger(__name__)
 
 
-def _in_active_hours(filt: dict[str, Any], bar_ts: int) -> tuple[bool, str]:
-    """Check active_hours_utc config gate. Empty string = always active."""
+def _in_active_hours(filt: dict[str, Any], bar_ts: int, symbol: str = "") -> tuple[bool, str]:
+    """Check active hours for the symbol using per-instrument schedule.
+
+    Falls back to config active_hours_utc if set; otherwise uses the
+    symbol-aware session module (BTCUSDT=24/7, XAUTUSDT=23h, etc).
+    """
     window: str = str(filt.get("active_hours_utc") or "")
-    if not window.strip():
-        return True, ""
-    try:
-        start_str, end_str = window.split("-")
-        start_h = int(start_str.split(":")[0])
-        end_h = int(end_str.split(":")[0])
-    except Exception:
-        return True, ""
-    sess = current_session(bar_ts)
-    if start_h <= sess.utc_hour < end_h:
-        return True, ""
-    return False, f"outside active hours {window} (UTC {sess.utc_hour:02d}:xx, session={sess.session})"
+    sess = current_session(bar_ts, symbol=symbol or None)
+
+    if window.strip():
+        # Config override: explicit hour range takes precedence
+        try:
+            start_str, end_str = window.split("-")
+            start_h = int(start_str.split(":")[0])
+            end_h = int(end_str.split(":")[0])
+        except Exception:
+            return True, ""
+        if start_h <= sess.utc_hour < end_h:
+            return True, ""
+        return False, f"outside active hours {window} (UTC {sess.utc_hour:02d}:xx, session={sess.session})"
+
+    if not sess.in_active_hours:
+        return False, f"outside {symbol or 'instrument'} active hours (UTC {sess.utc_hour:02d}:xx, session={sess.session})"
+    return True, ""
 
 
 def _same_direction_cooldown(symbol: str, cooldown_bars: int = 3) -> tuple[bool, str]:
@@ -97,7 +106,7 @@ def _has_setup(bar: Bar, settings: dict[str, Any]) -> tuple[bool, str]:
     min_delta_ratio = cal.min_delta_ratio if cal.sample_size >= 8 else 0.0
 
     # Time filter
-    active, time_reason = _in_active_hours(filt, bar.close_ts)
+    active, time_reason = _in_active_hours(filt, bar.close_ts, symbol=bar.symbol)
     if not active:
         return False, time_reason
 
@@ -130,6 +139,7 @@ def decide():
     symbol = body.get("symbol") or settings["instrument"]["symbol"]
     primary_tf = body.get("tf") or settings["instrument"]["primary_tf"]
     force = bool(body.get("force", False))
+    min_confidence = float((settings.get("decide_filter") or {}).get("min_confidence") or 0)
 
     s = store()
     latest = s.latest(symbol, primary_tf)
