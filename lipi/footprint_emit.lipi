@@ -1,0 +1,19 @@
+// FootprintBiot — production Lipi emitter
+//
+// EMPTY STUB until Phase 0a spike confirms Lipi syntax + footprint accessors.
+// Do NOT run this file in GoCharting yet — it will throw the same
+// "extraneous input 'payload'" error the spike threw.
+//
+// Workflow:
+//   1. Get spikes/spike_emit.lipi compiling in Lipi editor.
+//   2. Confirm: declaration keyword, assignment syntax, string concat operator,
+//      footprint accessors, alert primitive, replay-mode flag.
+//   3. Port the working syntax here, build up the lipi_v1 payload, send to
+//      http://<flask-host>:5000/ingest.
+//
+// See spikes/README.md for the spike decision matrix.
+
+//@version=1
+indicator("FootprintBiot Emit (stub)", overlay=false)
+
+plot(close)

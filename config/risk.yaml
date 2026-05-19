@@ -1,0 +1,10 @@
+per_trade:
+  max_r: 1.0               # max risk per trade in R units
+  rr_floor: 1.4            # reject decisions with R:R below this (was 1.5 — Claude systematically calculates 1.49)
+
+daily:
+  max_dd_r: 3.0            # halt for the day after this drawdown
+  max_trades: 8
+
+session:
+  cooldown_after_loss_min: 5

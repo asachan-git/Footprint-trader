@@ -1,0 +1,41 @@
+mode: paper              # journal | paper | live  (live also needs env ALLOW_LIVE=1)
+
+instrument:
+  symbol: NQ
+  timeframes: [1m, 5m, 15m]
+  primary_tf: 1m           # decision fires on close of this TF; higher TFs join as-of
+
+claude:
+  model: claude-sonnet-4-6
+  fallback_model: claude-opus-4-7   # used when validator flags ambiguity
+  cache: true
+  max_tokens_out: 600
+  timeout_s: 30
+
+prompt:
+  active_version_file: prompts/system/current.txt
+  recent_bars: 10          # variable suffix size (was 20 — reduced for latency)
+  few_shot_count: 4
+
+ingress:
+  format_default: bybit_v1   # atas_v1 | bybit_v1 | exness_v1 | capital_v1 | userscript_v1
+
+# VP cache — pre-computed on server start, updated at day/week boundaries
+vp_cache:
+  symbols: [BTCUSDT, XAUTUSDT]   # pre-compute VP for these symbols on startup
+  # Daily session start in UTC hours. Session runs start_utc → start_utc+24h.
+  # BTCUSDT: 5:30 AM IST = 00:00 UTC
+  # XAUTUSDT: 3:30 AM IST = 22:00 UTC previous day (Forex gold session)
+  session_start_utc:
+    BTCUSDT: 0      # midnight UTC
+    XAUTUSDT: 22    # 22:00 UTC (= 3:30 AM IST)
+
+# Pre-filter for /decide — skip Claude call when local features signal no setup.
+# Pass {"force": true} in /decide body to bypass.
+decide_filter:
+  min_abs_delta: 2.0        # tune per symbol (BTCUSDT ~10-50, XAUTUSDT ~2-5)
+  min_confidence: 0.60      # reject Claude decisions below this confidence
+  require_stacked: false
+  require_absorption: false
+  active_hours_utc: ""      # e.g. "07:00-17:00" to skip Asian dead zone (empty = always on)
+  same_direction_cooldown: 3  # block if last 2 non-flat decisions same direction (0=disabled)
