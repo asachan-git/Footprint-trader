@@ -28,13 +28,31 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 CACHE_FILE = ROOT / "data" / "vp_cache.json"
 
 
-def _day_key(ts: int) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _session_day_key(ts: int, sess_start_utc: int) -> str:
+    """Return the IST calendar-date label for whichever session is active at ts.
+
+    Works for any session_start_utc:
+      BTCUSDT (0):   UTC 23:30 May 19 → session started UTC 00:00 May 19 → key "2026-05-19"
+      XAUTUSDT (22): UTC 23:30 May 19 → session started UTC 22:00 May 19 → IST 03:30 May 20 → key "2026-05-20"
+      XAUTUSDT (22): UTC 21:00 May 19 → session started UTC 22:00 May 18 → IST 03:30 May 19 → key "2026-05-19"
+    """
+    utc_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    if utc_dt.hour >= sess_start_utc:
+        sess_start_dt = utc_dt.replace(hour=sess_start_utc, minute=0, second=0, microsecond=0)
+    else:
+        sess_start_dt = (utc_dt - timedelta(days=1)).replace(
+            hour=sess_start_utc, minute=0, second=0, microsecond=0
+        )
+    return sess_start_dt.astimezone(_IST).strftime("%Y-%m-%d")
 
 
 def _week_key(ts: int) -> str:
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-    return f"{dt.year}-W{dt.strftime('%V')}"
+    """ISO week key using IST date (consistent with _session_day_key for typical sessions)."""
+    dt = datetime.fromtimestamp(ts, tz=_IST)
+    return f"{dt.strftime('%G')}-W{dt.strftime('%V')}"
 
 
 IST_OFFSET_H = 5.5   # UTC+5:30
@@ -69,8 +87,13 @@ def _day_bounds(ist_date_str: str, session_start_utc: int = 0) -> tuple[int, int
 
 
 def _week_bounds(week_str: str, session_start_utc: int = 0) -> tuple[int, int]:
+    """Return (start_ts, end_ts) for an ISO week string like '2026-W21'.
+
+    Uses %G/%V/%u so the Monday start matches how _week_key generates keys.
+    %W (old) and %V (ISO) count differently — mixing them caused off-by-one weeks.
+    """
     year, week = week_str.split("-W")
-    dt = datetime.strptime(f"{year}-W{week}-1", "%Y-W%W-%w").replace(
+    dt = datetime.strptime(f"{year}-W{week}-1", "%G-W%V-%u").replace(
         hour=session_start_utc, minute=0, second=0, tzinfo=timezone.utc
     )
     start = int(dt.timestamp())
@@ -126,7 +149,6 @@ def build_and_save(
     session_cfg = session_start_utc or {}
     cache = _load()
     now_ts = int(time.time())
-    now_dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
 
     for symbol in symbols:
         s = _store()
@@ -139,25 +161,25 @@ def build_and_save(
         sess_start: int = int(session_cfg.get(symbol, 0))
         cache.setdefault(symbol, {"daily": {}, "weekly": {}, "session_start_utc": sess_start})  # type: ignore[union-attr]
         sym_cache: dict[str, _Any] = cache[symbol]  # type: ignore[assignment]
-        sym_cache["session_start_utc"] = sess_start   # update if changed
+        sym_cache["session_start_utc"] = sess_start
         computed = 0
 
-        # Last 5 days (including today)
+        # Last 5 days — key = session-aware IST date (correct for both BTC and XAUT)
         for days_back in range(5):
-            dt = now_dt - timedelta(days=days_back)
-            date_key = dt.strftime("%Y-%m-%d")
+            ts_for_day = now_ts - days_back * 86400
+            date_key = _session_day_key(ts_for_day, sess_start)
             if date_key in sym_cache["daily"] and days_back > 0:
-                continue   # past days already complete — skip
+                continue   # past days complete — skip
             start_ts, end_ts = _day_bounds(date_key, sess_start)
             vp = _compute_period_vp(all_bars, start_ts, min(end_ts, now_ts))
             if vp:
                 sym_cache["daily"][date_key] = vp
                 computed += 1
 
-        # Last 2 weeks (including current week)
+        # Last 2 weeks — ISO week key derived from session-aware timestamp
         for weeks_back in range(2):
-            dt = now_dt - timedelta(weeks=weeks_back)
-            week_key = f"{dt.year}-W{dt.strftime('%V')}"
+            ts_for_week = now_ts - weeks_back * 604800
+            week_key = _week_key(ts_for_week)
             if week_key in sym_cache["weekly"] and weeks_back > 0:
                 continue
             start_ts, end_ts = _week_bounds(week_key, sess_start)
@@ -179,8 +201,9 @@ def get(symbol: str, period: str) -> dict | None:
     cache = _load()
     sym = cache.get(symbol, {})
     now_ts = int(time.time())
+    sess_start: int = int(sym.get("session_start_utc") or 0)  # type: ignore[arg-type]
     if period == "daily":
-        key = _day_key(now_ts)
+        key = _session_day_key(now_ts, sess_start)
         return sym.get("daily", {}).get(key)
     elif period == "weekly":
         key = _week_key(now_ts)

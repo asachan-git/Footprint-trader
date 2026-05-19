@@ -5,7 +5,12 @@ Session windows (UTC):
   London:           07:00 - 12:00  — high activity
   London+NY Overlap: 12:00 - 16:00 — highest liquidity, best setups
   NY:               16:00 - 21:00  — good activity
-  Off-hours:        21:00 - 24:00  — low liquidity
+  Off-hours:        21:00 - 24:00  — low liquidity for gold; crypto still active
+
+Per-instrument active hours:
+  BTCUSDT:  24/7 — crypto never sleeps, always in_active_hours=True
+  XAUTUSDT: 22:00 UTC → 21:00 UTC (23h) — off only 21:00-22:00 UTC
+             (= 03:30 IST → 02:30 IST, 1h break between NY close and Asian gold open)
 
 HTF SMA bias: daily close vs 20-bar SMA on daily bars.
 """
@@ -15,27 +20,46 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+# Per-symbol active hour ranges (UTC).
+# Tuple: (start_inclusive, end_exclusive) or None = always active.
+# For XAUTUSDT the break is 21:00-22:00 UTC, so everything EXCEPT that hour is active.
+_SYMBOL_INACTIVE_HOURS: dict[str, set[int]] = {
+    "BTCUSDT":  set(),            # never inactive
+    "XAUTUSDT": {21},             # only 21:00-22:00 UTC is off (NY close to Asian gold open)
+}
+
 
 @dataclass(frozen=True)
 class SessionContext:
     session: str           # "Asia" | "London" | "Overlap" | "NY" | "Off"
-    in_active_hours: bool  # True during London + Overlap + NY
+    in_active_hours: bool  # True when the symbol is in its active trading window
     utc_hour: int
 
 
-def current_session(ts: int | None = None) -> SessionContext:
-    """Return session context for a UNIX timestamp (default: now)."""
+def current_session(ts: int | None = None, symbol: str | None = None) -> SessionContext:
+    """Return session context for a UNIX timestamp (default: now).
+
+    Pass symbol to get the correct per-instrument in_active_hours.
+    Without symbol: uses the generic Forex/equity schedule (off during Asia + Off).
+    """
     utc_hour = int(time.gmtime(ts or time.time()).tm_hour)
     if 0 <= utc_hour < 7:
-        session, active = "Asia", False
+        session = "Asia"
     elif 7 <= utc_hour < 12:
-        session, active = "London", True
+        session = "London"
     elif 12 <= utc_hour < 16:
-        session, active = "Overlap", True
+        session = "Overlap"
     elif 16 <= utc_hour < 21:
-        session, active = "NY", True
+        session = "NY"
     else:
-        session, active = "Off", False
+        session = "Off"
+
+    if symbol is not None and symbol in _SYMBOL_INACTIVE_HOURS:
+        active = utc_hour not in _SYMBOL_INACTIVE_HOURS[symbol]
+    else:
+        # Generic schedule: active during London + Overlap + NY
+        active = session in ("London", "Overlap", "NY")
+
     return SessionContext(session=session, in_active_hours=active, utc_hour=utc_hour)
 
 
