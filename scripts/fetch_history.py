@@ -108,11 +108,36 @@ def _build_synthetic_bar(symbol: str, tf: str, b: dict, price_step: float = 10.0
     while p <= hi + price_step:
         levels.append(p)
         p = round((p + price_step) / price_step) * price_step
+    rng = b["h"] - b["l"]
+    delta = b["vol"] * (2.0 * (b["c"] - b["l"]) / rng - 1.0) if rng > 0 else (b["vol"] if b["c"] >= b["o"] else -b["vol"])
     if not levels:
         levels = [b["c"]]
-    vol_per_level = b["vol"] / (2 * len(levels))  # split bid/ask
-    bid_ladder = tuple(Level(price=p, vol=vol_per_level) for p in levels)
-    ask_ladder = tuple(Level(price=p, vol=vol_per_level) for p in levels)
+    n_levels = len(levels)
+    rng_l = b["h"] - b["l"]
+    # Weight each level by proximity to close — gaussian-like (triangular)
+    weights = []
+    for p in levels:
+        dist = abs(p - b["c"]) / (rng_l + 1e-9)
+        weights.append(max(0.1, 1.0 - dist * 1.5))
+    total_w = sum(weights) or 1.0
+    # Bullish bar: more ask vol at low levels (buyers lifting offers), more bid at highs
+    # Bearish bar: reversed. Split 60/40 directionally.
+    is_bull = b["c"] >= b["o"]
+    bid_ladder_levels = []
+    ask_ladder_levels = []
+    for p, w in zip(levels, weights):
+        level_vol = b["vol"] * w / total_w
+        price_pos = (p - b["l"]) / (rng_l + 1e-9)  # 0=low, 1=high
+        if is_bull:
+            ask_frac = max(0.2, 0.7 - price_pos * 0.5)  # more ask at bottom
+            bid_frac = 1.0 - ask_frac
+        else:
+            bid_frac = max(0.2, 0.7 - price_pos * 0.5)  # more bid at bottom for bears
+            ask_frac = 1.0 - bid_frac
+        bid_ladder_levels.append(Level(price=p, vol=level_vol * bid_frac))
+        ask_ladder_levels.append(Level(price=p, vol=level_vol * ask_frac))
+    bid_ladder = tuple(bid_ladder_levels)
+    ask_ladder = tuple(ask_ladder_levels)
     return Bar(
         bar_id=_bar_id(symbol, tf, b["ts"]),
         symbol=symbol,
@@ -122,7 +147,7 @@ def _build_synthetic_bar(symbol: str, tf: str, b: dict, price_step: float = 10.0
         ohlc=OHLC(o=b["o"], h=b["h"], l=b["l"], c=b["c"]),
         bid_ladder=bid_ladder,
         ask_ladder=ask_ladder,
-        delta=None,
+        delta=round(delta, 4),
         poc=None,
     )
 
