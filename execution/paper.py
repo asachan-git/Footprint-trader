@@ -67,6 +67,20 @@ class PaperExecutor:
             f"[paper] OPEN {pos.side} {bar.symbol} fill={pos.avg_entry:.2f} {slip_note} "
             f"sl={pos.stop_loss:.2f} tp={pos.take_profit:.2f} R:R={rr:.1f}"
         )
+
+        # Register cycle for hedge/recovery tracking
+        try:
+            from execution.cycle_store import cycle_store
+            cycle_store().open_cycle(
+                symbol=bar.symbol,
+                tf=bar.tf,
+                direction=pos.side,
+                position_id=pos.position_id,
+                parent_cycle_id=decision.parent_position_id,
+            )
+        except Exception:
+            pass
+
         return {
             "mode": "paper",
             "opened": pos.position_id,
