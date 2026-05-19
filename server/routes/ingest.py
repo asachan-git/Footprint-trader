@@ -58,6 +58,10 @@ def _aggregate_mtf(bar, settings) -> None:
             s.put(synth)
 
 
+MIN_HOLD_SECS   = 180   # seconds a position must be open before invalidation/hedge fires
+MIN_HEDGE_SECS  = 300   # seconds a hedge must be held before recovery removal is allowed
+
+
 def _check_positions(bar, settings) -> list[dict]:
     """Check open positions for SL/TP/invalidation on this bar. Returns list of exit events."""
     ps = position_store()
@@ -75,38 +79,109 @@ def _check_positions(bar, settings) -> list[dict]:
     fp = build_fp(bar)
 
     for pos in ps.open_positions(bar.symbol):
-        # 1. Hard SL hit
-        if pos.side == "long" and bar.ohlc.l <= pos.stop_loss:
-            risk = abs(pos.avg_entry - pos.stop_loss)
-            realized_r = (pos.stop_loss - pos.avg_entry) / risk if risk > 0 else -1.0
-            ps.close_position(pos.position_id, "sl_hit", realized_r)
-            exits.append({"position_id": pos.position_id, "exit": "sl_hit", "realized_r": realized_r})
-            LOG.info(f"[ingest] SL hit {pos.position_id} long @ {bar.ohlc.l:.2f} ≤ SL {pos.stop_loss:.2f}")
+        risk = abs(pos.avg_entry - pos.stop_loss)
 
-        elif pos.side == "short" and bar.ohlc.h >= pos.stop_loss:
-            risk = abs(pos.avg_entry - pos.stop_loss)
-            realized_r = (pos.avg_entry - pos.stop_loss) / risk if risk > 0 else -1.0
-            ps.close_position(pos.position_id, "sl_hit", realized_r)
-            exits.append({"position_id": pos.position_id, "exit": "sl_hit", "realized_r": realized_r})
-            LOG.info(f"[ingest] SL hit {pos.position_id} short @ {bar.ohlc.h:.2f} ≥ SL {pos.stop_loss:.2f}")
+        sl_hit = (
+            (pos.side == "long"  and bar.ohlc.l <= pos.stop_loss) or
+            (pos.side == "short" and bar.ohlc.h >= pos.stop_loss)
+        )
+        tp_hit = (
+            (pos.side == "long"  and bar.ohlc.h >= pos.take_profit) or
+            (pos.side == "short" and bar.ohlc.l <= pos.take_profit)
+        )
 
-        # 2. TP absorption exit (full exit when opposite absorption forms at TP)
-        elif tp_reason := check_tp_absorption(bar, fp, pos.side, pos.take_profit):
-            risk = abs(pos.avg_entry - pos.stop_loss)
+        # 1. Hard SL hit — if same bar hits both SL and TP, SL wins (conservative)
+        if sl_hit:
+            realized_r = -1.0  # always exactly -1R by definition
+            if pos.side == "long":
+                ps.close_position(pos.position_id, f"sl_hit @ {bar.ohlc.l:.4f} ≤ SL {pos.stop_loss:.4f}", realized_r)
+                LOG.info(f"[ingest] SL hit {pos.position_id} long bar_low={bar.ohlc.l:.4f} sl={pos.stop_loss:.4f}")
+            else:
+                ps.close_position(pos.position_id, f"sl_hit @ {bar.ohlc.h:.4f} ≥ SL {pos.stop_loss:.4f}", realized_r)
+                LOG.info(f"[ingest] SL hit {pos.position_id} short bar_high={bar.ohlc.h:.4f} sl={pos.stop_loss:.4f}")
+            exits.append({"position_id": pos.position_id, "exit": "sl_hit", "realized_r": realized_r,
+                          "bar_extreme": bar.ohlc.l if pos.side == "long" else bar.ohlc.h,
+                          "sl": pos.stop_loss})
+
+        # 2. Hard TP hit — price actually reached the target level
+        elif tp_hit:
+            realized_r = abs(pos.take_profit - pos.avg_entry) / risk if risk > 0 else 1.5
+            if pos.side == "long":
+                ps.close_position(pos.position_id, f"tp_hit @ {bar.ohlc.h:.4f} ≥ TP {pos.take_profit:.4f}", realized_r)
+                LOG.info(f"[ingest] TP hit {pos.position_id} long bar_high={bar.ohlc.h:.4f} tp={pos.take_profit:.4f} R={realized_r:.2f}")
+            else:
+                ps.close_position(pos.position_id, f"tp_hit @ {bar.ohlc.l:.4f} ≤ TP {pos.take_profit:.4f}", realized_r)
+                LOG.info(f"[ingest] TP hit {pos.position_id} short bar_low={bar.ohlc.l:.4f} tp={pos.take_profit:.4f} R={realized_r:.2f}")
+            exits.append({"position_id": pos.position_id, "exit": "tp_hit", "realized_r": realized_r,
+                          "bar_extreme": bar.ohlc.h if pos.side == "long" else bar.ohlc.l,
+                          "tp": pos.take_profit})
+
+        # 3. TP absorption exit — footprint signal confirmed price reached TP zone (95% gate)
+        elif tp_reason := check_tp_absorption(bar, fp, pos.side, pos.take_profit, entry=pos.avg_entry):
             if risk > 0:
-                realized_r = abs(pos.take_profit - pos.avg_entry) / risk
+                # Exit price = actual bar extreme capped at TP (can't fill beyond TP)
+                exit_price = min(bar.ohlc.h, pos.take_profit) if pos.side == "long" else max(bar.ohlc.l, pos.take_profit)
+                realized_r = abs(exit_price - pos.avg_entry) / risk
             else:
                 realized_r = 1.5
             ps.close_position(pos.position_id, f"tp_absorption: {tp_reason}", realized_r)
-            exits.append({"position_id": pos.position_id, "exit": "tp_absorption", "realized_r": realized_r, "reason": tp_reason})
-            LOG.info(f"[ingest] TP absorption {pos.position_id}: {tp_reason}")
+            exits.append({"position_id": pos.position_id, "exit": "tp_absorption", "realized_r": round(realized_r, 4), "reason": tp_reason})
+            LOG.info(f"[ingest] TP absorption {pos.position_id} exit={exit_price:.4f} R={realized_r:.2f}: {tp_reason}")
 
-        # 3. Footprint invalidation (opposite absorption at entry zone)
-        elif inv := detect_invalidation(bar, fp, pos.side, pos.avg_entry):
+        # 4. Footprint invalidation → hedge (only after MIN_HOLD_SECS, avoids sub-bar fires)
+        elif (bar.close_ts - pos.opened_ts >= MIN_HOLD_SECS and
+              (inv := detect_invalidation(bar, fp, pos.side, pos.avg_entry))):
             if inv.strength == "strong":
-                ps.invalidate_position(pos.position_id, inv.reason)
-                exits.append({"position_id": pos.position_id, "exit": "invalidated", "reason": inv.reason})
-                LOG.info(f"[ingest] INVALIDATED {pos.position_id}: {inv.reason}")
+                try:
+                    from execution.hedge_manager import open_hedge, active_hedge_for_cycle
+                    from execution.cycle_store import cycle_store
+                    cs = cycle_store()
+                    active = [c for c in cs.active_cycles(bar.symbol)
+                              if c.position_id == pos.position_id]
+                    if active and not active_hedge_for_cycle(active[0].cycle_id):
+                        lots = float(settings.get("risk", {}).get("base_lot_size", 0.01)) * pos.leg_count
+                        hedge = open_hedge(active[0].cycle_id, bar.symbol, pos.side, lots, bar.ohlc.c)
+                        exits.append({
+                            "position_id": pos.position_id,
+                            "exit": "hedged",
+                            "hedge_id": hedge.hedge_id,
+                            "reason": inv.reason,
+                        })
+                        LOG.info(f"[ingest] HEDGED {pos.position_id} cycle={active[0].cycle_id}: {inv.reason}")
+                    else:
+                        # No active cycle tracked — fall back to invalidate
+                        ps.invalidate_position(pos.position_id, inv.reason)
+                        exits.append({"position_id": pos.position_id, "exit": "invalidated", "reason": inv.reason})
+                        LOG.info(f"[ingest] INVALIDATED {pos.position_id}: {inv.reason}")
+                except Exception:
+                    ps.invalidate_position(pos.position_id, inv.reason)
+                    exits.append({"position_id": pos.position_id, "exit": "invalidated", "reason": inv.reason})
+
+        # 5. Check if active hedge can be removed (price recovered, after MIN_HEDGE_SECS)
+        else:
+            try:
+                from execution.hedge_manager import active_hedge_for_cycle, should_remove_hedge, remove_hedge
+                from execution.cycle_store import cycle_store
+                cs = cycle_store()
+                for cyc in cs.active_cycles(bar.symbol):
+                    if cyc.position_id != pos.position_id:
+                        continue
+                    hedge = active_hedge_for_cycle(cyc.cycle_id)
+                    if hedge:
+                        # Don't remove hedge until it has been held for MIN_HEDGE_SECS
+                        if bar.close_ts - hedge.opened_ts < MIN_HEDGE_SECS:
+                            continue
+                        ok, reason = should_remove_hedge(bar, fp, hedge, pos.side, wave_cvd_quality=None)
+                        if ok:
+                            remove_hedge(hedge.hedge_id, reason)
+                            exits.append({
+                                "position_id": pos.position_id,
+                                "exit": "hedge_removed",
+                                "reason": reason,
+                            })
+                            LOG.info(f"[ingest] HEDGE REMOVED {hedge.hedge_id}: {reason}")
+            except Exception:
+                pass
 
     return exits
 
@@ -143,6 +218,36 @@ def ingest():
     # Trail SL / break-even after positions checked (so we don't move SL on a bar that just closed)
     recent_bars = store().recent(bar.symbol, bar.tf, 10)
     sl_adjustments = check_sl_adjustments(bar, recent_bars)
+
+    # Update swing point cache (used by sweep detector in builder.py)
+    if bar.tf == primary_tf:
+        try:
+            from pipeline.features.swing import update as _swing_update
+            session_start_utc = settings.get("vp_cache", {}).get(
+                "session_start_utc", {}
+            ).get(bar.symbol, 0)
+            import time as _time, datetime as _dt
+            _now = _dt.datetime.utcnow()
+            _sess_start_h = session_start_utc
+            if _now.hour >= _sess_start_h:
+                _sess_date = _now.date()
+            else:
+                _sess_date = (_now - _dt.timedelta(days=1)).date()
+            _sess_ts = int(_dt.datetime(
+                _sess_date.year, _sess_date.month, _sess_date.day,
+                _sess_start_h, 0, 0,
+            ).timestamp())
+            _swing_update(bar.symbol, primary_tf, _sess_ts)
+        except Exception:
+            pass
+
+    # Classify big trade outcomes for pending events
+    if bar.tf == primary_tf:
+        try:
+            from pipeline.features.big_trade import classify_outcomes as _classify_outcomes
+            _classify_outcomes(recent_bars, bar.symbol)
+        except Exception:
+            pass
 
     return jsonify({
         "ok": True,
