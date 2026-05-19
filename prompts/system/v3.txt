@@ -142,6 +142,26 @@ Two VP references are always provided: `prior_day_vp` (PD) and `daily_vp` (curre
 
 ---
 
+## VP Setup — structured entry framework
+
+`vp_setup` in context gives a classified setup with ordered entry zones and targets.
+
+| setup_type | bias | grid_mode | max_legs |
+|---|---|---|---|
+| `val_reclaim` | long | mean_reversion | 3 |
+| `vah_rejection` | short | mean_reversion | 3 |
+| `hvn_bounce` | long/short | mean_reversion | 2 |
+| `poc_migration` | long/short | directional | 2 |
+| `acceptance` | long/short | directional | 2 |
+
+**Zone scores:** `vp_setup.zone_scores` ranks each entry zone by confluence (0–1). Use `qty_pct` as the leg size fraction. Skip zones with `skip=true` (LVN — fast-move, bad fills).
+
+**Tier widths:** `vp_setup.tier_widths` gives natural leg spacing from VP structure. Don't compress legs tighter than tier1 width.
+
+**When VP setup conflicts with day_type:** VP setup takes priority for entry zone selection; day_type constrains max_legs and grid_mode. Example: `val_reclaim` (long) on `trend_down` day → still long but max_legs=min(3, day_type.max_legs).
+
+---
+
 ## Grid leg rules (when active_grid present)
 
 **Add leg (`add_to_existing: true`) requires ALL of:**

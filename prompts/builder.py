@@ -302,5 +302,51 @@ def variable_suffix(
             "sweep": sweep_ctx,
             "big_trade": big_trade_ctx,
         },
+        "vp_setup": _vp_setup_ctx(symbol, primary, cached_daily, htf, session_cvd),
     }
     return json.dumps(payload)
+
+
+def _vp_setup_ctx(symbol: str, primary: list, cached_daily, htf: dict, session_cvd: float) -> dict | None:
+    """Compute VP setup + confluence scores for the current bar."""
+    try:
+        from pipeline.features.vp_setup import from_store as _vps
+        from pipeline.features.confluence import score_zones as _score, grid_tier_spacing as _tiers
+        from pipeline.features.vp_cache import poc_sequence as _pocs, get_history as _hist
+        from pipeline.footprint import build as _bfp
+
+        setup = _vps(symbol, primary[0].tf if primary else "1m")
+        if setup.setup_type == "none":
+            return None
+
+        bar = primary[-1] if primary else None
+        fp = _bfp(bar) if bar else None
+        htf_bias = htf.get("bias", "neutral") if htf else "neutral"
+
+        zone_scores: list[dict] = []
+        if bar and fp and setup.entry_zones:
+            for sc in _score(setup.entry_zones, bar, fp, cached_daily, setup.bias, session_cvd, htf_bias):
+                zone_scores.append({
+                    "price":    sc.price,
+                    "score":    sc.score,
+                    "qty_pct":  sc.qty_pct,
+                    "skip":     sc.skip,
+                    "reasons":  sc.reasons,
+                })
+
+        tiers = _tiers(cached_daily)
+
+        return {
+            "setup_type":    setup.setup_type,
+            "bias":          setup.bias,
+            "entry_zones":   setup.entry_zones,
+            "target_zones":  setup.target_zones,
+            "max_legs":      setup.max_legs,
+            "setup_strength": setup.setup_strength,
+            "grid_mode":     setup.grid_mode,
+            "reason":        setup.reason,
+            "zone_scores":   zone_scores,
+            "tier_widths":   tiers,
+        }
+    except Exception:
+        return None
