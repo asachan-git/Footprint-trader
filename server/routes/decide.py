@@ -17,6 +17,7 @@ from execution.router import dispatch
 from execution.position_store import position_store
 from execution.grid_manager import should_add_leg, active_grid_summary
 from pipeline.features.session import current_session
+from pipeline.features.threshold_calibrator import get as get_thresholds
 from llm.client import ClaudeClient, ClientConfig
 from llm.logger import log_decision
 from llm.validator import validate
@@ -82,11 +83,18 @@ def _same_direction_cooldown(symbol: str, cooldown_bars: int = 3) -> tuple[bool,
 def _has_setup(bar: Bar, settings: dict[str, Any]) -> tuple[bool, str]:
     """Pre-filter: only call Claude if local features show a candidate setup."""
     filt: dict[str, Any] = settings.get("decide_filter") or {}
-    min_abs_delta = float(filt.get("min_abs_delta") or 0)
     min_confidence = float(filt.get("min_confidence") or 0)
     require_stacked = bool(filt.get("require_stacked", False))
     require_absorption = bool(filt.get("require_absorption", False))
     cooldown_bars = int(filt.get("same_direction_cooldown", 3))
+    primary_tf = str(settings.get("instrument", {}).get("primary_tf", "1m"))
+
+    # Auto-calibrated delta threshold from live bar history
+    cal = get_thresholds(bar.symbol, primary_tf, bar.tf)
+    config_min = float(filt.get("min_abs_delta") or 0)
+    # Use calibrated if sample is sufficient, else fall back to config
+    min_abs_delta = cal.min_abs_delta if cal.sample_size >= 8 else config_min
+    min_delta_ratio = cal.min_delta_ratio if cal.sample_size >= 8 else 0.0
 
     # Time filter
     active, time_reason = _in_active_hours(filt, bar.close_ts)
@@ -104,12 +112,15 @@ def _has_setup(bar: Bar, settings: dict[str, Any]) -> tuple[bool, str]:
     absorptions = detect_absorption(bar, fp)
 
     if abs(delta) < min_abs_delta:
-        return False, f"delta {delta:.2f} below threshold {min_abs_delta}"
+        return False, f"delta {delta:.2f} below calibrated threshold {min_abs_delta:.1f} (n={cal.sample_size})"
+    total_vol = fp.total_bid + fp.total_ask
+    if min_delta_ratio > 0 and total_vol > 0 and (abs(delta) / total_vol) < min_delta_ratio:
+        return False, f"delta_ratio {abs(delta)/total_vol:.4f} below threshold {min_delta_ratio:.4f}"
     if require_stacked and not stacked:
         return False, "no stacked imbalances"
     if require_absorption and not absorptions:
         return False, "no absorption detected"
-    return True, "filter passed"
+    return True, f"filter passed (delta={delta:.1f} thresh={min_abs_delta:.1f} n={cal.sample_size})"
 
 
 @bp.post("/decide")

@@ -11,8 +11,15 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from threading import Lock
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _ts_ist(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=_IST).strftime("%Y-%m-%d %H:%M:%S IST")
 from typing import Literal
 
 from llm.schema import Decision
@@ -129,7 +136,9 @@ class PositionStore:
                 self._positions[pid].legs[-1].stop_loss = event["new_sl"]
 
     def _write(self, event: dict) -> None:
-        event["ts"] = int(time.time())
+        now = int(time.time())
+        event["ts"] = now
+        event["ts_ist"] = _ts_ist(now)
         with POSITIONS_LOG.open("a") as fh:
             fh.write(json.dumps(event) + "\n")
         self._apply(event)
@@ -144,12 +153,14 @@ class PositionStore:
                 "symbol": symbol,
                 "tf": tf,
                 "side": decision.side,
-                "entry": decision.entry,
+                "entry": decision.entry,          # fill price (after slippage)
                 "stop_loss": decision.stop_loss,
                 "take_profit": decision.take_profit,
                 "confidence": decision.confidence,
                 "rationale": decision.rationale,
+                "invalidation_note": decision.invalidation_note,
                 "bar_id": bar_id,
+                "fill_type": "paper_simulated",   # mark as paper fill
             })
         return self._positions[pid]
 

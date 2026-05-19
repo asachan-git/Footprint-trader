@@ -160,6 +160,7 @@ def variable_suffix(
         "cumulative_delta": cumulative_delta(fps),
         "cvd_5bar": round(cvd_5, 4),
         "session_cvd": session_cvd,
+        "cvd_trend": "bearish" if session_cvd < -20 else "bullish" if session_cvd > 20 else "neutral",
         "higher_tf": {
             tf: (_bar_summary(b) if b else None)
             for tf, b in (higher_tfs or {}).items()

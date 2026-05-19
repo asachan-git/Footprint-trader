@@ -95,17 +95,40 @@ auto_decide_multi() {
       -H "Content-Type: application/json" \
       -d "{\"symbols\":[\"BTCUSDT\",\"XAUTUSDT\"],\"tf\":\"${tf}\"}")
     note=$(echo "$result" | python3 -c "
-import sys,json
-r=json.load(sys.stdin)
+import sys, json
+from datetime import datetime, timezone, timedelta
+IST = timezone(timedelta(hours=5, minutes=30))
+def ist(ts): return datetime.fromtimestamp(ts, tz=IST).strftime('%H:%M IST') if ts else ''
+
+r = json.load(sys.stdin)
 if not r.get('ok'):
-    print('ERR: '+str(r.get('error',''))[:80])
+    print('  ERR: ' + str(r.get('error',''))[:100])
     exit()
-for d in r.get('results',[]):
-    dec=d.get('decision',{})
-    print(f\"{d['symbol']}: {dec['side']} conf={dec['confidence']:.2f} | {dec.get('rationale','')[:80]}\")
-cross=r.get('cross_market_note','')
-if cross: print(f'cross: {cross[:100]}')
-" 2>/dev/null || echo "parse err")
+
+print('  ' + '-'*65)
+for d in r.get('results', []):
+    dec = d.get('decision', {})
+    side = dec['side'].upper()
+    conf = dec.get('confidence', 0)
+    rat  = dec.get('rationale', '')[:90]
+    inv  = dec.get('invalidation_note', '')[:60]
+    val  = d.get('validator_reason', '')
+    sym  = d.get('symbol', '')
+    e    = dec.get('entry')
+    sl   = dec.get('stop_loss')
+    tp   = dec.get('take_profit')
+    risk = abs(e - sl) if e and sl else 0
+    rr   = abs(tp - e) / risk if risk > 0 else 0
+    sid_icon = '📈' if side=='LONG' else '📉' if side=='SHORT' else '—'
+    trade_line = f'entry={e:.2f} SL={sl:.2f} TP={tp:.2f} R:R={rr:.1f}' if e else ''
+    print(f'  {sid_icon} {sym:12} {side:6} conf={conf:.2f}  {trade_line}')
+    if rat: print(f'     → {rat}')
+    if inv: print(f'     ⚠ exit if: {inv}')
+    if val: print(f'     ✗ rejected: {val}')
+
+cross = r.get('cross_market_note', '')
+if cross: print(f'  🔗 {cross[:110]}')
+" 2>/dev/null || echo "  parse err")
     echo "$ts | $note" | tee -a "$log"
   done
 }

@@ -47,6 +47,13 @@ class ClaudeClient:
             tool_choice={"type": "tool", "name": "submit_decision"},
             messages=[{"role": "user", "content": variable_suffix}],
         )
+        u = resp.usage
+        print(
+            f"[tokens] in={u.input_tokens} "
+            f"cache_created={getattr(u, 'cache_creation_input_tokens', 0)} "
+            f"cache_read={getattr(u, 'cache_read_input_tokens', 0)} "
+            f"out={u.output_tokens}"
+        )
         for block in resp.content:
             if block.type == "tool_use" and block.name == "submit_decision":
                 data = dict(block.input)

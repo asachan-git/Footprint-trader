@@ -81,72 +81,166 @@ def _compute_poc_va(vol_map: dict[float, float], va_pct: float = 0.70) -> tuple[
     return poc, prices[hi], prices[lo]
 
 
+def _smooth(vol_map: dict[float, float], window: int = 2) -> dict[float, float]:
+    """5-level rolling average to reduce noise before peak detection."""
+    prices = sorted(vol_map.keys())
+    vols = [vol_map[p] for p in prices]
+    n = len(prices)
+    smoothed: dict[float, float] = {}
+    for i, p in enumerate(prices):
+        lo = max(0, i - window)
+        hi = min(n, i + window + 1)
+        smoothed[p] = sum(vols[lo:hi]) / (hi - lo)
+    return smoothed
+
+
+def _find_peaks_valleys(smoothed: dict[float, float], n: int = 2) -> tuple[list[float], list[float]]:
+    """Local maxima (peaks) and local minima (valleys) on smoothed curve.
+
+    A price is a peak if its smoothed vol is the max of its [i-n .. i+n] window.
+    """
+    prices = sorted(smoothed.keys())
+    vols = [smoothed[p] for p in prices]
+    peaks: list[float] = []
+    valleys: list[float] = []
+    for i in range(n, len(prices) - n):
+        window = vols[i - n: i + n + 1]
+        if vols[i] == max(window):
+            peaks.append(prices[i])
+        if vols[i] == min(window):
+            valleys.append(prices[i])
+    return peaks, valleys
+
+
 def _detect_shape(vol_map: dict[float, float], poc: float) -> str:
-    """Classify VP shape: D / P / b / double / elongated / thin."""
+    """Classify VP shape using centroid + peak/valley detection.
+
+    Shape logic (institutional approach):
+    1. Centroid-based: weighted average price relative to range → P / D / b
+    2. Double: two statistically significant peaks with a significant valley between
+    3. Elongated: neither concentrated nor bimodal
+    """
     if len(vol_map) < 5:
         return "thin"
     prices = sorted(vol_map.keys())
     total = sum(vol_map.values())
-    if total == 0:
+    if total == 0 or prices[-1] == prices[0]:
         return "thin"
+
     price_range = prices[-1] - prices[0]
-    if price_range == 0:
-        return "thin"
 
-    # Split into thirds
-    low_cut = prices[0] + price_range / 3
-    high_cut = prices[0] + 2 * price_range / 3
-    low_vol = sum(v for p, v in vol_map.items() if p <= low_cut)
-    mid_vol = sum(v for p, v in vol_map.items() if low_cut < p <= high_cut)
-    high_vol = sum(v for p, v in vol_map.items() if p > high_cut)
-    dom = total * 0.45  # >45% in one zone = directional
+    # Step 1: volume centroid (weighted average price)
+    centroid = sum(p * v for p, v in vol_map.items()) / total
+    rel_pos = (centroid - prices[0]) / price_range   # 0=bottom, 1=top
 
-    # Double distribution: two peaks far apart
-    # Simple heuristic: two prices with vol > 1.3× avg, separated by >20% of range
-    avg_vol = total / len(vol_map)
-    peaks = [p for p, v in vol_map.items() if v > avg_vol * 1.5]
-    if len(peaks) >= 2 and (max(peaks) - min(peaks)) > price_range * 0.20:
-        return "double"
+    # Step 2: peak/valley detection for double detection
+    smoothed = _smooth(vol_map)
+    peaks, valleys = _find_peaks_valleys(smoothed)
 
-    if mid_vol > dom:
-        return "D"
-    if high_vol > dom:
-        return "P"
-    if low_vol > dom:
-        return "b"
-    return "elongated"
+    # Double: 2+ significant peaks with deep valley between, separated by >30% range
+    import statistics as _stats
+    avg = total / len(vol_map)
+    std = _stats.pstdev(vol_map.values()) if len(vol_map) > 1 else 0.0
+    sig_peaks = [p for p in peaks if smoothed[p] > avg + 0.8 * std]
+    if len(sig_peaks) >= 2:
+        peak_span = max(sig_peaks) - min(sig_peaks)
+        if peak_span > price_range * 0.30:
+            # verify there's a meaningful valley between the two main peaks
+            between_valleys = [v for v in valleys if min(sig_peaks) < v < max(sig_peaks)]
+            if between_valleys:
+                deepest_valley = min(smoothed[v] for v in between_valleys)
+                peak_avg_vol = (smoothed[sig_peaks[0]] + smoothed[sig_peaks[-1]]) / 2
+                if deepest_valley < peak_avg_vol * 0.65:  # valley is ≥35% below peak average
+                    return "double"
+
+    # Step 3: centroid-based shape
+    if rel_pos > 0.60:
+        return "P"    # volume concentrated in upper part = distribution
+    if rel_pos < 0.40:
+        return "b"    # volume concentrated in lower part = accumulation
+    return "D"        # balanced, centered
 
 
-def _group_levels_into_zones(prices: list[float], price_step: float) -> list[dict]:
-    """Merge consecutive price levels into zones: {low, high, avg_vol}."""
+def _group_levels_into_zones(
+    prices: list[float],
+    price_step: float,
+    price_range: float = 0.0,
+) -> list[dict]:
+    """Merge price levels into meaningful zones.
+
+    Merge gap: max(price_step × 5, price_range × 1%) — prevents tiny isolated zones.
+    Min width: max(price_step × 2, price_range × 0.5%) — filters single-point zones.
+    """
     if not prices:
         return []
     prices = sorted(prices)
-    zones = []
-    zone_start = prices[0]
-    zone_end = prices[0]
+    effective_range = price_range or (prices[-1] - prices[0]) or price_step
+    merge_gap = max(price_step * 5, effective_range * 0.01)
+    min_width  = max(price_step * 2, effective_range * 0.005)
+
+    zones: list[dict] = []
+    zone_start = zone_end = prices[0]
     for p in prices[1:]:
-        if p - zone_end <= price_step * 2:
+        if p - zone_end <= merge_gap:
             zone_end = p
         else:
-            zones.append({"low": zone_start, "high": zone_end})
+            if zone_end - zone_start >= min_width:
+                zones.append({"low": zone_start, "high": zone_end})
             zone_start = zone_end = p
-    zones.append({"low": zone_start, "high": zone_end})
+    if zone_end - zone_start >= min_width:
+        zones.append({"low": zone_start, "high": zone_end})
     return zones
 
 
 def _hvn_lvn(vol_map: dict[float, float]) -> tuple[list[dict], list[dict]]:
-    """Return HVN and LVN as zones [{low, high}] rather than individual prices."""
-    if not vol_map:
+    """Identify HVN and LVN zones using peak/valley detection on smoothed histogram.
+
+    HVN: zones surrounding statistically significant peaks (vol > mean + 1σ)
+    LVN: zones surrounding statistically significant valleys (vol < mean - 0.5σ)
+    """
+    if not vol_map or len(vol_map) < 3:
         return [], []
+
     prices = sorted(vol_map.keys())
-    if len(prices) < 2:
-        return [], []
+    price_range = prices[-1] - prices[0] if len(prices) > 1 else 1.0
     price_step = min(prices[i + 1] - prices[i] for i in range(len(prices) - 1)) or 1.0
-    avg = sum(vol_map.values()) / len(vol_map)
-    hvn_prices = [p for p, v in vol_map.items() if v >= avg * 1.5]
-    lvn_prices = [p for p, v in vol_map.items() if v <= avg * 0.5 and v > 0]
-    return _group_levels_into_zones(hvn_prices, price_step), _group_levels_into_zones(lvn_prices, price_step)
+
+    import statistics as _stats
+    vols = list(vol_map.values())
+    avg = sum(vols) / len(vols)
+    std = _stats.pstdev(vols) if len(vols) > 1 else 0.0
+
+    # Smooth and detect peaks/valleys
+    smoothed = _smooth(vol_map)
+    peaks, valleys = _find_peaks_valleys(smoothed)
+
+    # Significant peaks → HVN
+    hvn_prices = [p for p in peaks if vol_map[p] >= avg + 1.0 * std]
+    # Significant valleys → LVN
+    lvn_prices = [p for p in valleys if vol_map[p] <= avg - 0.5 * std]
+
+    # Fallback: use relative threshold if peak detection yields nothing
+    # For synthetic/flat data (low std/mean ratio), use top/bottom 20% by volume
+    cv = std / avg if avg > 0 else 0  # coefficient of variation
+    if not hvn_prices:
+        if cv >= 0.3:
+            hvn_prices = [p for p, v in vol_map.items() if v >= avg + 0.5 * std]
+        else:
+            # Flat distribution (synthetic data) — take top 20% by volume
+            vol_threshold = sorted(vol_map.values())[int(len(vol_map) * 0.80)]
+            hvn_prices = [p for p, v in vol_map.items() if v >= vol_threshold]
+    if not lvn_prices:
+        if cv >= 0.3:
+            lvn_prices = [p for p, v in vol_map.items() if 0 < v <= avg - 0.5 * std]
+        else:
+            # Flat distribution — take bottom 20% by volume
+            vol_threshold = sorted(vol_map.values())[int(len(vol_map) * 0.20)]
+            lvn_prices = [p for p, v in vol_map.items() if 0 < v <= vol_threshold]
+
+    return (
+        _group_levels_into_zones(hvn_prices, price_step, price_range),
+        _group_levels_into_zones(lvn_prices, price_step, price_range),
+    )
 
 
 def _current_position(close: float, poc: float, vah: float, val: float) -> str:
