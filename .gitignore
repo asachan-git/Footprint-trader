@@ -13,6 +13,13 @@ data/decisions.jsonl
 data/outcomes.jsonl
 data/datasets/*
 !data/datasets/.gitkeep
+data/positions.jsonl
+data/cycles.jsonl
+data/big_trades.jsonl
+data/vp_cache.json
+data/vp_history.jsonl
+data/archive/
+data/trade_cache/
 logs/*
 !logs/.gitkeep
 eval/reports/*
