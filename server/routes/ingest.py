@@ -231,6 +231,20 @@ def ingest():
 
     exits = _check_positions(bar, settings)
 
+    # Reconcile live broker state for tradable symbols (broker-side SL/TP closes)
+    if bar.tf == primary_tf:
+        _exec_cfg = settings.get("execution", {}) or {}
+        _tradable = set(_exec_cfg.get("tradable_symbols") or [])
+        if bar.symbol in _tradable:
+            try:
+                from execution.live.mt5_adapter import MT5Adapter
+                from execution.reconcile import reconcile as _reconcile
+                summary = _reconcile(MT5Adapter(), bar.symbol)
+                if summary.get("closed", 0) > 0:
+                    LOG.info(f"[ingest] reconcile {bar.symbol}: closed {summary['closed']} positions")
+            except Exception as e:
+                LOG.warning(f"[ingest] reconcile {bar.symbol} failed: {e}")
+
     # Trail SL / break-even after positions checked (so we don't move SL on a bar that just closed)
     recent_bars = store().recent(bar.symbol, bar.tf, 10)
     sl_adjustments = check_sl_adjustments(bar, recent_bars)

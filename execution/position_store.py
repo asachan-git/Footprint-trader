@@ -54,6 +54,7 @@ class GridPosition:
     opened_ts: int = 0
     closed_ts: int = 0
     close_reason: str = ""
+    broker_ticket: str = ""   # MetaApi positionId — empty for paper
 
     @property
     def avg_entry(self) -> float:
@@ -112,6 +113,7 @@ class PositionStore:
                 side=event["side"],
                 legs=[leg],
                 opened_ts=event["ts"],
+                broker_ticket=event.get("broker_ticket", ""),
             )
         elif etype == "add_leg" and pid in self._positions:
             leg = GridLeg(
@@ -143,7 +145,15 @@ class PositionStore:
             fh.write(json.dumps(event) + "\n")
         self._apply(event)
 
-    def open_position(self, decision: Decision, bar_id: str, symbol: str, tf: str) -> GridPosition:
+    def open_position(
+        self,
+        decision: Decision,
+        bar_id: str,
+        symbol: str,
+        tf: str,
+        broker_ticket: str = "",
+        fill_type: str = "paper_simulated",
+    ) -> GridPosition:
         import uuid
         pid = uuid.uuid4().hex[:12]
         with self._lock:
@@ -153,14 +163,15 @@ class PositionStore:
                 "symbol": symbol,
                 "tf": tf,
                 "side": decision.side,
-                "entry": decision.entry,          # fill price (after slippage)
+                "entry": decision.entry,
                 "stop_loss": decision.stop_loss,
                 "take_profit": decision.take_profit,
                 "confidence": decision.confidence,
                 "rationale": decision.rationale,
                 "invalidation_note": decision.invalidation_note,
                 "bar_id": bar_id,
-                "fill_type": "paper_simulated",   # mark as paper fill
+                "broker_ticket": broker_ticket,
+                "fill_type": fill_type,
             })
         return self._positions[pid]
 
@@ -214,6 +225,15 @@ class PositionStore:
                 if p.status == "open"
                 and (symbol is None or p.symbol == symbol)
             ]
+
+    def by_broker_ticket(self, ticket: str) -> GridPosition | None:
+        if not ticket:
+            return None
+        with self._lock:
+            for p in self._positions.values():
+                if p.broker_ticket == ticket and p.status == "open":
+                    return p
+            return None
 
     def daily_realized_r(self) -> float:
         return self._daily_r

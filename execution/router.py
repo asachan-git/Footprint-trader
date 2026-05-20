@@ -30,6 +30,26 @@ class LiveExecutor:
 
     def fire(self, decision, bar) -> dict:
         result = self._broker.submit_order(decision, bar)
+        # Record live fill into position_store (for reconciliation, journals, etc.)
+        broker_ticket = ""
+        if isinstance(result, dict):
+            order = result.get("order") or {}
+            broker_ticket = str(order.get("positionId") or order.get("orderId") or "")
+        if broker_ticket and not result.get("error") and not result.get("skipped"):
+            try:
+                from .position_store import position_store
+                pos = position_store().open_position(
+                    decision=decision, bar_id=bar.bar_id,
+                    symbol=bar.symbol, tf=bar.tf,
+                    broker_ticket=broker_ticket,
+                    fill_type="vantage_mt5_live",
+                )
+                result["position_id"] = pos.position_id
+            except Exception as e:
+                # Never let store failure mask a successful broker fill
+                import logging
+                logging.getLogger(__name__).exception(f"[live] position_store.open_position failed: {e}")
+                result["position_store_error"] = str(e)
         return {"mode": "live", **result}
 
 
