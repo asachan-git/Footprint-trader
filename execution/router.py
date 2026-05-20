@@ -29,6 +29,19 @@ class LiveExecutor:
         self._broker = broker
 
     def fire(self, decision, bar) -> dict:
+        # Duplicate-entry guard: skip a fresh entry when a position is already
+        # open for this symbol (unless it's an explicit grid add). Mirrors
+        # PaperExecutor — prevents 15m decide cycles from stacking positions.
+        if not decision.add_to_existing:
+            try:
+                from .position_store import position_store
+                existing = position_store().open_positions(bar.symbol)
+                if existing:
+                    return {"mode": "live", "skipped": "position already open",
+                            "position_id": existing[0].position_id}
+            except Exception:
+                pass
+
         result = self._broker.submit_order(decision, bar)
         # Record live fill into position_store (for reconciliation, journals, etc.)
         broker_ticket = ""

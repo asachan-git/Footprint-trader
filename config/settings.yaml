@@ -1,4 +1,4 @@
-mode: paper              # journal | paper | live  (live also needs env ALLOW_LIVE=1)
+mode: live               # journal | paper | live  (live also needs env ALLOW_LIVE=1)
 
 instrument:
   symbol: NQ
