@@ -77,8 +77,7 @@ class PositionStore:
     def __init__(self) -> None:
         self._lock = Lock()
         self._positions: dict[str, GridPosition] = {}
-        self._daily_r: float = 0.0
-        self._daily_date: str = ""
+        self._daily_r_by_date: dict[str, float] = {}   # IST date → realized R for that day
         POSITIONS_LOG.parent.mkdir(parents=True, exist_ok=True)
         self._replay()
 
@@ -132,7 +131,9 @@ class PositionStore:
             self._positions[pid].closed_ts = event["ts"]
             self._positions[pid].close_reason = event.get("reason", "")
             self._positions[pid].realized_r = event.get("realized_r", 0.0)
-            self._daily_r += event.get("realized_r", 0.0)
+            # Bucket realized R by the IST calendar date of the close
+            day = datetime.fromtimestamp(event["ts"], tz=_IST).strftime("%Y-%m-%d")
+            self._daily_r_by_date[day] = self._daily_r_by_date.get(day, 0.0) + event.get("realized_r", 0.0)
         elif etype == "sl_adjust" and pid in self._positions:
             if self._positions[pid].legs:
                 self._positions[pid].legs[-1].stop_loss = event["new_sl"]
@@ -247,7 +248,10 @@ class PositionStore:
             return None
 
     def daily_realized_r(self) -> float:
-        return self._daily_r
+        """Realized R for the current IST calendar day only (resets at IST midnight)."""
+        import time as _time
+        today = datetime.fromtimestamp(int(_time.time()), tz=_IST).strftime("%Y-%m-%d")
+        return self._daily_r_by_date.get(today, 0.0)
 
 
 _store: PositionStore | None = None
