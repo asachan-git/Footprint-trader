@@ -191,23 +191,34 @@ class PositionStore:
                 "bar_id": bar_id,
             })
 
-    def close_position(self, position_id: str, reason: str, realized_r: float) -> None:
+    def close_position(self, position_id: str, reason: str, realized_r: float) -> bool:
+        """Close a position. No-op (returns False) if already closed/invalidated —
+        prevents double-counting daily R when multiple paths (bar check +
+        reconciler) try to close the same position."""
         with self._lock:
+            pos = self._positions.get(position_id)
+            if not pos or pos.status != "open":
+                return False
             self._write({
                 "type": "close",
                 "position_id": position_id,
                 "reason": reason,
                 "realized_r": realized_r,
             })
+            return True
 
-    def invalidate_position(self, position_id: str, reason: str) -> None:
+    def invalidate_position(self, position_id: str, reason: str) -> bool:
         with self._lock:
+            pos = self._positions.get(position_id)
+            if not pos or pos.status != "open":
+                return False
             self._write({
                 "type": "invalidate",
                 "position_id": position_id,
                 "reason": reason,
                 "realized_r": -1.0,
             })
+            return True
 
     def adjust_sl(self, position_id: str, new_sl: float, reason: str) -> None:
         with self._lock:

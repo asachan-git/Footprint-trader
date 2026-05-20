@@ -151,14 +151,20 @@ class CycleStore:
         with self._lock:
             self._write({"type": "leg_added", "cycle_id": cycle_id})
 
-    def close_cycle(self, cycle_id: str, realized_pnl: float, reason: str) -> None:
+    def close_cycle(self, cycle_id: str, realized_pnl: float, reason: str) -> bool:
+        """No-op (returns False) if cycle already closed/circuit — prevents
+        double-close from bar-check + reconciler racing on the same cycle."""
         with self._lock:
+            c = self._cycles.get(cycle_id)
+            if not c or c.status in ("closed", "circuit"):
+                return False
             self._write({
                 "type": "close",
                 "cycle_id": cycle_id,
                 "realized_pnl": realized_pnl,
                 "reason": reason,
             })
+            return True
 
     def circuit_break(self, cycle_id: str, reason: str) -> None:
         with self._lock:
@@ -175,6 +181,13 @@ class CycleStore:
         return [c for c in self._cycles.values()
                 if c.status in ("active", "hedged", "recovered")
                 and (symbol is None or c.symbol == symbol)]
+
+    def by_position_id(self, position_id: str) -> TradeCycle | None:
+        """Find the active cycle (if any) linked to a position_id."""
+        for c in self._cycles.values():
+            if c.position_id == position_id and c.status in ("active", "hedged", "recovered"):
+                return c
+        return None
 
     def total_open_exposure(self, symbol: str) -> int:
         """Count total open legs across all active cycles for exposure check."""

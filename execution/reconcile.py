@@ -83,6 +83,15 @@ def reconcile(adapter, symbol: str) -> dict:
             reason=f"broker_closed (ticket {pos.broker_ticket}, close={close_price})",
             realized_r=realized_r,
         )
+        # Mirror to cycle_store
+        try:
+            from .cycle_store import cycle_store
+            cs = cycle_store()
+            cyc = cs.by_position_id(pos.position_id)
+            if cyc:
+                cs.close_cycle(cyc.cycle_id, realized_pnl=realized_r, reason="broker_closed")
+        except Exception as e:
+            LOG.warning(f"[reconcile] cycle close failed for {pos.position_id}: {e}")
         closed_count += 1
         closed_details.append({
             "position_id": pos.position_id,

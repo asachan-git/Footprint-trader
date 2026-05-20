@@ -45,6 +45,18 @@ class LiveExecutor:
                     fill_type="vantage_mt5_live",
                 )
                 result["position_id"] = pos.position_id
+                # Mirror paper: open a cycle for hedge/recovery tracking
+                try:
+                    from .cycle_store import cycle_store
+                    cycle_store().open_cycle(
+                        symbol=bar.symbol, tf=bar.tf,
+                        direction=pos.side,
+                        position_id=pos.position_id,
+                        parent_cycle_id=decision.parent_position_id,
+                    )
+                except Exception as e:
+                    import logging as _l
+                    _l.getLogger(__name__).warning(f"[live] cycle_store.open_cycle failed: {e}")
             except Exception as e:
                 # Never let store failure mask a successful broker fill
                 import logging

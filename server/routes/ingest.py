@@ -226,7 +226,34 @@ def _check_positions(bar, settings) -> list[dict]:
             except Exception:
                 pass
 
+    # Close any cycle whose position was closed/invalidated this bar
+    _close_cycles_for_exits(exits)
     return exits
+
+
+def _close_cycles_for_exits(exits: list[dict]) -> None:
+    """Mirror position close → cycle close. Closes the cycle linked to any
+    position that exited via sl/tp/invalidation this bar. Hedge exits are not
+    cycle-terminal (the cycle continues / recovers)."""
+    if not exits:
+        return
+    terminal = {"sl_hit", "tp_hit", "tp_absorption", "invalidated"}
+    try:
+        from execution.cycle_store import cycle_store
+        from execution.position_store import position_store
+        cs = cycle_store()
+        ps = position_store()
+        for ev in exits:
+            if ev.get("exit") not in terminal:
+                continue
+            pid = ev.get("position_id")
+            cyc = cs.by_position_id(pid) if pid else None
+            if cyc:
+                pos = next((p for p in ps._positions.values() if p.position_id == pid), None)
+                realized = pos.realized_r if pos else ev.get("realized_r", 0.0)
+                cs.close_cycle(cyc.cycle_id, realized_pnl=realized, reason=ev.get("exit", ""))
+    except Exception as e:
+        LOG.warning(f"[ingest] cycle close mirror failed: {e}")
 
 
 @bp.post("/ingest")
