@@ -211,14 +211,19 @@ def ingest():
             if snapped:
                 LOG.info(f"[ingest] VP snapshot: {bar.symbol} {snapped}")
                 from pipeline.features.vp_cache import build_and_save
-                build_and_save([bar.symbol], primary_tf)
+                _vp_cfg = settings.get("vp_cache", {}) or {}
+                build_and_save(
+                    [bar.symbol], primary_tf,
+                    session_start_utc=_vp_cfg.get("session_start_utc", {}),
+                    vp_bin_size=_vp_cfg.get("vp_bin_size", {}),
+                )
                 # Write journal for the day that just closed
                 if snapped.get("daily"):
                     try:
                         from pipeline.features.daily_journal import write_day_journal
-                        sess_utc = int((settings.get("vp_cache", {}).get("session_start_utc", {}) or {}).get(bar.symbol, 0))
+                        sess_anchor = (settings.get("vp_cache", {}).get("session_start_utc", {}) or {}).get(bar.symbol, 0)
                         closed_date = snapped["daily"]
-                        result = write_day_journal(bar.symbol, primary_tf, closed_date, sess_utc)
+                        result = write_day_journal(bar.symbol, primary_tf, closed_date, sess_anchor)
                         if result:
                             LOG.info(f"[ingest] Daily journal written: {result.name}")
                     except Exception:
@@ -234,20 +239,15 @@ def ingest():
     if bar.tf == primary_tf:
         try:
             from pipeline.features.swing import update as _swing_update
-            session_start_utc = settings.get("vp_cache", {}).get(
+            from pipeline.features.vp_cache import _session_day_key, _day_bounds
+            sess_anchor = settings.get("vp_cache", {}).get(
                 "session_start_utc", {}
             ).get(bar.symbol, 0)
-            import time as _time, datetime as _dt
-            _now = _dt.datetime.utcnow()
-            _sess_start_h = session_start_utc
-            if _now.hour >= _sess_start_h:
-                _sess_date = _now.date()
-            else:
-                _sess_date = (_now - _dt.timedelta(days=1)).date()
-            _sess_ts = int(_dt.datetime(
-                _sess_date.year, _sess_date.month, _sess_date.day,
-                _sess_start_h, 0, 0,
-            ).timestamp())
+            # DST-aware: resolve the IST session label for "now", then look up its UTC start
+            import time as _time
+            _now_ts = int(_time.time())
+            _label = _session_day_key(_now_ts, sess_anchor)
+            _sess_ts, _ = _day_bounds(_label, sess_anchor)
             _swing_update(bar.symbol, primary_tf, _sess_ts)
         except Exception:
             pass

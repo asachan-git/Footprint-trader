@@ -21,12 +21,15 @@ sys.path.insert(0, str(ROOT))
 
 from pipeline.state_store import store
 from pipeline.features.vp_cache import _day_bounds, _week_bounds, _compute_period_vp, _utc_session_date
-from pipeline.features.volume_profile import _build_price_map, _compute_poc_va, _detect_shape, _hvn_lvn
+from pipeline.features.volume_profile import (
+    _build_price_map, _build_bins, _classify_shape, _value_area,
+    _find_hvn_zones, _find_lvn_zones, NUM_BINS, VALUE_AREA_PCT,
+)
 
 
-SESSION_START = {
-    "BTCUSDT": 0,    # 00:00 UTC = 5:30 AM IST
-    "XAUTUSDT": 22,  # 22:00 UTC = 3:30 AM IST next day
+SESSION_ANCHOR = {
+    "BTCUSDT": 0,
+    "XAUTUSDT": 0,   # Bybit 24/7, 00:00 UTC daily roll (5:30 AM IST)
 }
 
 IST_OFFSET = 5 * 3600 + 30 * 60
@@ -48,7 +51,7 @@ def main() -> None:
     ap.add_argument("--top-n", type=int, default=30, help="Show top N price levels by volume")
     args = ap.parse_args()
 
-    sess_start = SESSION_START.get(args.symbol, 0)
+    sess_start = SESSION_ANCHOR.get(args.symbol, 0)
     s = store()
     all_bars = s.recent(args.symbol, args.tf, 100_000)
 
@@ -78,9 +81,12 @@ def main() -> None:
     print(f"\n{'='*60}")
     print(f"  VP VERIFICATION: {args.symbol} — {period_label}")
     print(f"{'='*60}")
-    sess_ist_h = (sess_start + 5) % 24
-    sess_ist_label = f"{sess_ist_h:02d}:30 IST"
-    print(f"  Session start UTC: {sess_start:02d}:00  (= {sess_ist_label})")
+    actual_utc_hour = datetime.fromtimestamp(start_ts, tz=timezone.utc).hour
+    if isinstance(sess_start, dict):
+        anchor_label = f"{sess_start['hour']:02d}:00 {sess_start['tz']}"
+    else:
+        anchor_label = f"{actual_utc_hour:02d}:00 UTC"
+    print(f"  Session anchor: {anchor_label}  (resolved to {actual_utc_hour:02d}:00 UTC for this date)")
     print(f"  Period start: {ist(start_ts)}  (unix: {start_ts})")
     print(f"  Period end:   {ist(effective_end)}  (unix: {effective_end})")
     print(f"  Bars included: {len(period_bars)} x {args.tf}")
@@ -93,23 +99,40 @@ def main() -> None:
     # Show bar time range
     print(f"  Bar range: {ist(period_bars[0].close_ts)} → {ist(period_bars[-1].close_ts)}")
 
-    # Build price-volume map
+    # Sparse ladder map (for the per-tick chart only)
     vol_map = _build_price_map(period_bars)
-    total_vol = sum(vol_map.values())
-    avg_vol = total_vol / len(vol_map) if vol_map else 0
+
+    # Tick-aligned bin size from volume_profile resolver (settings.yaml → defaults)
+    from pipeline.features.volume_profile import _resolve_bin_size
+    bin_size_cfg = _resolve_bin_size(args.symbol)
+
+    built = _build_bins(period_bars, bin_size=bin_size_cfg)
+    if built is None:
+        print("\n  ⚠ Cannot compute VP — no valid bars")
+        return
+    bins, _bin_centers, bin_size, p_min, p_max = built
+    n_bins = len(bins)
+    total_vol = float(bins.sum())
 
     print(f"\n  Total volume: {total_vol:.2f}")
-    print(f"  Price levels: {len(vol_map)}")
-    print(f"  Avg vol/level: {avg_vol:.2f}")
+    mode_label = "tick-aligned" if bin_size_cfg else "legacy range/68"
+    print(f"  Bins: {n_bins} × {bin_size:.3f}pt  (range {p_max - p_min:.1f}pt, {mode_label})")
+    print(f"  Distinct ladder prices: {len(vol_map)}")
 
     # POC + value area
-    result = _compute_poc_va(vol_map)
-    if not result:
-        print("\n  ⚠ Cannot compute POC — empty volume map")
-        return
-    poc, vah, val = result
-    shape = _detect_shape(vol_map, poc)
-    hvn, lvn = _hvn_lvn(vol_map)
+    max_v = float(bins.max())
+    tied = [i for i in range(n_bins) if bins[i] == max_v]
+    poc_idx = tied[len(tied) // 2]
+    lo_idx, hi_idx = _value_area(bins, poc_idx, VALUE_AREA_PCT)
+    if bin_size_cfg:
+        poc = round(p_min + poc_idx * bin_size, 4)
+    else:
+        poc = round(p_min + (poc_idx + 0.5) * bin_size, 2)
+    val = round(p_min + lo_idx * bin_size, 4)
+    vah = round(p_min + (hi_idx + 1) * bin_size, 4)
+    shape = _classify_shape(bins, poc_idx, lo_idx, hi_idx, n_bins)
+    hvn = _find_hvn_zones(bins, bin_size, p_min)
+    lvn = _find_lvn_zones(bins, bin_size, p_min)
 
     print(f"\n{'─'*60}")
     print(f"  POC:   {poc:.2f}  (price with highest volume)")

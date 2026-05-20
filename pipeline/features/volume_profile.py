@@ -1,9 +1,42 @@
 """Daily + Weekly Volume Profile from accumulated footprint bars.
 
-Aggregates bid+ask volume across all bars in a period → per-price volume map.
-Computes: POC, VAH, VAL (70%), shape (D/P/b/double/elongated), HVN, LVN zones, naked POC.
+============================================================================
+DATA FLOW
+============================================================================
+Input:
+  bars: list[Bar]  — from state_store.recent(symbol, "1m", N)
+                     Each Bar has .ohlc (o/h/l/c), .bid_ladder, .ask_ladder, .delta
 
-No new data source needed — uses bars already in state_store.
+Stage 1 — Per-price volume from ladders
+  bid_ladder[].price/vol  = aggressor SELLS (taker hit bid)
+  ask_ladder[].price/vol  = aggressor BUYS  (taker lifted ask)
+  Each (price, vol) is a real transaction at an exact price level.
+
+Stage 2 — Bin construction (ladder-aggregation)
+  Tick-aligned grid (institutional convention):
+    bin_size = symbol_config.bin_size           (e.g. 0.5pt XAU, 1.0pt BTC)
+    p_min    = floor(min(prices) / bin_size) × bin_size
+    n_bins   = ceil((max(prices) - p_min) / bin_size) + 1
+  For each ladder level on each bar:
+    bins[bin_of(level.price)] += level.vol
+  Fallback (bar with empty bid+ask ladders, degenerate data only):
+    distribute |delta| uniformly across [bar.l, bar.h].
+  Legacy mode when bin_size is None: bin_size = (p_max - p_min) / NUM_BINS=68.
+
+Stage 3 — Statistics on the bin array
+  POC      = bin with max volume (midpoint of ties)
+  VA       = Steidlmayer pair-test expansion from POC until 68% enclosed
+  HVN/LVN  = scipy.signal.find_peaks on smoothed bins (uniform_filter1d size=3)
+             with prominence ≥ 0.5×avg (HVN) / 0.3×avg (LVN)
+             zone boundaries from peak_widths(rel_height=0.5)
+  Shape    = P / b / D / B / thin classifier from bin distribution
+
+Output: VolumeProfilePeriod dataclass — POC, VAH, VAL, shape, HVN/LVN zones,
+        naked POC, current position, total volume, price range, bar count.
+
+Tick-alignment makes POC/VAH/VAL land on exact bin_size multiples (no
+fractional residue like 4539.14 — instead 4539.0 or 4539.5).
+============================================================================
 """
 
 from __future__ import annotations
@@ -11,21 +44,29 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
+
+import numpy as np
+from scipy.ndimage import uniform_filter1d
+from scipy.signal import find_peaks, peak_widths
 
 _TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1d": 86400, "1w": 604800}
+
+NUM_BINS = 68
+VALUE_AREA_PCT = 0.68
 
 
 @dataclass
 class VolumeProfilePeriod:
-    period: str                    # "daily" | "weekly"
+    period: str                    # "daily" | "weekly" | "cached"
     poc: float | None              # price with highest volume
-    vah: float | None              # value area high (70%)
-    val: float | None              # value area low (70%)
-    shape: str                     # "D" | "P" | "b" | "double" | "elongated" | "thin"
-    hvn_zones: list[dict]          # high-volume zones [{low, high}] — strong S/R areas
-    lvn_zones: list[dict]          # low-volume zones [{low, high}] — fast-move areas
-    naked_poc: float | None        # previous period POC not yet revisited by current bars
-    current_position: str          # "above_vah" | "in_va_above_poc" | "at_poc" | "in_va_below_poc" | "below_val"
+    vah: float | None              # value area high (68%)
+    val: float | None              # value area low (68%)
+    shape: str                     # "D" | "P" | "b" | "B" | "thin"
+    hvn_zones: list[dict]          # high-volume zones [{low, high}] — strong S/R
+    lvn_zones: list[dict]          # low-volume zones [{low, high}] — fast-move
+    naked_poc: float | None        # previous period POC not yet revisited
+    current_position: str          # "above_vah" | "in_va_above_poc" | "at_poc" | "in_va_below_poc" | "below_val" | "unknown"
     total_volume: float
     price_range: float             # high - low of period
     bar_count: int
@@ -38,15 +79,110 @@ def _period_bounds(now_ts: int, period: str) -> tuple[int, int]:
         start = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
         end = int(start.timestamp()) + 86400
         return int(start.timestamp()), end
-    else:  # weekly — Monday 00:00 UTC
+    else:
         monday = dt - __import__("datetime").timedelta(days=dt.weekday())
         start = datetime(monday.year, monday.month, monday.day, tzinfo=timezone.utc)
         end = int(start.timestamp()) + 604800
         return int(start.timestamp()), end
 
 
+def _bar_volume(bar) -> float:
+    """Total volume for a bar — sum bid + ask ladder, or fall back to |delta|."""
+    total = sum(lvl.vol for lvl in bar.bid_ladder) + sum(lvl.vol for lvl in bar.ask_ladder)
+    if total > 0:
+        return total
+    return abs(bar.delta or 0.0)
+
+
+def _build_bins(
+    bars,
+    bin_size: float | None = None,
+    num_bins: int = NUM_BINS,
+) -> tuple[np.ndarray, np.ndarray, float, float, float] | None:
+    """Aggregate ladder volume into a tick-aligned bin grid.
+
+    Primary path: per-bar bid_ladder + ask_ladder give exact transaction
+    volume at exact prices. Each level's price is snapped to the tick-aligned
+    bin and its volume added — preserves true orderflow resolution.
+
+    Fallback (no ladder data at all on a bar): distribute that bar's
+    |delta| uniformly across [bar.l, bar.h]. Only kicks in for bars where
+    both ladders are empty.
+
+    Tick-aligned mode (recommended): pass `bin_size` = fixed instrument tick
+    multiple (e.g. 0.5 for XAU, 1.0 for BTC). Grid anchored to
+    floor(p_min / bin_size) × bin_size so POC/VAH/VAL land on bin_size multiples.
+
+    Legacy mode (bin_size=None): bin_size derived as (p_max - p_min) / num_bins.
+    Produces fractional non-tick-aligned values; kept for backwards compat.
+
+    Returns (bins, bin_centers, bin_size, price_min, price_max) — or None if no data.
+    """
+    if not bars:
+        return None
+    highs = [b.ohlc.h for b in bars]
+    lows = [b.ohlc.l for b in bars]
+
+    raw_min = min(lows)
+    p_max = max(highs)
+    if p_max <= raw_min:
+        return None
+
+    # Widen p_min/p_max so any ladder level is covered too
+    for bar in bars:
+        for lvl in bar.bid_ladder:
+            if lvl.price < raw_min:
+                raw_min = lvl.price
+            if lvl.price > p_max:
+                p_max = lvl.price
+        for lvl in bar.ask_ladder:
+            if lvl.price < raw_min:
+                raw_min = lvl.price
+            if lvl.price > p_max:
+                p_max = lvl.price
+
+    if bin_size is not None and bin_size > 0:
+        p_min = math.floor(raw_min / bin_size) * bin_size
+        n = max(1, int(math.ceil((p_max - p_min) / bin_size)) + 1)
+    else:
+        p_min = raw_min
+        bin_size = (p_max - p_min) / num_bins
+        n = num_bins
+
+    bins = np.zeros(n, dtype=float)
+    bin_centers = np.array([p_min + (i + 0.5) * bin_size for i in range(n)])
+
+    def _bin_of(price: float) -> int:
+        return max(0, min(n - 1, int((price - p_min) / bin_size)))
+
+    for bar in bars:
+        has_ladder = bool(bar.bid_ladder) or bool(bar.ask_ladder)
+        if has_ladder:
+            # True orderflow: aggregate exact-price ladder volumes
+            for lvl in bar.bid_ladder:
+                if lvl.vol > 0:
+                    bins[_bin_of(lvl.price)] += lvl.vol
+            for lvl in bar.ask_ladder:
+                if lvl.vol > 0:
+                    bins[_bin_of(lvl.price)] += lvl.vol
+        else:
+            # Fallback for ladder-less bars (degenerate synthetic data)
+            v = abs(bar.delta or 0.0)
+            if v <= 0 or bar.ohlc.h <= bar.ohlc.l:
+                continue
+            b_lo = _bin_of(bar.ohlc.l)
+            b_hi = _bin_of(bar.ohlc.h)
+            span = max(b_hi - b_lo + 1, 1)
+            bins[b_lo:b_hi + 1] += v / span
+
+    return bins, bin_centers, bin_size, p_min, p_max
+
+
 def _build_price_map(bars) -> dict[float, float]:
-    """Aggregate bid + ask volume per price level across all bars."""
+    """Backwards-compat helper — aggregate ladder bid+ask volume per price.
+
+    Kept for vp_cache.py / verify_vp.py / vp_history.py which import it.
+    """
     vol_map: dict[float, float] = {}
     for bar in bars:
         for lvl in bar.bid_ladder:
@@ -56,190 +192,217 @@ def _build_price_map(bars) -> dict[float, float]:
     return vol_map
 
 
-def _compute_poc_va(vol_map: dict[float, float], va_pct: float = 0.70) -> tuple[float, float, float] | None:
-    """Returns (poc, vah, val). None if no data."""
+def _value_area(bins: np.ndarray, poc_idx: int, va_pct: float) -> tuple[int, int]:
+    """Steidlmayer pair-test expansion: from POC, step into the heavier 1-bin side."""
+    n = len(bins)
+    total = bins.sum()
+    target = total * va_pct
+    lo_idx = hi_idx = poc_idx
+    acc = float(bins[poc_idx])
+    while acc < target:
+        up = float(bins[hi_idx + 1]) if hi_idx + 1 < n else 0.0
+        down = float(bins[lo_idx - 1]) if lo_idx - 1 >= 0 else 0.0
+        if up == 0.0 and down == 0.0:
+            break
+        if up >= down and hi_idx + 1 < n:
+            hi_idx += 1
+            acc += up
+        elif lo_idx - 1 >= 0:
+            lo_idx -= 1
+            acc += down
+        else:
+            break
+    return lo_idx, hi_idx
+
+
+def _classify_shape(
+    bins: np.ndarray, poc_idx: int, lo_idx: int, hi_idx: int, num_bins: int
+) -> str:
+    """Classify VP shape: P (distribution top), b (accumulation bottom), D (balanced), B (bimodal), thin."""
+    total = float(bins.sum())
+    if total == 0:
+        return "thin"
+
+    third = num_bins // 3
+    lower = float(bins[:third].sum())
+    mid = float(bins[third: 2 * third].sum())
+    upper = float(bins[2 * third:].sum())
+
+    lower_pct = lower / total
+    mid_pct = mid / total
+    upper_pct = upper / total
+
+    if poc_idx >= 2 * third and upper_pct > 0.45:
+        return "P"
+    if poc_idx < third and lower_pct > 0.45:
+        return "b"
+    if mid_pct > 0.40 and abs(upper_pct - lower_pct) < 0.15:
+        return "D"
+
+    # Bimodal: second peak away from POC with comparable volume
+    gap = max(num_bins // 10, 5)
+    outside = [bins[i] for i in range(num_bins) if abs(i - poc_idx) > gap]
+    if outside:
+        second_peak = float(max(outside))
+        if second_peak > float(bins.max()) * 0.65:
+            return "B"
+
+    avg = total / num_bins
+    if avg > 0 and float(bins.max()) / avg < 2.0:
+        return "thin"
+    return "D"
+
+
+def _zones_from_peaks(
+    arr: np.ndarray,
+    peaks: np.ndarray,
+    left_ips: np.ndarray,
+    right_ips: np.ndarray,
+    bin_size: float,
+    price_min: float,
+    offset: int = 0,
+    top_n: int = 4,
+    ascending: bool = False,
+) -> list[dict]:
+    """Convert peak_widths output into sorted zone dicts.
+
+    `offset` shifts indices back into the full array's coordinate space (used
+    when LVN detection runs on a sliced region).
+    """
+    scored: list[tuple[float, float, float]] = []
+    for i in range(len(peaks)):
+        l = max(0, math.floor(left_ips[i]))
+        r = min(len(arr) - 1, math.floor(right_ips[i]))
+        seg = arr[l: r + 1]
+        vol = float(seg.mean()) if len(seg) > 0 else 0.0
+        scored.append((vol, offset + left_ips[i], offset + right_ips[i]))
+
+    scored.sort(key=lambda x: x[0], reverse=not ascending)
+
+    result: list[dict] = []
+    for _, lip, rip in scored[:top_n]:
+        low = round(price_min + math.floor(lip) * bin_size, 2)
+        high = round(price_min + (math.floor(rip) + 1) * bin_size, 2)
+        if low < high:
+            result.append({"low": low, "high": high})
+    return sorted(result, key=lambda z: z["low"])
+
+
+def _find_hvn_zones(
+    bins: np.ndarray, bin_size: float, price_min: float, top_n: int = 4
+) -> list[dict]:
+    """HVN via find_peaks on smoothed bins, prominence ≥ 0.5×avg, height ≥ avg."""
+    smoothed = uniform_filter1d(bins, size=3)
+    active = bins[bins > 0]
+    if len(active) == 0:
+        return []
+    avg = float(active.mean())
+
+    peaks, _ = find_peaks(smoothed, prominence=avg * 0.5, height=avg)
+    if len(peaks) == 0:
+        return []
+
+    _, _, left_ips, right_ips = peak_widths(smoothed, peaks, rel_height=0.5)
+    return _zones_from_peaks(bins, peaks, left_ips, right_ips, bin_size, price_min, top_n=top_n)
+
+
+def _find_lvn_zones(
+    bins: np.ndarray, bin_size: float, price_min: float, top_n: int = 4
+) -> list[dict]:
+    """LVN via find_peaks on the INVERTED signal, restricted to active price range.
+
+    Restricting to [first_active, last_active] means tails (where price barely
+    visited) are never flagged as LVN — only true valleys between active zones.
+    """
+    smoothed = uniform_filter1d(bins, size=3)
+    active_idxs = np.where(bins > 0)[0]
+    if len(active_idxs) == 0:
+        return []
+    avg = float(bins[active_idxs].mean())
+    first, last = int(active_idxs[0]), int(active_idxs[-1])
+    if last - first < 4:
+        return []
+
+    region = smoothed[first: last + 1]
+    inverted = -region
+
+    valleys, _ = find_peaks(inverted, prominence=avg * 0.3)
+    if len(valleys) == 0:
+        return []
+
+    _, _, left_ips, right_ips = peak_widths(inverted, valleys, rel_height=0.5)
+    return _zones_from_peaks(
+        bins[first: last + 1], valleys, left_ips, right_ips,
+        bin_size, price_min, offset=first, top_n=top_n, ascending=True,
+    )
+
+
+def _compute_poc_va(
+    vol_map: dict[float, float],
+    va_pct: float = VALUE_AREA_PCT,
+) -> tuple[float, float, float] | None:
+    """Backwards-compat helper for callers that pass a sparse price→vol map.
+
+    Bins the sparse map into NUM_BINS and runs the standard POC/VA pipeline.
+    """
     if not vol_map:
         return None
     prices = sorted(vol_map.keys())
-    total = sum(vol_map.values())
-    poc = max(prices, key=lambda p: vol_map[p])
-    poc_idx = prices.index(poc)
-    target = total * va_pct
-    lo = hi = poc_idx
-    acc = vol_map[poc]
-    while acc < target and (lo > 0 or hi < len(prices) - 1):
-        left = vol_map[prices[lo - 1]] if lo > 0 else -1
-        right = vol_map[prices[hi + 1]] if hi < len(prices) - 1 else -1
-        if right >= left and hi < len(prices) - 1:
-            hi += 1
-            acc += vol_map[prices[hi]]
-        elif lo > 0:
-            lo -= 1
-            acc += vol_map[prices[lo]]
-        else:
-            break
-    return poc, prices[hi], prices[lo]
+    p_min, p_max = prices[0], prices[-1]
+    if p_max <= p_min:
+        return p_min, p_min, p_min
+
+    bin_size = (p_max - p_min) / NUM_BINS
+    bins = np.zeros(NUM_BINS, dtype=float)
+    for p, v in vol_map.items():
+        idx = max(0, min(NUM_BINS - 1, int((p - p_min) / bin_size)))
+        bins[idx] += v
+
+    max_v = float(bins.max())
+    tied = [i for i in range(NUM_BINS) if bins[i] == max_v]
+    poc_idx = tied[len(tied) // 2]
+    lo_idx, hi_idx = _value_area(bins, poc_idx, va_pct)
+
+    poc = round(p_min + (poc_idx + 0.5) * bin_size, 2)
+    val = round(p_min + lo_idx * bin_size, 2)
+    vah = round(p_min + (hi_idx + 1) * bin_size, 2)
+    return poc, vah, val
 
 
-def _smooth(vol_map: dict[float, float], window: int = 2) -> dict[float, float]:
-    """5-level rolling average to reduce noise before peak detection."""
-    prices = sorted(vol_map.keys())
-    vols = [vol_map[p] for p in prices]
-    n = len(prices)
-    smoothed: dict[float, float] = {}
-    for i, p in enumerate(prices):
-        lo = max(0, i - window)
-        hi = min(n, i + window + 1)
-        smoothed[p] = sum(vols[lo:hi]) / (hi - lo)
-    return smoothed
-
-
-def _find_peaks_valleys(smoothed: dict[float, float], n: int = 2) -> tuple[list[float], list[float]]:
-    """Local maxima (peaks) and local minima (valleys) on smoothed curve.
-
-    A price is a peak if its smoothed vol is the max of its [i-n .. i+n] window.
-    """
-    prices = sorted(smoothed.keys())
-    vols = [smoothed[p] for p in prices]
-    peaks: list[float] = []
-    valleys: list[float] = []
-    for i in range(n, len(prices) - n):
-        window = vols[i - n: i + n + 1]
-        if vols[i] == max(window):
-            peaks.append(prices[i])
-        if vols[i] == min(window):
-            valleys.append(prices[i])
-    return peaks, valleys
-
-
-def _detect_shape(vol_map: dict[float, float], poc: float) -> str:
-    """Classify VP shape using centroid + peak/valley detection.
-
-    Shape logic (institutional approach):
-    1. Centroid-based: weighted average price relative to range → P / D / b
-    2. Double: two statistically significant peaks with a significant valley between
-    3. Elongated: neither concentrated nor bimodal
-    """
-    if len(vol_map) < 5:
+def _detect_shape(vol_map: dict[float, float], poc: float | None) -> str:
+    """Backwards-compat shape detection from sparse vol_map."""
+    if not vol_map or poc is None:
         return "thin"
     prices = sorted(vol_map.keys())
-    total = sum(vol_map.values())
-    if total == 0 or prices[-1] == prices[0]:
+    p_min, p_max = prices[0], prices[-1]
+    if p_max <= p_min:
         return "thin"
-
-    price_range = prices[-1] - prices[0]
-
-    # Step 1: volume centroid (weighted average price)
-    centroid = sum(p * v for p, v in vol_map.items()) / total
-    rel_pos = (centroid - prices[0]) / price_range   # 0=bottom, 1=top
-
-    # Step 2: peak/valley detection for double detection
-    smoothed = _smooth(vol_map)
-    peaks, valleys = _find_peaks_valleys(smoothed)
-
-    # Double: 2+ significant peaks with deep valley between, separated by >30% range
-    import statistics as _stats
-    avg = total / len(vol_map)
-    std = _stats.pstdev(vol_map.values()) if len(vol_map) > 1 else 0.0
-    sig_peaks = [p for p in peaks if smoothed[p] > avg + 0.8 * std]
-    if len(sig_peaks) >= 2:
-        peak_span = max(sig_peaks) - min(sig_peaks)
-        if peak_span > price_range * 0.30:
-            # verify there's a meaningful valley between the two main peaks
-            between_valleys = [v for v in valleys if min(sig_peaks) < v < max(sig_peaks)]
-            if between_valleys:
-                deepest_valley = min(smoothed[v] for v in between_valleys)
-                peak_avg_vol = (smoothed[sig_peaks[0]] + smoothed[sig_peaks[-1]]) / 2
-                if deepest_valley < peak_avg_vol * 0.65:  # valley is ≥35% below peak average
-                    return "double"
-
-    # Step 3: centroid-based shape
-    if rel_pos > 0.60:
-        return "P"    # volume concentrated in upper part = distribution
-    if rel_pos < 0.40:
-        return "b"    # volume concentrated in lower part = accumulation
-    return "D"        # balanced, centered
-
-
-def _group_levels_into_zones(
-    prices: list[float],
-    price_step: float,
-    price_range: float = 0.0,
-) -> list[dict]:
-    """Merge price levels into meaningful zones.
-
-    Merge gap: max(price_step × 5, price_range × 1%) — prevents tiny isolated zones.
-    Min width: max(price_step × 2, price_range × 0.5%) — filters single-point zones.
-    """
-    if not prices:
-        return []
-    prices = sorted(prices)
-    effective_range = price_range or (prices[-1] - prices[0]) or price_step
-    merge_gap = max(price_step * 5, effective_range * 0.01)
-    min_width  = max(price_step * 2, effective_range * 0.005)
-
-    zones: list[dict] = []
-    zone_start = zone_end = prices[0]
-    for p in prices[1:]:
-        if p - zone_end <= merge_gap:
-            zone_end = p
-        else:
-            if zone_end - zone_start >= min_width:
-                zones.append({"low": zone_start, "high": zone_end})
-            zone_start = zone_end = p
-    if zone_end - zone_start >= min_width:
-        zones.append({"low": zone_start, "high": zone_end})
-    return zones
+    bin_size = (p_max - p_min) / NUM_BINS
+    bins = np.zeros(NUM_BINS, dtype=float)
+    for p, v in vol_map.items():
+        idx = max(0, min(NUM_BINS - 1, int((p - p_min) / bin_size)))
+        bins[idx] += v
+    poc_idx = max(0, min(NUM_BINS - 1, int((poc - p_min) / bin_size)))
+    lo_idx, hi_idx = _value_area(bins, poc_idx, VALUE_AREA_PCT)
+    return _classify_shape(bins, poc_idx, lo_idx, hi_idx, NUM_BINS)
 
 
 def _hvn_lvn(vol_map: dict[float, float]) -> tuple[list[dict], list[dict]]:
-    """Identify HVN and LVN zones using peak/valley detection on smoothed histogram.
-
-    HVN: zones surrounding statistically significant peaks (vol > mean + 1σ)
-    LVN: zones surrounding statistically significant valleys (vol < mean - 0.5σ)
-    """
-    if not vol_map or len(vol_map) < 3:
+    """Backwards-compat HVN/LVN from sparse vol_map (used by verify_vp.py)."""
+    if not vol_map:
         return [], []
-
     prices = sorted(vol_map.keys())
-    price_range = prices[-1] - prices[0] if len(prices) > 1 else 1.0
-    price_step = min(prices[i + 1] - prices[i] for i in range(len(prices) - 1)) or 1.0
-
-    import statistics as _stats
-    vols = list(vol_map.values())
-    avg = sum(vols) / len(vols)
-    std = _stats.pstdev(vols) if len(vols) > 1 else 0.0
-
-    # Smooth and detect peaks/valleys
-    smoothed = _smooth(vol_map)
-    peaks, valleys = _find_peaks_valleys(smoothed)
-
-    # Significant peaks → HVN
-    hvn_prices = [p for p in peaks if vol_map[p] >= avg + 1.0 * std]
-    # Significant valleys → LVN
-    lvn_prices = [p for p in valleys if vol_map[p] <= avg - 0.5 * std]
-
-    # Fallback: use relative threshold if peak detection yields nothing
-    # For synthetic/flat data (low std/mean ratio), use top/bottom 20% by volume
-    cv = std / avg if avg > 0 else 0  # coefficient of variation
-    if not hvn_prices:
-        if cv >= 0.3:
-            hvn_prices = [p for p, v in vol_map.items() if v >= avg + 0.5 * std]
-        else:
-            # Flat distribution (synthetic data) — take top 20% by volume
-            vol_threshold = sorted(vol_map.values())[int(len(vol_map) * 0.80)]
-            hvn_prices = [p for p, v in vol_map.items() if v >= vol_threshold]
-    if not lvn_prices:
-        if cv >= 0.3:
-            lvn_prices = [p for p, v in vol_map.items() if 0 < v <= avg - 0.5 * std]
-        else:
-            # Flat distribution — take bottom 20% by volume
-            vol_threshold = sorted(vol_map.values())[int(len(vol_map) * 0.20)]
-            lvn_prices = [p for p, v in vol_map.items() if 0 < v <= vol_threshold]
-
+    p_min, p_max = prices[0], prices[-1]
+    if p_max <= p_min:
+        return [], []
+    bin_size = (p_max - p_min) / NUM_BINS
+    bins = np.zeros(NUM_BINS, dtype=float)
+    for p, v in vol_map.items():
+        idx = max(0, min(NUM_BINS - 1, int((p - p_min) / bin_size)))
+        bins[idx] += v
     return (
-        _group_levels_into_zones(hvn_prices, price_step, price_range),
-        _group_levels_into_zones(lvn_prices, price_step, price_range),
+        _find_hvn_zones(bins, bin_size, p_min),
+        _find_lvn_zones(bins, bin_size, p_min),
     )
 
 
@@ -260,10 +423,17 @@ def compute(
     period: str,
     current_close: float,
     prev_poc: float | None = None,
+    *,
+    bin_size: float | None = None,
 ) -> VolumeProfilePeriod:
-    """Compute VolumeProfilePeriod from a list of Bar objects for the period."""
-    vol_map = _build_price_map(bars)
-    if not vol_map:
+    """Compute VolumeProfilePeriod from a list of Bar objects for the period.
+
+    bin_size: tick-aligned bin width (e.g. 0.5 for XAU, 1.0 for BTC). When
+    provided, POC/VAH/VAL land on exact multiples. When None, falls back to
+    legacy range/NUM_BINS=68 binning.
+    """
+    built = _build_bins(bars, bin_size=bin_size)
+    if built is None:
         return VolumeProfilePeriod(
             period=period, poc=None, vah=None, val=None,
             shape="thin", hvn_zones=[], lvn_zones=[],
@@ -271,25 +441,37 @@ def compute(
             total_volume=0.0, price_range=0.0, bar_count=len(bars),
         )
 
-    prices = list(vol_map.keys())
-    result = _compute_poc_va(vol_map)
-    if result is None:
-        poc = vah = val = None
+    bins, _bin_centers, used_bin_size, p_min, p_max = built
+    n = len(bins)
+
+    max_v = float(bins.max())
+    tied = [i for i in range(n) if bins[i] == max_v]
+    poc_idx = tied[len(tied) // 2]
+    lo_idx, hi_idx = _value_area(bins, poc_idx, VALUE_AREA_PCT)
+
+    # Tick-aligned mode → POC = bin LOWER edge so values land on bin_size grid.
+    # Legacy mode → keep center-of-bin convention.
+    if bin_size is not None and bin_size > 0:
+        poc = round(p_min + poc_idx * used_bin_size, 4)
     else:
-        poc, vah, val = result
+        poc = round(p_min + (poc_idx + 0.5) * used_bin_size, 2)
+    val = round(p_min + lo_idx * used_bin_size, 4)
+    vah = round(p_min + (hi_idx + 1) * used_bin_size, 4)
 
-    shape = _detect_shape(vol_map, poc) if poc else "thin"
-    hvn, lvn = _hvn_lvn(vol_map)
-    price_range = max(prices) - min(prices) if prices else 0.0
+    hvn = _find_hvn_zones(bins, used_bin_size, p_min)
+    lvn = _find_lvn_zones(bins, used_bin_size, p_min)
+    shape = _classify_shape(bins, poc_idx, lo_idx, hi_idx, n)
 
-    # Naked POC: previous period POC not yet touched by current period bars
-    naked = None
-    if prev_poc is not None and poc is not None:
-        touched = any(abs(p - prev_poc) <= price_range * 0.001 for p in prices)
-        if not touched:
+    # Naked POC: prior-period POC not revisited by this period's bars
+    naked: float | None = None
+    if prev_poc is not None:
+        tol = (p_max - p_min) * 0.001
+        revisited = any(abs(b.ohlc.h - prev_poc) <= tol or abs(b.ohlc.l - prev_poc) <= tol
+                        or (b.ohlc.l <= prev_poc <= b.ohlc.h) for b in bars)
+        if not revisited:
             naked = prev_poc
 
-    pos = _current_position(current_close, poc, vah, val) if poc and vah and val else "unknown"
+    pos = _current_position(current_close, poc, vah, val)
 
     return VolumeProfilePeriod(
         period=period,
@@ -301,20 +483,41 @@ def compute(
         lvn_zones=lvn,
         naked_poc=naked,
         current_position=pos,
-        total_volume=sum(vol_map.values()),
-        price_range=price_range,
+        total_volume=float(bins.sum()),
+        price_range=p_max - p_min,
         bar_count=len(bars),
     )
 
 
-MIN_BARS_DAILY = 60     # need at least 60 x 1m bars (~1hr) for meaningful daily VP
-MIN_BARS_WEEKLY = 300   # need at least 300 x 1m bars (~5hr) for meaningful weekly VP
+MIN_BARS_DAILY = 60
+MIN_BARS_WEEKLY = 300
+
+
+# Tick-aligned bin sizes per symbol — institutional convention. Used when
+# settings.yaml lacks vp_bin_size or callers go through from_store() directly.
+DEFAULT_BIN_SIZE: dict[str, float] = {
+    "BTCUSDT": 1.0,
+    "XAUTUSDT": 0.5,
+}
+
+
+def _resolve_bin_size(symbol: str) -> float | None:
+    """Read vp_bin_size[symbol] from config/settings.yaml; fall back to DEFAULT_BIN_SIZE."""
+    try:
+        import yaml as _yaml
+        from pathlib import Path as _Path
+        _root = _Path(__file__).resolve().parent.parent.parent
+        _cfg = _yaml.safe_load((_root / "config" / "settings.yaml").read_text())
+        bs_cfg = (_cfg or {}).get("vp_cache", {}).get("vp_bin_size", {}) or {}
+        if symbol in bs_cfg:
+            return float(bs_cfg[symbol])
+    except Exception:
+        pass
+    return DEFAULT_BIN_SIZE.get(symbol)
 
 
 def from_store(symbol: str, primary_tf: str, period: str) -> VolumeProfilePeriod | None:
-    """Convenience: compute VP from state_store bars for the given period.
-    Returns None if insufficient bars for meaningful profile.
-    """
+    """Convenience: compute VP from state_store bars for the given period."""
     from pipeline.state_store import store
     import time
 
@@ -327,19 +530,26 @@ def from_store(symbol: str, primary_tf: str, period: str) -> VolumeProfilePeriod
 
     min_bars = MIN_BARS_WEEKLY if period == "weekly" else MIN_BARS_DAILY
     if len(period_bars) < min_bars:
-        return None   # too few bars for meaningful VP — avoid noisy profile
+        return None
 
     latest = period_bars[-1]
     current_close = latest.ohlc.c
+    bin_size = _resolve_bin_size(symbol)
 
     # Previous period for naked POC
     prev_period_bars = [b for b in all_bars if b.close_ts < start_ts]
-    prev_result = None
+    prev_poc: float | None = None
     if prev_period_bars:
-        prev_vol_map = _build_price_map(prev_period_bars[-500:])
-        if prev_vol_map:
-            r = _compute_poc_va(prev_vol_map)
-            if r:
-                prev_result = r[0]
+        prev_built = _build_bins(prev_period_bars[-500:], bin_size=bin_size)
+        if prev_built is not None:
+            prev_bins, _, prev_bin_size, prev_p_min, _ = prev_built
+            n = len(prev_bins)
+            max_v = float(prev_bins.max())
+            tied = [i for i in range(n) if prev_bins[i] == max_v]
+            prev_poc_idx = tied[len(tied) // 2]
+            if bin_size is not None and bin_size > 0:
+                prev_poc = round(prev_p_min + prev_poc_idx * prev_bin_size, 4)
+            else:
+                prev_poc = round(prev_p_min + (prev_poc_idx + 0.5) * prev_bin_size, 2)
 
-    return compute(period_bars, period, current_close, prev_poc=prev_result)
+    return compute(period_bars, period, current_close, prev_poc=prev_poc, bin_size=bin_size)

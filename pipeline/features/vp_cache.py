@@ -21,6 +21,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 LOG = logging.getLogger(__name__)
 
@@ -31,22 +32,54 @@ CACHE_FILE = ROOT / "data" / "vp_cache.json"
 _IST = timezone(timedelta(hours=5, minutes=30))
 
 
-def _session_day_key(ts: int, sess_start_utc: int) -> str:
+# Session anchor type:
+#   int               → static UTC hour (e.g. 0 for BTC) — DST-naive, fine for 24/7 markets
+#   (tz_name, hour)   → local hour in IANA timezone (e.g. ("America/New_York", 18))
+#                       UTC offset is recomputed per-date so DST transitions are handled
+SessionAnchor = int | tuple[str, int]
+
+
+def _resolve_start_utc_dt(anchor: SessionAnchor, calendar_date: datetime) -> datetime:
+    """Return a tz-aware UTC datetime for the session that anchors on `calendar_date`.
+
+    For int anchor: returns `calendar_date` at `hour:00 UTC` (always the same offset).
+    For (tz, hour) anchor: returns `calendar_date` at `hour:00 local_tz`, converted
+    to UTC — so EDT/EST transitions automatically shift the UTC equivalent.
+    """
+    if isinstance(anchor, int):
+        return calendar_date.replace(hour=anchor, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+    tz_name, local_hour = anchor
+    local_dt = calendar_date.replace(hour=local_hour, minute=0, second=0, microsecond=0, tzinfo=ZoneInfo(tz_name))
+    return local_dt.astimezone(timezone.utc)
+
+
+def _normalize_anchor(raw) -> SessionAnchor:
+    """Accept either an int or a dict {tz, hour} from settings.yaml. Returns SessionAnchor."""
+    if isinstance(raw, dict):
+        tz = raw.get("tz") or raw.get("timezone")
+        hour = raw.get("hour")
+        if tz is not None and hour is not None:
+            return (str(tz), int(hour))
+    return int(raw or 0)
+
+
+def _session_day_key(ts: int, anchor) -> str:
     """Return the IST calendar-date label for whichever session is active at ts.
 
-    Works for any session_start_utc:
-      BTCUSDT (0):   UTC 23:30 May 19 → session started UTC 00:00 May 19 → key "2026-05-19"
-      XAUTUSDT (22): UTC 23:30 May 19 → session started UTC 22:00 May 19 → IST 03:30 May 20 → key "2026-05-20"
-      XAUTUSDT (22): UTC 21:00 May 19 → session started UTC 22:00 May 18 → IST 03:30 May 19 → key "2026-05-19"
+    Accepts anchor as int (UTC hour) / tuple (tz, hour) / dict {tz, hour} —
+    normalized internally so all consumers can pass whatever form they have.
+
+    Examples:
+      BTCUSDT  (0):  UTC 23:30 May 19 → start UTC 00:00 May 19 → IST 05:30 May 19 → "2026-05-19"
+      XAUTUSDT (NY 18, DST):  UTC 21:00 May 19 → start UTC 22:00 May 18 → IST 03:30 May 19 → "2026-05-19"
+      XAUTUSDT (NY 18, EST):  UTC 21:00 Dec 19 → start UTC 23:00 Dec 18 → IST 04:30 Dec 19 → "2026-12-19"
     """
+    a: SessionAnchor = _normalize_anchor(anchor) if not isinstance(anchor, (int, tuple)) else anchor
     utc_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-    if utc_dt.hour >= sess_start_utc:
-        sess_start_dt = utc_dt.replace(hour=sess_start_utc, minute=0, second=0, microsecond=0)
-    else:
-        sess_start_dt = (utc_dt - timedelta(days=1)).replace(
-            hour=sess_start_utc, minute=0, second=0, microsecond=0
-        )
-    return sess_start_dt.astimezone(_IST).strftime("%Y-%m-%d")
+    candidate = _resolve_start_utc_dt(a, utc_dt)
+    if candidate > utc_dt:
+        candidate = _resolve_start_utc_dt(a, utc_dt - timedelta(days=1))
+    return candidate.astimezone(_IST).strftime("%Y-%m-%d")
 
 
 def _week_key(ts: int) -> str:
@@ -55,49 +88,48 @@ def _week_key(ts: int) -> str:
     return f"{dt.strftime('%G')}-W{dt.strftime('%V')}"
 
 
-IST_OFFSET_H = 5.5   # UTC+5:30
+def _day_bounds(ist_date_str: str, anchor: "int | tuple[str, int] | dict | None" = 0) -> tuple[int, int]:
+    """Return (start_ts, end_ts) for the session labeled by IST date `ist_date_str`.
 
+    The IST label is always +1 calendar day from the session's UTC/local start
+    (for any sane session that begins after IST midnight). So we anchor on
+    (IST date - 1).
 
-def _utc_session_date(ist_date_str: str, session_start_utc: int) -> str:
-    """Convert IST calendar date → UTC date for the session start.
-
-    If session_start_utc + IST_OFFSET >= 24, the session crosses midnight IST:
-    the UTC date is one day earlier than the IST date.
-    e.g. XAUTUSDT session_start=22: IST "May 19" = UTC "May 18" 22:00
+    BTCUSDT  (anchor=0):    IST "2026-05-19" → 2026-05-19 00:00 UTC → +24h
+    XAUTUSDT (NY 18, EDT):  IST "2026-05-19" → NY  2026-05-18 18:00 EDT = 22:00 UTC → +24h
+    XAUTUSDT (NY 18, EST):  IST "2026-12-19" → NY  2026-12-18 18:00 EST = 23:00 UTC → +24h
     """
-    if session_start_utc + IST_OFFSET_H >= 24:
-        ist_dt = datetime.strptime(ist_date_str, "%Y-%m-%d") - timedelta(days=1)
-        return ist_dt.strftime("%Y-%m-%d")
-    return ist_date_str
-
-
-def _day_bounds(ist_date_str: str, session_start_utc: int = 0) -> tuple[int, int]:
-    """Return (start_ts, end_ts) for the session covering IST date `ist_date_str`.
-
-    BTCUSDT (start=0):  2026-05-19 00:00 UTC → 2026-05-20 00:00 UTC
-    XAUTUSDT (start=22): 2026-05-18 22:00 UTC → 2026-05-19 22:00 UTC
-                         (= IST 2026-05-19 03:30 → 2026-05-20 03:30)
-    """
-    utc_date = _utc_session_date(ist_date_str, session_start_utc)
-    dt = datetime.strptime(utc_date, "%Y-%m-%d").replace(
-        hour=session_start_utc, minute=0, second=0, tzinfo=timezone.utc
-    )
-    start = int(dt.timestamp())
+    a: SessionAnchor = anchor if isinstance(anchor, (int, tuple)) else _normalize_anchor(anchor)
+    ist_dt = datetime.strptime(ist_date_str, "%Y-%m-%d")
+    # For UTC-midnight sessions (anchor=0), label = anchor date. Otherwise +1.
+    if isinstance(a, int) and a == 0:
+        anchor_date = ist_dt
+    else:
+        anchor_date = ist_dt - timedelta(days=1)
+    start_dt = _resolve_start_utc_dt(a, anchor_date)
+    start = int(start_dt.timestamp())
     return start, start + 86400
 
 
-def _week_bounds(week_str: str, session_start_utc: int = 0) -> tuple[int, int]:
+def _week_bounds(week_str: str, anchor: "int | tuple[str, int] | dict[str, object] | None" = 0) -> tuple[int, int]:
     """Return (start_ts, end_ts) for an ISO week string like '2026-W21'.
 
-    Uses %G/%V/%u so the Monday start matches how _week_key generates keys.
-    %W (old) and %V (ISO) count differently — mixing them caused off-by-one weeks.
+    Anchored at Monday of that ISO week. For non-UTC anchors (e.g. NY 18:00),
+    we take Monday's *local* 18:00 and convert to UTC.
     """
+    a: SessionAnchor = anchor if isinstance(anchor, (int, tuple)) else _normalize_anchor(anchor)
     year, week = week_str.split("-W")
-    dt = datetime.strptime(f"{year}-W{week}-1", "%G-W%V-%u").replace(
-        hour=session_start_utc, minute=0, second=0, tzinfo=timezone.utc
-    )
-    start = int(dt.timestamp())
+    monday = datetime.strptime(f"{year}-W{week}-1", "%G-W%V-%u")
+    start_dt = _resolve_start_utc_dt(a, monday)
+    start = int(start_dt.timestamp())
     return start, start + 604800
+
+
+# ── backwards-compat shim for legacy callers passing a plain UTC hour int ────
+def _utc_session_date(ist_date_str: str, session_start_utc: int) -> str:
+    """Kept for any old callers — returns the UTC calendar-date for the anchor."""
+    start_ts, _ = _day_bounds(ist_date_str, session_start_utc)
+    return datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
 def _load() -> dict:
@@ -126,27 +158,40 @@ def _vp_to_dict(vp) -> dict | None:
     }
 
 
-def _compute_period_vp(all_bars, start_ts: int, end_ts: int) -> dict | None:
+def _compute_period_vp(
+    all_bars, start_ts: int, end_ts: int,
+    bin_size: float | None = None,
+) -> dict | None:
     from .volume_profile import compute
     period_bars = [b for b in all_bars if start_ts <= b.close_ts < end_ts]
     if len(period_bars) < 30:   # need at least 30 bars for cached VP
         return None
     latest_close = period_bars[-1].ohlc.c
-    vp = compute(period_bars, "cached", latest_close)
+    vp = compute(period_bars, "cached", latest_close, bin_size=bin_size)
     return _vp_to_dict(vp)
+
+
+def _anchor_to_storage(anchor: SessionAnchor) -> int | dict:
+    """Serialize a SessionAnchor to a JSON-friendly form for the cache."""
+    if isinstance(anchor, tuple):
+        return {"tz": anchor[0], "hour": anchor[1]}
+    return int(anchor)
 
 
 def build_and_save(
     symbols: list[str],
     primary_tf: str = "1m",
-    session_start_utc: dict[str, int] | None = None,
+    session_start_utc: dict | None = None,
+    vp_bin_size: dict | None = None,
 ) -> None:
     """Pre-compute last 5 days + last 2 weeks VP for each symbol. Save to cache.
 
-    session_start_utc: {symbol: utc_hour} — e.g. {"XAUTUSDT": 22, "BTCUSDT": 0}
+    session_start_utc: {symbol: anchor} — int (DST-naive) or {tz, hour} (DST-aware).
+    vp_bin_size:       {symbol: float} — tick-aligned bin width (e.g. {"XAUTUSDT": 0.5}).
     """
     from pipeline.state_store import store as _store
     session_cfg = session_start_utc or {}
+    bin_cfg = vp_bin_size or {}
     cache = _load()
     now_ts = int(time.time())
 
@@ -158,32 +203,33 @@ def build_and_save(
             continue
 
         from typing import Any as _Any
-        sess_start: int = int(session_cfg.get(symbol, 0))
-        cache.setdefault(symbol, {"daily": {}, "weekly": {}, "session_start_utc": sess_start})  # type: ignore[union-attr]
+        anchor: SessionAnchor = _normalize_anchor(session_cfg.get(symbol, 0))
+        bin_size: float | None = float(bin_cfg[symbol]) if symbol in bin_cfg else None
+        cache.setdefault(symbol, {"daily": {}, "weekly": {}, "session_start_utc": _anchor_to_storage(anchor)})  # type: ignore[union-attr]
         sym_cache: dict[str, _Any] = cache[symbol]  # type: ignore[assignment]
-        sym_cache["session_start_utc"] = sess_start
+        sym_cache["session_start_utc"] = _anchor_to_storage(anchor)
+        if bin_size is not None:
+            sym_cache["bin_size"] = bin_size
         computed = 0
 
-        # Last 5 days — key = session-aware IST date (correct for both BTC and XAUT)
         for days_back in range(5):
             ts_for_day = now_ts - days_back * 86400
-            date_key = _session_day_key(ts_for_day, sess_start)
+            date_key = _session_day_key(ts_for_day, anchor)
             if date_key in sym_cache["daily"] and days_back > 0:
-                continue   # past days complete — skip
-            start_ts, end_ts = _day_bounds(date_key, sess_start)
-            vp = _compute_period_vp(all_bars, start_ts, min(end_ts, now_ts))
+                continue
+            start_ts, end_ts = _day_bounds(date_key, anchor)
+            vp = _compute_period_vp(all_bars, start_ts, min(end_ts, now_ts), bin_size=bin_size)
             if vp:
                 sym_cache["daily"][date_key] = vp
                 computed += 1
 
-        # Last 2 weeks — ISO week key derived from session-aware timestamp
         for weeks_back in range(2):
             ts_for_week = now_ts - weeks_back * 604800
             week_key = _week_key(ts_for_week)
             if week_key in sym_cache["weekly"] and weeks_back > 0:
                 continue
-            start_ts, end_ts = _week_bounds(week_key, sess_start)
-            vp = _compute_period_vp(all_bars, start_ts, min(end_ts, now_ts))
+            start_ts, end_ts = _week_bounds(week_key, anchor)
+            vp = _compute_period_vp(all_bars, start_ts, min(end_ts, now_ts), bin_size=bin_size)
             if vp:
                 sym_cache["weekly"][week_key] = vp
                 computed += 1
@@ -201,9 +247,9 @@ def get(symbol: str, period: str) -> dict | None:
     cache = _load()
     sym = cache.get(symbol, {})
     now_ts = int(time.time())
-    sess_start: int = int(sym.get("session_start_utc") or 0)  # type: ignore[arg-type]
+    anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
     if period == "daily":
-        key = _session_day_key(now_ts, sess_start)
+        key = _session_day_key(now_ts, anchor)
         return sym.get("daily", {}).get(key)
     elif period == "weekly":
         key = _week_key(now_ts)

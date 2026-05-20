@@ -41,10 +41,15 @@ def _precompute_vp(settings: dict) -> None:
     vp_cfg = settings.get("vp_cache", {})
     symbols = vp_cfg.get("symbols", [settings["instrument"]["symbol"]])
     session_start = vp_cfg.get("session_start_utc", {})
+    bin_size_cfg = vp_cfg.get("vp_bin_size", {})
     primary_tf = settings["instrument"]["primary_tf"]
-    LOG.info(f"[startup] pre-computing VP cache for {symbols} (session_start={session_start})...")
+    LOG.info(f"[startup] pre-computing VP cache for {symbols} (session_start={session_start}, bin_size={bin_size_cfg})...")
     try:
-        build_and_save(list(set(symbols)), primary_tf, session_start_utc=session_start)
+        build_and_save(
+            list(set(symbols)), primary_tf,
+            session_start_utc=session_start,
+            vp_bin_size=bin_size_cfg,
+        )
     except Exception as e:
         LOG.warning(f"[startup] VP cache build failed (non-fatal): {e}")
 

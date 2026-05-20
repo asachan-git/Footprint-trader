@@ -20,8 +20,8 @@ sys.path.insert(0, str(ROOT))
 _IST = timezone(timedelta(hours=5, minutes=30))
 
 SYMBOL_CONFIG = {
-    "BTCUSDT":  {"session_start_utc": 0,  "primary_tf": "1m"},
-    "XAUTUSDT": {"session_start_utc": 22, "primary_tf": "1m"},
+    "BTCUSDT":  {"session_anchor": 0, "primary_tf": "1m"},
+    "XAUTUSDT": {"session_anchor": 0, "primary_tf": "1m"},  # Bybit 24/7, 00:00 UTC
 }
 
 
@@ -41,14 +41,14 @@ def main() -> None:
     total = 0
 
     for symbol in symbols:
-        cfg = SYMBOL_CONFIG.get(symbol, {"session_start_utc": 0, "primary_tf": "1m"})
-        sess_utc = cfg["session_start_utc"]
+        cfg = SYMBOL_CONFIG.get(symbol, {"session_anchor": 0, "primary_tf": "1m"})
+        sess_anchor = cfg["session_anchor"]
         primary_tf = cfg["primary_tf"]
 
         generated: set[str] = set()
         for days_ago in range(1, args.days + 1):
             ts = now_ts - days_ago * 86400
-            date_key = _session_day_key(ts, sess_utc)
+            date_key = _session_day_key(ts, sess_anchor)
             if date_key in generated:
                 continue
             generated.add(date_key)
@@ -58,7 +58,7 @@ def main() -> None:
                 print(f"  {symbol} {date_key}  [exists, skipping]")
                 continue
 
-            result = write_day_journal(symbol, primary_tf, date_key, sess_utc)
+            result = write_day_journal(symbol, primary_tf, date_key, sess_anchor)
             if result:
                 print(f"  {symbol} {date_key}  → {result.name}")
                 total += 1

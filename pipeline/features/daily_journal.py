@@ -37,9 +37,12 @@ def write_day_journal(
     symbol: str,
     primary_tf: str,
     date_key: str,
-    session_start_utc: int = 0,
+    session_anchor: object = 0,
 ) -> Path | None:
     """Generate journal for symbol on date_key (YYYY-MM-DD IST session label).
+
+    session_anchor accepts the same forms as vp_cache: int UTC hour, tuple
+    (tz, hour), or dict {tz, hour}. DST-aware for non-UTC anchors.
 
     Returns path to the generated file, or None if insufficient data.
     """
@@ -50,9 +53,11 @@ def write_day_journal(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{date_key}.md"
 
-    # Get session bounds for this date
+    # Get session bounds for this date (DST-aware via vp_cache helper)
     from pipeline.features.vp_cache import _day_bounds as _db
-    start_ts, end_ts = _db(date_key, session_start_utc)
+    start_ts, end_ts = _db(date_key, session_anchor)
+    # Derive the actual UTC hour for this specific date (may differ across DST)
+    session_start_utc = datetime.fromtimestamp(start_ts, tz=timezone.utc).hour
 
     # Load bars for this session
     s = _store()
@@ -118,6 +123,7 @@ def write_day_journal(
             "D": "balanced (mean reversion)",
             "P": "distribution (short bias)",
             "b": "accumulation (long bias)",
+            "B": "bimodal (two-zone, fast-move setup)",
             "double": "bimodal (two zones)",
             "elongated": "trending (directional)",
             "thin": "thin data",

@@ -23,12 +23,23 @@ ingress:
 # VP cache — pre-computed on server start, updated at day/week boundaries
 vp_cache:
   symbols: [BTCUSDT, XAUTUSDT]   # pre-compute VP for these symbols on startup
-  # Daily session start in UTC hours. Session runs start_utc → start_utc+24h.
-  # BTCUSDT: 5:30 AM IST = 00:00 UTC
-  # XAUTUSDT: 3:30 AM IST = 22:00 UTC previous day (Forex gold session)
+  # Per-symbol daily session anchor. Two forms accepted:
+  #   <int>             — static UTC hour (DST-naive; fine for 24/7 crypto)
+  #   {tz, hour}        — local-time anchor, automatically DST-adjusted via zoneinfo
+  # XAUTUSDT uses CME Gold's 18:00 ET session open:
+  #   EDT (Mar–Nov): 18:00 ET = 22:00 UTC = 03:30 IST next day
+  #   EST (Nov–Mar): 18:00 ET = 23:00 UTC = 04:30 IST next day
   session_start_utc:
-    BTCUSDT: 0      # midnight UTC
-    XAUTUSDT: 22    # 22:00 UTC (= 3:30 AM IST)
+    BTCUSDT: 0      # midnight UTC (24/7 market)
+    XAUTUSDT: 0     # Bybit XAUTUSDT is a 24/7 crypto-tokenized pair, rolls at 00:00 UTC = 05:30 IST.
+                    # NOT CME Gold futures — weekends trade. Same anchor as BTC.
+  # Tick-aligned VP bin width (institutional convention).
+  # Falls back to range/68 if symbol not declared. Set in floats matching tick:
+  #   XAU tick = 0.1 → 0.5 = 5-tick bins
+  #   BTC tick = 0.1 → 1.0 = 10-tick bins
+  vp_bin_size:
+    BTCUSDT:  1.0
+    XAUTUSDT: 0.5
 
 # Pre-filter for /decide — skip Claude call when local features signal no setup.
 # Pass {"force": true} in /decide body to bypass.

@@ -31,7 +31,7 @@ from pipeline.features.vp_cache import build_and_save
 IST_TZ = timezone(timedelta(hours=5, minutes=30))
 SESSION_START_UTC = {
     "BTCUSDT": 0,
-    "XAUTUSDT": 22,
+    "XAUTUSDT": 0,  # Bybit 24/7 crypto-tokenized pair, 00:00 UTC daily roll
 }
 
 
@@ -157,7 +157,7 @@ def download_and_store(
     days: int,
     category: str,
     price_step: float,
-    session_start_utc: int,
+    session_start_utc: object = 0,
 ) -> int:
     """Download last N days of 1m bars and inject into state_store. Returns count injected."""
     now_ms = int(time.time() * 1000)
