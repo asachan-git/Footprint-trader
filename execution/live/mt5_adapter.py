@@ -55,12 +55,16 @@ class MT5Adapter:
         self._symbol_map: dict[str, str] = self._cfg.get("symbol_map", {}) or {}
         self._default_lots: dict[str, float] = self._cfg.get("default_lots", {}) or {}
         self._comment_prefix = str(self._cfg.get("order_comment_prefix", "FB"))
+        self._tradable: set[str] = set(self._cfg.get("tradable_symbols") or [])
 
     # ── public sync API ──────────────────────────────────────────────────
 
     def submit_order(self, decision: Decision, bar: Bar) -> dict:
         if decision.side == "flat":
             return {"broker": "vantage_mt5", "noop": True}
+        if self._tradable and bar.symbol not in self._tradable:
+            LOG.info(f"[mt5] {bar.symbol} not in tradable_symbols — skipping order")
+            return {"broker": "vantage_mt5", "skipped": f"{bar.symbol} not tradable"}
         if decision.entry is None or decision.stop_loss is None or decision.take_profit is None:
             return {"broker": "vantage_mt5", "error": "missing entry/SL/TP"}
 
