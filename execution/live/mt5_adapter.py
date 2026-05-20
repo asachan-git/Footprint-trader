@@ -115,6 +115,23 @@ class MT5Adapter:
             LOG.exception(f"[mt5] close failed: {e}")
             return {"broker": "vantage_mt5", "error": str(e)}
 
+    def modify_position(
+        self,
+        position_id: str,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+    ) -> dict:
+        """Update SL/TP on an existing broker position. Either bound may be None
+        to leave that side unchanged."""
+        if stop_loss is None and take_profit is None:
+            return {"broker": "vantage_mt5", "noop": True}
+        try:
+            result = self._run(self._async_modify(position_id, stop_loss, take_profit))
+            return {"broker": "vantage_mt5", "modified": position_id, "sl": stop_loss, "tp": take_profit, "result": result}
+        except Exception as e:
+            LOG.exception(f"[mt5] modify failed: {e}")
+            return {"broker": "vantage_mt5", "error": str(e)}
+
     def get_open_positions(self) -> list[dict]:
         try:
             return self._run(self._async_positions())
@@ -260,6 +277,29 @@ class MT5Adapter:
     async def _async_close(self, position_id: str) -> dict:
         conn = await self._ensure_conn()
         return await conn.close_position(position_id)
+
+    async def _async_modify(
+        self,
+        position_id: str,
+        stop_loss: float | None,
+        take_profit: float | None,
+    ) -> dict:
+        conn = await self._ensure_conn()
+        # MetaApi clears any bound passed as None. Read current values for the
+        # bound the caller did NOT specify, so partial-modify preserves the other.
+        if stop_loss is None or take_profit is None:
+            positions = await conn.get_positions()
+            current = next((p for p in (positions or []) if str(p.get("id")) == str(position_id)), None)
+            if current:
+                if stop_loss is None:
+                    stop_loss = current.get("stopLoss")
+                if take_profit is None:
+                    take_profit = current.get("takeProfit")
+        return await conn.modify_position(
+            position_id,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+        )
 
     async def _async_positions(self) -> list[dict]:
         conn = await self._ensure_conn()

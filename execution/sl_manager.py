@@ -92,4 +92,21 @@ def check_sl_adjustments(
             adjustments.append(SLAdjustment(pos.position_id, old_sl, new_sl, reason))
             LOG.info(f"[sl_manager] {pos.position_id} {pos.side} SL {old_sl:.2f} → {new_sl:.2f} ({reason})")
 
+            # Push to broker when this is a live ticket (paper positions have ticket="")
+            if pos.broker_ticket:
+                try:
+                    from execution.live.mt5_adapter import MT5Adapter
+                    # Pass current TP explicitly so partial-modify doesn't clear it
+                    result = MT5Adapter().modify_position(
+                        pos.broker_ticket,
+                        stop_loss=new_sl,
+                        take_profit=pos.take_profit or None,
+                    )
+                    if result.get("error"):
+                        LOG.warning(f"[sl_manager] broker modify failed {pos.broker_ticket}: {result['error']}")
+                    else:
+                        LOG.info(f"[sl_manager] broker SL updated {pos.broker_ticket} → {new_sl}")
+                except Exception as e:
+                    LOG.warning(f"[sl_manager] broker modify exception {pos.broker_ticket}: {e}")
+
     return adjustments
