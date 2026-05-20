@@ -44,6 +44,27 @@ def _build_context(symbol: str, tf: str, settings: dict) -> dict | None:
     }
 
 
+_DECISION_ITEM = {
+    "type": "object",
+    "properties": {
+        "symbol":           {"type": "string"},
+        "side":             {"type": "string", "enum": ["long", "short", "flat"]},
+        "entry":            {"type": ["number", "null"]},
+        "stop_loss":        {"type": ["number", "null"]},
+        "take_profit":      {"type": ["number", "null"]},
+        "confidence":       {"type": "number", "minimum": 0, "maximum": 1},
+        "rationale":        {"type": "string", "description": "Full prose summary"},
+        "entry_reasoning":  {"type": "string", "description": "2-3 bullet points confirming entry"},
+        "sl_reasoning":     {"type": "string", "description": "1-2 bullets: structural SL level + risk check"},
+        "target_reasoning": {"type": "string", "description": "1-2 bullets: specific TP level and why"},
+        "grid_leg":         {"type": "integer", "minimum": 1, "maximum": 3},
+        "parent_position_id": {"type": ["string", "null"]},
+        "add_to_existing":  {"type": "boolean"},
+        "invalidation_note": {"type": "string"},
+    },
+    "required": ["symbol", "side", "confidence", "rationale"],
+}
+
 MULTI_TOOL = {
     "name": "submit_multi_decision",
     "description": "Submit one trading decision per symbol analyzed.",
@@ -52,19 +73,7 @@ MULTI_TOOL = {
         "properties": {
             "decisions": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "symbol": {"type": "string"},
-                        "side": {"type": "string", "enum": ["long", "short", "flat"]},
-                        "entry": {"type": ["number", "null"]},
-                        "stop_loss": {"type": ["number", "null"]},
-                        "take_profit": {"type": ["number", "null"]},
-                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                        "rationale": {"type": "string"},
-                    },
-                    "required": ["symbol", "side", "confidence", "rationale"],
-                },
+                "items": _DECISION_ITEM,
             },
             "cross_market_note": {
                 "type": "string",
@@ -102,7 +111,7 @@ def decide_multi():
     client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     cfg = ClientConfig(
         model=settings["claude"]["model"],
-        max_tokens=settings["claude"]["max_tokens_out"] * len(contexts),
+        max_tokens=max(2400, settings["claude"]["max_tokens_out"] * len(contexts) * 2),
         timeout_s=settings["claude"]["timeout_s"],
     )
 
@@ -140,6 +149,10 @@ def decide_multi():
         if not ctx:
             continue
         d.setdefault("rationale", "")
+        d.setdefault("entry_reasoning", "")
+        d.setdefault("sl_reasoning", "")
+        d.setdefault("target_reasoning", "")
+        d.setdefault("invalidation_note", "")
         decision = Decision(
             side=d["side"],
             entry=d.get("entry"),
@@ -147,6 +160,13 @@ def decide_multi():
             take_profit=d.get("take_profit"),
             confidence=float(d.get("confidence", 0)),
             rationale=d["rationale"],
+            entry_reasoning=d["entry_reasoning"],
+            sl_reasoning=d["sl_reasoning"],
+            target_reasoning=d["target_reasoning"],
+            grid_leg=int(d.get("grid_leg", 1)),
+            parent_position_id=d.get("parent_position_id"),
+            add_to_existing=bool(d.get("add_to_existing", False)),
+            invalidation_note=d["invalidation_note"],
         )
         validator_reason = validate(decision)
         decision_id = log_decision(
