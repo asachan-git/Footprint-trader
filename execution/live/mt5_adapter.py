@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import threading
 from pathlib import Path
@@ -48,6 +49,7 @@ class MT5Adapter:
     _shared_loop: asyncio.AbstractEventLoop | None = None
     _shared_thread: threading.Thread | None = None
     _shared_conn: Any | None = None
+    _spec_cache: dict[str, dict] = {}
 
     def __init__(self) -> None:
         self._cfg = _load_execution_cfg()
@@ -56,6 +58,8 @@ class MT5Adapter:
         self._default_lots: dict[str, float] = self._cfg.get("default_lots", {}) or {}
         self._comment_prefix = str(self._cfg.get("order_comment_prefix", "FB"))
         self._tradable: set[str] = set(self._cfg.get("tradable_symbols") or [])
+        self._risk_pct = float(self._cfg.get("risk_per_trade_pct", 0.0) or 0.0)
+        self._max_lots = float(self._cfg.get("max_lots", 0.0) or 0.0)
 
     # ── public sync API ──────────────────────────────────────────────────
 
@@ -69,12 +73,13 @@ class MT5Adapter:
             return {"broker": "vantage_mt5", "error": "missing entry/SL/TP"}
 
         broker_symbol = self._symbol_map.get(bar.symbol, bar.symbol)
-        lots = self._resolve_lots(broker_symbol)
-        if lots <= 0:
-            return {"broker": "vantage_mt5", "error": f"no lot size configured for {broker_symbol}"}
-
         comment = f"{self._comment_prefix}|{decision.side}|leg{decision.grid_leg}"
         try:
+            lots, sizing = self._run(self._async_resolve_lots(
+                broker_symbol, decision.entry, decision.stop_loss,
+            ))
+            if lots <= 0:
+                return {"broker": "vantage_mt5", "error": f"no lot size resolved for {broker_symbol}", "sizing": sizing}
             result = self._run(self._async_submit(
                 broker_symbol=broker_symbol,
                 side=decision.side,
@@ -95,6 +100,7 @@ class MT5Adapter:
                 "lots": lots,
                 "stop_loss": decision.stop_loss,
                 "take_profit": decision.take_profit,
+                "sizing": sizing,
                 "order": result,
             }
         except Exception as e:
@@ -118,10 +124,69 @@ class MT5Adapter:
 
     # ── lot sizing ───────────────────────────────────────────────────────
 
-    def _resolve_lots(self, broker_symbol: str) -> float:
-        # Conservative first version: fixed per-symbol lot from settings.
-        # Risk-adjusted sizing (lots = risk_$ / pip_distance) is a follow-up.
+    def _default_lot(self, broker_symbol: str) -> float:
         return float(self._default_lots.get(broker_symbol, 0.0))
+
+    async def _get_spec(self, broker_symbol: str) -> dict:
+        cached = MT5Adapter._spec_cache.get(broker_symbol)
+        if cached:
+            return cached
+        conn = await self._ensure_conn()
+        spec = await conn.get_symbol_specification(broker_symbol)
+        MT5Adapter._spec_cache[broker_symbol] = spec
+        return spec
+
+    async def _async_resolve_lots(
+        self,
+        broker_symbol: str,
+        entry: float | None,
+        stop_loss: float | None,
+    ) -> tuple[float, dict]:
+        """Return (lots, sizing_info). Risk-adjusted when possible, else default."""
+        sizing: dict[str, Any] = {"method": "default", "default_lot": self._default_lot(broker_symbol)}
+
+        if self._risk_pct <= 0 or entry is None or stop_loss is None:
+            return self._default_lot(broker_symbol), sizing
+
+        sl_dist = abs(float(entry) - float(stop_loss))
+        if sl_dist <= 0:
+            return self._default_lot(broker_symbol), sizing
+
+        conn = await self._ensure_conn()
+        info = await conn.get_account_information()
+        balance = float(info.get("balance") or info.get("equity") or 0.0)
+        if balance <= 0:
+            return self._default_lot(broker_symbol), sizing
+
+        spec = await self._get_spec(broker_symbol)
+        contract_size = float(spec.get("contractSize") or 0.0)
+        if contract_size <= 0:
+            return self._default_lot(broker_symbol), sizing
+        volume_step = float(spec.get("volumeStep") or 0.01)
+        min_vol = float(spec.get("minVolume") or 0.01)
+
+        risk_usd = balance * self._risk_pct
+        # USD-denominated symbol shortcut: P&L_per_pt_per_lot ≈ contract_size
+        # (true for XAUUSD, BTCUSD, EURUSD-against-USD-balance, etc.)
+        raw_lots = risk_usd / (sl_dist * contract_size)
+        lots = math.floor(raw_lots / volume_step) * volume_step
+        lots = max(lots, min_vol)
+        if self._max_lots > 0:
+            lots = min(lots, self._max_lots)
+        lots = round(lots, 4)
+
+        sizing = {
+            "method": "risk_adjusted",
+            "balance_usd": balance,
+            "risk_pct": self._risk_pct,
+            "risk_usd": round(risk_usd, 2),
+            "sl_distance": round(sl_dist, 4),
+            "contract_size": contract_size,
+            "raw_lots": round(raw_lots, 4),
+            "lots_after_step": lots,
+            "max_lots_cap": self._max_lots,
+        }
+        return lots, sizing
 
     # ── persistent async loop ────────────────────────────────────────────
 

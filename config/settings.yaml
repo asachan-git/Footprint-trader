@@ -43,17 +43,15 @@ vp_cache:
 # Execution venue (Vantage MT5 via MetaApi)
 execution:
   broker: vantage_mt5
-  # Analysis symbols allowed to fire orders. Decisions for any other symbol
-  # are rejected before reaching MetaApi (defense in depth — BTC analysis
-  # runs but never executes).
   tradable_symbols: [XAUTUSDT]
-  # Map analysis symbol (Bybit feed) → broker symbol (Vantage MT5)
   symbol_map:
     XAUTUSDT: "XAUUSD+"
-  # Lot sizing (Vantage MT5 minimum = 0.01 lot for most instruments)
-  default_lots:
+  # Risk-adjusted sizing: lots = (balance × risk_per_trade_pct) / (SL_distance × contract_size)
+  # Set risk_per_trade_pct = 0 to disable; falls back to default_lots.
+  risk_per_trade_pct: 0.0025    # 0.25% of equity per trade
+  max_lots: 1.0                 # hard cap regardless of risk math
+  default_lots:                 # fallback when risk math fails (no SL, etc.)
     "XAUUSD+": 0.01
-  # MetaApi connection
   metaapi_timeout_s: 30
   order_comment_prefix: "FB"
 
