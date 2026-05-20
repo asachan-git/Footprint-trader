@@ -64,6 +64,15 @@ execution:
     "XAUUSD+": 0.50
   news_blackout_utc: []         # e.g. ["12:25-12:35", "18:00-18:05"] — no orders in these UTC windows
 
+# Risk controls (used by ingest DD halt + hedge_manager circuit breaker)
+risk:
+  base_lot_size: 0.01          # base unit for hedge sizing (× leg_count)
+  circuit_breaker_r: -5.0      # force-close all when net unrealized R below this
+  max_cycles: 3                # max concurrent recovery cycles per symbol
+  max_legs_per_cycle: 6        # max legs per cycle (total exposure cap = max_cycles × this)
+  daily:
+    max_dd_r: 4.0              # halt + close all + block re-entry when daily realized R ≤ -this
+
 # Pre-filter for /decide — skip Claude call when local features signal no setup.
 # Pass {"force": true} in /decide body to bypass.
 decide_filter:

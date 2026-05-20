@@ -222,7 +222,13 @@ def decide():
 
     dispatch_result = None
     if validator_reason is None and decision.side != "flat":
-        dispatch_result = dispatch(decision, latest, settings)
+        # Daily DD halt — block new entries for the rest of the session
+        max_dd = float(settings.get("risk", {}).get("daily", {}).get("max_dd_r", 99))
+        daily_r = position_store().daily_realized_r()
+        if daily_r < -abs(max_dd):
+            dispatch_result = {"skipped": f"daily DD halt active (R={daily_r:.2f} ≤ -{max_dd})"}
+        else:
+            dispatch_result = dispatch(decision, latest, settings)
 
     return jsonify({
         "ok": True,

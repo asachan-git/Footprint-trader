@@ -68,12 +68,21 @@ def _check_positions(bar, settings) -> list[dict]:
     exits = []
     max_dd = float(settings.get("risk", {}).get("daily", {}).get("max_dd_r", 99))
 
-    # Daily DD circuit breaker
+    # Daily DD circuit breaker — close everything (store + broker) and halt
     if ps.daily_realized_r() < -abs(max_dd):
         for pos in ps.open_positions(bar.symbol):
+            # Close at broker first for live tickets, then mark in store
+            if pos.broker_ticket:
+                try:
+                    from execution.live.mt5_adapter import MT5Adapter as _MT5
+                    _MT5().close_position(pos.broker_ticket)
+                    LOG.warning(f"[ingest] DD halt broker close {pos.broker_ticket}")
+                except Exception as e:
+                    LOG.error(f"[ingest] DD halt broker close FAILED {pos.broker_ticket}: {e}")
             ps.invalidate_position(pos.position_id, "daily DD circuit breaker triggered")
-            exits.append({"position_id": pos.position_id, "exit": "daily_dd_halt"})
+            exits.append({"position_id": pos.position_id, "exit": "daily_dd_halt", "broker_ticket": pos.broker_ticket})
             LOG.warning(f"[ingest] Daily DD halt — closing {pos.position_id}")
+        _close_cycles_for_exits([{"exit": "invalidated", "position_id": e["position_id"]} for e in exits])
         return exits
 
     fp = build_fp(bar)

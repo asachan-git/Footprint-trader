@@ -181,7 +181,12 @@ def decide_multi():
         if validator_reason is None and decision.side != "flat":
             latest = store().latest(sym, tf)
             if latest:
-                dispatch(decision, latest, settings)
+                from execution.position_store import position_store as _ps
+                max_dd = float(settings.get("risk", {}).get("daily", {}).get("max_dd_r", 99))
+                if _ps().daily_realized_r() < -abs(max_dd):
+                    pass  # daily DD halt — skip new entry
+                else:
+                    dispatch(decision, latest, settings)
 
         results.append({
             "symbol": sym,
