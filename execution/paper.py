@@ -21,8 +21,9 @@ LOG = logging.getLogger(__name__)
 SLIPPAGE_PCT = 0.0002   # 0.02% simulated slippage (conservative for liquid markets)
 
 
-def _sim_lots(symbol: str, entry: float, stop_loss: float) -> float:
-    """Simulate the lot size live would have used — same risk math, paper balance."""
+def _sim_lots(symbol: str, entry: float, stop_loss: float, qty_pct: float = 1.0) -> float:
+    """Simulate the lot size live would have used — same risk math, paper balance.
+    qty_pct (0.3–1.0) scales for confluence-weighted fractional legs."""
     try:
         import yaml
         root = Path(__file__).resolve().parent.parent
@@ -38,6 +39,8 @@ def _sim_lots(symbol: str, entry: float, stop_loss: float) -> float:
         lots = math.floor(raw / 0.01) * 0.01
         if max_lots > 0:
             lots = min(lots, max_lots)
+        if 0 < qty_pct < 1.0:
+            lots = math.floor((lots * qty_pct) / 0.01) * 0.01
         return round(max(lots, 0.01), 2)
     except Exception:
         return 0.0
@@ -117,7 +120,8 @@ class PaperExecutor:
         except Exception:
             pass
 
-        sim_lots = _sim_lots(bar.symbol, pos.avg_entry, pos.stop_loss)
+        sim_lots = _sim_lots(bar.symbol, pos.avg_entry, pos.stop_loss,
+                             qty_pct=float(getattr(decision, "qty_pct", 1.0) or 1.0))
 
         return {
             "mode": "paper",

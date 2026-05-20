@@ -28,6 +28,7 @@ class Decision(BaseModel):
     grid_leg: int = Field(default=1, description="Which leg of the grid (1=first entry, 2=add, 3=add)")
     parent_position_id: str | None = Field(None, description="Position ID to add a leg to; None = new grid")
     add_to_existing: bool = Field(default=False, description="True = add leg to active grid; False = new position")
+    qty_pct: float = Field(default=1.0, ge=0.3, le=1.0, description="Fraction of risk-based size for this leg (0.3–1.0), from confluence strength. 1.0 = full size on strong confluence; 0.3 = weak.")
     invalidation_note: str = Field(default="", description="What footprint event would invalidate this trade")
 
 
@@ -58,6 +59,8 @@ CLAUDE_TOOL = {
             "grid_leg": {"type": "integer", "minimum": 1, "maximum": 3},
             "parent_position_id": {"type": ["string", "null"]},
             "add_to_existing": {"type": "boolean"},
+            "qty_pct": {"type": "number", "minimum": 0.3, "maximum": 1.0,
+                        "description": "Fraction of risk-based size (0.3–1.0) from confluence strength. Strong confluence (absorption + imbalance + HVN + CVD aligned) → 1.0; weak → 0.3."},
             "invalidation_note": {"type": "string"},
         },
         "required": ["side", "confidence", "rationale"],

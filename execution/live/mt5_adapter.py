@@ -93,6 +93,13 @@ class MT5Adapter:
             lots, sizing = self._run(self._async_resolve_lots(
                 broker_symbol, decision.entry, decision.stop_loss,
             ))
+            # Fractional-leg scaling from confluence strength
+            qty_pct = float(getattr(decision, "qty_pct", 1.0) or 1.0)
+            if 0 < qty_pct < 1.0 and lots > 0:
+                scaled = max(0.01, math.floor((lots * qty_pct) / 0.01) * 0.01)
+                sizing["qty_pct"] = qty_pct
+                sizing["lots_before_qty_pct"] = lots
+                lots = round(scaled, 4)
             if lots <= 0:
                 return {"broker": "vantage_mt5", "error": f"no lot size resolved for {broker_symbol}", "sizing": sizing}
             result = self._run(self._async_submit(
