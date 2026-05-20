@@ -223,10 +223,13 @@ def check_circuit_breaker(
     symbol: str,
     settings: dict,
     position_store,
+    current_price: float | None = None,
 ) -> tuple[bool, str]:
     """Return (triggered, reason).
 
-    Fires if net unrealized R across all open positions exceeds the configured limit.
+    Two independent triggers:
+      1. Total open legs ≥ max_cycles × max_legs_per_cycle (exposure cap)
+      2. Net unrealized R ≤ circuit_breaker_r (needs current_price)
     """
     risk_cfg = settings.get("risk", {})
     cb_r = float(risk_cfg.get("circuit_breaker_r", -5.0))
@@ -235,25 +238,18 @@ def check_circuit_breaker(
     if not open_positions:
         return False, ""
 
-    # Estimate unrealized R for each position
-    total_unrealized_r = 0.0
-    for pos in open_positions:
-        if not pos.legs:
-            continue
-        latest_leg = pos.legs[-1]
-        sl_dist = abs(latest_leg.entry - latest_leg.stop_loss)
-        if sl_dist <= 0:
-            continue
-        # We don't have live prices here; use a conservative estimate
-        # Actual check happens in ingest where we have the current bar
-        # This is a pre-check based on position count
-
+    # Trigger 1: total-leg exposure cap
     from execution.cycle_store import cycle_store
     total_legs = cycle_store().total_open_exposure(symbol)
     max_legs_total = int(risk_cfg.get("max_cycles", 3)) * int(risk_cfg.get("max_legs_per_cycle", 6))
-
     if total_legs >= max_legs_total:
         return True, f"max total legs reached: {total_legs} >= {max_legs_total}"
+
+    # Trigger 2: net unrealized R (only if we have a live price)
+    if current_price is not None:
+        nur = net_unrealized_r(symbol, current_price, position_store)
+        if nur <= cb_r:
+            return True, f"net unrealized R {nur:.2f} ≤ circuit_breaker_r {cb_r}"
 
     return False, ""
 

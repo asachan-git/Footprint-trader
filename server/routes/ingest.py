@@ -85,6 +85,27 @@ def _check_positions(bar, settings) -> list[dict]:
         _close_cycles_for_exits([{"exit": "invalidated", "position_id": e["position_id"]} for e in exits])
         return exits
 
+    # Circuit breaker: net unrealized R ≤ limit OR exposure cap → force-close all
+    try:
+        from execution.hedge_manager import check_circuit_breaker
+        cb_hit, cb_reason = check_circuit_breaker(bar.symbol, settings, ps, current_price=bar.ohlc.c)
+        if cb_hit:
+            for pos in ps.open_positions(bar.symbol):
+                if pos.broker_ticket:
+                    try:
+                        from execution.live.mt5_adapter import MT5Adapter as _MT5
+                        _MT5().close_position(pos.broker_ticket)
+                    except Exception as e:
+                        LOG.error(f"[ingest] circuit breaker broker close FAILED {pos.broker_ticket}: {e}")
+                ps.invalidate_position(pos.position_id, f"circuit breaker: {cb_reason}")
+                exits.append({"position_id": pos.position_id, "exit": "circuit_breaker", "reason": cb_reason})
+                LOG.warning(f"[ingest] CIRCUIT BREAKER close {pos.position_id}: {cb_reason}")
+            if exits:
+                _close_cycles_for_exits([{"exit": "invalidated", "position_id": e["position_id"]} for e in exits])
+                return exits
+    except Exception as e:
+        LOG.warning(f"[ingest] circuit breaker check failed: {e}")
+
     fp = build_fp(bar)
 
     for pos in ps.open_positions(bar.symbol):
