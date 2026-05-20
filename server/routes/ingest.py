@@ -205,13 +205,24 @@ def ingest():
             return jsonify({"ok": True, "duplicate": True, "bar_id": bar.bar_id})
         _aggregate_mtf(bar, settings)
 
-        # Snapshot VP + refresh cache if bar crosses day/week boundary
+        # Snapshot VP + refresh cache + write daily journal at day boundary
         if prev and bar.tf == primary_tf:
             snapped = snapshot_if_boundary(prev.close_ts, bar.close_ts, bar.symbol, primary_tf)
             if snapped:
                 LOG.info(f"[ingest] VP snapshot: {bar.symbol} {snapped}")
                 from pipeline.features.vp_cache import build_and_save
                 build_and_save([bar.symbol], primary_tf)
+                # Write journal for the day that just closed
+                if snapped.get("daily"):
+                    try:
+                        from pipeline.features.daily_journal import write_day_journal
+                        sess_utc = int((settings.get("vp_cache", {}).get("session_start_utc", {}) or {}).get(bar.symbol, 0))
+                        closed_date = snapped["daily"]
+                        result = write_day_journal(bar.symbol, primary_tf, closed_date, sess_utc)
+                        if result:
+                            LOG.info(f"[ingest] Daily journal written: {result.name}")
+                    except Exception:
+                        pass
 
     exits = _check_positions(bar, settings)
 

@@ -19,7 +19,11 @@ class Decision(BaseModel):
     stop_loss: float | None = Field(None, description="Stop loss; required if side != flat")
     take_profit: float | None = Field(None, description="Take profit; required if side != flat")
     confidence: float = Field(ge=0.0, le=1.0, description="0..1 model confidence")
-    rationale: str = Field(default="", description="One- or two-sentence reason citing footprint features")
+    rationale: str = Field(default="", description="Full prose summary of the trade thesis")
+    # Structured reasoning breakdown (non-flat decisions)
+    entry_reasoning: str = Field(default="", description="2-3 bullet points (- prefix) citing specific footprint/VP levels that confirm the entry")
+    sl_reasoning: str = Field(default="", description="1-2 bullets: structural level protecting SL + risk distance check")
+    target_reasoning: str = Field(default="", description="1-2 bullets: specific TP level (naked POC, Fibonacci T1/T2, HVN, etc.)")
     # Grid fields (Phase 2)
     grid_leg: int = Field(default=1, description="Which leg of the grid (1=first entry, 2=add, 3=add)")
     parent_position_id: str | None = Field(None, description="Position ID to add a leg to; None = new grid")
@@ -38,7 +42,19 @@ CLAUDE_TOOL = {
             "stop_loss": {"type": ["number", "null"]},
             "take_profit": {"type": ["number", "null"]},
             "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-            "rationale": {"type": "string"},
+            "rationale": {"type": "string", "description": "Full prose summary of the trade thesis"},
+            "entry_reasoning": {
+                "type": "string",
+                "description": "2-3 bullet points (use '- ' prefix) citing specific footprint/VP levels confirming the entry. Example: '- Stacked buy imbalance 76710-76780 (3 levels)\\n- CVD_5bar +86 confirms buying\\n- Price reclaimed VAL 76540'"
+            },
+            "sl_reasoning": {
+                "type": "string",
+                "description": "1-2 bullets explaining the SL structural level + risk check. Example: '- Below stacked buy zone base at 76740 (invalidation)\\n- 80pts = 0.10% of entry, above 0.05% minimum'"
+            },
+            "target_reasoning": {
+                "type": "string",
+                "description": "1-2 bullets naming the specific TP level and why. Example: '- Prior day POC 76910 + weekly POC 76900 cluster\\n- T1 measured move at 76980'"
+            },
             "grid_leg": {"type": "integer", "minimum": 1, "maximum": 3},
             "parent_position_id": {"type": ["string", "null"]},
             "add_to_existing": {"type": "boolean"},

@@ -223,6 +223,35 @@ Use `big_trade.session_summary` in your rationale.
 
 ---
 
+## Structured reasoning fields (non-flat decisions)
+
+For every long/short decision, populate these three fields with bullet points:
+
+**`entry_reasoning`** — 2-3 bullets citing specific footprint/VP levels confirming the entry.
+Use `- ` prefix per bullet. Example:
+```
+- Stacked buy imbalance 76710–76780 (3 levels, delta +54.5)
+- CVD_5bar +86.1 confirms aggressive near-term buying
+- Price reclaimed daily VAL 76540 from below
+```
+
+**`sl_reasoning`** — 1-2 bullets: the structural level that sets the SL and risk distance check.
+```
+- Below stacked buy zone base at 76740 (structural invalidation level)
+- 80pts = 0.10% of entry, above 0.05% minimum rule
+```
+
+**`target_reasoning`** — 1-2 bullets: exactly which level/zone the TP targets and why.
+```
+- Prior day POC 76910 + weekly POC 76900 cluster (strong unfilled magnet)
+- T1 measured move extension also at 76980 — triple confirmation
+```
+
+Keep `rationale` as the full prose summary. These three fields are the structured breakdown.
+For flat decisions: leave all three empty — rationale only.
+
+---
+
 ## Inputs you should NOT invent
 
 Macro news, fundamental data, broker feeds — unavailable. Reference only data in the provided context.

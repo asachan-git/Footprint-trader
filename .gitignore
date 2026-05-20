@@ -20,6 +20,8 @@ data/vp_cache.json
 data/vp_history.jsonl
 data/archive/
 data/trade_cache/
+data/decisions.md
+data/journal/
 logs/*
 !logs/.gitkeep
 eval/reports/*
