@@ -57,6 +57,17 @@ class LiveExecutor:
                 except Exception as e:
                     import logging as _l
                     _l.getLogger(__name__).warning(f"[live] cycle_store.open_cycle failed: {e}")
+                try:
+                    from utils.notify import notify
+                    notify(
+                        "🟢 ORDER FILLED",
+                        f"{result.get('symbol_broker', bar.symbol)} {decision.side} "
+                        f"{result.get('lots')} lot @ {decision.entry}\n"
+                        f"SL {decision.stop_loss}  TP {decision.take_profit}  "
+                        f"conf {decision.confidence:.2f}",
+                    )
+                except Exception:
+                    pass
             except Exception as e:
                 # Never let store failure mask a successful broker fill
                 import logging

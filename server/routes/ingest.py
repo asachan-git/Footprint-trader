@@ -83,6 +83,12 @@ def _check_positions(bar, settings) -> list[dict]:
             exits.append({"position_id": pos.position_id, "exit": "daily_dd_halt", "broker_ticket": pos.broker_ticket})
             LOG.warning(f"[ingest] Daily DD halt — closing {pos.position_id}")
         _close_cycles_for_exits([{"exit": "invalidated", "position_id": e["position_id"]} for e in exits])
+        if exits:
+            try:
+                from utils.notify import notify
+                notify("🛑 DAILY DD HALT", f"{bar.symbol} daily R {ps.daily_realized_r():.2f} ≤ -{max_dd}\nClosed {len(exits)} position(s), re-entry blocked")
+            except Exception:
+                pass
         return exits
 
     # Circuit breaker: net unrealized R ≤ limit OR exposure cap → force-close all
@@ -102,6 +108,11 @@ def _check_positions(bar, settings) -> list[dict]:
                 LOG.warning(f"[ingest] CIRCUIT BREAKER close {pos.position_id}: {cb_reason}")
             if exits:
                 _close_cycles_for_exits([{"exit": "invalidated", "position_id": e["position_id"]} for e in exits])
+                try:
+                    from utils.notify import notify
+                    notify("⛔ CIRCUIT BREAKER", f"{bar.symbol}: {cb_reason}\nForce-closed {len(exits)} position(s)")
+                except Exception:
+                    pass
                 return exits
     except Exception as e:
         LOG.warning(f"[ingest] circuit breaker check failed: {e}")
@@ -211,6 +222,11 @@ def _check_positions(bar, settings) -> list[dict]:
                             "reason": inv.reason,
                         })
                         LOG.info(f"[ingest] HEDGED {pos.position_id} cycle={active[0].cycle_id}: {inv.reason}")
+                        try:
+                            from utils.notify import notify
+                            notify("🔵 HEDGE OPENED", f"{bar.symbol} {hedge.side} {hedge.lots} lot @ {bar.ohlc.c}\nticket {hedge.broker_ticket}\n{inv.reason}")
+                        except Exception:
+                            pass
                     else:
                         # No active cycle tracked — fall back to invalidate
                         ps.invalidate_position(pos.position_id, inv.reason)
