@@ -59,6 +59,10 @@ execution:
   contract_size:                # used by paper lot simulation
     XAUTUSDT: 100
     BTCUSDT: 1
+  # Pre-trade execution gates (live only — checked in MT5Adapter.submit_order)
+  max_spread:                   # reject order if (ask-bid) exceeds, per broker symbol
+    "XAUUSD+": 0.50
+  news_blackout_utc: []         # e.g. ["12:25-12:35", "18:00-18:05"] — no orders in these UTC windows
 
 # Pre-filter for /decide — skip Claude call when local features signal no setup.
 # Pass {"force": true} in /decide body to bypass.

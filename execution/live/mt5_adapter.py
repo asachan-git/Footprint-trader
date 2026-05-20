@@ -60,6 +60,8 @@ class MT5Adapter:
         self._tradable: set[str] = set(self._cfg.get("tradable_symbols") or [])
         self._risk_pct = float(self._cfg.get("risk_per_trade_pct", 0.0) or 0.0)
         self._max_lots = float(self._cfg.get("max_lots", 0.0) or 0.0)
+        self._max_spread: dict[str, float] = self._cfg.get("max_spread", {}) or {}
+        self._news_blackout: list[str] = self._cfg.get("news_blackout_utc", []) or []
 
     # ── public sync API ──────────────────────────────────────────────────
 
@@ -73,8 +75,21 @@ class MT5Adapter:
             return {"broker": "vantage_mt5", "error": "missing entry/SL/TP"}
 
         broker_symbol = self._symbol_map.get(bar.symbol, bar.symbol)
+
+        # Pre-trade gate: news blackout window (UTC)
+        blocked, reason = self._in_news_blackout()
+        if blocked:
+            LOG.info(f"[mt5] order blocked — news blackout {reason}")
+            return {"broker": "vantage_mt5", "skipped": f"news_blackout {reason}"}
+
         comment = f"{self._comment_prefix}|{decision.side}|leg{decision.grid_leg}"
         try:
+            # Pre-trade gate: spread check (live market quote)
+            spread_ok, spread_info = self._run(self._async_check_spread(broker_symbol))
+            if not spread_ok:
+                LOG.info(f"[mt5] order blocked — spread {spread_info}")
+                return {"broker": "vantage_mt5", "skipped": f"spread_too_wide {spread_info}"}
+
             lots, sizing = self._run(self._async_resolve_lots(
                 broker_symbol, decision.entry, decision.stop_loss,
             ))
@@ -138,6 +153,43 @@ class MT5Adapter:
         except Exception as e:
             LOG.exception(f"[mt5] get_positions failed: {e}")
             return []
+
+    # ── pre-trade gates ──────────────────────────────────────────────────
+
+    def _in_news_blackout(self) -> tuple[bool, str]:
+        """True if current UTC time falls in a configured blackout window."""
+        if not self._news_blackout:
+            return False, ""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        cur = now.hour * 60 + now.minute
+        for window in self._news_blackout:
+            try:
+                start_s, end_s = window.split("-")
+                sh, sm = (int(x) for x in start_s.split(":"))
+                eh, em = (int(x) for x in end_s.split(":"))
+                start, end = sh * 60 + sm, eh * 60 + em
+                if start <= cur <= end:
+                    return True, window
+            except Exception:
+                continue
+        return False, ""
+
+    async def _async_check_spread(self, broker_symbol: str) -> tuple[bool, str]:
+        """Reject if live spread exceeds max_spread[symbol]. No cap → always ok."""
+        cap = float(self._max_spread.get(broker_symbol, 0.0) or 0.0)
+        if cap <= 0:
+            return True, "no cap"
+        conn = await self._ensure_conn()
+        price = await conn.get_symbol_price(broker_symbol)
+        bid = price.get("bid")
+        ask = price.get("ask")
+        if bid is None or ask is None:
+            return False, "no quote (market closed?)"
+        spread = ask - bid
+        if spread > cap:
+            return False, f"{spread:.4f} > {cap}"
+        return True, f"{spread:.4f} ≤ {cap}"
 
     # ── lot sizing ───────────────────────────────────────────────────────
 
