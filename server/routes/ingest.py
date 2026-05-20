@@ -141,10 +141,43 @@ def _check_positions(bar, settings) -> list[dict]:
                     if active and not active_hedge_for_cycle(active[0].cycle_id):
                         lots = float(settings.get("risk", {}).get("base_lot_size", 0.01)) * pos.leg_count
                         hedge = open_hedge(active[0].cycle_id, bar.symbol, pos.side, lots, bar.ohlc.c)
+
+                        # Fire opposite-side order through normal dispatch path
+                        # (lives + paper + journal all handled — gated by settings.mode).
+                        try:
+                            from execution.router import dispatch as _dispatch
+                            from llm.schema import Decision as _SynthDecision
+                            sl_dist = abs(pos.avg_entry - pos.stop_loss) or (bar.ohlc.c * 0.002)
+                            if hedge.side == "long":
+                                h_sl = round(bar.ohlc.c - sl_dist, 4)
+                                h_tp = round(bar.ohlc.c + sl_dist * 2, 4)
+                            else:
+                                h_sl = round(bar.ohlc.c + sl_dist, 4)
+                                h_tp = round(bar.ohlc.c - sl_dist * 2, 4)
+                            synth = _SynthDecision(
+                                side=hedge.side,
+                                entry=round(bar.ohlc.c, 4),
+                                stop_loss=h_sl,
+                                take_profit=h_tp,
+                                confidence=1.0,
+                                rationale=f"hedge cycle={active[0].cycle_id} reason={inv.reason}",
+                            )
+                            h_result = _dispatch(synth, bar, settings)
+                            if isinstance(h_result, dict):
+                                hedge.position_id = str(h_result.get("position_id") or "")
+                                order = h_result.get("order") or {}
+                                hedge.broker_ticket = str(order.get("positionId") or order.get("orderId") or "")
+                            LOG.info(
+                                f"[ingest] HEDGE order {hedge.hedge_id} → ticket={hedge.broker_ticket} pid={hedge.position_id}"
+                            )
+                        except Exception as e:
+                            LOG.warning(f"[ingest] hedge order dispatch failed for {hedge.hedge_id}: {e}")
+
                         exits.append({
                             "position_id": pos.position_id,
                             "exit": "hedged",
                             "hedge_id": hedge.hedge_id,
+                            "broker_ticket": hedge.broker_ticket,
                             "reason": inv.reason,
                         })
                         LOG.info(f"[ingest] HEDGED {pos.position_id} cycle={active[0].cycle_id}: {inv.reason}")
@@ -173,10 +206,20 @@ def _check_positions(bar, settings) -> list[dict]:
                             continue
                         ok, reason = should_remove_hedge(bar, fp, hedge, pos.side, wave_cvd_quality=None)
                         if ok:
+                            # Close the opposite-side ticket at broker first (live only).
+                            # Paper / journal modes have no ticket; skip silently.
+                            if hedge.broker_ticket:
+                                try:
+                                    from execution.live.mt5_adapter import MT5Adapter as _MT5
+                                    close_res = _MT5().close_position(hedge.broker_ticket)
+                                    LOG.info(f"[ingest] hedge broker close {hedge.broker_ticket} → {close_res}")
+                                except Exception as e:
+                                    LOG.warning(f"[ingest] hedge broker close failed {hedge.broker_ticket}: {e}")
                             remove_hedge(hedge.hedge_id, reason)
                             exits.append({
                                 "position_id": pos.position_id,
                                 "exit": "hedge_removed",
+                                "broker_ticket": hedge.broker_ticket,
                                 "reason": reason,
                             })
                             LOG.info(f"[ingest] HEDGE REMOVED {hedge.hedge_id}: {reason}")

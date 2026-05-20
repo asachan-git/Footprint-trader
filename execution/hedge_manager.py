@@ -51,6 +51,8 @@ class HedgePosition:
     status: str = "active"  # "active" | "removed" | "converted"
     removed_ts: int = 0
     remove_reason: str = ""
+    broker_ticket: str = ""  # MetaApi positionId of the opposite-side fill (live only)
+    position_id: str = ""    # internal position_store id of the hedge (paper or live)
 
 
 # ── Hedge trigger evaluation ──────────────────────────────────────────────────
