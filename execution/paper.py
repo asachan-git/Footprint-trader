@@ -7,6 +7,8 @@ Position state persisted in data/positions.jsonl (survives restarts).
 from __future__ import annotations
 
 import logging
+import math
+from pathlib import Path
 
 from llm.schema import Decision
 from pipeline.types import Bar
@@ -17,6 +19,28 @@ LOG = logging.getLogger(__name__)
 
 
 SLIPPAGE_PCT = 0.0002   # 0.02% simulated slippage (conservative for liquid markets)
+
+
+def _sim_lots(symbol: str, entry: float, stop_loss: float) -> float:
+    """Simulate the lot size live would have used — same risk math, paper balance."""
+    try:
+        import yaml
+        root = Path(__file__).resolve().parent.parent
+        cfg = (yaml.safe_load((root / "config" / "settings.yaml").read_text()) or {}).get("execution", {})
+        risk_pct = float(cfg.get("risk_per_trade_pct", 0) or 0)
+        balance = float(cfg.get("paper_balance", 0) or 0)
+        contract = float((cfg.get("contract_size", {}) or {}).get(symbol, 0) or 0)
+        max_lots = float(cfg.get("max_lots", 0) or 0)
+        sl_dist = abs(entry - stop_loss)
+        if risk_pct <= 0 or balance <= 0 or contract <= 0 or sl_dist <= 0:
+            return 0.0
+        raw = (balance * risk_pct) / (sl_dist * contract)
+        lots = math.floor(raw / 0.01) * 0.01
+        if max_lots > 0:
+            lots = min(lots, max_lots)
+        return round(max(lots, 0.01), 2)
+    except Exception:
+        return 0.0
 
 
 class PaperExecutor:
@@ -34,6 +58,18 @@ class PaperExecutor:
         open_for_symbol = store.open_positions(bar.symbol)
         if open_for_symbol:
             existing = open_for_symbol[0]
+            # Grid add: honor add_to_existing → append a leg instead of skipping
+            if decision.add_to_existing:
+                store.add_leg(existing.position_id, decision, bar.bar_id)
+                try:
+                    from .cycle_store import cycle_store
+                    cyc = cycle_store().by_position_id(existing.position_id)
+                    if cyc:
+                        cycle_store().record_leg(cyc.cycle_id)
+                except Exception:
+                    pass
+                LOG.info(f"[paper] ADD LEG {existing.position_id} leg{decision.grid_leg} @ {decision.entry}")
+                return {"mode": "paper", "added_leg": existing.position_id, "leg": decision.grid_leg}
             LOG.info(f"[paper] position already open for {bar.symbol} ({existing.position_id}), skipping")
             return {"mode": "paper", "skipped": "position already open", "position_id": existing.position_id}
 
@@ -81,6 +117,8 @@ class PaperExecutor:
         except Exception:
             pass
 
+        sim_lots = _sim_lots(bar.symbol, pos.avg_entry, pos.stop_loss)
+
         return {
             "mode": "paper",
             "opened": pos.position_id,
@@ -89,6 +127,7 @@ class PaperExecutor:
             "sl": pos.stop_loss,
             "tp": pos.take_profit,
             "rr": round(rr, 2),
+            "sim_lots": sim_lots,
             "confidence": decision.confidence,
             "rationale": decision.rationale,
         }

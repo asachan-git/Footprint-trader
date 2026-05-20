@@ -54,6 +54,11 @@ execution:
     "XAUUSD+": 0.01
   metaapi_timeout_s: 30
   order_comment_prefix: "FB"
+  # Paper-mode simulation: matches live risk math without a broker connection
+  paper_balance: 100000
+  contract_size:                # used by paper lot simulation
+    XAUTUSDT: 100
+    BTCUSDT: 1
 
 # Pre-filter for /decide — skip Claude call when local features signal no setup.
 # Pass {"force": true} in /decide body to bypass.
