@@ -498,6 +498,9 @@ MIN_BARS_WEEKLY = 300
 DEFAULT_BIN_SIZE: dict[str, float] = {
     "BTCUSDT": 1.0,
     "XAUTUSDT": 0.5,
+    "BTCUSD": 1.0,      # Vantage CFD
+    "XAUUSD+": 0.1,     # Vantage CFD
+    "XAUUSD": 0.1,      # generic spot XAU
 }
 
 

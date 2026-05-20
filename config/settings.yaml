@@ -22,7 +22,7 @@ ingress:
 
 # VP cache — pre-computed on server start, updated at day/week boundaries
 vp_cache:
-  symbols: [BTCUSDT, XAUTUSDT]   # pre-compute VP for these symbols on startup
+  symbols: [BTCUSDT, XAUTUSDT]   # Analysis only — Bybit feed. Vantage = execution venue, no ticks ingested.
   # Per-symbol daily session anchor. Two forms accepted:
   #   <int>             — static UTC hour (DST-naive; fine for 24/7 crypto)
   #   {tz, hour}        — local-time anchor, automatically DST-adjusted via zoneinfo
@@ -30,9 +30,8 @@ vp_cache:
   #   EDT (Mar–Nov): 18:00 ET = 22:00 UTC = 03:30 IST next day
   #   EST (Nov–Mar): 18:00 ET = 23:00 UTC = 04:30 IST next day
   session_start_utc:
-    BTCUSDT: 0      # midnight UTC (24/7 market)
-    XAUTUSDT: 0     # Bybit XAUTUSDT is a 24/7 crypto-tokenized pair, rolls at 00:00 UTC = 05:30 IST.
-                    # NOT CME Gold futures — weekends trade. Same anchor as BTC.
+    BTCUSDT: 0      # Bybit 24/7
+    XAUTUSDT: 0     # Bybit XAUTUSDT crypto-tokenized — weekends trade, 00:00 UTC roll
   # Tick-aligned VP bin width (institutional convention).
   # Falls back to range/68 if symbol not declared. Set in floats matching tick:
   #   XAU tick = 0.1 → 0.5 = 5-tick bins
@@ -40,6 +39,21 @@ vp_cache:
   vp_bin_size:
     BTCUSDT:  1.0
     XAUTUSDT: 0.5
+
+# Execution venue (Vantage MT5 via MetaApi)
+execution:
+  broker: vantage_mt5
+  # Map analysis symbol (Bybit feed) → broker symbol (Vantage MT5)
+  symbol_map:
+    BTCUSDT:  BTCUSD
+    XAUTUSDT: "XAUUSD+"
+  # Lot sizing (Vantage MT5 minimum = 0.01 lot for most instruments)
+  default_lots:
+    BTCUSD:    0.01
+    "XAUUSD+": 0.01
+  # MetaApi connection
+  metaapi_timeout_s: 30
+  order_comment_prefix: "FB"
 
 # Pre-filter for /decide — skip Claude call when local features signal no setup.
 # Pass {"force": true} in /decide body to bypass.
