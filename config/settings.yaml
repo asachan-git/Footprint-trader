@@ -1,6 +1,12 @@
 mode: paper              # journal | paper | live  (live also needs env ALLOW_LIVE=1)
 trading_mode: buy_sell_only   # buy_sell_only | grid  (buy_sell_only: Claude picks direction; mechanical 5-leg Fib grid; ChoCh+VA invalidation)
 
+# Event-driven decide trigger — fires Mode 1 + Mode 2 instantly when a new TF
+# bar is emitted by mtf_aggregator (replaces wall-clock cron loops in start.sh).
+decide_on_bar_close:
+  enabled: true
+  tf: 15m
+
 instrument:
   symbol: XAUTUSDT
   timeframes: [1m, 5m, 15m]

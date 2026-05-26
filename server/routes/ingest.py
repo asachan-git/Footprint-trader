@@ -44,18 +44,65 @@ def _lock_for(bar_id: str) -> Lock:
         return _bar_locks[bar_id]
 
 
+_triggered_decide_bars: set[str] = set()
+
+
+def _trigger_decide_on_bar_close(symbol: str, tf: str, bar_id: str) -> None:
+    """Fire Mode 1 (Claude) + Mode 2 (rules dry-run) instantly on bar close.
+
+    Idempotent per bar_id. Non-blocking — runs HTTP calls in a background thread
+    so ingest returns immediately.
+    """
+    if bar_id in _triggered_decide_bars:
+        return
+    _triggered_decide_bars.add(bar_id)
+    if len(_triggered_decide_bars) > 500:
+        # cap memory — drop oldest half
+        kept = list(_triggered_decide_bars)[-250:]
+        _triggered_decide_bars.clear()
+        _triggered_decide_bars.update(kept)
+
+    import threading
+    import urllib.request as _req
+    import json as _json
+
+    def _run():
+        for endpoint, body, timeout in (
+            ("/decide_multi", {"symbols": [symbol], "tf": tf}, 120),
+            ("/grid_tick", {"symbols": [symbol], "tf": tf, "dry_run": True}, 30),
+        ):
+            try:
+                data = _json.dumps(body).encode()
+                req = _req.Request(
+                    f"http://localhost:5000{endpoint}",
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                _req.urlopen(req, timeout=timeout).read()
+            except Exception as e:
+                LOG.warning(f"[ingest][trigger] {endpoint} failed for {symbol} {bar_id}: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    LOG.info(f"[ingest][trigger] event-driven decide fired for {symbol} {tf} {bar_id}")
+
+
 def _aggregate_mtf(bar, settings) -> None:
     primary_tf = settings["instrument"]["primary_tf"]
     if bar.tf != primary_tf:
         return
     s = store()
     primary_bars = s.recent(bar.symbol, primary_tf, 1_000)
+    decide_tf = str((settings.get("decide_on_bar_close") or {}).get("tf", "15m"))
+    enabled = bool((settings.get("decide_on_bar_close") or {}).get("enabled", True))
     for tf in settings["instrument"]["timeframes"]:
         if tf == primary_tf:
             continue
         synth = maybe_emit(primary_bars, primary_tf, tf)
         if synth is not None:
             s.put(synth)
+            if enabled and tf == decide_tf:
+                _trigger_decide_on_bar_close(bar.symbol, tf, synth.bar_id)
 
 
 MIN_HOLD_SECS   = 180   # seconds a position must be open before invalidation/hedge fires

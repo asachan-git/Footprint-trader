@@ -30,6 +30,10 @@ LOG = logging.getLogger(__name__)
 
 _COMPARE_LOG = Path(__file__).resolve().parent.parent.parent / "data" / "mode_compare.jsonl"
 
+# Per-symbol last bar_id processed — prevents duplicate fires when both event-driven
+# (ingest mtf_aggregator hook) AND wall-clock loop (start.sh) trigger the same bar.
+_last_bars: dict[str, str] = {}
+
 
 def _log_comparison(symbol: str, decision, bar_id: str, dry_run: bool, dispatched: dict | None) -> None:
     """Append a Mode 2 decision row for later A/B vs Mode 1 (data/decisions.jsonl)."""
@@ -62,6 +66,7 @@ def grid_tick():
     symbols = body.get("symbols") or [settings["instrument"]["symbol"]]
     primary_tf = body.get("tf") or settings["instrument"]["primary_tf"]
     dry_run = bool(body.get("dry_run", False))
+    force = bool(body.get("force", False))
 
     results = []
     for sym in symbols:
@@ -70,6 +75,15 @@ def grid_tick():
             if latest is None:
                 results.append({"symbol": sym, "skipped": "no bars"})
                 continue
+
+            # Dedup: same bar already processed (unless force=true)
+            if not force and _last_bars.get(sym) == latest.bar_id:
+                results.append({
+                    "symbol": sym, "skipped": "bar already processed",
+                    "bar_id": latest.bar_id,
+                })
+                continue
+            _last_bars[sym] = latest.bar_id
 
             # Same-direction guard (skip dispatch path; dry_run still runs engine)
             same_dir_open = [] if dry_run else [p for p in position_store().open_positions(sym)]
