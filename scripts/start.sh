@@ -144,6 +144,47 @@ export -f auto_decide_multi
 bash -c "auto_decide_multi '$FLASK_URL' '$DECIDE_INTERVAL' '$DECIDE_TF'" > logs/decide_multi.log 2>&1 &
 PIDS+=($!)
 
+# 5b — Mode 2 dry-run grid_tick alongside Mode 1 for A/B comparison
+auto_grid_tick_dry() {
+  local flask="$1"
+  local interval="$2"
+  local tf="$3"
+  local log="logs/grid_tick_dry.log"
+  local offset=10  # 5s after auto_decide_multi so both fire on same bar
+  echo "[grid-tick/dry] started — Mode 2 dry-run every ${interval}s for A/B vs Mode 1"
+  while true; do
+    local now next sleep_s
+    now=$(date +%s)
+    if [[ $interval -ge 60 ]]; then
+      next=$(( (now / interval + 1) * interval + offset ))
+      sleep_s=$((next - now))
+    else
+      sleep_s=$interval
+    fi
+    sleep $sleep_s
+    local ts result note
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    result=$(curl -s -X POST "${flask}/grid_tick" \
+      -H "Content-Type: application/json" \
+      -d "{\"symbols\":[\"BTCUSDT\",\"XAUTUSDT\"],\"tf\":\"${tf}\",\"dry_run\":true}")
+    note=$(echo "$result" | python3 -c "
+import sys, json
+r = json.load(sys.stdin)
+for d in r.get('results', []):
+    sym = d.get('symbol','')
+    side = d.get('side','-').upper()
+    bs = d.get('bias_strength','-')
+    sc = d.get('score','-')
+    icon = '📈' if side=='LONG' else '📉' if side=='SHORT' else '—'
+    print(f'  {icon} {sym:10} {side:6} bias={bs} score={sc}')
+" 2>/dev/null || echo "  parse err")
+    echo "$ts | $note" | tee -a "$log"
+  done
+}
+export -f auto_grid_tick_dry
+bash -c "auto_grid_tick_dry '$FLASK_URL' '$DECIDE_INTERVAL' '$DECIDE_TF'" > logs/grid_tick_dry.log 2>&1 &
+PIDS+=($!)
+
 echo ""
 echo "[start] ✓ All services running. PIDs: ${PIDS[*]}"
 echo ""
@@ -151,7 +192,8 @@ echo "  Logs:"
 echo "    Flask:           logs/flask.log"
 echo "    Bybit BTC:       logs/bybit_btc.log"
 echo "    Bybit XAUT:      logs/bybit_xaut.log"
-echo "    Multi-decide:    logs/decide_multi.log"
+echo "    Multi-decide:    logs/decide_multi.log    (Mode 1: Claude)"
+echo "    Grid-tick dry:   logs/grid_tick_dry.log   (Mode 2: rules, A/B compare)"
 echo "    History rebuild: logs/rebuild_history.log"
 [[ $EXNESS -eq 1 ]] && echo "    Exness:          logs/exness.log"
 echo ""
