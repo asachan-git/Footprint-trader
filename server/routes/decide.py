@@ -79,7 +79,9 @@ def _same_direction_cooldown(symbol: str, cooldown_bars: int = 3) -> tuple[bool,
                     rows.append(r)
             except Exception:
                 pass
-    recent = rows[-cooldown_bars:] if len(rows) >= cooldown_bars else rows
+    # Only count decisions that actually executed (not rejected by validator)
+    executed = [r for r in rows if r.get("validator_reason") is None]
+    recent = executed[-cooldown_bars:] if len(executed) >= cooldown_bars else executed
     non_flat = [r for r in recent if r.get("decision", {}).get("side") not in ("flat", None)]
     if len(non_flat) < 2:
         return False, ""
@@ -164,25 +166,25 @@ def decide():
         if tf != primary_tf
     }
 
-    # Check if active grid exists — pass context to Claude
-    ps = position_store()
-    active_grids = ps.open_positions(symbol)
-    active_grid_ctx = active_grid_summary(active_grids[0]) if active_grids else None
+    trading_mode = str(settings.get("trading_mode") or "buy_sell_only")
 
+    # Grid context only injected when trading_mode=grid
     prefix = cached_prefix(settings["prompt"]["few_shot_count"])
     suffix_base = variable_suffix(recent, higher)
-
-    # Inject active grid context into suffix
     import json as _json
     suffix_dict = _json.loads(suffix_base)
-    if active_grid_ctx:
-        suffix_dict["active_grid"] = active_grid_ctx
-        fp_latest = build_fp(latest)
-        leg_signal = should_add_leg(latest, fp_latest, active_grids[0])
-        suffix_dict["grid_leg_signal"] = {
-            "should_add": leg_signal.should_add,
-            "reason": leg_signal.reason,
-        }
+    if trading_mode == "grid":
+        ps = position_store()
+        active_grids = ps.open_positions(symbol)
+        active_grid_ctx = active_grid_summary(active_grids[0]) if active_grids else None
+        if active_grid_ctx:
+            suffix_dict["active_grid"] = active_grid_ctx
+            fp_latest = build_fp(latest)
+            leg_signal = should_add_leg(latest, fp_latest, active_grids[0])
+            suffix_dict["grid_leg_signal"] = {
+                "should_add": leg_signal.should_add,
+                "reason": leg_signal.reason,
+            }
     suffix = _json.dumps(suffix_dict)
 
     cfg = ClientConfig(
@@ -209,7 +211,13 @@ def decide():
             "bar_id": latest.bar_id,
         })
 
-    validator_reason = validate(decision)
+    _filt = settings.get("decide_filter") or {}
+    rr_floor = float(
+        (_filt.get("rr_floor_per_symbol") or {}).get(symbol)
+        or _filt.get("rr_floor")
+        or 1.5
+    )
+    validator_reason = validate(decision, rr_floor=rr_floor)
     decision_id = log_decision(
         bar_id=latest.bar_id,
         symbol=symbol,

@@ -135,3 +135,80 @@ class PaperExecutor:
             "confidence": decision.confidence,
             "rationale": decision.rationale,
         }
+
+    def submit_grid(self, plan, bar: Bar) -> dict:
+        """Paper simulation of a 5-leg limit grid.
+
+        MVP: fill leg 1 immediately at its limit price; legs 2-5 stored as
+        pending in pending_orders.jsonl. cycle_manager will fill them as
+        price reaches each leg (checked on every bar close).
+        """
+        from execution.pending_orders import pending_store
+
+        store = position_store()
+        open_for_symbol = store.open_positions(bar.symbol)
+        if open_for_symbol:
+            existing = open_for_symbol[0]
+            if existing.side == plan.side:
+                LOG.info(f"[paper-grid] same-direction cycle open for {bar.symbol}, skipping")
+                return {"mode": "paper", "skipped": "same-direction cycle open",
+                        "position_id": existing.position_id}
+
+        # Leg 1 fills immediately as the entry anchor
+        leg1 = plan.legs[0]
+        from llm.schema import Decision as _D
+        filled = _D(
+            side=plan.side,
+            entry=round(leg1.price, 4),
+            stop_loss=plan.safety_sl if plan.safety_sl is not None else (leg1.price * 0.95 if plan.side == "long" else leg1.price * 1.05),
+            take_profit=plan.take_profit,
+            confidence=min(1.0, plan.bias_strength / 5.0),
+            rationale=f"grid leg1 anchor (bias={plan.bias_strength}/5)",
+            grid_leg=1,
+            bias_strength=plan.bias_strength,
+        )
+        pos = store.open_position(filled, bar.bar_id, bar.symbol, bar.tf)
+
+        # Legs 2-5 stored as pending
+        ps = pending_store()
+        pending_ids = []
+        for leg in plan.legs[1:]:
+            pid = ps.add(
+                position_id=pos.position_id,
+                symbol=bar.symbol,
+                side=plan.side,
+                limit_price=leg.price,
+                lots=leg.lots,
+                leg_idx=leg.leg_idx,
+                tp=plan.take_profit,
+                safety_sl=plan.safety_sl,
+            )
+            pending_ids.append(pid)
+
+        try:
+            from execution.cycle_store import cycle_store
+            cycle_store().open_cycle(
+                symbol=bar.symbol, tf=bar.tf,
+                direction=plan.side, position_id=pos.position_id,
+            )
+        except Exception:
+            pass
+
+        LOG.info(
+            f"[paper-grid] OPEN {plan.side} {bar.symbol} leg1@{leg1.price:.4f} lots={leg1.lots} "
+            f"+ 4 pending legs, TP={plan.take_profit:.4f} ({plan.tp_source})"
+        )
+
+        return {
+            "mode": "paper", "grid": True,
+            "position_id": pos.position_id,
+            "side": plan.side,
+            "leg1_filled": {"price": leg1.price, "lots": leg1.lots},
+            "pending_legs": [{"id": pid, "price": leg.price, "lots": leg.lots, "leg": leg.leg_idx}
+                              for pid, leg in zip(pending_ids, plan.legs[1:])],
+            "take_profit": plan.take_profit,
+            "tp_source": plan.tp_source,
+            "safety_sl": plan.safety_sl,
+            "avg_entry_on_full_fill": plan.avg_entry_on_full_fill,
+            "bias_strength": plan.bias_strength,
+        }

@@ -52,17 +52,17 @@ PYTHONPATH=. python3 -m server.app > logs/flask.log 2>&1 &
 PIDS+=($!)
 sleep 2
 
-# 2 — BTCUSDT via Bybit linear perpetual (confirmed working from India)
-echo "[start] BTCUSDT ingress (Bybit)..."
-PYTHONPATH=. python3 -m bybit.main \
-  --symbol BTCUSDT --tf 1m --price-step 10.0 --category linear \
+# 2 — BTCUSDT via Binance spot WS (stream.binance.com:9443 works from India)
+echo "[start] BTCUSDT ingress (Binance spot WS)..."
+PYTHONPATH=. python3 -m binance.main \
+  --symbol BTCUSDT --tf 1m --price-step 10.0 \
   > logs/bybit_btc.log 2>&1 &
 PIDS+=($!)
 
-# 3 — XAUTUSDT (Tether Gold, Bybit spot)
-echo "[start] XAUTUSDT ingress (Bybit spot)..."
+# 3 — XAUTUSDT via Bybit REST polling (WS geo-blocked; REST accessible from India)
+echo "[start] XAUTUSDT ingress (Bybit REST poll)..."
 PYTHONPATH=. python3 -m bybit.main \
-  --symbol XAUTUSDT --tf 1m --price-step 0.1 --category spot \
+  --symbol XAUTUSDT --tf 1m --price-step 0.1 --category spot --rest \
   > logs/bybit_xaut.log 2>&1 &
 PIDS+=($!)
 

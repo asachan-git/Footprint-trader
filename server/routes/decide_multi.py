@@ -24,6 +24,9 @@ from prompts.builder import active_version, cached_prefix, variable_suffix
 bp = Blueprint("decide_multi", __name__)
 LOG = logging.getLogger(__name__)
 
+# Per-symbol last-fired bar_id cache — prevents re-calling Claude on same bar
+_last_bar_ids: dict[str, str] = {}
+
 
 def _build_context(symbol: str, tf: str, settings: dict) -> dict | None:
     s = store()
@@ -92,11 +95,16 @@ def decide_multi():
     symbols = body.get("symbols") or ["BTCUSDT", "XAUTUSDT"]
     tf = body.get("tf") or settings["instrument"]["primary_tf"]
 
+    force = bool(body.get("force", False))
     contexts = {}
     for sym in symbols:
         ctx = _build_context(sym, tf, settings)
-        if ctx:
-            contexts[sym] = ctx
+        if not ctx:
+            continue
+        if not force and _last_bar_ids.get(sym) == ctx["latest_bar_id"]:
+            LOG.info(f"[decide_multi] {sym} skipped — same bar_id {ctx['latest_bar_id'][:25]}")
+            continue
+        contexts[sym] = ctx
 
     if not contexts:
         return jsonify({"ok": False, "error": "no bars stored for any requested symbol"}), 404
@@ -111,7 +119,7 @@ def decide_multi():
     client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     cfg = ClientConfig(
         model=settings["claude"]["model"],
-        max_tokens=max(2400, settings["claude"]["max_tokens_out"] * len(contexts) * 2),
+        max_tokens=max(4096, settings["claude"]["max_tokens_out"] * len(contexts) * 3),
         timeout_s=settings["claude"]["timeout_s"],
     )
 
@@ -136,10 +144,18 @@ def decide_multi():
             raw = block.input
             break
 
-    if not raw:
-        return jsonify({"ok": False, "error": "no submit_multi_decision tool call in response"}), 500
+    if raw is None:
+        stop = getattr(resp, "stop_reason", "unknown")
+        LOG.error(f"[decide_multi] no tool call in response stop_reason={stop} content_types={[b.type for b in resp.content]}")
+        return jsonify({"ok": False, "error": f"no submit_multi_decision tool call in response (stop_reason={stop})"}), 500
+
+    # Mark bar_ids as processed so re-calls on same bar are skipped
+    for sym, ctx in contexts.items():
+        _last_bar_ids[sym] = ctx["latest_bar_id"]
 
     cross_note = raw.get("cross_market_note", "")
+    if cross_note:
+        LOG.info(f"[decide_multi] cross_market_note: {cross_note}")
     results = []
     version = active_version()
 
@@ -166,9 +182,16 @@ def decide_multi():
             grid_leg=int(d.get("grid_leg", 1)),
             parent_position_id=d.get("parent_position_id"),
             add_to_existing=bool(d.get("add_to_existing", False)),
+            bias_strength=int(d.get("bias_strength", 3)),
             invalidation_note=d["invalidation_note"],
         )
-        validator_reason = validate(decision)
+        _filt = settings.get("decide_filter") or {}
+        rr_floor = float(
+            (_filt.get("rr_floor_per_symbol") or {}).get(sym)
+            or _filt.get("rr_floor")
+            or 1.5
+        )
+        validator_reason = validate(decision, rr_floor=rr_floor)
         decision_id = log_decision(
             bar_id=ctx["latest_bar_id"],
             symbol=sym,

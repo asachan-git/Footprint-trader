@@ -137,6 +137,9 @@ class PositionStore:
         elif etype == "sl_adjust" and pid in self._positions:
             if self._positions[pid].legs:
                 self._positions[pid].legs[-1].stop_loss = event["new_sl"]
+        elif etype == "tp_adjust" and pid in self._positions:
+            if self._positions[pid].legs:
+                self._positions[pid].legs[-1].take_profit = event["new_tp"]
 
     def _write(self, event: dict) -> None:
         now = int(time.time())
@@ -227,6 +230,15 @@ class PositionStore:
                 "type": "sl_adjust",
                 "position_id": position_id,
                 "new_sl": new_sl,
+                "reason": reason,
+            })
+
+    def adjust_tp(self, position_id: str, new_tp: float, reason: str) -> None:
+        with self._lock:
+            self._write({
+                "type": "tp_adjust",
+                "position_id": position_id,
+                "new_tp": new_tp,
                 "reason": reason,
             })
 

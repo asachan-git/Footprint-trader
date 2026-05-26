@@ -1,7 +1,8 @@
-mode: live               # journal | paper | live  (live also needs env ALLOW_LIVE=1)
+mode: paper              # journal | paper | live  (live also needs env ALLOW_LIVE=1)
+trading_mode: buy_sell_only   # buy_sell_only | grid  (buy_sell_only: Claude picks direction; mechanical 5-leg Fib grid; ChoCh+VA invalidation)
 
 instrument:
-  symbol: NQ
+  symbol: XAUTUSDT
   timeframes: [1m, 5m, 15m]
   primary_tf: 1m           # decision fires on close of this TF; higher TFs join as-of
 
@@ -10,11 +11,11 @@ claude:
   fallback_model: claude-opus-4-7   # used when validator flags ambiguity
   cache: true
   max_tokens_out: 600
-  timeout_s: 30
+  timeout_s: 90
 
 prompt:
   active_version_file: prompts/system/current.txt
-  recent_bars: 10          # variable suffix size (was 20 — reduced for latency)
+  recent_bars: 20          # 20 bars = 5h context at 15m (was 10)
   few_shot_count: 4
 
 ingress:
@@ -37,21 +38,23 @@ vp_cache:
   #   XAU tick = 0.1 → 0.5 = 5-tick bins
   #   BTC tick = 0.1 → 1.0 = 10-tick bins
   vp_bin_size:
-    BTCUSDT:  1.0
-    XAUTUSDT: 0.5
+    BTCUSDT:  25.0          # 25$ bins (Sierra/Bookmap convention for BTC ~1300/day range = ~52 bins)
+    XAUTUSDT: 1.0           # 1$ bins (was 0.5; gives ~25 bins per day for typical XAU range)
 
 # Execution venue (Vantage MT5 via MetaApi)
 execution:
   broker: vantage_mt5
-  tradable_symbols: [XAUTUSDT]
+  tradable_symbols: [XAUTUSDT, BTCUSDT]
   symbol_map:
     XAUTUSDT: "XAUUSD+"
+    BTCUSDT:  "BTCUSD+"
   # Risk-adjusted sizing: lots = (balance × risk_per_trade_pct) / (SL_distance × contract_size)
   # Set risk_per_trade_pct = 0 to disable; falls back to default_lots.
   risk_per_trade_pct: 0.0025    # 0.25% of equity per trade
   max_lots: 1.0                 # hard cap regardless of risk math
   default_lots:                 # fallback when risk math fails (no SL, etc.)
     "XAUUSD+": 0.01
+    "BTCUSD+": 0.001
   metaapi_timeout_s: 30
   order_comment_prefix: "FB"
   # Paper-mode simulation: matches live risk math without a broker connection
@@ -59,9 +62,11 @@ execution:
   contract_size:                # used by paper lot simulation
     XAUTUSDT: 100
     BTCUSDT: 1
+    "BTCUSD+": 1
   # Pre-trade execution gates (live only — checked in MT5Adapter.submit_order)
   max_spread:                   # reject order if (ask-bid) exceeds, per broker symbol
     "XAUUSD+": 0.50
+    "BTCUSD+": 50.0
   news_blackout_utc: []         # e.g. ["12:25-12:35", "18:00-18:05"] — no orders in these UTC windows
 
 # Risk controls (used by ingest DD halt + hedge_manager circuit breaker)
@@ -73,6 +78,29 @@ risk:
   daily:
     max_dd_r: 4.0              # halt + close all + block re-entry when daily realized R ≤ -this
 
+# Dhan options trading configuration
+dhan:
+  # Broker for /options/decide route. Set execution.broker: dhan + mode: live to use.
+  default_lots: 1          # lots per trade (quantity = lots × instrument.lot_size)
+  max_lots: 2              # hard cap
+  # Per-symbol lot overrides (optional)
+  lots_per_symbol:
+    NIFTY: 1
+    BANKNIFTY: 1
+    FINNIFTY: 1
+  # Options SL/TP as fraction of entry premium (only used for premium-based stops)
+  sl_premium_pct: 0.50     # exit if option LTP drops to 50% of entry premium
+  tp_premium_pct: 1.00     # exit if option LTP reaches 200% of entry premium (+100%)
+  # IV rank thresholds
+  iv_rank_max_buy: 70      # skip buying options when IV rank > this (IV crush risk)
+  # Market hours gate (NSE: 9:15–15:30 IST = 03:45–10:00 UTC)
+  active_hours_utc: "03:45-10:00"
+  # Options decide filter
+  options_decide_filter:
+    min_confidence: 0.55         # lower than futures — options need less certainty for entry
+    same_direction_cooldown: 2   # block if last 2 decisions same direction
+    skip_0dte: true              # skip on expiry day (0DTE) unless forced
+
 # Pre-filter for /decide — skip Claude call when local features signal no setup.
 # Pass {"force": true} in /decide body to bypass.
 decide_filter:
@@ -82,3 +110,7 @@ decide_filter:
   require_absorption: false
   active_hours_utc: ""      # e.g. "07:00-17:00" to skip Asian dead zone (empty = always on)
   same_direction_cooldown: 3  # block if last 2 non-flat decisions same direction (0=disabled)
+  rr_floor: 1.5             # default R:R floor (overridden per-symbol below)
+  rr_floor_per_symbol:
+    XAUTUSDT: 1.2           # gold 15m ranges are structurally tighter — 52% WR at 1.1-1.4
+    BTCUSDT: 1.5

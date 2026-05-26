@@ -214,7 +214,7 @@ Use `big_trade.session_summary` in your rationale.
 ## Hard rules
 
 1. Ambiguous footprint → flat. No forced trades.
-2. R:R ≥ 1.4 mandatory.
+2. R:R ≥ 1.5 mandatory.
 3. Rationale REQUIRED. Cite footprint features, Fibonacci level, wave phase, day type.
 4. SL minimum 0.05% of entry (XAUUSD ≈ 2.5pts, BTC ≈ 38pts).
 5. Never repeat same direction on 2+ consecutive bars without NEW event (new absorption, sweep, divergence, or delta ≥ 30% change).

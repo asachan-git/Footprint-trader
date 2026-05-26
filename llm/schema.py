@@ -29,7 +29,14 @@ class Decision(BaseModel):
     parent_position_id: str | None = Field(None, description="Position ID to add a leg to; None = new grid")
     add_to_existing: bool = Field(default=False, description="True = add leg to active grid; False = new position")
     qty_pct: float = Field(default=1.0, ge=0.3, le=1.0, description="Fraction of risk-based size for this leg (0.3–1.0), from confluence strength. 1.0 = full size on strong confluence; 0.3 = weak.")
+    bias_strength: int = Field(default=3, ge=1, le=5, description="Direction conviction 1-5. Drives total grid exposure: lots = ladder × BASE × (bias_strength/5). 5 = max conviction, 1 = weak.")
     invalidation_note: str = Field(default="", description="What footprint event would invalidate this trade")
+    # Options fields — populated only for options instruments (dhan mode)
+    option_type: Literal["CE", "PE", "NONE"] = Field(default="NONE", description="CE (buy call) | PE (buy put) | NONE (non-options)")
+    option_strike: float | None = Field(None, description="Selected option strike price")
+    option_expiry: str | None = Field(None, description="Option expiry date YYYY-MM-DD")
+    option_security_id: str | None = Field(None, description="Dhan security_id for the selected option (from strike_candidates)")
+    option_product: Literal["INTRA", "MARGIN", "NONE"] = Field(default="NONE", description="INTRA=MIS intraday | MARGIN=NRML carry | NONE=non-options")
 
 
 CLAUDE_TOOL = {
@@ -61,7 +68,26 @@ CLAUDE_TOOL = {
             "add_to_existing": {"type": "boolean"},
             "qty_pct": {"type": "number", "minimum": 0.3, "maximum": 1.0,
                         "description": "Fraction of risk-based size (0.3–1.0) from confluence strength. Strong confluence (absorption + imbalance + HVN + CVD aligned) → 1.0; weak → 0.3."},
+            "bias_strength": {"type": "integer", "minimum": 1, "maximum": 5,
+                              "description": "Direction conviction 1-5. Scales grid total exposure. 5=max conviction (multi-TF aligned, clean structure), 3=balanced, 1=weak (mixed signals). Used by mechanical grid placer."},
             "invalidation_note": {"type": "string"},
+            # Options fields — only required for options instruments
+            "option_type": {
+                "type": "string",
+                "enum": ["CE", "PE", "NONE"],
+                "description": "CE = buy call (long bias), PE = buy put (short bias), NONE = not an options trade",
+            },
+            "option_strike": {"type": ["number", "null"], "description": "Strike price selected from strike_candidates"},
+            "option_expiry": {"type": ["string", "null"], "description": "Expiry date YYYY-MM-DD from strike_candidates"},
+            "option_security_id": {
+                "type": ["string", "null"],
+                "description": "security_id from the selected candidate in strike_candidates — copy exactly",
+            },
+            "option_product": {
+                "type": "string",
+                "enum": ["INTRA", "MARGIN", "NONE"],
+                "description": "INTRA for intraday (MIS, squared off 3:20 PM IST), MARGIN for overnight/swing (NRML)",
+            },
         },
         "required": ["side", "confidence", "rationale"],
     },

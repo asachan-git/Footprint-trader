@@ -496,11 +496,11 @@ MIN_BARS_WEEKLY = 300
 # Tick-aligned bin sizes per symbol — institutional convention. Used when
 # settings.yaml lacks vp_bin_size or callers go through from_store() directly.
 DEFAULT_BIN_SIZE: dict[str, float] = {
-    "BTCUSDT": 1.0,
-    "XAUTUSDT": 0.5,
-    "BTCUSD": 1.0,      # Vantage CFD
-    "XAUUSD+": 0.1,     # Vantage CFD
-    "XAUUSD": 0.1,      # generic spot XAU
+    "BTCUSDT": 25.0,    # $25 bins (Sierra/Bookmap convention; ~52 bins per $1300 daily range)
+    "XAUTUSDT": 1.0,    # $1 bins
+    "BTCUSD": 25.0,     # Vantage CFD
+    "XAUUSD+": 1.0,     # Vantage CFD
+    "XAUUSD": 1.0,      # generic spot XAU
 }
 
 

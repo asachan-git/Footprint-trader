@@ -126,7 +126,16 @@ def _check_positions(bar, settings) -> list[dict]:
             (pos.side == "long"  and bar.ohlc.l <= pos.stop_loss) or
             (pos.side == "short" and bar.ohlc.h >= pos.stop_loss)
         )
-        tp_hit = (
+        # Grid TP guard: when trading_mode is buy_sell_only / grid, the position's
+        # stored TP is computed for the full-fill avg_entry. While only leg-1 is
+        # filled, avg_entry sits on the wrong side of TP and would trigger a
+        # loss-close. Skip the TP check until avg_entry crosses to the profitable side.
+        _grid_mode = str(settings.get("trading_mode") or "buy_sell_only") in ("buy_sell_only", "grid")
+        tp_guard_skips = _grid_mode and (
+            (pos.side == "long"  and pos.take_profit <= pos.avg_entry) or
+            (pos.side == "short" and pos.take_profit >= pos.avg_entry)
+        )
+        tp_hit = (not tp_guard_skips) and (
             (pos.side == "long"  and bar.ohlc.h >= pos.take_profit) or
             (pos.side == "short" and bar.ohlc.l <= pos.take_profit)
         )
@@ -150,9 +159,19 @@ def _check_positions(bar, settings) -> list[dict]:
             if pos.side == "long":
                 ps.close_position(pos.position_id, f"tp_hit @ {bar.ohlc.h:.4f} ≥ TP {pos.take_profit:.4f}", realized_r)
                 LOG.info(f"[ingest] TP hit {pos.position_id} long bar_high={bar.ohlc.h:.4f} tp={pos.take_profit:.4f} R={realized_r:.2f}")
+                try:
+                    from execution.pending_orders import pending_store as _ps2
+                    _ps2().cancel_for_position(pos.position_id)
+                except Exception:
+                    pass
             else:
                 ps.close_position(pos.position_id, f"tp_hit @ {bar.ohlc.l:.4f} ≤ TP {pos.take_profit:.4f}", realized_r)
                 LOG.info(f"[ingest] TP hit {pos.position_id} short bar_low={bar.ohlc.l:.4f} tp={pos.take_profit:.4f} R={realized_r:.2f}")
+                try:
+                    from execution.pending_orders import pending_store as _ps2
+                    _ps2().cancel_for_position(pos.position_id)
+                except Exception:
+                    pass
             exits.append({"position_id": pos.position_id, "exit": "tp_hit", "realized_r": realized_r,
                           "bar_extreme": bar.ohlc.h if pos.side == "long" else bar.ohlc.l,
                           "tp": pos.take_profit})
@@ -389,6 +408,18 @@ def ingest():
             _classify_outcomes(recent_bars, bar.symbol)
         except Exception:
             pass
+
+    # Cycle manager heartbeat (fills pending legs, checks TP, ChoCh + VA invalidation, hedge eval)
+    if bar.tf == primary_tf:
+        try:
+            from execution.cycle_manager import on_bar_close as _cycle_tick
+            _cycle_actions = _cycle_tick(bar.symbol, primary_tf, bar, settings)
+            if _cycle_actions and (_cycle_actions.get("filled") or _cycle_actions.get("closed_tp") or _cycle_actions.get("hedge_evals")):
+                import logging as _l
+                _l.getLogger(__name__).info(f"[ingest][cycle] {_cycle_actions}")
+        except Exception as e:
+            import logging as _l
+            _l.getLogger(__name__).warning(f"[ingest][cycle] tick failed: {e}")
 
     return jsonify({
         "ok": True,

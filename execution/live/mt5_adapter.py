@@ -129,6 +129,62 @@ class MT5Adapter:
             LOG.exception(f"[mt5] order failed: {e}")
             return {"broker": "vantage_mt5", "error": str(e)}
 
+    def submit_grid(self, plan, bar: Bar) -> dict:
+        """Submit a 5-leg limit-order grid via MetaApi.
+
+        plan: execution.grid_placer.GridPlan
+        Returns dict with per-leg results + cycle metadata.
+        """
+        if self._tradable and bar.symbol not in self._tradable:
+            return {"broker": "vantage_mt5", "skipped": f"{bar.symbol} not tradable"}
+        blocked, reason = self._in_news_blackout()
+        if blocked:
+            return {"broker": "vantage_mt5", "skipped": f"news_blackout {reason}"}
+        try:
+            spread_ok, spread_info = self._run(self._async_check_spread(plan.broker_symbol))
+            if not spread_ok:
+                return {"broker": "vantage_mt5", "skipped": f"spread_too_wide {spread_info}"}
+            leg_results = []
+            for leg in plan.legs:
+                comment = f"{self._comment_prefix}|{plan.side}|grid|leg{leg.leg_idx}"
+                res = self._run(self._async_submit_limit(
+                    broker_symbol=plan.broker_symbol,
+                    side=plan.side,
+                    lots=leg.lots,
+                    open_price=leg.price,
+                    stop_loss=plan.safety_sl,
+                    take_profit=plan.take_profit,
+                    comment=comment,
+                ))
+                leg_results.append({
+                    "leg": leg.leg_idx, "price": leg.price, "lots": leg.lots,
+                    "result": res,
+                })
+            return {
+                "broker": "vantage_mt5",
+                "symbol_analysis": bar.symbol,
+                "symbol_broker": plan.broker_symbol,
+                "side": plan.side,
+                "grid": True,
+                "legs": leg_results,
+                "take_profit": plan.take_profit,
+                "safety_sl": plan.safety_sl,
+                "avg_entry_on_full_fill": plan.avg_entry_on_full_fill,
+                "tp_source": plan.tp_source,
+                "bias_strength": plan.bias_strength,
+            }
+        except Exception as e:
+            LOG.exception(f"[mt5] grid submit failed: {e}")
+            return {"broker": "vantage_mt5", "error": str(e)}
+
+    def cancel_pending_order(self, order_id: str) -> dict:
+        try:
+            result = self._run(self._async_cancel_pending(order_id))
+            return {"broker": "vantage_mt5", "cancelled": order_id, "result": result}
+        except Exception as e:
+            LOG.exception(f"[mt5] cancel pending failed: {e}")
+            return {"broker": "vantage_mt5", "error": str(e)}
+
     def close_position(self, position_id: str) -> dict:
         try:
             result = self._run(self._async_close(position_id))
@@ -332,6 +388,36 @@ class MT5Adapter:
                 take_profit=take_profit,
                 options={"comment": comment},
             )
+
+    async def _async_submit_limit(
+        self,
+        broker_symbol: str,
+        side: str,
+        lots: float,
+        open_price: float,
+        stop_loss: float | None,
+        take_profit: float | None,
+        comment: str,
+    ) -> dict:
+        conn = await self._ensure_conn()
+        if side == "long":
+            return await conn.create_limit_buy_order(
+                broker_symbol, lots, open_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                options={"comment": comment},
+            )
+        else:
+            return await conn.create_limit_sell_order(
+                broker_symbol, lots, open_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                options={"comment": comment},
+            )
+
+    async def _async_cancel_pending(self, order_id: str) -> dict:
+        conn = await self._ensure_conn()
+        return await conn.cancel_order(order_id)
 
     async def _async_close(self, position_id: str) -> dict:
         conn = await self._ensure_conn()
