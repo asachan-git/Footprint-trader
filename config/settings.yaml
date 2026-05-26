@@ -1,6 +1,20 @@
 mode: paper              # journal | paper | live  (live also needs env ALLOW_LIVE=1)
 trading_mode: buy_sell_only   # buy_sell_only | grid  (buy_sell_only: Claude picks direction; mechanical 5-leg Fib grid; ChoCh+VA invalidation)
 
+# Standardized data window across all analysis modules (sweep, delta_div, wick_trap, cvd_vote)
+analysis:
+  standard_lookback: 20    # bars (primary TF for short-window modules; 15m for direction engine)
+
+# Regime gate — refuse entries against confirmed trend
+regime:
+  block_against_trend_confidence: 0.75   # day_type.confidence threshold to block
+
+# Catastrophic-trend escape — force-close cycle if price runs against without bounce
+cycle:
+  trend_escape:
+    bars: 3              # K consecutive bars against
+    atr_mult: 1.5        # N x ATR adverse from avg_entry
+
 # Event-driven decide trigger — fires Mode 1 + Mode 2 instantly when a new TF
 # bar is emitted by mtf_aggregator (replaces wall-clock cron loops in start.sh).
 decide_on_bar_close:

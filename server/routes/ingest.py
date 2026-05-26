@@ -235,72 +235,48 @@ def _check_positions(bar, settings) -> list[dict]:
             exits.append({"position_id": pos.position_id, "exit": "tp_absorption", "realized_r": round(realized_r, 4), "reason": tp_reason})
             LOG.info(f"[ingest] TP absorption {pos.position_id} exit={exit_price:.4f} R={realized_r:.2f}: {tp_reason}")
 
-        # 4. Footprint invalidation → hedge (only after MIN_HOLD_SECS, avoids sub-bar fires)
-        elif (bar.close_ts - pos.opened_ts >= MIN_HOLD_SECS and
-              (inv := detect_invalidation(bar, fp, pos.side, pos.avg_entry))):
-            if inv.strength == "strong":
-                try:
-                    from execution.hedge_manager import open_hedge, active_hedge_for_cycle
-                    from execution.cycle_store import cycle_store
-                    cs = cycle_store()
-                    active = [c for c in cs.active_cycles(bar.symbol)
-                              if c.position_id == pos.position_id]
-                    if active and not active_hedge_for_cycle(active[0].cycle_id):
-                        lots = float(settings.get("risk", {}).get("base_lot_size", 0.01)) * pos.leg_count
-                        hedge = open_hedge(active[0].cycle_id, bar.symbol, pos.side, lots, bar.ohlc.c)
-
-                        # Fire opposite-side order through normal dispatch path
-                        # (lives + paper + journal all handled — gated by settings.mode).
+        # 4. Strong-zone profit booking on absorption
+        #    Replaces the legacy "absorption-at-entry → hedge/invalidate" path.
+        #    Rules (side-mirrored):
+        #      - Detect absorption on this bar (sell absorption for long, buy for short)
+        #      - If absorption price is at a strong zone (HVN/POC/VAH/VAL/FVG) AND
+        #        the cycle has positive PnL → book profit at current price
+        #      - If at strong zone but PnL negative → HOLD (let trail_sl handle)
+        #      - If NOT at strong zone → IGNORE (no auto-close on absorption alone)
+        elif _grid_mode and bar.close_ts - pos.opened_ts >= MIN_HOLD_SECS:
+            try:
+                from pipeline.features.absorption import detect_absorption
+                from execution.zone_collector import _all_zones
+                absorps = detect_absorption(bar, fp, absorb_ratio=0.20)
+                cur_price = bar.ohlc.c
+                pnl_positive = ((pos.side == "long" and cur_price > pos.avg_entry) or
+                                (pos.side == "short" and cur_price < pos.avg_entry))
+                # Which absorption side threatens this cycle?
+                relevant_side = "sell" if pos.side == "long" else "buy"
+                relevant = [a for a in absorps if a.side == relevant_side]
+                if relevant and pnl_positive:
+                    # Get all strong zones (need to grab htf_bars for FVG)
+                    htf_bars = s.recent(bar.symbol, "15m", 200)
+                    zones = _all_zones(bar.symbol, htf_bars=htf_bars)
+                    tol = max(bar.ohlc.c * 0.001, 0.5)   # 0.1% zone tolerance
+                    a = relevant[0]
+                    at_zone = next((z for z in zones if abs(a.price - z.price) <= tol and z.strength >= 0.7), None)
+                    if at_zone:
+                        realized_r = abs(cur_price - pos.avg_entry) / risk if risk > 0 else 0.5
+                        reason = (f"strong_zone_book: {relevant_side} absorption {a.bar_pct:.0%} at "
+                                  f"{a.price:.2f} = {at_zone.source}, PnL+ → book at {cur_price:.4f}")
+                        ps.close_position(pos.position_id, reason, realized_r)
                         try:
-                            from execution.router import dispatch as _dispatch
-                            from llm.schema import Decision as _SynthDecision
-                            sl_dist = abs(pos.avg_entry - pos.stop_loss) or (bar.ohlc.c * 0.002)
-                            if hedge.side == "long":
-                                h_sl = round(bar.ohlc.c - sl_dist, 4)
-                                h_tp = round(bar.ohlc.c + sl_dist * 2, 4)
-                            else:
-                                h_sl = round(bar.ohlc.c + sl_dist, 4)
-                                h_tp = round(bar.ohlc.c - sl_dist * 2, 4)
-                            synth = _SynthDecision(
-                                side=hedge.side,
-                                entry=round(bar.ohlc.c, 4),
-                                stop_loss=h_sl,
-                                take_profit=h_tp,
-                                confidence=1.0,
-                                rationale=f"hedge cycle={active[0].cycle_id} reason={inv.reason}",
-                            )
-                            h_result = _dispatch(synth, bar, settings)
-                            if isinstance(h_result, dict):
-                                hedge.position_id = str(h_result.get("position_id") or "")
-                                order = h_result.get("order") or {}
-                                hedge.broker_ticket = str(order.get("positionId") or order.get("orderId") or "")
-                            LOG.info(
-                                f"[ingest] HEDGE order {hedge.hedge_id} → ticket={hedge.broker_ticket} pid={hedge.position_id}"
-                            )
-                        except Exception as e:
-                            LOG.warning(f"[ingest] hedge order dispatch failed for {hedge.hedge_id}: {e}")
-
-                        exits.append({
-                            "position_id": pos.position_id,
-                            "exit": "hedged",
-                            "hedge_id": hedge.hedge_id,
-                            "broker_ticket": hedge.broker_ticket,
-                            "reason": inv.reason,
-                        })
-                        LOG.info(f"[ingest] HEDGED {pos.position_id} cycle={active[0].cycle_id}: {inv.reason}")
-                        try:
-                            from utils.notify import notify
-                            notify("🔵 HEDGE OPENED", f"{bar.symbol} {hedge.side} {hedge.lots} lot @ {bar.ohlc.c}\nticket {hedge.broker_ticket}\n{inv.reason}")
+                            from execution.pending_orders import pending_store as _ps2
+                            _ps2().cancel_for_position(pos.position_id)
                         except Exception:
                             pass
-                    else:
-                        # No active cycle tracked — fall back to invalidate
-                        ps.invalidate_position(pos.position_id, inv.reason)
-                        exits.append({"position_id": pos.position_id, "exit": "invalidated", "reason": inv.reason})
-                        LOG.info(f"[ingest] INVALIDATED {pos.position_id}: {inv.reason}")
-                except Exception:
-                    ps.invalidate_position(pos.position_id, inv.reason)
-                    exits.append({"position_id": pos.position_id, "exit": "invalidated", "reason": inv.reason})
+                        exits.append({"position_id": pos.position_id, "exit": "strong_zone_book",
+                                      "realized_r": round(realized_r, 4), "reason": reason})
+                        LOG.info(f"[ingest] STRONG-ZONE BOOK {pos.position_id} {pos.side} "
+                                 f"R={realized_r:.2f}: {reason}")
+            except Exception as e:
+                LOG.warning(f"[ingest] strong-zone book check failed: {e}")
 
         # 5. Check if active hedge can be removed (price recovered, after MIN_HEDGE_SECS)
         else:

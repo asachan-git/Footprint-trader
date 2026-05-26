@@ -110,32 +110,52 @@ def plan_grid(
 
     scale = bias_strength / 5.0
 
+    # ── Regime-aware leg count + spacing + safety SL ──────────────────────
+    try:
+        from execution.regime import get_regime, grid_shape_for_regime
+        regime = get_regime(symbol)
+        shape = grid_shape_for_regime(regime, direction)
+        n_legs = int(shape["n_legs"])
+        step_mult = float(shape["step_mult"])
+        grid_mode_label = shape["mode"]
+        # Override safety_sl_atr_mult only if caller used default (5.0)
+        if safety_sl_atr_mult == 5.0:
+            safety_sl_atr_mult = float(shape["safety_sl_atr_mult"])
+        regime_label = f"{regime.type}({regime.confidence:.2f})"
+    except Exception:
+        n_legs = N_LEGS
+        grid_mode_label = "mean_reversion"
+        regime_label = "regime_unknown"
+
     # ── Collect zones ──────────────────────────────────────────────────────
-    min_gap = max(atr_15m * 0.05, 0.1)  # min spacing between zones
+    min_gap = max(atr_15m * 0.05, 0.1)
     try:
         from execution.zone_collector import collect as _collect
         zones = _collect(symbol, direction, anchor, htf_bars=htf_bars or [],
-                         n=N_LEGS, min_gap=min_gap)
+                         n=n_legs, min_gap=min_gap)
     except Exception:
         zones = []
 
     zone_prices: list[tuple[float, str]] = [(z.price, z.source) for z in zones]
 
     # Fill remaining slots with ATR-step fallback
-    if len(zone_prices) < N_LEGS:
+    if len(zone_prices) < n_legs:
         fallbacks = _fallback_leg_prices(direction, anchor, atr_15m, step_mult,
-                                         N_LEGS - len(zone_prices))
+                                         n_legs - len(zone_prices))
         zone_prices.extend(fallbacks)
 
-    # Ensure exactly N_LEGS, sorted by distance (nearest first)
+    # Sort + slice to exactly n_legs (nearest first)
     zone_prices.sort(key=lambda x: abs(x[0] - anchor))
-    zone_prices = zone_prices[:N_LEGS]
+    zone_prices = zone_prices[:n_legs]
 
     # ── Build legs ─────────────────────────────────────────────────────────
+    # Use first n_legs entries of Fib ladder. For 2-leg cautious: [1,1].
+    # For 3-leg directional: [1,1,2]. For 5-leg range: [1,1,2,3,5].
+    ladder = FIB_LADDER[:n_legs]
     legs: list[GridLegPlan] = []
     weighted_price = 0.0
     weighted_units = 0
-    for i, (mult, (price, source)) in enumerate(zip(FIB_LADDER, zone_prices)):
+    for i, (mult, (price, source)) in enumerate(zip(ladder, zone_prices)):
         lots = round(base_lot * mult * scale, 2) or 0.01
         legs.append(GridLegPlan(leg_idx=i + 1, price=price, lots=lots,
                                 side=direction, source=source))
@@ -144,10 +164,21 @@ def plan_grid(
 
     avg_entry = weighted_price / weighted_units
 
-    # ── TP ─────────────────────────────────────────────────────────────────
+    # ── TP — place FAR initially so cycle_manager shrinker has room ────────
+    # In RANGE mode: TP at next major HVN/POC (minimum distance = 1.5×ATR)
+    # In TREND mode (with trend): TP at next HTF FVG / swept level (1.5×ATR)
+    # In CAUTIOUS: tight TP (0.5×ATR) to lock quick exits
+    if grid_mode_label == "directional":
+        # Push TP further — trending move can extend
+        tp_min_mult = max(min_tp_distance_mult, 1.5)
+    elif grid_mode_label == "cautious":
+        tp_min_mult = min(min_tp_distance_mult, 0.5)
+    else:
+        # Range / default — moderate TP, shrinker will tighten as legs fill
+        tp_min_mult = max(min_tp_distance_mult, 1.5)
     tp_price, tp_source = _resolve_tp_with_fallback(
         symbol=symbol, direction=direction, avg_entry=avg_entry, atr=atr_15m,
-        htf_bars=htf_bars or [], min_distance=min_tp_distance_mult * atr_15m,
+        htf_bars=htf_bars or [], min_distance=tp_min_mult * atr_15m,
     )
 
     # ── Safety SL ──────────────────────────────────────────────────────────
@@ -164,5 +195,6 @@ def plan_grid(
         avg_entry_on_full_fill=avg_entry,
         take_profit=tp_price, tp_source=tp_source,
         bias_strength=bias_strength, safety_sl=safety_sl,
-        note=f"zone-grid bias={bias_strength}/5 avg={avg_entry:.2f} tp={tp_price:.2f}({tp_source}) | {sources_summary}",
+        note=(f"regime={regime_label} mode={grid_mode_label} legs={n_legs} "
+              f"bias={bias_strength}/5 avg={avg_entry:.2f} tp={tp_price:.2f}({tp_source}) | {sources_summary}"),
     )

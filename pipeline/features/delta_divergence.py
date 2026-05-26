@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-LOOKBACK = 5          # bars used to measure divergence
+LOOKBACK = 20         # bars used to measure divergence (standard analysis window)
 MIN_PRICE_MOVE = 0.0003  # minimum price move as fraction of price (filters noise)
 MIN_DELTA_BARS = 3    # need at least this many bars with non-zero delta
 

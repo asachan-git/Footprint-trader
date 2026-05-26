@@ -123,9 +123,13 @@ def detect_wick_trap(bar: Bar, fp: FootprintMatrix, min_wick_pct: float = 0.30) 
 
 
 def wick_trap_signal(bars: list[Bar], fps: list[FootprintMatrix],
-                     min_wick_pct: float = 0.30) -> WickTrap | None:
-    """Check last 3 bars for any wick trap. Returns most recent match."""
-    for bar, fp in zip(reversed(bars[-3:]), reversed(fps[-3:])):
+                     min_wick_pct: float = 0.30,
+                     lookback: int = 20) -> WickTrap | None:
+    """Check last `lookback` bars for any wick trap. Returns most recent match.
+    Default lookback=20 = standard analysis window.
+    """
+    n = min(lookback, len(bars), len(fps))
+    for bar, fp in zip(reversed(bars[-n:]), reversed(fps[-n:])):
         t = detect_wick_trap(bar, fp, min_wick_pct)
         if t is not None:
             return t

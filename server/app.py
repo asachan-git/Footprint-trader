@@ -56,6 +56,14 @@ def _precompute_vp(settings: dict) -> None:
     except Exception as e:
         LOG.warning(f"[startup] VP cache build failed (non-fatal): {e}")
 
+    # Iteration observation snapshot
+    try:
+        from execution.observation_logger import write_snapshot
+        snap = write_snapshot(tag="startup")
+        LOG.info(f"[startup] observation snapshot written: {snap.name}")
+    except Exception as e:
+        LOG.warning(f"[startup] observation snapshot failed (non-fatal): {e}")
+
 
 def create_app() -> Flask:
     load_dotenv(ROOT / ".env")

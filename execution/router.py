@@ -191,6 +191,22 @@ def dispatch(decision: Decision, bar: Bar, settings: dict) -> dict:
 
     # Grid path: trading_mode in {buy_sell_only, grid} → fire mechanical 5-leg grid
     if trading_mode in ("buy_sell_only", "grid") and decision.side != "flat":
+        # Regime gate — refuse trades against confirmed trends
+        try:
+            from .regime import get_regime, is_blocked_by_regime
+            primary_tf = str(settings.get("instrument", {}).get("primary_tf", "1m"))
+            regime = get_regime(bar.symbol, primary_tf)
+            floor = float((settings.get("regime") or {}).get("block_against_trend_confidence", 0.75))
+            blocked, reason = is_blocked_by_regime(regime, decision.side, confidence_floor=floor)
+            if blocked:
+                import logging as _l
+                _l.getLogger(__name__).info(f"[router] {bar.symbol} {reason}")
+                return {"mode": settings["mode"], "skipped": reason,
+                        "regime": regime.type, "regime_confidence": regime.confidence}
+        except Exception as e:
+            import logging as _l
+            _l.getLogger(__name__).warning(f"[router] regime gate skipped: {e}")
+
         # Same-direction cycle guard
         try:
             from .position_store import position_store as _ps

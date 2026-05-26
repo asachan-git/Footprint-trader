@@ -203,7 +203,7 @@ def from_store(symbol: str, primary_tf: str) -> SweepSignal:
     from pipeline.features.swing import get as get_swing
 
     s = store()
-    recent = s.recent(symbol, primary_tf, 5)
+    recent = s.recent(symbol, primary_tf, 20)  # standardized analysis window
     if not recent:
         return _NONE
 
