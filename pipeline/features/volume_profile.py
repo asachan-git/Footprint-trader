@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
-from scipy.ndimage import uniform_filter1d
+from scipy.ndimage import gaussian_filter1d, uniform_filter1d
 from scipy.signal import find_peaks, peak_widths
 
 _TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1d": 86400, "1w": 604800}
@@ -193,23 +193,50 @@ def _build_price_map(bars) -> dict[float, float]:
 
 
 def _value_area(bins: np.ndarray, poc_idx: int, va_pct: float) -> tuple[int, int]:
-    """Steidlmayer pair-test expansion: from POC, step into the heavier 1-bin side."""
+    """Steidlmayer expansion: 2-bin pair-test for DIRECTION, 1-bin step size.
+
+    Uses 2-bin lookahead (classic Steidlmayer) to decide which side to expand
+    toward, but always moves 1 bin at a time so we never overshoot the target.
+    When both immediate neighbors are zero (sparse tick grid), skip ahead to
+    the next non-zero bin on each side rather than stopping.
+    """
     n = len(bins)
     total = bins.sum()
+    if total == 0:
+        return poc_idx, poc_idx
     target = total * va_pct
     lo_idx = hi_idx = poc_idx
     acc = float(bins[poc_idx])
-    while acc < target:
-        up = float(bins[hi_idx + 1]) if hi_idx + 1 < n else 0.0
-        down = float(bins[lo_idx - 1]) if lo_idx - 1 >= 0 else 0.0
-        if up == 0.0 and down == 0.0:
+    for _ in range(n * 2):
+        if acc >= target:
             break
-        if up >= down and hi_idx + 1 < n:
-            hi_idx += 1
-            acc += up
-        elif lo_idx - 1 >= 0:
-            lo_idx -= 1
-            acc += down
+        at_top = hi_idx + 1 >= n
+        at_bot = lo_idx - 1 < 0
+        if at_top and at_bot:
+            break
+        # Skip-zero: advance boundary past empty bins to find next volume
+        hi_look = hi_idx + 1
+        while hi_look < n and bins[hi_look] == 0:
+            hi_look += 1
+        lo_look = lo_idx - 1
+        while lo_look >= 0 and bins[lo_look] == 0:
+            lo_look -= 1
+        # 2-bin pair sums for direction decision
+        up1 = float(bins[hi_look]) if hi_look < n else 0.0
+        up2 = float(bins[hi_look + 1]) if hi_look + 1 < n else 0.0
+        dn1 = float(bins[lo_look]) if lo_look >= 0 else 0.0
+        dn2 = float(bins[lo_look - 1]) if lo_look - 1 >= 0 else 0.0
+        up_pair = up1 + up2
+        dn_pair = dn1 + dn2
+        if up_pair == 0 and dn_pair == 0:
+            break
+        # 1-bin step toward the heavier pair
+        if not at_top and (at_bot or up_pair >= dn_pair):
+            hi_idx = hi_look          # jump to next non-zero
+            acc += float(bins[hi_idx])
+        elif not at_bot:
+            lo_idx = lo_look
+            acc += float(bins[lo_idx])
         else:
             break
     return lo_idx, hi_idx
@@ -288,11 +315,32 @@ def _zones_from_peaks(
     return sorted(result, key=lambda z: z["low"])
 
 
+def _smooth(bins: np.ndarray, n_bins: int) -> np.ndarray:
+    """Gaussian smoothing — sigma fixed at 1.5 bins (just enough to merge tick noise)."""
+    return gaussian_filter1d(bins.astype(float), sigma=1.5)
+
+
+def _merge_zones(zones: list[dict], merge_tol: float) -> list[dict]:
+    """Merge adjacent zones whose gap is ≤ merge_tol (Sierra/Bookmap cluster merging)."""
+    if not zones:
+        return zones
+    merged = [dict(zones[0])]
+    for z in zones[1:]:
+        if z["low"] - merged[-1]["high"] <= merge_tol:
+            merged[-1]["high"] = max(merged[-1]["high"], z["high"])
+        else:
+            merged.append(dict(z))
+    return merged
+
+
 def _find_hvn_zones(
     bins: np.ndarray, bin_size: float, price_min: float, top_n: int = 4
 ) -> list[dict]:
-    """HVN via find_peaks on smoothed bins, prominence ≥ 0.5×avg, height ≥ avg."""
-    smoothed = uniform_filter1d(bins, size=3)
+    """HVN via Gaussian-smoothed bins, prominence ≥ 0.5×avg, height ≥ avg.
+    Adjacent zones within 2×bin_size are merged (Sierra/Bookmap convention).
+    """
+    n = len(bins)
+    smoothed = _smooth(bins, n)
     active = bins[bins > 0]
     if len(active) == 0:
         return []
@@ -303,18 +351,19 @@ def _find_hvn_zones(
         return []
 
     _, _, left_ips, right_ips = peak_widths(smoothed, peaks, rel_height=0.5)
-    return _zones_from_peaks(bins, peaks, left_ips, right_ips, bin_size, price_min, top_n=top_n)
+    zones = _zones_from_peaks(bins, peaks, left_ips, right_ips, bin_size, price_min, top_n=top_n * 2)
+    merged = _merge_zones(zones, merge_tol=bin_size)  # 1× bin_size gap = same cluster
+    return merged[:top_n]
 
 
 def _find_lvn_zones(
     bins: np.ndarray, bin_size: float, price_min: float, top_n: int = 4
 ) -> list[dict]:
-    """LVN via find_peaks on the INVERTED signal, restricted to active price range.
-
-    Restricting to [first_active, last_active] means tails (where price barely
-    visited) are never flagged as LVN — only true valleys between active zones.
+    """LVN via Gaussian-smoothed inverted signal, restricted to active range.
+    Adjacent valleys within 2×bin_size are merged.
     """
-    smoothed = uniform_filter1d(bins, size=3)
+    n = len(bins)
+    smoothed = _smooth(bins, n)
     active_idxs = np.where(bins > 0)[0]
     if len(active_idxs) == 0:
         return []
@@ -331,10 +380,12 @@ def _find_lvn_zones(
         return []
 
     _, _, left_ips, right_ips = peak_widths(inverted, valleys, rel_height=0.5)
-    return _zones_from_peaks(
+    zones = _zones_from_peaks(
         bins[first: last + 1], valleys, left_ips, right_ips,
-        bin_size, price_min, offset=first, top_n=top_n, ascending=True,
+        bin_size, price_min, offset=first, top_n=top_n * 2, ascending=True,
     )
+    merged = _merge_zones(zones, merge_tol=bin_size)
+    return merged[:top_n]
 
 
 def _compute_poc_va(
