@@ -46,6 +46,9 @@ vp_cache:
   vp_bin_size:
     BTCUSDT:  25.0          # 25$ bins (Sierra/Bookmap convention for BTC ~1300/day range = ~52 bins)
     XAUTUSDT: 1.0           # 1$ bins (was 0.5; gives ~25 bins per day for typical XAU range)
+  # Intra-day VP refresh — rebuild current day's POC/VAH/VAL/HVN/LVN every N
+  # primary-TF bars. Default 5 = every 5 minutes at 1m primary TF. Set 0 to disable.
+  intraday_refresh_bars: 5
 
 # Execution venue (Vantage MT5 via MetaApi)
 execution:

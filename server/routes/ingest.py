@@ -387,6 +387,22 @@ def ingest():
             return jsonify({"ok": True, "duplicate": True, "bar_id": bar.bar_id})
         _aggregate_mtf(bar, settings)
 
+        # Intra-day VP refresh — rebuild current-day VP every Nth primary bar
+        # so HVN/LVN, POC, VAH/VAL reflect today's accumulating volume.
+        if bar.tf == primary_tf:
+            refresh_n = int((settings.get("vp_cache") or {}).get("intraday_refresh_bars", 5))
+            if refresh_n > 0 and (bar.close_ts // 60) % refresh_n == 0:
+                try:
+                    from pipeline.features.vp_cache import build_and_save as _vp_build
+                    _vp_cfg = settings.get("vp_cache", {}) or {}
+                    _vp_build(
+                        [bar.symbol], primary_tf,
+                        session_start_utc=_vp_cfg.get("session_start_utc", {}),
+                        vp_bin_size=_vp_cfg.get("vp_bin_size", {}),
+                    )
+                except Exception as e:
+                    LOG.warning(f"[ingest] intraday VP refresh failed: {e}")
+
         # Snapshot VP + refresh cache + write daily journal at day boundary
         if prev and bar.tf == primary_tf:
             snapped = snapshot_if_boundary(prev.close_ts, bar.close_ts, bar.symbol, primary_tf)
