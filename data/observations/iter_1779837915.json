@@ -1,0 +1,99 @@
+{
+  "iter_ts": 1779837915,
+  "ist": "2026-05-27 04:55 IST",
+  "tag": "startup",
+  "git_sha": "59b9737",
+  "settings_excerpt": {
+    "trading_mode": "buy_sell_only",
+    "mode": "paper",
+    "vp_bin_size": {
+      "BTCUSDT": 25.0,
+      "XAUTUSDT": 1.0
+    },
+    "analysis": {
+      "standard_lookback": 20
+    },
+    "regime": {
+      "block_against_trend_confidence": 0.75
+    },
+    "cycle": {
+      "trend_escape": {
+        "bars": 3,
+        "atr_mult": 1.5
+      }
+    },
+    "decide_filter": {
+      "min_abs_delta": 2.0,
+      "min_confidence": 0.6,
+      "require_stacked": false,
+      "require_absorption": false,
+      "active_hours_utc": "",
+      "same_direction_cooldown": 3,
+      "rr_floor": 1.5,
+      "rr_floor_per_symbol": {
+        "XAUTUSDT": 1.2,
+        "BTCUSDT": 1.5
+      }
+    }
+  },
+  "decisions_last_24h": {
+    "BTCUSDT": {
+      "flat": 70,
+      "long": 19,
+      "rejected": 19,
+      "short": 36
+    },
+    "XAUTUSDT": {
+      "flat": 59,
+      "short": 26,
+      "rejected": 14,
+      "long": 16
+    }
+  },
+  "cycles_outcome_last_24h": {
+    "tp_hit": 14,
+    "sl_hit": 0,
+    "invalidated": 9,
+    "still_open": 0,
+    "total_cycles": 26,
+    "median_R": 0.0,
+    "sum_R": -7.543,
+    "max_legs_used": 5
+  },
+  "mode2_vote_distribution_last_24h": {
+    "cvd": {
+      "short": 25,
+      "long": 8
+    },
+    "vp_position": {
+      "short": 25,
+      "long": 1
+    },
+    "structure": {
+      "short": 23,
+      "long": 5
+    },
+    "fvg": {
+      "short": 23,
+      "long": 11
+    },
+    "wave": {
+      "short": 4
+    },
+    "wick_trap": {
+      "long": 14,
+      "short": 5
+    },
+    "sweep": {
+      "long": 0,
+      "short": 0,
+      "abstain": 0
+    },
+    "vp_shape": {
+      "long": 0,
+      "short": 0,
+      "abstain": 0
+    }
+  },
+  "open_positions": []
+}
