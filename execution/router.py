@@ -168,12 +168,37 @@ def _build_grid_plan(decision: Decision, bar: Bar, settings: dict):
 
 
 def dispatch_grid(plan, bar: Bar, settings: dict, parent_position_id: str | None = None) -> dict:
-    """Route a GridPlan to the active executor in {paper, live}."""
+    """Route a GridPlan to the active executor in {paper, live}.
+
+    For LIVE mode, the plan is venue-translated: % offsets from analysis-venue
+    anchor are re-applied to the execution-venue (Vantage) live mid quote.
+    This decouples Bybit/Binance analysis from Vantage MT5 execution.
+    """
     mode = settings.get("mode", "paper")
+    broker = str((settings.get("execution") or {}).get("broker") or "vantage_mt5")
+
+    # Venue translation (live mode only — paper uses Bybit price directly)
+    if mode == "live" and getattr(plan, "leg_offsets_pct", ()):
+        try:
+            from execution.grid_placer import to_normalized
+            from execution.venue_translator import translate, fetch_venue_quote
+            norm = to_normalized(plan)
+            quote = fetch_venue_quote(broker, plan.broker_symbol)
+            translated = translate(norm, quote, plan.broker_symbol, plan.side)
+            import logging as _l
+            _l.getLogger(__name__).info(
+                f"[router] venue-translated {plan.symbol}→{plan.broker_symbol}: "
+                f"bybit_anchor={plan.anchor_price:.4f} → vantage_anchor={translated.anchor_price:.4f} "
+                f"(quote_ok={quote.get('ok')}, tick={quote.get('tick_size')})"
+            )
+            plan = translated
+        except Exception as e:
+            import logging as _l
+            _l.getLogger(__name__).warning(f"[router] venue translation failed (using raw plan): {e}")
+
     if mode == "live":
         if os.environ.get("ALLOW_LIVE") != "1":
             raise LiveTripwireError("mode=live but ALLOW_LIVE != '1'")
-        broker = str((settings.get("execution") or {}).get("broker") or "vantage_mt5")
         adapter = _live(broker)._broker  # type: ignore[attr-defined]
         result = adapter.submit_grid(plan, bar)
         result["parent_position_id"] = parent_position_id

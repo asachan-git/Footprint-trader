@@ -45,6 +45,33 @@ class GridPlan:
     bias_strength: int
     safety_sl: float | None
     note: str
+    # NEW: scale-free view, populated by plan_grid for cross-venue translation
+    anchor_price: float = 0.0
+    leg_offsets_pct: tuple = ()      # tuple[float, ...] of (price - anchor) / anchor per leg
+    tp_offset_pct: float = 0.0       # (tp - anchor) / anchor
+    safety_sl_offset_pct: float | None = None
+
+
+@dataclass(frozen=True)
+class NormalizedGridLeg:
+    leg_idx: int
+    offset_pct: float          # signed % from anchor (negative = below)
+    lots: float
+    source: str
+
+
+@dataclass(frozen=True)
+class NormalizedGridPlan:
+    """Venue-neutral grid plan. Use venue_translator to materialize on a specific venue."""
+    symbol: str                # analysis-venue symbol
+    side: Literal["long", "short"]
+    anchor_price: float        # analysis-venue close at decision time (reference only)
+    legs: list[NormalizedGridLeg]
+    tp_offset_pct: float       # signed
+    tp_source: str
+    bias_strength: int
+    safety_sl_offset_pct: float | None
+    note: str
 
 
 def _fallback_leg_prices(
@@ -189,6 +216,14 @@ def plan_grid(
         safety_sl = (leg5_price - offset if direction == "long" else leg5_price + offset)
 
     sources_summary = ", ".join(f"leg{l.leg_idx}@{l.price:.2f}({l.source})" for l in legs)
+
+    # Scale-free view — % offsets from anchor for cross-venue translation
+    leg_offsets_pct = tuple((l.price - anchor) / anchor if anchor > 0 else 0.0 for l in legs)
+    tp_offset_pct = (tp_price - anchor) / anchor if anchor > 0 else 0.0
+    safety_sl_offset_pct = (
+        (safety_sl - anchor) / anchor if (safety_sl is not None and anchor > 0) else None
+    )
+
     return GridPlan(
         symbol=symbol, broker_symbol=broker_symbol,
         side=direction, legs=legs,
@@ -197,4 +232,30 @@ def plan_grid(
         bias_strength=bias_strength, safety_sl=safety_sl,
         note=(f"regime={regime_label} mode={grid_mode_label} legs={n_legs} "
               f"bias={bias_strength}/5 avg={avg_entry:.2f} tp={tp_price:.2f}({tp_source}) | {sources_summary}"),
+        anchor_price=anchor,
+        leg_offsets_pct=leg_offsets_pct,
+        tp_offset_pct=tp_offset_pct,
+        safety_sl_offset_pct=safety_sl_offset_pct,
+    )
+
+
+def to_normalized(plan: GridPlan) -> NormalizedGridPlan:
+    """Project a venue-bound GridPlan into a venue-neutral NormalizedGridPlan."""
+    n_legs = [
+        NormalizedGridLeg(
+            leg_idx=l.leg_idx,
+            offset_pct=plan.leg_offsets_pct[i] if i < len(plan.leg_offsets_pct) else 0.0,
+            lots=l.lots, source=l.source,
+        )
+        for i, l in enumerate(plan.legs)
+    ]
+    return NormalizedGridPlan(
+        symbol=plan.symbol, side=plan.side,
+        anchor_price=plan.anchor_price,
+        legs=n_legs,
+        tp_offset_pct=plan.tp_offset_pct,
+        tp_source=plan.tp_source,
+        bias_strength=plan.bias_strength,
+        safety_sl_offset_pct=plan.safety_sl_offset_pct,
+        note=plan.note,
     )

@@ -238,6 +238,40 @@ class MT5Adapter:
                 continue
         return False, ""
 
+    def get_quote(self, broker_symbol: str) -> dict:
+        """Sync helper: return live bid/ask/mid + tick size for a broker symbol.
+
+        Used by venue_translator to convert analysis-venue % offsets to
+        absolute Vantage prices at dispatch time.
+
+        Returns: {"bid": float, "ask": float, "mid": float, "tick_size": float,
+                  "min_distance": float|None, "ok": bool, "error": str|None}
+        """
+        try:
+            quote = self._run(self._async_get_quote(broker_symbol))
+            return quote
+        except Exception as e:
+            LOG.warning(f"[mt5] get_quote failed for {broker_symbol}: {e}")
+            return {"bid": None, "ask": None, "mid": None, "tick_size": 0.01,
+                    "min_distance": None, "ok": False, "error": str(e)}
+
+    async def _async_get_quote(self, broker_symbol: str) -> dict:
+        conn = await self._ensure_conn()
+        price = await conn.get_symbol_price(broker_symbol)
+        bid = price.get("bid")
+        ask = price.get("ask")
+        spec = await self._get_spec(broker_symbol)
+        tick_size = float(spec.get("tickSize") or 0.01)
+        stops_level = spec.get("stopsLevel") or 0   # broker minimum stop distance in points
+        # min distance in PRICE = stops_level × tickSize
+        min_distance = float(stops_level) * tick_size if stops_level else None
+        mid = ((bid + ask) / 2) if (bid is not None and ask is not None) else None
+        return {
+            "bid": bid, "ask": ask, "mid": mid,
+            "tick_size": tick_size, "min_distance": min_distance,
+            "ok": (bid is not None and ask is not None), "error": None,
+        }
+
     async def _async_check_spread(self, broker_symbol: str) -> tuple[bool, str]:
         """Reject if live spread exceeds max_spread[symbol]. No cap → always ok."""
         cap = float(self._max_spread.get(broker_symbol, 0.0) or 0.0)
