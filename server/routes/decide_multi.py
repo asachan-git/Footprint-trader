@@ -201,21 +201,24 @@ def decide_multi():
             prompt_version=version,
             model=cfg.model,
         )
+        dispatch_result = None
         if validator_reason is None and decision.side != "flat":
             latest = store().latest(sym, tf)
             if latest:
-                from execution.position_store import position_store as _ps
-                max_dd = float(settings.get("risk", {}).get("daily", {}).get("max_dd_r", 99))
-                if _ps().daily_realized_r() < -abs(max_dd):
-                    pass  # daily DD halt — skip new entry
-                else:
-                    dispatch(decision, latest, settings)
+                dispatch_result = dispatch(decision, latest, settings)
+                # Append dispatch result to the jsonl record
+                try:
+                    from llm.logger import append_dispatch_result
+                    append_dispatch_result(decision_id, dispatch_result)
+                except Exception as _e:
+                    LOG.warning(f"[decide_multi] dispatch result log failed: {_e}")
 
         results.append({
             "symbol": sym,
             "decision_id": decision_id,
             "decision": decision.model_dump(),
             "validator_reason": validator_reason,
+            "dispatched": dispatch_result,
         })
 
     return jsonify({

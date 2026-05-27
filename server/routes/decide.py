@@ -230,18 +230,7 @@ def decide():
 
     dispatch_result = None
     if validator_reason is None and decision.side != "flat":
-        # Daily DD halt — block new entries for the rest of the session
-        max_dd = float(settings.get("risk", {}).get("daily", {}).get("max_dd_r", 99))
-        daily_r = position_store().daily_realized_r()
-        # Circuit breaker — block new entries if exposure cap / net-R breached
-        from execution.hedge_manager import check_circuit_breaker
-        cb_hit, cb_reason = check_circuit_breaker(symbol, settings, position_store(), current_price=latest.ohlc.c)
-        if daily_r < -abs(max_dd):
-            dispatch_result = {"skipped": f"daily DD halt active (R={daily_r:.2f} ≤ -{max_dd})"}
-        elif cb_hit and not decision.add_to_existing:
-            dispatch_result = {"skipped": f"circuit breaker: {cb_reason}"}
-        else:
-            dispatch_result = dispatch(decision, latest, settings)
+        dispatch_result = dispatch(decision, latest, settings)
 
     return jsonify({
         "ok": True,

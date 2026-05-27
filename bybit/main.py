@@ -16,7 +16,8 @@ import logging
 from urllib import request as urlreq
 
 from .footprint_builder import FootprintBuilder
-from .ws_client import stream_trades
+from .ws_client import stream_trades as ws_stream_trades
+from .rest_poller import stream_trades as rest_stream_trades
 
 import sys; sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 from utils.logging_config import setup as _setup_logging; _setup_logging()
@@ -39,15 +40,19 @@ def _post(flask_url: str, payload: dict) -> None:
         LOG.warning(f"[bar→flask] POST failed: {e}")
 
 
-async def run(symbol: str, tf: str, flask_url: str, price_step: float, category: str) -> None:
+async def run(symbol: str, tf: str, flask_url: str, price_step: float, category: str, use_rest: bool = False) -> None:
     builder = FootprintBuilder(
         symbol=symbol,
         tf=tf,
         on_bar_close=lambda payload: _post(flask_url, payload),
         price_step=price_step,
     )
-    LOG.info(f"[bybit] streaming {symbol} {tf} ({category}) → {flask_url}/ingest (price_step={price_step})")
-    await stream_trades(symbol, builder.on_tick, category=category)
+    if use_rest:
+        LOG.info(f"[bybit] REST polling {symbol} {tf} ({category}) → {flask_url}/ingest (price_step={price_step})")
+        await rest_stream_trades(symbol, builder.on_tick, category=category)
+    else:
+        LOG.info(f"[bybit] streaming {symbol} {tf} ({category}) → {flask_url}/ingest (price_step={price_step})")
+        await ws_stream_trades(symbol, builder.on_tick, category=category)
 
 
 def main() -> None:
@@ -59,8 +64,10 @@ def main() -> None:
                     help="Round prices to this tick size for footprint cell grouping.")
     ap.add_argument("--category", default="linear", choices=["linear", "spot"],
                     help="linear=perpetuals (BTCUSDT), spot=spot pairs (PAXGUSDT)")
+    ap.add_argument("--rest", action="store_true",
+                    help="Use REST polling fallback instead of WebSocket (for geo-blocked regions)")
     args = ap.parse_args()
-    asyncio.run(run(args.symbol, args.tf, args.flask, args.price_step, args.category))
+    asyncio.run(run(args.symbol, args.tf, args.flask, args.price_step, args.category, use_rest=args.rest))
 
 
 if __name__ == "__main__":

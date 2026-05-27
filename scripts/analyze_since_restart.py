@@ -184,7 +184,16 @@ def main():
         else:
             print(f"Filter: since last restart {_ist(since)}")
 
-    m1_raw = [d for d in load_jsonl(ROOT / "data" / "decisions.jsonl") if d.get("ts", 0) >= since]
+    all_decision_recs = load_jsonl(ROOT / "data" / "decisions.jsonl")
+    # Build dispatch_result lookup: decision_id → dispatch_result dict
+    dispatch_lookup: dict = {}
+    for rec in all_decision_recs:
+        if "dispatch_result" in rec and "decision_id" in rec:
+            dispatch_lookup[rec["decision_id"]] = rec["dispatch_result"]
+        elif "dispatched" in rec and "decision_id" in rec:
+            dispatch_lookup[rec["decision_id"]] = rec["dispatched"]
+
+    m1_raw = [d for d in all_decision_recs if d.get("ts", 0) >= since and "decision" in d]
     # Dedup per (symbol, bar_id) — keep highest-confidence decision per bar
     by_bar: dict = {}
     for d in m1_raw:
@@ -217,12 +226,16 @@ def main():
                 entry=pos["entry"], sl=pos["sl"], tp=pos["tp"], side=pos["side"],
             )
 
+        did = d.get("decision_id", "")
+        dr = dispatch_lookup.get(did) or {}
         rows.append({
             "ts": d.get("ts"),
             "symbol": sym, "bar_id": bar,
             "side": dec.get("side"), "conf": dec.get("confidence", 0),
             "entry": dec.get("entry"), "sl": dec.get("stop_loss"), "tp": dec.get("take_profit"),
             "validator": d.get("validator_reason"),
+            "dispatch_skipped": dr.get("skipped") if isinstance(dr, dict) else None,
+            "dispatch_mode": dr.get("mode") if isinstance(dr, dict) else None,
             "rationale": (dec.get("rationale") or "")[:500],
             "entry_reasoning": dec.get("entry_reasoning", ""),
             "sl_reasoning": dec.get("sl_reasoning", ""),
@@ -251,6 +264,8 @@ def main():
                 mfe_mae = f"{mfe:+.2f}/{mae:+.2f}"
         elif r["validator"]:
             outcome = "rejected: " + r["validator"][:20]
+        elif r.get("dispatch_skipped"):
+            outcome = "skipped: " + str(r["dispatch_skipped"])[:20]
         else:
             outcome = r["side"] if r["side"] == "flat" else "no-dispatch"
         print(f"{_ist(r['ts']):<17} {r['symbol']:<10} {r['side']:<6} {r['conf']:<5.2f} {outcome:<22} {rr:<7} {mfe_mae:<14}")

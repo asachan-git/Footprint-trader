@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .parsers import atas_v1, binance_v1, bybit_v1, capital_v1, exness_v1, userscript_v1
+from .parsers import atas_v1, binance_v1, bybit_v1, capital_v1, dhan_v1, dhan_dom_v1, exness_v1, userscript_v1
 from .types import Bar
 
 
@@ -20,6 +20,10 @@ def normalize(payload: dict) -> Bar:
         return bybit_v1.parse(payload)
     if fmt == "capital_v1":
         return capital_v1.parse(payload)
+    if fmt == "dhan_v1":
+        return dhan_v1.parse(payload)
+    if fmt == "dhan_dom_v1":
+        return dhan_dom_v1.parse(payload)
     if fmt == "exness_v1":
         return exness_v1.parse(payload)
     if fmt == "userscript_v1":

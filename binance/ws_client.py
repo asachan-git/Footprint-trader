@@ -1,6 +1,6 @@
 """Binance Futures aggTrade WebSocket stream.
 
-Endpoint: wss://fstream.binance.com/ws/<symbol_lower>@aggTrade
+Endpoint: wss://stream.binance.com:9443/ws/<symbol_lower>@aggTrade
 No auth needed. Free public stream.
 
 aggTrade fields used:
@@ -23,7 +23,7 @@ import websockets
 
 LOG = logging.getLogger(__name__)
 
-BASE = "wss://fstream.binance.com/ws"
+BASE = "wss://stream.binance.com:9443/ws"
 
 
 async def stream_trades(

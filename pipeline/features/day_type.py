@@ -256,7 +256,7 @@ def from_store(symbol: str, primary_tf: str, session_start_utc: int = 0) -> DayT
     now = int(time.time())
     # Compute session start timestamp
     import datetime
-    utc_now = datetime.datetime.utcfromtimestamp(now)
+    utc_now = datetime.datetime.fromtimestamp(now, tz=datetime.timezone.utc)
     if utc_now.hour >= session_start_utc:
         session_date = utc_now.date()
     else:
@@ -264,6 +264,7 @@ def from_store(symbol: str, primary_tf: str, session_start_utc: int = 0) -> DayT
     session_start_ts = int(datetime.datetime(
         session_date.year, session_date.month, session_date.day,
         session_start_utc, 0, 0,
+        tzinfo=datetime.timezone.utc,
     ).timestamp())
 
     s = store()

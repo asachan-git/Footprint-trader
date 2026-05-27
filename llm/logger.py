@@ -60,6 +60,19 @@ def log_decision(
     return decision_id
 
 
+def append_dispatch_result(decision_id: str, dispatch_result: dict) -> None:
+    """Append a separate dispatch_result record to decisions.jsonl (linked by decision_id)."""
+    now = int(time.time())
+    rec = {
+        "decision_id": decision_id,
+        "ts": now,
+        "ts_ist": _ts_ist(now),
+        "dispatch_result": dispatch_result,
+    }
+    with _path().open("a") as fh:
+        fh.write(json.dumps(rec) + "\n")
+
+
 def _append_md(
     decision_id: str,
     ts: int,
