@@ -65,3 +65,6 @@ data/mode_compare.jsonl
 data/trade_analysis_*.md
 data/iter_compare_*.md
 
+
+# MetaApi runtime cache
+.metaapi/

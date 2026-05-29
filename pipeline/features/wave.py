@@ -1,56 +1,55 @@
 """Wave Phase + CVD Quality + Fibonacci Level Computation.
 
-Identifies where in the impulse-correction-exhaustion cycle the market is,
-using price structure and cumulative delta (CVD) together.
+Identifies current phase (impulse vs correction) from price structure + CVD.
+Fibonacci levels from impulse leg drive grid entry tiers (retrace) and TP tiers (extend).
 
-CVD is the key differentiator:
-  Correction + CVD HOLDING  → healthy pullback, add legs here
-  Correction + CVD DECLINING → potential reversal, reduce/skip
-  Exhaustion (delta divergence at extreme) → exit signal before price turns
-
-Fibonacci levels are measured from the detected impulse leg and give
-precise grid entry tiers (retrace) and dynamic TP tiers (extension).
+Elliott Wave counting runs on 15m bars (100-bar lookback) to identify which
+wave we're in: w1/w2/w3/w4/w5 or corrective wA/wB/wC.
+Wave 3 = strongest impulse (best trend-continuation entry, wider TP).
+Wave 5 = final leg (weaker volume, CVD divergence common — watch exhaustion).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# Fibonacci ratios used for retracement and extension
+# Fibonacci ratios
 RETRACE_LEVELS = (0.382, 0.500, 0.618, 0.786)
 EXTEND_LEVELS  = (1.000, 1.272, 1.618)
 
-# Minimum bars to form an identifiable impulse leg
 MIN_IMPULSE_BARS = 4
-# An impulse must move at least this fraction of the recent price range
-MIN_IMPULSE_PCT  = 0.002   # 0.2%
-# CVD holding tolerance: CVD decline ≤ this fraction of price decline = "holding"
+MIN_IMPULSE_PCT  = 0.002   # 0.2% minimum impulse size
 CVD_HOLD_TOLERANCE = 0.30
+
+# Wave counting constants
+WAVE_COUNT_LOOKBACK = 100   # 15m bars ≈ 25 hours of structure
+WAVE_SWING_HALF = 3         # ±3 bars = ±45 min at 15m for swing detection
 
 
 @dataclass
 class WavePhase:
-    phase: str              # "impulse" | "correction" | "exhaustion" | "reversal" | "unknown"
-    direction: str          # "up" | "down" (direction of the identified impulse)
+    phase: str              # "impulse" | "correction" | "unknown"
+    direction: str          # "up" | "down"
     confidence: float       # 0.0 – 1.0
 
-    # Impulse leg bounds (None if not identified)
     impulse_low: float | None
     impulse_high: float | None
-    impulse_range: float    # high - low (0 if not identified)
+    impulse_range: float
 
-    # Retracement state
-    retrace_pct: float      # 0.0 – 1.0 (how deep current correction is)
+    retrace_pct: float
     cvd_quality: str        # "holding" | "declining" | "diverging" | "unknown"
 
-    # Fibonacci price levels (populated when impulse is identified)
-    fib_retrace: dict[float, float] = field(default_factory=dict)   # {0.382: price, ...}
-    fib_extend:  dict[float, float] = field(default_factory=dict)   # {1.000: price, ...}
+    fib_retrace: dict[float, float] = field(default_factory=dict)
+    fib_extend:  dict[float, float] = field(default_factory=dict)
 
-    # Invalidation price: close below this = impulse thesis dead
     invalidation: float | None = None
-
     reason: str = ""
+
+    # Elliott Wave counting fields (populated when 15m lookback available)
+    impulse_count: int = 0       # segment number from anchor (1=w1, 2=w2, … 5=w5, 6+=corrective)
+    wave_label: str = "unknown"  # "w1"|"w2"|"w3"|"w4"|"w5"|"wA"|"wB"|"wC"|"unknown"
+    is_wave3: bool = False       # wave 3: length ≥ wave 1 + confirmed by structure
+    is_wave5: bool = False       # wave 5: shorter than wave 3, CVD diverging
 
 
 _UNKNOWN = WavePhase(
@@ -60,19 +59,28 @@ _UNKNOWN = WavePhase(
     reason="insufficient data",
 )
 
+_WAVE_LABELS: dict[int, str] = {
+    1: "w1", 2: "w2", 3: "w3", 4: "w4", 5: "w5",
+    6: "wA", 7: "wB", 8: "wC",
+}
 
-def detect_swing_points(bars, lookback: int = 5) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+
+def detect_swing_points(
+    bars, lookback: int = 2
+) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
     """Return (swing_highs, swing_lows) as (index, price) pairs.
 
-    A bar is a swing high if its high is the highest in a [i-2 .. i+2] window.
-    A bar is a swing low if its low is the lowest in that window.
+    lookback: half-window size. Bar i is a swing high if its high is the highest
+    in [i-lookback .. i+lookback]. Default 2 = ±2 bars (10 min at 1m, 30 min at 15m).
+    Use lookback=3 for 15m wave counting (±45 min).
     """
+    half = max(1, lookback)
     highs: list[tuple[int, float]] = []
     lows:  list[tuple[int, float]] = []
     n = len(bars)
-    for i in range(2, n - 2):
-        window_h = [bars[j].ohlc.h for j in range(i - 2, i + 3)]
-        window_l = [bars[j].ohlc.l for j in range(i - 2, i + 3)]
+    for i in range(half, n - half):
+        window_h = [bars[j].ohlc.h for j in range(i - half, i + half + 1)]
+        window_l = [bars[j].ohlc.l for j in range(i - half, i + half + 1)]
         if bars[i].ohlc.h == max(window_h):
             highs.append((i, bars[i].ohlc.h))
         if bars[i].ohlc.l == min(window_l):
@@ -81,29 +89,13 @@ def detect_swing_points(bars, lookback: int = 5) -> tuple[list[tuple[int, float]
 
 
 def _cum_delta_at(bars, idx: int) -> float:
-    """Cumulative delta from bar 0 up to and including bar idx."""
     return sum(b.delta or 0.0 for b in bars[:idx + 1])
 
 
-def _cvd_quality(
-    bars,
-    impulse_start_idx: int,
-    impulse_end_idx: int,
-    current_idx: int,
-    direction: str,
-) -> str:
-    """Assess CVD behaviour during the correction.
-
-    Compares:
-    - CVD at impulse end (peak/trough of the impulse)
-    - CVD now (during the correction)
-
-    direction: "up" impulse → correction = price falling, check if CVD holding up
-    direction: "down" impulse → correction = price rising, check if CVD holding down
-    """
+def _cvd_quality(bars, impulse_start_idx: int, impulse_end_idx: int,
+                 current_idx: int, direction: str) -> str:
     cvd_impulse_end = _cum_delta_at(bars, impulse_end_idx)
     cvd_now = _cum_delta_at(bars, current_idx)
-
     price_impulse_end = bars[impulse_end_idx].ohlc.c
     price_now = bars[current_idx].ohlc.c
 
@@ -113,23 +105,19 @@ def _cvd_quality(
     price_retrace_chg = abs(price_now - price_impulse_end) / abs(price_impulse_end)
 
     if direction == "up":
-        # Upward impulse → correction is price falling
-        # CVD holding = CVD not falling as fast as price
-        cvd_chg = cvd_now - cvd_impulse_end   # negative = CVD declining
+        cvd_chg = cvd_now - cvd_impulse_end
         if cvd_chg >= 0:
-            return "holding"  # CVD actually rising during price pullback (strong)
-        # Normalize: how much did CVD fall relative to price fall?
+            return "holding"
         cvd_decline_ratio = abs(cvd_chg) / (abs(cvd_impulse_end) + 1)
         if cvd_decline_ratio <= CVD_HOLD_TOLERANCE * price_retrace_chg:
             return "holding"
         if cvd_decline_ratio <= 0.5:
             return "declining"
-        return "diverging"  # CVD falling hard → reversal risk
-
-    else:  # direction == "down"
-        cvd_chg = cvd_now - cvd_impulse_end   # positive = CVD rising (correction buying)
+        return "diverging"
+    else:
+        cvd_chg = cvd_now - cvd_impulse_end
         if cvd_chg <= 0:
-            return "holding"  # CVD still falling / flat
+            return "holding"
         cvd_rise_ratio = abs(cvd_chg) / (abs(cvd_impulse_end) + 1)
         if cvd_rise_ratio <= CVD_HOLD_TOLERANCE * price_retrace_chg:
             return "holding"
@@ -138,46 +126,145 @@ def _cvd_quality(
         return "diverging"
 
 
-def _fib_levels(
-    low: float, high: float, direction: str
-) -> tuple[dict[float, float], dict[float, float]]:
-    """Compute Fibonacci retrace and extension levels from an impulse leg.
-
-    For an upward impulse (low → high):
-      Retracements are prices below the high.
-      Extensions are prices above the high.
-
-    For a downward impulse (high → low):
-      Retracements are prices above the low.
-      Extensions are prices below the low.
-    """
+def _fib_levels(low: float, high: float, direction: str) -> tuple[dict[float, float], dict[float, float]]:
     rng = high - low
     if rng <= 0:
         return {}, {}
-
     retrace: dict[float, float] = {}
     extend:  dict[float, float] = {}
-
     if direction == "up":
         for r in RETRACE_LEVELS:
             retrace[r] = round(high - rng * r, 6)
         for e in EXTEND_LEVELS:
             extend[e] = round(low + rng * e, 6)
-    else:  # down
+    else:
         for r in RETRACE_LEVELS:
             retrace[r] = round(low + rng * r, 6)
         for e in EXTEND_LEVELS:
             extend[e] = round(high - rng * e, 6)
-
     return retrace, extend
 
 
-def classify(bars, lookback: int = 20) -> WavePhase:
+# ── Elliott Wave counting ──────────────────────────────────────────────────────
+
+def _build_alternating_swings(
+    highs: list[tuple[int, float]], lows: list[tuple[int, float]]
+) -> list[tuple[int, float, str]]:
+    """Merge highs + lows into alternating sequence (H L H L …).
+
+    Consecutive same-type swings are collapsed to the most extreme.
+    Returns list of (bar_idx, price, "H"|"L").
+    """
+    combined = [(idx, price, "H") for idx, price in highs] + \
+               [(idx, price, "L") for idx, price in lows]
+    combined.sort(key=lambda x: x[0])
+
+    filtered: list[tuple[int, float, str]] = []
+    for swing in combined:
+        if not filtered or filtered[-1][2] != swing[2]:
+            filtered.append(swing)
+        else:
+            # Same type — keep more extreme
+            prev = filtered[-1]
+            if swing[2] == "H" and swing[1] > prev[1]:
+                filtered[-1] = swing
+            elif swing[2] == "L" and swing[1] < prev[1]:
+                filtered[-1] = swing
+    return filtered
+
+
+def _count_waves(bars, lookback: int = WAVE_COUNT_LOOKBACK) -> tuple[int, str, bool, bool]:
+    """Count Elliott Wave position from alternating swing sequence.
+
+    Returns (impulse_count, wave_label, is_wave3, is_wave5).
+
+    Algorithm:
+    1. Find swings with ±3 bar window (suitable for 15m structure)
+    2. Build alternating H/L sequence
+    3. Find macro anchor: lowest low (bullish) or highest high (bearish)
+       whichever comes first in the sequence
+    4. Count segments from anchor → map to wave label
+    5. Confirm wave 3 (length ≥ wave 1) and wave 5 (shorter than wave 3)
+    """
+    window = bars[-lookback:] if len(bars) >= lookback else bars
+    if len(window) < 20:
+        return 0, "unknown", False, False
+
+    highs, lows = detect_swing_points(window, lookback=WAVE_SWING_HALF)
+    if len(highs) < 2 or len(lows) < 2:
+        return 0, "unknown", False, False
+
+    raw_seq = _build_alternating_swings(highs, lows)
+
+    # Filter trivially small swings (flat bars, noise) — min 0.1% price move between swings
+    if raw_seq:
+        price_ref = raw_seq[0][1] or 1.0
+        seq: list[tuple[int, float, str]] = [raw_seq[0]]
+        for s in raw_seq[1:]:
+            if abs(s[1] - seq[-1][1]) / price_ref >= 0.001:
+                seq.append(s)
+            elif (s[2] == "H" and s[1] > seq[-1][1]) or (s[2] == "L" and s[1] < seq[-1][1]):
+                seq[-1] = s  # replace with more extreme within same micro-cluster
+        # EW never needs more than 10 alternating swings; take most recent
+        if len(seq) > 10:
+            seq = seq[-10:]
+    else:
+        seq = []
+
+    if len(seq) < 3:
+        return 0, "unknown", False, False
+
+    # Locate the macro anchor (most significant extreme in the sequence)
+    seq_lows  = [(i, s) for i, s in enumerate(seq) if s[2] == "L"]
+    seq_highs = [(i, s) for i, s in enumerate(seq) if s[2] == "H"]
+
+    if not seq_lows or not seq_highs:
+        return 0, "unknown", False, False
+
+    min_low_seqidx,  min_low_swing  = min(seq_lows,  key=lambda x: x[1][1])
+    max_high_seqidx, max_high_swing = max(seq_highs, key=lambda x: x[1][1])
+
+    # Anchor is whichever extreme comes FIRST in time
+    if min_low_seqidx < max_high_seqidx:
+        anchor_idx = min_low_seqidx   # bullish: low is anchor
+    else:
+        anchor_idx = max_high_seqidx  # bearish: high is anchor
+
+    sub = seq[anchor_idx:]           # sequence from anchor to present
+    if len(sub) < 2:
+        return 0, "unknown", False, False
+
+    segment_count = len(sub) - 1    # completed moves from anchor
+    wave_label = _WAVE_LABELS.get(segment_count, "unknown")
+
+    # Wave 3 confirmation: third leg, length ≥ wave 1
+    is_wave3 = False
+    if segment_count == 3 and len(sub) >= 4:
+        w1_range = abs(sub[1][1] - sub[0][1])
+        w3_range = abs(sub[3][1] - sub[2][1])
+        is_wave3 = w1_range > 0 and w3_range >= w1_range * 0.90
+
+    # Wave 5 confirmation: fifth leg, shorter than wave 3
+    is_wave5 = False
+    if segment_count == 5 and len(sub) >= 6:
+        w3_range = abs(sub[3][1] - sub[2][1])
+        w5_range = abs(sub[5][1] - sub[4][1])
+        # Wave 5 is typically shorter than wave 3 (no extended wave 5 case)
+        is_wave5 = w3_range > 0 and w5_range < w3_range * 0.95
+
+    return segment_count, wave_label, is_wave3, is_wave5
+
+
+# ── Main classify function ─────────────────────────────────────────────────────
+
+def classify(bars, lookback: int = 20, count_waves: bool = False) -> WavePhase:
     """Identify the current wave phase from recent bars.
 
     Args:
-        bars:     Recent bars ascending by close_ts. At least 8 needed.
-        lookback: How many of the recent bars to analyse for swing structure.
+        bars:        Recent bars ascending by close_ts. At least 8 needed.
+        lookback:    Bars to analyse for impulse/correction/Fib structure.
+        count_waves: If True, run Elliott Wave counting (needs ≥ 40 bars in `bars`).
+                     Set True when calling with 15m bars for full EW labeling.
     """
     window = bars[-lookback:] if len(bars) >= lookback else bars
     if len(window) < MIN_IMPULSE_BARS + 2:
@@ -188,140 +275,114 @@ def classify(bars, lookback: int = 20) -> WavePhase:
         return _UNKNOWN
 
     n = len(window)
-    current_price = window[-1].ohlc.c
     current_idx = n - 1
-
-    # --- Identify most recent impulse leg ---
-    # Try upward impulse: last significant swing_low → last significant swing_high
-    # Try downward impulse: last significant swing_high → last significant swing_low
-    # Use whichever leg is more recent and meaningful
-
     best_phase: WavePhase | None = None
 
-    # Upward impulse candidate
-    if swing_lows and swing_highs:
-        last_low_idx,  last_low_price  = swing_lows[-1]
-        last_high_idx, last_high_price = swing_highs[-1]
+    last_low_idx,  last_low_price  = swing_lows[-1]
+    last_high_idx, last_high_price = swing_highs[-1]
 
-        # Upward impulse: low comes before high
-        if last_low_idx < last_high_idx:
-            impulse_range = last_high_price - last_low_price
-            min_range = last_low_price * MIN_IMPULSE_PCT
-            if impulse_range >= min_range:
-                retrace_now = (last_high_price - current_price) / impulse_range
-                retrace_now = max(0.0, min(1.0, retrace_now))
-                cvd_q = _cvd_quality(window, last_low_idx, last_high_idx, current_idx, "up")
-                retrace, extend = _fib_levels(last_low_price, last_high_price, "up")
+    if last_low_idx < last_high_idx:
+        # Upward impulse
+        impulse_range = last_high_price - last_low_price
+        min_range = last_low_price * MIN_IMPULSE_PCT
+        if impulse_range >= min_range:
+            retrace_now = max(0.0, min(1.0, (last_high_price - window[-1].ohlc.c) / impulse_range))
+            cvd_q = _cvd_quality(window, last_low_idx, last_high_idx, current_idx, "up")
+            retrace, extend = _fib_levels(last_low_price, last_high_price, "up")
+            phase, conf = _assign_phase(retrace_now, cvd_q, "up")
+            best_phase = WavePhase(
+                phase=phase, direction="up", confidence=conf,
+                impulse_low=last_low_price, impulse_high=last_high_price,
+                impulse_range=round(impulse_range, 6),
+                retrace_pct=round(retrace_now, 3),
+                cvd_quality=cvd_q,
+                fib_retrace=retrace, fib_extend=extend,
+                invalidation=round(retrace.get(0.786, last_low_price), 6),
+                reason=f"up {last_low_price:.2f}→{last_high_price:.2f} retrace {retrace_now*100:.1f}% CVD {cvd_q}",
+            )
 
-                phase, conf = _assign_phase(retrace_now, cvd_q, "up")
-                best_phase = WavePhase(
-                    phase=phase, direction="up", confidence=conf,
-                    impulse_low=last_low_price, impulse_high=last_high_price,
-                    impulse_range=round(impulse_range, 6),
-                    retrace_pct=round(retrace_now, 3),
-                    cvd_quality=cvd_q,
-                    fib_retrace=retrace, fib_extend=extend,
-                    invalidation=round(retrace.get(0.786, last_low_price), 6),
-                    reason=f"upward impulse {last_low_price:.2f}→{last_high_price:.2f}, retrace {retrace_now*100:.1f}%, CVD {cvd_q}",
-                )
+    elif last_high_idx < last_low_idx:
+        # Downward impulse
+        impulse_range = last_high_price - last_low_price
+        min_range = last_high_price * MIN_IMPULSE_PCT
+        if impulse_range >= min_range:
+            retrace_now = max(0.0, min(1.0, (window[-1].ohlc.c - last_low_price) / impulse_range))
+            cvd_q = _cvd_quality(window, last_high_idx, last_low_idx, current_idx, "down")
+            retrace, extend = _fib_levels(last_low_price, last_high_price, "down")
+            phase, conf = _assign_phase(retrace_now, cvd_q, "down")
+            best_phase = WavePhase(
+                phase=phase, direction="down", confidence=conf,
+                impulse_low=last_low_price, impulse_high=last_high_price,
+                impulse_range=round(impulse_range, 6),
+                retrace_pct=round(retrace_now, 3),
+                cvd_quality=cvd_q,
+                fib_retrace=retrace, fib_extend=extend,
+                invalidation=round(retrace.get(0.786, last_high_price), 6),
+                reason=f"down {last_high_price:.2f}→{last_low_price:.2f} retrace {retrace_now*100:.1f}% CVD {cvd_q}",
+            )
 
-        # Downward impulse: high comes before low
-        elif last_high_idx < last_low_idx:
-            impulse_range = last_high_price - last_low_price
-            min_range = last_high_price * MIN_IMPULSE_PCT
-            if impulse_range >= min_range:
-                retrace_now = (current_price - last_low_price) / impulse_range
-                retrace_now = max(0.0, min(1.0, retrace_now))
-                cvd_q = _cvd_quality(window, last_high_idx, last_low_idx, current_idx, "down")
-                retrace, extend = _fib_levels(last_low_price, last_high_price, "down")
-
-                phase, conf = _assign_phase(retrace_now, cvd_q, "down")
-                best_phase = WavePhase(
-                    phase=phase, direction="down", confidence=conf,
-                    impulse_low=last_low_price, impulse_high=last_high_price,
-                    impulse_range=round(impulse_range, 6),
-                    retrace_pct=round(retrace_now, 3),
-                    cvd_quality=cvd_q,
-                    fib_retrace=retrace, fib_extend=extend,
-                    invalidation=round(retrace.get(0.786, last_high_price), 6),
-                    reason=f"downward impulse {last_high_price:.2f}→{last_low_price:.2f}, retrace {retrace_now*100:.1f}%, CVD {cvd_q}",
-                )
+    # Elliott Wave counting (only when requested + impulse detected + enough bars)
+    if count_waves and best_phase is not None and len(bars) >= 40:
+        seg, label, w3, w5 = _count_waves(bars)
+        best_phase.impulse_count = seg
+        best_phase.wave_label = label
+        best_phase.is_wave3 = w3
+        best_phase.is_wave5 = w5
 
     return best_phase or _UNKNOWN
 
 
 def _assign_phase(retrace_pct: float, cvd_quality: str, direction: str) -> tuple[str, float]:
-    """Assign phase name and confidence from retracement depth and CVD quality."""
-    # Not retraced yet — still in impulse or just at top/bottom
     if retrace_pct < 0.10:
-        if cvd_quality == "diverging":
-            return "exhaustion", 0.70
         return "impulse", 0.65
-
-    # Healthy correction zone (38.2% – 61.8%)
     if 0.30 <= retrace_pct <= 0.65:
         if cvd_quality == "holding":
             return "correction", 0.80
         if cvd_quality == "declining":
             return "correction", 0.55
-        return "correction", 0.45  # diverging CVD in correction = watch carefully
-
-    # Deep correction (61.8% – 78.6%) — still valid but weakening
-    if 0.65 < retrace_pct <= 0.82:
-        if cvd_quality == "holding":
-            return "correction", 0.60
-        return "reversal", 0.55
-
-    # Beyond 78.6% — invalidation zone
-    if retrace_pct > 0.82:
-        return "reversal", 0.75
-
-    # Shallow retrace (10% – 30%) — early correction
+        return "correction", 0.45
+    if retrace_pct > 0.65:
+        return "correction", 0.55 if cvd_quality == "holding" else 0.40
     return "correction", 0.50
 
 
 def target_tier(wave: WavePhase, current_price: float) -> tuple[str, float | None]:
-    """Suggest current target tier based on wave extension levels.
-
-    Returns (tier_name, price): "T1", "T2", or "T3" with the price target.
-    """
-    if not wave.fib_extend or wave.phase not in ("impulse", "correction"):
+    if not wave.fib_extend or wave.phase == "unknown":
         return "none", None
-
     ext = wave.fib_extend
     t1 = ext.get(1.000)
     t2 = ext.get(1.272)
     t3 = ext.get(1.618)
-
     if wave.direction == "up":
-        if t1 and current_price < t1:
-            return "T1", t1
-        if t2 and current_price < t2:
-            return "T2", t2
-        if t3:
-            return "T3", t3
+        if t1 and current_price < t1: return "T1", t1
+        if t2 and current_price < t2: return "T2", t2
+        if t3: return "T3", t3
     else:
-        if t1 and current_price > t1:
-            return "T1", t1
-        if t2 and current_price > t2:
-            return "T2", t2
-        if t3:
-            return "T3", t3
-
+        if t1 and current_price > t1: return "T1", t1
+        if t2 and current_price > t2: return "T2", t2
+        if t3: return "T3", t3
     return "none", None
 
 
 def nearest_retrace_level(wave: WavePhase, current_price: float) -> tuple[float | None, float | None]:
-    """Return (fib_ratio, price) of the nearest Fibonacci retrace level to current price."""
     if not wave.fib_retrace:
         return None, None
-    closest = min(wave.fib_retrace.items(), key=lambda kv: abs(kv[1] - current_price))
-    return closest
+    return min(wave.fib_retrace.items(), key=lambda kv: abs(kv[1] - current_price))
 
 
 def from_store(symbol: str, primary_tf: str, lookback: int = 20) -> WavePhase:
-    """Convenience: classify wave phase from state_store recent bars."""
+    """Classify wave phase from state_store bars on given TF."""
     from pipeline.state_store import store
-    s = store()
-    bars = s.recent(symbol, primary_tf, lookback + 5)
+    bars = store().recent(symbol, primary_tf, lookback + 5)
     return classify(bars, lookback=lookback)
+
+
+def from_store_15m(symbol: str, lookback: int = 20) -> WavePhase:
+    """Classify wave phase + Elliott Wave count from 15m bars.
+
+    Uses WAVE_COUNT_LOOKBACK (100 bars) for wave counting and `lookback`
+    bars for the impulse/correction/Fib structure.
+    """
+    from pipeline.state_store import store
+    bars = store().recent(symbol, "15m", max(WAVE_COUNT_LOOKBACK + 5, lookback + 5))
+    return classify(bars, lookback=lookback, count_waves=True)

@@ -68,7 +68,7 @@ async def main() -> int:
     if not bid or not ask:
         LOG.error("[abort] no price for symbol — market closed?")
         return 3
-    LOG.info(f"[market] {SYMBOL} bid={bid} ask={ask} spread={ask - bid:.4f}")
+    LOG.info(f"[market] {SYMBOL} bid={bid} ask={ask} spread={ask - bid:.2f}")
 
     sl = round(ask - SL_DISTANCE, 2)
     tp = round(ask + TP_DISTANCE, 2)

@@ -19,12 +19,9 @@ from pipeline.features import (
     imbalance_per_level,
     stacked_imbalances,
     detect_absorption,
-    poc,
-    value_area,
 )
 from pipeline.features.volume_profile import from_store as vp_from_store
 from pipeline.features.vp_history import get_history as vp_history
-from pipeline.features import poc as poc_feat
 import pipeline.features.vp_cache as vp_cache
 from pipeline.features.session import current_session, htf_bias
 from pipeline.types import Bar
@@ -40,13 +37,27 @@ def _few_shot_block(n: int) -> str:
     p = PROMPTS_DIR / "few_shot" / "examples.jsonl"
     if not p.exists():
         return ""
-    lines = [ln for ln in p.read_text().splitlines() if ln.strip()][:n]
-    return "\n\nExamples:\n" + "\n".join(lines)
+    raw_lines = [ln for ln in p.read_text().splitlines() if ln.strip()][:n]
+    parts: list[str] = []
+    for ln in raw_lines:
+        try:
+            ex = json.loads(ln)
+            if "input" in ex and "output" in ex:
+                parts.append(f"Input:\n{ex['input']}\nOutput:\n{json.dumps(ex['output'])}")
+            else:
+                parts.append(ln)
+        except Exception:
+            parts.append(ln)
+    return "\n\n[FEW-SHOT EXAMPLES]\n" + "\n\n---\n".join(parts)
 
 
-def cached_prefix(few_shot_count: int = 4) -> str:
+def cached_prefix(few_shot_count: int = 6) -> str:
     version = active_version()
-    system_text = (PROMPTS_DIR / "system" / f"{version}.txt").read_text()
+    body_path = PROMPTS_DIR / "system" / f"{version}_body.txt"
+    if body_path.exists():
+        system_text = body_path.read_text()
+    else:
+        system_text = (PROMPTS_DIR / "system" / f"{version}.txt").read_text()
     return system_text + _few_shot_block(few_shot_count)
 
 
@@ -62,7 +73,7 @@ def _bar_summary(bar: Bar) -> dict:
         "close_ts": bar.close_ts,
         "ohlc": {"o": bar.ohlc.o, "h": bar.ohlc.h, "l": bar.ohlc.l, "c": bar.ohlc.c},
         "delta": bar_delta(fp),
-        "poc": poc(fp),
+        "poc": fp.poc_price,
         "stacked": [
             {"side": z.side, "low": z.price_low, "high": z.price_high, "count": z.count}
             for z in stacked
@@ -205,21 +216,6 @@ def variable_suffix(
     except Exception:
         pass
 
-    # Delta divergence
-    divergence_ctx: dict | None = None
-    try:
-        from pipeline.features.delta_divergence import detect as _div_detect
-        _dsig = _div_detect(primary, n=5)
-        if _dsig.type != "none":
-            divergence_ctx = {
-                "type": _dsig.type,
-                "confidence": _dsig.confidence,
-                "price_change_pct": _dsig.price_change_pct,
-                "reason": _dsig.reason,
-            }
-    except Exception:
-        pass
-
     # Wave phase + Fibonacci levels
     wave_ctx: dict | None = None
     try:
@@ -297,7 +293,6 @@ def variable_suffix(
         "market_structure": {
             "day_type": day_type_ctx,
             "auction": auction_ctx,
-            "divergence": divergence_ctx,
             "wave": wave_ctx,
             "sweep": sweep_ctx,
             "big_trade": big_trade_ctx,
@@ -305,6 +300,283 @@ def variable_suffix(
         "vp_setup": _vp_setup_ctx(symbol, primary, cached_daily, htf, session_cvd),
     }
     return json.dumps(payload)
+
+
+def _sym_abbrev(symbol: str) -> str:
+    """XAUTUSDT → XAU, BTCUSDT → BTC, etc."""
+    s = symbol.upper().replace("USDT", "").replace("USD", "")
+    return s[:6]
+
+
+def build_cached_prefix(few_shot_count: int = 6) -> str:
+    """Build the cacheable prefix: v4 system prompt + tool schema + few-shots.
+
+    This block is marked cache_control by llm/client.py and paid once per
+    5-min Anthropic cache window (~4000-5000 tokens, zero per-call after hit).
+    """
+    body_path = PROMPTS_DIR / "system" / "v4_body.txt"
+    if body_path.exists():
+        system_text = body_path.read_text()
+    else:
+        version = active_version()
+        system_text = (PROMPTS_DIR / "system" / f"{version}.txt").read_text()
+
+    # Append tool schema
+    try:
+        from llm.schema import GRID_PLAN_TOOL
+        tool_block = "\n\n[TOOL SCHEMA]\n" + json.dumps(GRID_PLAN_TOOL, indent=2)
+    except Exception:
+        tool_block = ""
+
+    return system_text + tool_block + _few_shot_block(few_shot_count)
+
+
+def build_compact_suffix(
+    primary: list[Bar],
+    direction_result: dict | None = None,
+    atr_val: float | None = None,
+) -> str:
+    """Build the compact variable suffix (~140 tokens for FULL mode).
+
+    Format:
+        sym=XAU p=4456 atr=8 reg=trend_up:.72 shape=b htf=bull
+        vp:poc=4455 va=4448-4462 hvn=4450,4458
+        dir=long conf=.85 sig=continuation
+        z=+0:.92,-4:.85,-8:.78
+        d=-45,-120,30,-200,-125
+        [anchors_inrange=...]   ← only when price within 0.3×ATR of anchor
+        [sweeps_active=...]     ← only when fresh sweep with delta_confirms
+    """
+    if not primary:
+        return ""
+
+    symbol = primary[0].symbol
+    bar = primary[-1]
+    current_price = bar.ohlc.c
+
+    # ATR
+    if atr_val is None or atr_val <= 0:
+        try:
+            from pipeline.features.atr import atr_from_store
+            atr_val = atr_from_store(symbol, primary[0].tf, period=14)
+        except Exception:
+            atr_val = 0.0
+    if atr_val <= 0:
+        atr_val = max(bar.ohlc.h - bar.ohlc.l, 1e-6)
+
+    # Regime
+    reg_str = "uncertain:.50"
+    shape_str = "D"
+    try:
+        from pipeline.features.day_type import classify as _dt_classify
+        from pipeline.state_store import store as _store
+        session_bars = _store().recent(symbol, primary[0].tf, 500)
+        from types import SimpleNamespace as _NS
+        import pipeline.features.vp_cache as _vpc
+        _cached_daily = _vpc.get(symbol, "daily")
+        _daily_vp_ns = _NS(**_cached_daily) if _cached_daily else None
+        _dt = _dt_classify(session_bars or primary, daily_vp=_daily_vp_ns)
+        reg_str = f"{_dt.type}:{_dt.confidence:.2f}"
+        if _cached_daily:
+            shape_str = _cached_daily.get("shape", "D") or "D"
+    except Exception:
+        pass
+
+    # HTF bias
+    htf_str = "neutral"
+    try:
+        from pipeline.features.session import htf_bias as _htf_bias
+        from pipeline.state_store import store as _store
+        daily_bars = _store().recent(symbol, "1d", 30) or []
+        if daily_bars:
+            htf_str = _htf_bias(daily_bars).get("bias", "neutral")
+    except Exception:
+        pass
+
+    # VP block
+    poc_str = vah_str = val_str = ""
+    hvn_str = ""
+    try:
+        import pipeline.features.vp_cache as _vpc
+        _vp = _vpc.get(symbol, "daily")
+        if _vp:
+            poc_str = str(round(float(_vp.get("poc", 0) or 0), 2))
+            vah_str = str(round(float(_vp.get("vah", 0) or 0), 2))
+            val_str = str(round(float(_vp.get("val", 0) or 0), 2))
+            _hvns = (_vp.get("hvn_zones") or [])[:2]
+            hvn_prices = [round((h["low"] + h["high"]) / 2, 2) for h in _hvns]
+            hvn_str = ",".join(str(p) for p in hvn_prices)
+    except Exception:
+        pass
+
+    # Direction
+    dir_str = conf_str = sig_str = "flat"
+    conf_str = ".50"
+    sig_str = "none"
+    if direction_result:
+        dir_str = direction_result.get("side", "flat")
+        _conf = direction_result.get("confidence", 0.5)
+        conf_str = f"{_conf:.2f}".lstrip("0") or ".50"
+        sig_str = direction_result.get("signal", direction_result.get("sig", "none"))
+    else:
+        dir_str = "flat"
+
+    # Entry zones as offsets
+    z_parts: list[str] = []
+    try:
+        from execution.zone_collector import collect as _collect_zones
+        _side = dir_str if dir_str != "flat" else "long"
+        _zones = _collect_zones(symbol, _side, current_price, n=5, min_gap=atr_val * 0.3)
+        for z in _zones[:3]:
+            offset = round(z.price - current_price, 2)
+            sign = "+" if offset >= 0 else ""
+            z_parts.append(f"{sign}{offset}:{z.strength:.2f}".rstrip("0").rstrip("."))
+    except Exception:
+        pass
+    z_str = ",".join(z_parts) if z_parts else "+0:.80"
+
+    # Last 5 bar deltas
+    d_parts: list[str] = []
+    try:
+        fps = [build_fp(b) for b in primary[-5:]]
+        from pipeline.features import bar_delta as _bar_delta
+        d_parts = [str(round(_bar_delta(fp))) for fp in reversed(fps)]
+    except Exception:
+        pass
+    d_str = ",".join(d_parts) if d_parts else "0"
+
+    abbrev = _sym_abbrev(symbol)
+    lines = [
+        f"sym={abbrev} p={round(current_price,2)} atr={round(atr_val,2)} reg={reg_str} shape={shape_str} htf={htf_str}",
+    ]
+
+    vp_line_parts = []
+    if poc_str:
+        vp_line_parts.append(f"poc={poc_str}")
+    if val_str and vah_str:
+        vp_line_parts.append(f"va={val_str}-{vah_str}")
+    if hvn_str:
+        vp_line_parts.append(f"hvn={hvn_str}")
+    if vp_line_parts:
+        lines.append("vp:" + " ".join(vp_line_parts))
+
+    lines.append(f"dir={dir_str} conf={conf_str} sig={sig_str}")
+    lines.append(f"z={z_str}")
+    lines.append(f"d={d_str}")
+
+    # Optional: active anchor bars in range
+    try:
+        from pipeline.features.anchor_bar import active_anchors as _active_anchors
+        anchors = _active_anchors(symbol, current_price, atr_val)
+        if anchors:
+            parts = [f"{round((a.high+a.low)/2,2)}:{a.delta_sign} age={a.age_bars} vol_z={a.vol_z:.1f}"
+                     for a in anchors[:3]]
+            lines.append(f"anchors_inrange=[{', '.join(parts)}]")
+    except Exception:
+        pass
+
+    # Optional: active sweeps
+    try:
+        from pipeline.features.sweep import active_sweeps as _active_sweeps
+        sweeps = _active_sweeps(symbol)
+        fresh = [s for s in sweeps if s.delta_confirms and s.age_bars <= 10]
+        if fresh:
+            parts = [f"{s.swept_level}:{s.sweep_type.replace('sweep_','')} age={s.age_bars}"
+                     for s in fresh[:2]]
+            lines.append(f"sweeps_active=[{', '.join(parts)}]")
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+
+def _coarse_footprint(bars: list[Bar], bin_size: float, top_k: int = 10) -> str:
+    """Re-bin footprint into wider price buckets for coarse_footprint mode.
+
+    Returns multi-line string, one line per bar:
+      b-2: <price>[<delta>:<vol>] ...
+      b-1: ...
+      b0:  ...
+    """
+    if not bars:
+        return ""
+    lines = []
+    n = len(bars)
+    for i, bar in enumerate(bars):
+        label = f"b{i - n + 1}" if i < n - 1 else "b0"
+        label = label.replace("b-0", "b0")
+        fp = build_fp(bar)
+        # Aggregate cells into wider bins: delta = ask - bid, vol = ask + bid
+        bins: dict[float, list] = {}  # bin_low → [delta, vol]
+        for cell in fp.cells:
+            bin_low = (cell.price // bin_size) * bin_size
+            b = bins.setdefault(bin_low, [0.0, 0.0])
+            b[0] += cell.ask_vol - cell.bid_vol
+            b[1] += cell.ask_vol + cell.bid_vol
+        # Sort by vol descending, keep top_k
+        top = sorted(bins.items(), key=lambda x: x[1][1], reverse=True)[:top_k]
+        top.sort(key=lambda x: x[0])  # re-sort by price for readability
+        level_strs = [f"{round(bl,2)}[{round(dv[0]):+d}:{round(dv[1])}]"
+                      for bl, dv in top if dv[1] > 0]
+        lines.append(f" {label}: {' '.join(level_strs)}")
+    return "\n".join(lines)
+
+
+def build_coarse_footprint_suffix(
+    primary: list[Bar],
+    direction_result: dict | None = None,
+    atr_val: float | None = None,
+    bin_size: float | None = None,
+    full_fp_bars: int = 3,
+    delta_tail: int = 5,
+    top_k: int = 10,
+) -> str:
+    """~250-token variant: compact header + coarse-binned footprint for last 3 bars
+    + delta-only tail for bars -3 to -7.
+    """
+    if not primary:
+        return ""
+
+    symbol = primary[0].symbol
+
+    if bin_size is None:
+        try:
+            import pipeline.features.vp_cache as _vpc
+            _cfg = (_vpc._load() or {}).get(symbol, {})
+            _inst = _cfg.get("instrument") or {}
+            bin_size = float(_inst.get("coarse_fp_bin_size") or 2.5)
+        except Exception:
+            bin_size = 2.5
+
+    # Build compact header (same as compact suffix but without z= and d=)
+    compact = build_compact_suffix(primary, direction_result, atr_val)
+    compact_lines = compact.splitlines()
+    # Keep header lines, replace d= with coarse footprint block
+    header_lines = [l for l in compact_lines if not l.startswith("d=")]
+
+    # Full footprint: last full_fp_bars bars
+    fp_bars = primary[-full_fp_bars:] if len(primary) >= full_fp_bars else primary
+    fp_block = _coarse_footprint(fp_bars, bin_size, top_k)
+
+    # Delta tail: bars before the fp_bars
+    tail_bars = primary[-(full_fp_bars + delta_tail):-full_fp_bars] if len(primary) > full_fp_bars else []
+    d_tail_parts: list[str] = []
+    if tail_bars:
+        try:
+            fps = [build_fp(b) for b in tail_bars]
+            from pipeline.features import bar_delta as _bar_delta
+            d_tail_parts = [str(round(_bar_delta(fp))) for fp in reversed(fps)]
+        except Exception:
+            pass
+    d_tail_line = f"d_tail={','.join(d_tail_parts)}" if d_tail_parts else ""
+
+    parts = header_lines
+    if fp_block:
+        parts += [f"fp bins={bin_size}"] + fp_block.splitlines()
+    if d_tail_line:
+        parts.append(d_tail_line)
+
+    return "\n".join(parts)
 
 
 def _vp_setup_ctx(symbol: str, primary: list, cached_daily, htf: dict, session_cvd: float) -> dict | None:

@@ -168,6 +168,26 @@ def patch_jsonl(symbol: str, new_bars: dict[int, dict], dry_run: bool = False) -
     """Replace synthetic_ohlcv entries in the stored JSONL with real tick data."""
     fpath = DATA_DIR / f"{symbol}_1m.jsonl"
     if not fpath.exists():
+        # Fresh write — no existing file to merge with
+        if not dry_run:
+            lines = []
+            for close_ts, b in sorted(new_bars.items()):
+                bid = [{"price": p, "vol": round(v, 6)} for p, v in sorted(b["bid_ladder"].items())]
+                ask = [{"price": p, "vol": round(v, 6)} for p, v in sorted(b["ask_ladder"].items())]
+                lines.append(json.dumps({
+                    "bar_id":      _bar_id(symbol, "1m", close_ts),
+                    "symbol":      symbol,
+                    "tf":          "1m",
+                    "close_ts":    close_ts,
+                    "source":      "bybit_tick_rebuilt",
+                    "ohlc":        {"o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"]},
+                    "bid_ladder":  bid,
+                    "ask_ladder":  ask,
+                    "poc":         None,
+                    "delta":       round(b["delta"], 6),
+                    "trade_count": b["trade_count"],
+                }))
+            fpath.write_text("\n".join(lines) + "\n")
         return {"status": "no_file"}
 
     existing = [json.loads(l) for l in fpath.read_text().splitlines() if l.strip()]
@@ -266,11 +286,14 @@ def run(days: int = 7, dry_run: bool = False, symbols: list[str] | None = None) 
         result = patch_jsonl(symbol, all_bars, dry_run=dry_run)
         action = "(dry-run)" if dry_run else "→ written"
         print(f"  [patch]  {action}")
-        print(f"    replaced:       {result['replaced']:>6}  synthetic→real")
-        print(f"    kept synthetic: {result['kept_synthetic']:>6}  (outside tick range)")
-        print(f"    kept live:      {result['kept_live']:>6}  (WebSocket bars unchanged)")
-        print(f"    new added:      {result['new_added']:>6}  (gaps filled)")
-        print(f"    total bars:     {result['total']:>6}")
+        if result.get("status") == "no_file":
+            print(f"    fresh write:    {len(all_bars):>6}  (no existing file)")
+        else:
+            print(f"    replaced:       {result['replaced']:>6}  synthetic→real")
+            print(f"    kept synthetic: {result['kept_synthetic']:>6}  (outside tick range)")
+            print(f"    kept live:      {result['kept_live']:>6}  (WebSocket bars unchanged)")
+            print(f"    new added:      {result['new_added']:>6}  (gaps filled)")
+            print(f"    total bars:     {result['total']:>6}")
 
     print(f"\n{'='*60}")
     if not dry_run:
