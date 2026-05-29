@@ -1,23 +1,36 @@
-"""Liquidity sweep detector.
+"""Liquidity sweep detector with persistent SweepRegistry.
 
 A sweep = price exceeds a tracked reference level (session high/low, prior day
 high/low, VAH/VAL), then CLOSES BACK inside — indicating the move was a stop
 hunt / liquidity grab with no acceptance at that level.
 
-Footprint confirms the sweep:
-  - High volume at the extreme (stops + institutional absorption)
-  - Opposing absorption at the wick tip (sellers defending at sweep high)
-  - Bar closes back inside the swept level (rejection confirmed)
-  - Delta at extreme is opposite to the wick direction
+Detection granularities:
+  candle  — single-bar: high > level + close < level with ≥ 35% rejection
+  range   — 3–5 bar rolling: any bar wick > level, latest bar closes < level
+             (slow stop-sweep / grinding rejection) [TODO: Phase 3 extension]
+  session — session-high updated above prior_day_high + closes below by session end
+             [TODO: Phase 3 extension]
 
-A confirmed sweep is the highest-probability reversal setup in this system.
-It means: trapped retail participants + institutional inventory built in
-the opposite direction.
+Follow-up patterns (tracked via SweepRegistry, populated next bar):
+  sweep_reclaim    — sweep fires, next bar closes further INTO range (strong reversal)
+  sweep_acceptance — sweep fires, next bar closes BACK BEYOND swept level (sweep failed)
+
+Delta validation at wick:
+  sweep_high: bid-side volume dominates at extreme 10% (sellers hit bids — bearish)
+  sweep_low:  ask-side volume dominates at extreme 10% (buyers lift asks — bullish)
+  If opposite side dominates → delta_confirms=False → confidence × 0.5
+
+SweepRegistry keeps events alive for 20 bars. Eviction on:
+  - Age > 20 bars
+  - Opposite-direction sweep at same level
+  - Sweep failure (price closes back through swept level 2+ bars)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from threading import Lock
+from typing import Literal
 
 from pipeline.features.swing import SwingPoints, all_reference_levels
 
@@ -28,20 +41,42 @@ EXTREME_VOL_MULTIPLIER = 1.5  # extreme levels must have this × avg level volum
 MIN_REJECTION_PCT = 0.35
 # Minimum bar range as % of price to filter tiny bars
 MIN_BAR_RANGE_PCT = 0.0005   # 0.05%
+# Registry event lifetime in bars
+SWEEP_EVENT_MAX_AGE = 20
 
 
 @dataclass
 class SweepSignal:
-    type: str           # "sweep_high" | "sweep_low" | "none"
-    swept_level: float  # the reference level that was swept
-    level_label: str    # e.g. "session_high", "prior_day_high", "vah"
-    wick_extreme: float # highest high (sweep_high) or lowest low (sweep_low)
+    type: str              # "sweep_high" | "sweep_low" | "none"
+    swept_level: float     # the reference level that was swept
+    level_label: str       # e.g. "session_high", "prior_day_high", "vah"
+    wick_extreme: float    # highest high (sweep_high) or lowest low (sweep_low)
     bar_close: float
-    confidence: float   # 0.0 – 1.0
+    confidence: float      # 0.0 – 1.0
     volume_at_extreme: float
     avg_level_volume: float
-    vol_ratio: float    # volume_at_extreme / avg_level_volume
+    vol_ratio: float       # volume_at_extreme / avg_level_volume
     reason: str
+    delta_confirms: bool = True    # False → confidence × 0.5
+    granularity: str = "candle"    # "candle" | "range" | "session"
+    age_bars: int = 0              # bars since sweep fired
+
+
+@dataclass
+class SweepEvent:
+    """Persistent registry entry for a sweep that fired."""
+    sweep_type: str             # "sweep_high" | "sweep_low"
+    swept_level: float
+    level_label: str
+    wick_extreme: float
+    initial_close: float        # bar close when sweep fired
+    confidence: float
+    delta_confirms: bool
+    granularity: str
+    age_bars: int = 0
+    pattern: str = ""           # "" | "sweep_reclaim" | "sweep_acceptance"
+    stale: bool = False
+    _consecutive_fails: int = field(default=0, repr=False)
 
 
 _NONE = SweepSignal(
@@ -50,13 +85,96 @@ _NONE = SweepSignal(
     avg_level_volume=0.0, vol_ratio=0.0, reason="",
 )
 
+# ── Registry ───────────────────────────────────────────────────────────────────
+
+_registry: dict[str, list[SweepEvent]] = {}  # symbol → list[SweepEvent]
+_reg_lock = Lock()
+
+
+def _evict(events: list[SweepEvent]) -> list[SweepEvent]:
+    """Remove stale + aged-out events."""
+    return [e for e in events if not e.stale and e.age_bars <= SWEEP_EVENT_MAX_AGE]
+
+
+def _update_events(events: list[SweepEvent], current_bar) -> list[SweepEvent]:
+    """Increment age, detect sweep_reclaim / sweep_acceptance, mark failures."""
+    close = current_bar.ohlc.c
+    updated = []
+    for ev in events:
+        ev.age_bars += 1
+        if ev.pattern == "":
+            # Check for follow-up pattern on the bar AFTER the sweep
+            if ev.age_bars == 1:
+                if ev.sweep_type == "sweep_high":
+                    if close < ev.initial_close:
+                        ev.pattern = "sweep_reclaim"
+                    elif close > ev.swept_level:
+                        ev.pattern = "sweep_acceptance"
+                elif ev.sweep_type == "sweep_low":
+                    if close > ev.initial_close:
+                        ev.pattern = "sweep_reclaim"
+                    elif close < ev.swept_level:
+                        ev.pattern = "sweep_acceptance"
+        # Failure check: price closes back through swept level 2+ consecutive bars
+        if ev.sweep_type == "sweep_high" and close > ev.swept_level:
+            ev._consecutive_fails += 1
+        elif ev.sweep_type == "sweep_low" and close < ev.swept_level:
+            ev._consecutive_fails += 1
+        else:
+            ev._consecutive_fails = 0
+        if ev._consecutive_fails >= 2:
+            ev.stale = True
+        updated.append(ev)
+    return updated
+
+
+def _register_new_sweep(symbol: str, sig: SweepSignal) -> None:
+    """Add or replace registry entry for a fresh sweep event."""
+    with _reg_lock:
+        evs = _registry.get(symbol, [])
+        # Evict any existing event at the same level (opposite direction = invalidation)
+        key = (sig.level_label, round(sig.swept_level, 2))
+        evs = [e for e in evs
+               if not (e.level_label == sig.level_label and
+                       abs(e.swept_level - sig.swept_level) < 0.01)]
+        evs.append(SweepEvent(
+            sweep_type=sig.type,
+            swept_level=sig.swept_level,
+            level_label=sig.level_label,
+            wick_extreme=sig.wick_extreme,
+            initial_close=sig.bar_close,
+            confidence=sig.confidence,
+            delta_confirms=sig.delta_confirms,
+            granularity=sig.granularity,
+        ))
+        _registry[symbol] = evs
+
+
+def tick_registry(symbol: str, current_bar) -> None:
+    """Advance all registry events by one bar (call every bar after detect)."""
+    with _reg_lock:
+        evs = _registry.get(symbol, [])
+        evs = _update_events(evs, current_bar)
+        evs = _evict(evs)
+        _registry[symbol] = evs
+
+
+def active_sweeps(symbol: str) -> list[SweepEvent]:
+    """Return live (not stale, not aged-out) sweep events for symbol."""
+    with _reg_lock:
+        return list(_registry.get(symbol, []))
+
+
+def reset_registry(symbol: str) -> None:
+    """Clear all registry events (e.g. at session boundary)."""
+    with _reg_lock:
+        _registry.pop(symbol, None)
+
+
+# ── Volume helpers ─────────────────────────────────────────────────────────────
 
 def _extreme_volume(bar, direction: str, extreme_frac: float = EXTREME_VOL_FRACTION) -> tuple[float, float]:
-    """Return (vol_at_extreme, avg_vol_per_level) for a bar.
-
-    direction="high": look at top extreme_frac of bar range (sweep high)
-    direction="low":  look at bottom extreme_frac (sweep low)
-    """
+    """Return (vol_at_extreme, avg_vol_per_level) for a bar."""
     bar_range = bar.ohlc.h - bar.ohlc.l
     if bar_range <= 0:
         return 0.0, 0.0
@@ -64,10 +182,12 @@ def _extreme_volume(bar, direction: str, extreme_frac: float = EXTREME_VOL_FRACT
     extreme_width = bar_range * extreme_frac
     if direction == "high":
         threshold = bar.ohlc.h - extreme_width
-        extreme_levels = [lvl for lvl in list(bar.bid_ladder) + list(bar.ask_ladder) if lvl.price >= threshold]
+        extreme_levels = [lvl for lvl in list(bar.bid_ladder) + list(bar.ask_ladder)
+                          if lvl.price >= threshold]
     else:
         threshold = bar.ohlc.l + extreme_width
-        extreme_levels = [lvl for lvl in list(bar.bid_ladder) + list(bar.ask_ladder) if lvl.price <= threshold]
+        extreme_levels = [lvl for lvl in list(bar.bid_ladder) + list(bar.ask_ladder)
+                          if lvl.price <= threshold]
 
     all_levels = list(bar.bid_ladder) + list(bar.ask_ladder)
     if not all_levels:
@@ -78,14 +198,33 @@ def _extreme_volume(bar, direction: str, extreme_frac: float = EXTREME_VOL_FRACT
     return vol_at_extreme, avg_vol
 
 
-def _close_rejection_pct(bar, direction: str) -> float:
-    """How far the close is from the extreme as fraction of bar range.
+def _delta_confirms_sweep(bar, sweep_type: str) -> bool:
+    """Check if delta at wick extreme confirms the sweep direction.
 
-    direction="high": close should be far below the high (sweep high rejection)
-    direction="low":  close should be far above the low (sweep low rejection)
-
-    Returns 0.0–1.0. Higher = stronger rejection.
+    sweep_high: expect bid-side dominance at extreme (sellers hit bids → bearish)
+    sweep_low:  expect ask-side dominance at extreme (buyers lift asks → bullish)
     """
+    bar_range = bar.ohlc.h - bar.ohlc.l
+    if bar_range <= 0:
+        return True  # can't check → assume confirms
+
+    extreme_width = bar_range * EXTREME_VOL_FRACTION
+    if sweep_type == "sweep_high":
+        threshold = bar.ohlc.h - extreme_width
+        bid_vol = sum(lvl.vol for lvl in bar.bid_ladder if lvl.price >= threshold)
+        ask_vol = sum(lvl.vol for lvl in bar.ask_ladder if lvl.price >= threshold)
+        # Sellers dominated at the high → confirms bearish sweep
+        return bid_vol >= ask_vol * 0.8  # bid_vol should be ≥ ask_vol (sellers dominant)
+    else:  # sweep_low
+        threshold = bar.ohlc.l + extreme_width
+        bid_vol = sum(lvl.vol for lvl in bar.bid_ladder if lvl.price <= threshold)
+        ask_vol = sum(lvl.vol for lvl in bar.ask_ladder if lvl.price <= threshold)
+        # Buyers dominated at the low → confirms bullish sweep
+        return ask_vol >= bid_vol * 0.8  # ask_vol should be ≥ bid_vol (buyers dominant)
+
+
+def _close_rejection_pct(bar, direction: str) -> float:
+    """How far the close is from the extreme as fraction of bar range."""
     bar_range = bar.ohlc.h - bar.ohlc.l
     if bar_range <= 0:
         return 0.0
@@ -95,13 +234,15 @@ def _close_rejection_pct(bar, direction: str) -> float:
         return (bar.ohlc.c - bar.ohlc.l) / bar_range
 
 
-def detect(bar, swing_pts: SwingPoints, prev_bars: list | None = None) -> SweepSignal:
-    """Detect a liquidity sweep on the current bar against tracked reference levels.
+# ── Core detection ─────────────────────────────────────────────────────────────
 
-    Args:
-        bar:        Current bar (just closed).
-        swing_pts:  Tracked reference levels for this session.
-        prev_bars:  Recent prior bars (used for context; optional).
+def detect(bar, swing_pts: SwingPoints, prev_bars: list | None = None) -> SweepSignal:
+    """Detect a candle-granularity liquidity sweep on the current bar.
+
+    Populates SweepRegistry with confirmed sweeps.
+    Call tick_registry() after this each bar to advance event ages.
+
+    Returns the best SweepSignal detected (or _NONE).
     """
     bar_range = bar.ohlc.h - bar.ohlc.l
     if bar_range <= 0 or bar_range / max(bar.ohlc.c, 0.01) < MIN_BAR_RANGE_PCT:
@@ -113,17 +254,17 @@ def detect(bar, swing_pts: SwingPoints, prev_bars: list | None = None) -> SweepS
     for label, level in ref_levels:
         # --- Sweep HIGH check ---
         if bar.ohlc.h > level and bar.ohlc.c < level:
-            # Bar exceeded the level but closed back below it
-            wick_above = bar.ohlc.h - level
             rejection_pct = _close_rejection_pct(bar, "high")
-
             if rejection_pct < MIN_REJECTION_PCT:
-                continue  # close too near the high — not a clear rejection
+                continue
 
             vol_extreme, avg_vol = _extreme_volume(bar, "high")
             vol_ratio = vol_extreme / avg_vol if avg_vol > 0 else 0.0
-
+            delta_ok = _delta_confirms_sweep(bar, "sweep_high")
             conf = _sweep_confidence(rejection_pct, vol_ratio, label)
+            if not delta_ok:
+                conf = round(conf * 0.5, 2)
+
             if conf > best.confidence:
                 best = SweepSignal(
                     type="sweep_high",
@@ -138,22 +279,25 @@ def detect(bar, swing_pts: SwingPoints, prev_bars: list | None = None) -> SweepS
                     reason=(
                         f"{label} {level:.2f} swept (high={bar.ohlc.h:.2f}), "
                         f"close={bar.ohlc.c:.2f}, rejection={rejection_pct*100:.0f}%, "
-                        f"extreme_vol_ratio={vol_ratio:.2f}×"
+                        f"vol_ratio={vol_ratio:.2f}× delta_confirms={delta_ok}"
                     ),
+                    delta_confirms=delta_ok,
+                    granularity="candle",
                 )
 
         # --- Sweep LOW check ---
         elif bar.ohlc.l < level and bar.ohlc.c > level:
-            wick_below = level - bar.ohlc.l
             rejection_pct = _close_rejection_pct(bar, "low")
-
             if rejection_pct < MIN_REJECTION_PCT:
                 continue
 
             vol_extreme, avg_vol = _extreme_volume(bar, "low")
             vol_ratio = vol_extreme / avg_vol if avg_vol > 0 else 0.0
-
+            delta_ok = _delta_confirms_sweep(bar, "sweep_low")
             conf = _sweep_confidence(rejection_pct, vol_ratio, label)
+            if not delta_ok:
+                conf = round(conf * 0.5, 2)
+
             if conf > best.confidence:
                 best = SweepSignal(
                     type="sweep_low",
@@ -168,22 +312,21 @@ def detect(bar, swing_pts: SwingPoints, prev_bars: list | None = None) -> SweepS
                     reason=(
                         f"{label} {level:.2f} swept (low={bar.ohlc.l:.2f}), "
                         f"close={bar.ohlc.c:.2f}, rejection={rejection_pct*100:.0f}%, "
-                        f"extreme_vol_ratio={vol_ratio:.2f}×"
+                        f"vol_ratio={vol_ratio:.2f}× delta_confirms={delta_ok}"
                     ),
+                    delta_confirms=delta_ok,
+                    granularity="candle",
                 )
+
+    if best.type != "none":
+        _register_new_sweep(swing_pts.symbol, best)
 
     return best
 
 
 def _sweep_confidence(rejection_pct: float, vol_ratio: float, level_label: str) -> float:
-    """Confidence from rejection strength, volume, and level significance."""
-    # Rejection quality: how far close is from wick (0.35 = min, 1.0 = max)
     rejection_score = min(1.0, (rejection_pct - MIN_REJECTION_PCT) / (1.0 - MIN_REJECTION_PCT))
-
-    # Volume at extreme (higher = more trapped participants)
     vol_score = min(1.0, (vol_ratio - 1.0) / 3.0) if vol_ratio >= 1.0 else 0.0
-
-    # Level significance bonus
     label_bonus = {
         "prior_day_high": 0.15,
         "prior_day_low":  0.15,
@@ -192,18 +335,21 @@ def _sweep_confidence(rejection_pct: float, vol_ratio: float, level_label: str) 
         "session_high":   0.05,
         "session_low":    0.05,
     }.get(level_label, 0.0)
-
     raw = 0.50 * rejection_score + 0.35 * vol_score + label_bonus
     return round(min(0.92, max(0.35, 0.30 + raw * 0.70)), 2)
 
 
 def from_store(symbol: str, primary_tf: str) -> SweepSignal:
-    """Convenience: detect sweep on latest bar using cached swing points."""
+    """Convenience: detect sweep on latest bar + advance registry one tick.
+
+    Returns the best sweep on the latest bar (or _NONE).
+    Call this once per bar close. Use active_sweeps(symbol) to read registry.
+    """
     from pipeline.state_store import store
     from pipeline.features.swing import get as get_swing
 
     s = store()
-    recent = s.recent(symbol, primary_tf, 20)  # standardized analysis window
+    recent = s.recent(symbol, primary_tf, 20)
     if not recent:
         return _NONE
 
@@ -211,4 +357,9 @@ def from_store(symbol: str, primary_tf: str) -> SweepSignal:
     if sp is None:
         return _NONE
 
-    return detect(recent[-1], sp, prev_bars=recent[:-1])
+    current = recent[-1]
+    sig = detect(current, sp, prev_bars=recent[:-1])
+    # Advance existing registry events (age + follow-up pattern detection)
+    # Skip the bar we just registered (it starts at age_bars=0)
+    tick_registry(symbol, current)
+    return sig

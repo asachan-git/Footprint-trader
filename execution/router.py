@@ -188,7 +188,7 @@ def dispatch_grid(plan, bar: Bar, settings: dict, parent_position_id: str | None
             import logging as _l
             _l.getLogger(__name__).info(
                 f"[router] venue-translated {plan.symbol}→{plan.broker_symbol}: "
-                f"bybit_anchor={plan.anchor_price:.4f} → vantage_anchor={translated.anchor_price:.4f} "
+                f"bybit_anchor={plan.anchor_price:.2f} → vantage_anchor={translated.anchor_price:.2f} "
                 f"(quote_ok={quote.get('ok')}, tick={quote.get('tick_size')})"
             )
             plan = translated
@@ -204,7 +204,11 @@ def dispatch_grid(plan, bar: Bar, settings: dict, parent_position_id: str | None
         result["parent_position_id"] = parent_position_id
         return {"mode": "live", **result}
     elif mode == "paper":
-        result = _paper().submit_grid(plan, bar)  # type: ignore[attr-defined]
+        if settings.get("_m2_paper"):
+            from execution.position_store import position_store_m2 as _ps_m2
+            result = _paper().submit_grid(plan, bar, _store=_ps_m2())  # type: ignore[attr-defined]
+        else:
+            result = _paper().submit_grid(plan, bar)  # type: ignore[attr-defined]
         result["parent_position_id"] = parent_position_id
         return result
     else:
@@ -218,7 +222,7 @@ def dispatch(decision: Decision, bar: Bar, settings: dict) -> dict:
     if trading_mode in ("buy_sell_only", "grid") and decision.side != "flat":
         # Regime gate — refuse trades against confirmed trends
         try:
-            from .regime import get_regime, is_blocked_by_regime
+            from pipeline.features.day_type import get_regime, is_blocked_by_regime
             primary_tf = str(settings.get("instrument", {}).get("primary_tf", "1m"))
             regime = get_regime(bar.symbol, primary_tf)
             floor = float((settings.get("regime") or {}).get("block_against_trend_confidence", 0.75))
@@ -241,6 +245,23 @@ def dispatch(decision: Decision, bar: Bar, settings: dict) -> dict:
                         "position_id": same_dir[0].position_id}
         except Exception:
             pass
+        # Decision veto layer — auction + confluence + session + threshold checks
+        try:
+            from execution.decision_validator import validate as _dv_validate
+            _vr = _dv_validate(decision.side, bar.symbol, bar, settings,
+                               entry_price=decision.entry)
+            if not _vr.ok:
+                import logging as _l
+                _l.getLogger(__name__).info(
+                    f"[router][veto] {bar.symbol} {decision.side} rejected: {_vr.veto_reason} "
+                    f"score={_vr.score:.2f}"
+                )
+                return {"mode": settings["mode"], "skipped": f"veto:{_vr.veto_reason}",
+                        "veto_score": _vr.score, "veto_details": _vr.details}
+        except Exception as _ve:
+            import logging as _l
+            _l.getLogger(__name__).debug(f"[router] decision_validator skipped: {_ve}")
+
         try:
             plan = _build_grid_plan(decision, bar, settings)
             return dispatch_grid(plan, bar, settings)

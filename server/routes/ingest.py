@@ -50,6 +50,9 @@ _triggered_decide_bars: set[str] = set()
 def _trigger_decide_on_bar_close(symbol: str, tf: str, bar_id: str) -> None:
     """Fire Mode 1 (Claude) + Mode 2 (rules dry-run) instantly on bar close.
 
+    Claude call (/decide_multi) gated on ClaudeMode.FULL — RESTRICTED and OFF
+    modes skip the per-bar decide; cycle_manager handles RESTRICTED cycle-init calls.
+
     Idempotent per bar_id. Non-blocking — runs HTTP calls in a background thread
     so ingest returns immediately.
     """
@@ -57,7 +60,6 @@ def _trigger_decide_on_bar_close(symbol: str, tf: str, bar_id: str) -> None:
         return
     _triggered_decide_bars.add(bar_id)
     if len(_triggered_decide_bars) > 500:
-        # cap memory — drop oldest half
         kept = list(_triggered_decide_bars)[-250:]
         _triggered_decide_bars.clear()
         _triggered_decide_bars.update(kept)
@@ -66,11 +68,19 @@ def _trigger_decide_on_bar_close(symbol: str, tf: str, bar_id: str) -> None:
     import urllib.request as _req
     import json as _json
 
+    # Gate Claude per-bar call
+    try:
+        from execution.claude_mode import is_per_bar
+        _claude_per_bar = is_per_bar()
+    except Exception:
+        _claude_per_bar = True  # safe default: allow if module missing
+
     def _run():
-        for endpoint, body, timeout in (
-            ("/decide_multi", {"symbols": [symbol], "tf": tf}, 120),
-            ("/grid_tick", {"symbols": [symbol], "tf": tf, "dry_run": True}, 30),
-        ):
+        endpoints: list[tuple[str, dict[str, object], int]] = []
+        if _claude_per_bar:
+            endpoints.append(("/decide_multi", {"symbols": [symbol], "tf": tf}, 120))
+        endpoints.append(("/grid_tick", {"symbols": [symbol], "tf": tf, "dry_run": True}, 30))
+        for endpoint, body, timeout in endpoints:
             try:
                 data = _json.dumps(body).encode()
                 req = _req.Request(
@@ -84,7 +94,7 @@ def _trigger_decide_on_bar_close(symbol: str, tf: str, bar_id: str) -> None:
                 LOG.warning(f"[ingest][trigger] {endpoint} failed for {symbol} {bar_id}: {e}")
 
     threading.Thread(target=_run, daemon=True).start()
-    LOG.info(f"[ingest][trigger] event-driven decide fired for {symbol} {tf} {bar_id}")
+    LOG.info(f"[ingest][trigger] event-driven decide fired for {symbol} {tf} {bar_id} claude_per_bar={_claude_per_bar}")
 
 
 def _aggregate_mtf(bar, settings) -> None:
@@ -119,10 +129,22 @@ def _check_positions(bar, settings) -> list[dict]:
     for pos in ps.open_positions(bar.symbol):
         risk = abs(pos.avg_entry - pos.stop_loss)
 
-        sl_hit = (
+        # SL acts as DISASTER FLOOR only — must be far away from entry
+        # (≥ 3 % for BTC, ≥ 1.5 % for XAU). Closer SL is ignored; cycle exits
+        # only via TP / absorption / explicit invalidation. Prevents the
+        # "−1 R repeatedly" pattern that broke expectancy.
+        _floor_pct = 0.03 if pos.symbol.startswith("BTC") else 0.015
+        _is_disaster = risk >= pos.avg_entry * _floor_pct
+        _raw_sl_hit = (
             (pos.side == "long"  and bar.ohlc.l <= pos.stop_loss) or
             (pos.side == "short" and bar.ohlc.h >= pos.stop_loss)
         )
+        sl_hit = _is_disaster and _raw_sl_hit
+        if _raw_sl_hit and not _is_disaster:
+            LOG.info(
+                f"[ingest] SL skipped (within floor) {pos.position_id} {pos.symbol} "
+                f"risk={risk:.2f} threshold={pos.avg_entry * _floor_pct:.2f}"
+            )
         # Grid TP guard: when trading_mode is buy_sell_only / grid, the position's
         # stored TP is computed for the full-fill avg_entry. While only leg-1 is
         # filled, avg_entry sits on the wrong side of TP and would trigger a
@@ -141,11 +163,11 @@ def _check_positions(bar, settings) -> list[dict]:
         if sl_hit:
             realized_r = -1.0  # always exactly -1R by definition
             if pos.side == "long":
-                ps.close_position(pos.position_id, f"sl_hit @ {bar.ohlc.l:.4f} ≤ SL {pos.stop_loss:.4f}", realized_r)
-                LOG.info(f"[ingest] SL hit {pos.position_id} long bar_low={bar.ohlc.l:.4f} sl={pos.stop_loss:.4f}")
+                ps.close_position(pos.position_id, f"sl_hit @ {bar.ohlc.l:.2f} ≤ SL {pos.stop_loss:.2f}", realized_r)
+                LOG.info(f"[ingest] SL hit {pos.position_id} long bar_low={bar.ohlc.l:.2f} sl={pos.stop_loss:.2f}")
             else:
-                ps.close_position(pos.position_id, f"sl_hit @ {bar.ohlc.h:.4f} ≥ SL {pos.stop_loss:.4f}", realized_r)
-                LOG.info(f"[ingest] SL hit {pos.position_id} short bar_high={bar.ohlc.h:.4f} sl={pos.stop_loss:.4f}")
+                ps.close_position(pos.position_id, f"sl_hit @ {bar.ohlc.h:.2f} ≥ SL {pos.stop_loss:.2f}", realized_r)
+                LOG.info(f"[ingest] SL hit {pos.position_id} short bar_high={bar.ohlc.h:.2f} sl={pos.stop_loss:.2f}")
             exits.append({"position_id": pos.position_id, "exit": "sl_hit", "realized_r": realized_r,
                           "bar_extreme": bar.ohlc.l if pos.side == "long" else bar.ohlc.h,
                           "sl": pos.stop_loss})
@@ -154,16 +176,16 @@ def _check_positions(bar, settings) -> list[dict]:
         elif tp_hit:
             realized_r = abs(pos.take_profit - pos.avg_entry) / risk if risk > 0 else 1.5
             if pos.side == "long":
-                ps.close_position(pos.position_id, f"tp_hit @ {bar.ohlc.h:.4f} ≥ TP {pos.take_profit:.4f}", realized_r)
-                LOG.info(f"[ingest] TP hit {pos.position_id} long bar_high={bar.ohlc.h:.4f} tp={pos.take_profit:.4f} R={realized_r:.2f}")
+                ps.close_position(pos.position_id, f"tp_hit @ {bar.ohlc.h:.2f} ≥ TP {pos.take_profit:.2f}", realized_r)
+                LOG.info(f"[ingest] TP hit {pos.position_id} long bar_high={bar.ohlc.h:.2f} tp={pos.take_profit:.2f} R={realized_r:.2f}")
                 try:
                     from execution.pending_orders import pending_store as _ps2
                     _ps2().cancel_for_position(pos.position_id)
                 except Exception:
                     pass
             else:
-                ps.close_position(pos.position_id, f"tp_hit @ {bar.ohlc.l:.4f} ≤ TP {pos.take_profit:.4f}", realized_r)
-                LOG.info(f"[ingest] TP hit {pos.position_id} short bar_low={bar.ohlc.l:.4f} tp={pos.take_profit:.4f} R={realized_r:.2f}")
+                ps.close_position(pos.position_id, f"tp_hit @ {bar.ohlc.l:.2f} ≤ TP {pos.take_profit:.2f}", realized_r)
+                LOG.info(f"[ingest] TP hit {pos.position_id} short bar_low={bar.ohlc.l:.2f} tp={pos.take_profit:.2f} R={realized_r:.2f}")
                 try:
                     from execution.pending_orders import pending_store as _ps2
                     _ps2().cancel_for_position(pos.position_id)
@@ -183,7 +205,7 @@ def _check_positions(bar, settings) -> list[dict]:
                 realized_r = 1.5
             ps.close_position(pos.position_id, f"tp_absorption: {tp_reason}", realized_r)
             exits.append({"position_id": pos.position_id, "exit": "tp_absorption", "realized_r": round(realized_r, 4), "reason": tp_reason})
-            LOG.info(f"[ingest] TP absorption {pos.position_id} exit={exit_price:.4f} R={realized_r:.2f}: {tp_reason}")
+            LOG.info(f"[ingest] TP absorption {pos.position_id} exit={exit_price:.2f} R={realized_r:.2f}: {tp_reason}")
 
         # 4. Strong-zone profit booking on absorption
         #    Replaces the legacy "absorption-at-entry → hedge/invalidate" path.
@@ -214,7 +236,7 @@ def _check_positions(bar, settings) -> list[dict]:
                     if at_zone:
                         realized_r = abs(cur_price - pos.avg_entry) / risk if risk > 0 else 0.5
                         reason = (f"strong_zone_book: {relevant_side} absorption {a.bar_pct:.0%} at "
-                                  f"{a.price:.2f} = {at_zone.source}, PnL+ → book at {cur_price:.4f}")
+                                  f"{a.price:.2f} = {at_zone.source}, PnL+ → book at {cur_price:.2f}")
                         ps.close_position(pos.position_id, reason, realized_r)
                         try:
                             from execution.pending_orders import pending_store as _ps2
@@ -325,6 +347,8 @@ def ingest():
                         [bar.symbol], primary_tf,
                         session_start_utc=_vp_cfg.get("session_start_utc", {}),
                         vp_bin_size=_vp_cfg.get("vp_bin_size", {}),
+                        venue_price_offset=_vp_cfg.get("venue_price_offset", {}),
+                        symbol_map=(settings.get("execution") or {}).get("symbol_map", {}),
                     )
                 except Exception as e:
                     LOG.warning(f"[ingest] intraday VP refresh failed: {e}")
@@ -340,6 +364,8 @@ def ingest():
                     [bar.symbol], primary_tf,
                     session_start_utc=_vp_cfg.get("session_start_utc", {}),
                     vp_bin_size=_vp_cfg.get("vp_bin_size", {}),
+                    venue_price_offset=_vp_cfg.get("venue_price_offset", {}),
+                    symbol_map=(settings.get("execution") or {}).get("symbol_map", {}),
                 )
                 # Write journal for the day that just closed
                 if snapped.get("daily"):
@@ -395,6 +421,22 @@ def ingest():
         try:
             from pipeline.features.big_trade import classify_outcomes as _classify_outcomes
             _classify_outcomes(recent_bars, bar.symbol)
+        except Exception:
+            pass
+
+    # Tick anchor bar registry (detect high-vol/delta bars; evict stale)
+    if bar.tf == primary_tf:
+        try:
+            from pipeline.features.anchor_bar import update as _anchor_update
+            _anchor_update(bar.symbol, bar, recent_bars)
+        except Exception:
+            pass
+
+    # Tick sweep registry (age tracking + reclaim/acceptance follow-up patterns)
+    if bar.tf == primary_tf:
+        try:
+            from pipeline.features.sweep import tick_registry as _sweep_tick
+            _sweep_tick(bar.symbol, bar)
         except Exception:
             pass
 

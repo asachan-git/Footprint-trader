@@ -40,6 +40,7 @@ class GridLeg:
     bar_id: str
     confidence: float
     rationale: str
+    lots: float = 0.0   # actual fill qty; 0.0 = unknown (older events / live fills)
 
 
 @dataclass
@@ -74,17 +75,18 @@ class GridPosition:
 
 
 class PositionStore:
-    def __init__(self) -> None:
+    def __init__(self, log_path: Path | None = None) -> None:
         self._lock = Lock()
         self._positions: dict[str, GridPosition] = {}
         self._daily_r_by_date: dict[str, float] = {}   # IST date → realized R for that day
-        POSITIONS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        self._log_path = log_path or POSITIONS_LOG
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
         self._replay()
 
     def _replay(self) -> None:
-        if not POSITIONS_LOG.exists():
+        if not self._log_path.exists():
             return
-        with POSITIONS_LOG.open() as fh:
+        with self._log_path.open() as fh:
             for line in fh:
                 try:
                     self._apply(json.loads(line))
@@ -104,6 +106,7 @@ class PositionStore:
                 bar_id=event["bar_id"],
                 confidence=event.get("confidence", 0),
                 rationale=event.get("rationale", ""),
+                lots=float(event.get("lots", 0.0) or 0.0),
             )
             self._positions[pid] = GridPosition(
                 position_id=pid,
@@ -124,6 +127,7 @@ class PositionStore:
                 bar_id=event["bar_id"],
                 confidence=event.get("confidence", 0),
                 rationale=event.get("rationale", ""),
+                lots=float(event.get("lots", 0.0) or 0.0),
             )
             self._positions[pid].legs.append(leg)
         elif etype in ("close", "invalidate") and pid in self._positions:
@@ -145,7 +149,7 @@ class PositionStore:
         now = int(time.time())
         event["ts"] = now
         event["ts_ist"] = _ts_ist(now)
-        with POSITIONS_LOG.open("a") as fh:
+        with self._log_path.open("a") as fh:
             fh.write(json.dumps(event) + "\n")
         self._apply(event)
 
@@ -157,6 +161,7 @@ class PositionStore:
         tf: str,
         broker_ticket: str = "",
         fill_type: str = "paper_simulated",
+        lots: float = 0.0,
     ) -> GridPosition:
         import uuid
         pid = uuid.uuid4().hex[:12]
@@ -176,10 +181,12 @@ class PositionStore:
                 "bar_id": bar_id,
                 "broker_ticket": broker_ticket,
                 "fill_type": fill_type,
+                "lots": float(lots or 0.0),
             })
         return self._positions[pid]
 
-    def add_leg(self, position_id: str, decision: Decision, bar_id: str) -> None:
+    def add_leg(self, position_id: str, decision: Decision, bar_id: str,
+                lots: float = 0.0) -> None:
         with self._lock:
             pos = self._positions.get(position_id)
             if not pos or pos.status != "open":
@@ -193,6 +200,7 @@ class PositionStore:
                 "confidence": decision.confidence,
                 "rationale": decision.rationale,
                 "bar_id": bar_id,
+                "lots": float(lots or 0.0),
             })
 
     def close_position(self, position_id: str, reason: str, realized_r: float) -> bool:
@@ -250,6 +258,17 @@ class PositionStore:
                 and (symbol is None or p.symbol == symbol)
             ]
 
+    def closed_positions(self, symbol: str | None = None, n: int = 50) -> list[GridPosition]:
+        """Recent closed/invalidated positions, newest first."""
+        with self._lock:
+            xs = [
+                p for p in self._positions.values()
+                if p.status != "open"
+                and (symbol is None or p.symbol == symbol)
+            ]
+        xs.sort(key=lambda p: p.closed_ts or 0, reverse=True)
+        return xs[:n]
+
     def by_broker_ticket(self, ticket: str) -> GridPosition | None:
         if not ticket:
             return None
@@ -267,7 +286,10 @@ class PositionStore:
 
 
 _store: PositionStore | None = None
+_store_m2: PositionStore | None = None
 _store_lock = Lock()
+
+POSITIONS_LOG_M2 = ROOT / "data" / "positions_m2.jsonl"
 
 
 def position_store() -> PositionStore:
@@ -277,3 +299,13 @@ def position_store() -> PositionStore:
             if _store is None:
                 _store = PositionStore()
     return _store
+
+
+def position_store_m2() -> PositionStore:
+    """Isolated paper store for Mode 2 A/B — never blocks Mode 1 live positions."""
+    global _store_m2
+    if _store_m2 is None:
+        with _store_lock:
+            if _store_m2 is None:
+                _store_m2 = PositionStore(log_path=POSITIONS_LOG_M2)
+    return _store_m2

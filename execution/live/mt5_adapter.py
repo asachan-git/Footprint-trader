@@ -285,8 +285,8 @@ class MT5Adapter:
             return False, "no quote (market closed?)"
         spread = ask - bid
         if spread > cap:
-            return False, f"{spread:.4f} > {cap}"
-        return True, f"{spread:.4f} ≤ {cap}"
+            return False, f"{spread:.2f} > {cap}"
+        return True, f"{spread:.2f} ≤ {cap}"
 
     # ── lot sizing ───────────────────────────────────────────────────────
 

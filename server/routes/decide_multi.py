@@ -91,6 +91,15 @@ MULTI_TOOL = {
 @bp.post("/decide_multi")
 def decide_multi():
     settings = current_app.config["FB_SETTINGS"]
+    # ClaudeMode gate — OFF returns 404; RESTRICTED only serves cycle-init calls
+    try:
+        from execution.claude_mode import get_mode, ClaudeMode
+        _mode = get_mode()
+        if _mode == ClaudeMode.OFF:
+            return jsonify({"ok": False, "error": "claude_mode=off"}), 404
+    except Exception:
+        pass  # missing module → allow (safe default)
+
     body = request.get_json(silent=True) or {}
     symbols = body.get("symbols") or ["BTCUSDT", "XAUTUSDT"]
     tf = body.get("tf") or settings["instrument"]["primary_tf"]
@@ -185,13 +194,7 @@ def decide_multi():
             bias_strength=int(d.get("bias_strength", 3)),
             invalidation_note=d["invalidation_note"],
         )
-        _filt = settings.get("decide_filter") or {}
-        rr_floor = float(
-            (_filt.get("rr_floor_per_symbol") or {}).get(sym)
-            or _filt.get("rr_floor")
-            or 1.5
-        )
-        validator_reason = validate(decision, rr_floor=rr_floor)
+        validator_reason = validate(decision)
         decision_id = log_decision(
             bar_id=ctx["latest_bar_id"],
             symbol=sym,

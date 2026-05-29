@@ -16,18 +16,14 @@ from flask import Flask
 
 from .routes.health import bp as health_bp
 from .routes.ingest import bp as ingest_bp
-from .routes.replay import bp as replay_bp
-from .routes.decision import bp as decision_bp
 from .routes.decide import bp as decide_bp
-from .routes.analyze import bp as analyze_bp
-from .routes.label import bp as label_bp
-from .routes.stats import bp as stats_bp
 from .routes.footprint_view import bp as footprint_bp
 from .routes.decide_multi import bp as decide_multi_bp
 from .routes.grid_tick import bp as grid_tick_bp
 from .routes.heatmap import bp as heatmap_bp
 from .routes.options_ingest import bp as options_ingest_bp
 from .routes.options_decide import bp as options_decide_bp
+from .routes.dashboard import bp as dashboard_bp
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -45,13 +41,17 @@ def _precompute_vp(settings: dict) -> None:
     symbols = vp_cfg.get("symbols", [settings["instrument"]["symbol"]])
     session_start = vp_cfg.get("session_start_utc", {})
     bin_size_cfg = vp_cfg.get("vp_bin_size", {})
+    offset_cfg = vp_cfg.get("venue_price_offset", {})
+    sym_map = (settings.get("execution") or {}).get("symbol_map", {})
     primary_tf = settings["instrument"]["primary_tf"]
-    LOG.info(f"[startup] pre-computing VP cache for {symbols} (session_start={session_start}, bin_size={bin_size_cfg})...")
+    LOG.info(f"[startup] pre-computing VP cache for {symbols} (session_start={session_start}, bin_size={bin_size_cfg}, offset={offset_cfg})...")
     try:
         build_and_save(
             list(set(symbols)), primary_tf,
             session_start_utc=session_start,
             vp_bin_size=bin_size_cfg,
+            venue_price_offset=offset_cfg,
+            symbol_map=sym_map,
         )
     except Exception as e:
         LOG.warning(f"[startup] VP cache build failed (non-fatal): {e}")
@@ -74,18 +74,14 @@ def create_app() -> Flask:
     _precompute_vp(settings)
     app.register_blueprint(health_bp)
     app.register_blueprint(ingest_bp)
-    app.register_blueprint(replay_bp)
-    app.register_blueprint(decision_bp)
     app.register_blueprint(decide_bp)
-    app.register_blueprint(analyze_bp)
-    app.register_blueprint(label_bp)
-    app.register_blueprint(stats_bp)
     app.register_blueprint(footprint_bp)
     app.register_blueprint(decide_multi_bp)
     app.register_blueprint(grid_tick_bp)
     app.register_blueprint(heatmap_bp)
     app.register_blueprint(options_ingest_bp)
     app.register_blueprint(options_decide_bp)
+    app.register_blueprint(dashboard_bp)
     return app
 
 

@@ -94,6 +94,18 @@ def collect(
         except Exception:
             pass
 
+    # ── Fresh sweep wicks — confirmed (delta_confirms=True) sweeps only ────
+    try:
+        from pipeline.features.sweep import active_sweeps as _active_sweeps
+        for _sw in _active_sweeps(symbol):
+            if not _sw.delta_confirms:
+                continue
+            # sweep_low wick = potential long entry; sweep_high wick = potential short entry
+            _wick = float(_sw.wick_extreme) if _sw.wick_extreme else float(_sw.swept_level)
+            raw.append(Zone(price=_wick, source=f"sweep_{_sw.sweep_type}", strength=0.85))
+    except Exception:
+        pass
+
     # ── Filter to correct side ─────────────────────────────────────────────
     if direction == "short":
         candidates = [z for z in raw if z.price > anchor]

@@ -243,6 +243,74 @@ def classify(session_bars, daily_vp=None) -> DayType:
     )
 
 
+# ── Regime helpers (relocated from execution/regime.py) ───────────────────────
+
+from typing import Literal as _Literal
+
+
+def get_regime(symbol: str, primary_tf: str = "1m", session_bars_n: int = 100) -> DayType:
+    """Fetch day_type for symbol from current session bars. Returns uncertain DayType on error."""
+    _null = DayType(
+        type="uncertain", confidence=0.0, ib_range=0.0, ib_expansion=0.0,
+        ib_expansion_pct=0.0, reason="no_data",
+        max_legs=_MAX_LEGS["uncertain"], grid_mode=_GRID_MODE["uncertain"],
+    )
+    try:
+        from pipeline.state_store import store
+        from pipeline.features.vp_cache import get as vp_get
+        bars = store().recent(symbol, primary_tf, session_bars_n)
+        if not bars:
+            return _null
+        daily_vp = vp_get(symbol, "daily")
+        return classify(bars, daily_vp=daily_vp)
+    except Exception:
+        return _null
+
+
+def is_blocked_by_regime(
+    regime: DayType, side: _Literal["long", "short"], confidence_floor: float = 0.75
+) -> tuple[bool, str]:
+    """Block entries that fight a confirmed trend. Returns (blocked, reason)."""
+    if regime.confidence < confidence_floor:
+        return False, ""
+    if regime.type == "trend_up" and side == "short":
+        return True, f"regime-blocked: trend_up (conf={regime.confidence:.2f}) opposes short"
+    if regime.type == "trend_down" and side == "long":
+        return True, f"regime-blocked: trend_down (conf={regime.confidence:.2f}) opposes long"
+    return False, ""
+
+
+def grid_shape_for_regime(regime: DayType, side: _Literal["long", "short"]) -> dict:
+    """Return grid placement parameters for the current regime + side."""
+    out = {
+        "n_legs": 5,
+        "step_mult": 0.5,
+        "mode": "mean_reversion",
+        "tighter_spacing": False,
+        "safety_sl_atr_mult": 5.0,
+    }
+    if regime.type in ("trend_up", "trend_down") and regime.confidence >= 0.60:
+        with_trend = (regime.type == "trend_up" and side == "long") or \
+                     (regime.type == "trend_down" and side == "short")
+        if with_trend:
+            out.update({
+                "n_legs": 3,
+                "step_mult": 0.35,
+                "mode": "directional",
+                "tighter_spacing": True,
+                "safety_sl_atr_mult": 3.0,
+            })
+    elif regime.type == "uncertain":
+        out.update({
+            "n_legs": 2,
+            "step_mult": 0.5,
+            "mode": "cautious",
+            "tighter_spacing": False,
+            "safety_sl_atr_mult": 7.0,
+        })
+    return out
+
+
 def from_store(symbol: str, primary_tf: str, session_start_utc: int = 0) -> DayType | None:
     """Convenience: classify from state_store bars since today's session open.
 

@@ -71,14 +71,14 @@ def _fill_pending_legs(symbol: str, latest: Bar) -> list[dict]:
             stop_loss=po.safety_sl or (po.limit_price * 0.95 if po.side == "long" else po.limit_price * 1.05),
             take_profit=po.tp,
             confidence=0.5,
-            rationale=f"pending limit leg{po.leg_idx} filled @ {po.limit_price:.4f}",
+            rationale=f"pending limit leg{po.leg_idx} filled @ {po.limit_price:.2f}",
             grid_leg=po.leg_idx,
             add_to_existing=True,
         )
-        pos_store.add_leg(po.position_id, d, latest.bar_id)
+        pos_store.add_leg(po.position_id, d, latest.bar_id, lots=float(po.lots or 0.0))
         ps.mark_filled(po.pending_id)
         filled.append({"position_id": po.position_id, "leg": po.leg_idx, "price": po.limit_price})
-        LOG.info(f"[cycle] fill leg{po.leg_idx} {po.symbol} {po.side} @ {po.limit_price:.4f}")
+        LOG.info(f"[cycle] fill leg{po.leg_idx} {po.symbol} {po.side} @ {po.limit_price:.2f}")
         # Shrink TP toward avg (book profit at consistent interval on adverse fills)
         try:
             updated_pos = next((p for p in pos_store.open_positions(po.symbol) if p.position_id == po.position_id), None)
@@ -93,10 +93,10 @@ def _fill_pending_legs(symbol: str, latest: Bar) -> list[dict]:
                 )
                 if new_zone is not None:
                     pos_store.adjust_tp(po.position_id, new_zone.price,
-                                        f"shrink leg{po.leg_idx}_fill avg={updated_pos.avg_entry:.4f} "
+                                        f"shrink leg{po.leg_idx}_fill avg={updated_pos.avg_entry:.2f} "
                                         f"src={new_zone.source}")
-                    LOG.info(f"[cycle] TP shrunk {po.position_id} {old_tp:.4f} → "
-                             f"{new_zone.price:.4f} (toward avg {updated_pos.avg_entry:.4f}, "
+                    LOG.info(f"[cycle] TP shrunk {po.position_id} {old_tp:.2f} → "
+                             f"{new_zone.price:.2f} (toward avg {updated_pos.avg_entry:.2f}, "
                              f"src={new_zone.source})")
         except Exception as _e:
             LOG.debug(f"[cycle] TP shrink skipped: {_e}")
@@ -121,9 +121,9 @@ def _check_cycle_tp(symbol: str, latest: Bar) -> list[dict]:
             continue
         if pos.side == "short" and tp >= pos.avg_entry:
             continue
-        # Sweep-continuation override — let TP run on momentum bars
-        if _detect_sweep_continuation(symbol, latest, pos.side):
-            LOG.info(f"[cycle] sweep-continuation on {symbol} {pos.side} — TP held")
+        # Sweep-continuation override — let TP run if a fresh sweep_reclaim aligns with cycle
+        if _sweep_continuation_active(symbol, pos.side):
+            LOG.info(f"[cycle] sweep_reclaim on {symbol} {pos.side} — TP held")
             continue
         hit = False
         if pos.side == "long" and latest.ohlc.h >= tp:
@@ -142,31 +142,29 @@ def _check_cycle_tp(symbol: str, latest: Bar) -> list[dict]:
             pending_store().cancel_for_position(pos.position_id)
             _va_state.pop(pos.position_id, None)
             closed.append({"position_id": pos.position_id, "realized_r": round(realized_r, 3)})
-            LOG.info(f"[cycle] TP HIT {pos.position_id} {pos.side} @ {tp:.4f} R={realized_r:.2f}")
+            LOG.info(f"[cycle] TP HIT {pos.position_id} {pos.side} @ {tp:.2f} R={realized_r:.2f}")
     return closed
 
 
-def _detect_sweep_continuation(symbol: str, latest: Bar, side: Literal["long", "short"]) -> bool:
-    """True if the latest bar swept previous bar's extreme in cycle direction AND closed beyond.
-    Used to suppress TP-take during momentum continuation.
+def _sweep_continuation_active(symbol: str, side: Literal["long", "short"]) -> bool:
+    """True if there is a fresh sweep_reclaim event that aligns with cycle direction.
+
+    sweep_reclaim on sweep_low + long cycle = downside liquidity grabbed, bulls reclaimed
+    sweep_reclaim on sweep_high + short cycle = upside liquidity grabbed, bears reclaimed
     """
     try:
-        from pipeline.state_store import store
-        bars = store().recent(symbol, "15m", 3)
-        if len(bars) < 2 or bars[-1].bar_id != latest.bar_id:
-            return False
-        prev = bars[-2]
-        if side == "long":
-            # Strong bull bar that swept prev low + closed near high
-            swept = latest.ohlc.l < prev.ohlc.l
-            strong = latest.ohlc.c > (latest.ohlc.l + 0.7 * (latest.ohlc.h - latest.ohlc.l))
-            return swept and strong
-        # short
-        swept = latest.ohlc.h > prev.ohlc.h
-        strong = latest.ohlc.c < (latest.ohlc.l + 0.3 * (latest.ohlc.h - latest.ohlc.l))
-        return swept and strong
+        from pipeline.features.sweep import active_sweeps
+        evs = active_sweeps(symbol)
+        for ev in evs:
+            if ev.pattern != "sweep_reclaim" or ev.age_bars > 5:
+                continue
+            if side == "long" and ev.sweep_type == "sweep_low":
+                return True
+            if side == "short" and ev.sweep_type == "sweep_high":
+                return True
     except Exception:
-        return False
+        pass
+    return False
 
 
 def _trail_sl_on_favorable_move(symbol: str, latest: Bar) -> list[dict]:
@@ -208,12 +206,12 @@ def _trail_sl_on_favorable_move(symbol: str, latest: Bar) -> list[dict]:
 
         pos_store.adjust_sl(
             pos.position_id, zone.price,
-            f"trail {pos.side} → {zone.source} @ {zone.price:.4f} (was {old_sl:.4f}, price {cur_price:.4f})",
+            f"trail {pos.side} → {zone.source} @ {zone.price:.2f} (was {old_sl:.2f}, price {cur_price:.2f})",
         )
         trailed.append({"position_id": pos.position_id, "old_sl": old_sl, "new_sl": zone.price,
                         "source": zone.source})
-        LOG.info(f"[cycle] SL trail {pos.position_id} {pos.side} {old_sl:.4f} → "
-                 f"{zone.price:.4f} ({zone.source})")
+        LOG.info(f"[cycle] SL trail {pos.position_id} {pos.side} {old_sl:.2f} → "
+                 f"{zone.price:.2f} ({zone.source})")
     return trailed
 
 
@@ -328,7 +326,7 @@ def _check_va_break(symbol: str, latest: Bar) -> list[str]:
             if (side == "long" and c < level) or (side == "short" and c > level):
                 st.phase = "BROKE"
                 st.broke_at_ts = latest.close_ts
-                LOG.info(f"[cycle][VA] {pos.position_id} BROKE level={level:.4f} close={c:.4f}")
+                LOG.info(f"[cycle][VA] {pos.position_id} BROKE level={level:.2f} close={c:.2f}")
         elif st.phase == "BROKE":
             # Retest = price returns to within 0.1% of level
             tol = abs(level) * 0.001
@@ -336,7 +334,7 @@ def _check_va_break(symbol: str, latest: Bar) -> list[str]:
                (side == "short" and latest.ohlc.l <= level):
                 st.phase = "RETESTING"
                 st.retested_at_ts = latest.close_ts
-                LOG.info(f"[cycle][VA] {pos.position_id} RETESTING level={level:.4f}")
+                LOG.info(f"[cycle][VA] {pos.position_id} RETESTING level={level:.2f}")
         elif st.phase == "RETESTING":
             # Reject = close back beyond level against cycle (full structure event)
             if (side == "long" and c < level) or (side == "short" and c > level):
@@ -366,30 +364,13 @@ def _cvd_confirms_invalidation(bars: list, pos_side: str, n_bars: int = 20) -> b
     return sum(1 for b in recent if (b.delta or 0) > 0) >= len(recent) - 1
 
 
-def _wick_trap_confirms_invalidation(bars: list, fps: list, pos_side: str) -> bool:
-    """True if a wick-trap signal supports the OPPOSITE direction (confirming invalidation)."""
-    try:
-        from pipeline.features.wick_trap import wick_trap_signal
-        trap = wick_trap_signal(bars, fps)
-        if trap is None or trap.confidence < 0.40:
-            return False
-        # bull_trap confirms invalidation of a SHORT cycle (buyers squeezed out)
-        # bear_trap confirms invalidation of a LONG cycle (buyers trapped)
-        return (pos_side == "short" and trap.side == "bull_trap") or \
-               (pos_side == "long" and trap.side == "bear_trap")
-    except Exception:
-        return False
-
-
 def _check_choch_invalidation(symbol: str, primary_tf: str = "15m") -> list[str]:
     """Check open cycles for a ChoCh against their direction.
 
-    Requires ChoCh PLUS at least one of: CVD confirmation OR wick-trap confirmation.
-    Reduces false invalidations from brief structural breaks.
+    Requires ChoCh PLUS CVD confirmation to reduce false invalidations.
     """
     from pipeline.state_store import store
     from pipeline.features.choch import detect_choch
-    from pipeline.footprint import build as build_fp
     from execution.position_store import position_store
 
     bars = store().recent(symbol, primary_tf, 200)
@@ -399,27 +380,22 @@ def _check_choch_invalidation(symbol: str, primary_tf: str = "15m") -> list[str]
     if ev is None:
         return []
 
-    # Standardized 20-bar analysis window for confirmation modules
-    fps = [build_fp(b) for b in bars[-20:]]
-
     invalidated = []
     for pos in position_store().open_positions(symbol):
         direction_match = (pos.side == "long" and ev.direction == "bear") or \
                           (pos.side == "short" and ev.direction == "bull")
         if not direction_match:
             continue
-        # Require CVD or wick-trap confirmation (20-bar window)
         cvd_ok = _cvd_confirms_invalidation(bars, pos.side, n_bars=20)
-        wick_ok = _wick_trap_confirms_invalidation(bars[-20:], fps, pos.side)
-        if not (cvd_ok or wick_ok):
+        if not cvd_ok:
             LOG.info(
-                f"[cycle][ChoCh] {pos.position_id} ChoCh fired but no CVD/wick confirmation — held"
+                f"[cycle][ChoCh] {pos.position_id} ChoCh fired but no CVD confirmation — held"
             )
             continue
         invalidated.append(pos.position_id)
         LOG.warning(
             f"[cycle][ChoCh] {pos.position_id} {pos.side} INVALIDATED "
-            f"ChoCh@{ev.broken_level:.4f} cvd={cvd_ok} wick={wick_ok}"
+            f"ChoCh@{ev.broken_level:.2f} cvd={cvd_ok}"
         )
     return invalidated
 
@@ -527,6 +503,35 @@ def on_bar_close(symbol: str, primary_tf: str, latest: Bar, settings: dict | Non
     except Exception as e:
         LOG.exception(f"[cycle] check_tp failed: {e}")
         actions["tp_error"] = str(e)
+
+    # TP participation adjustment — extend/shrink TP based on live order-flow score
+    try:
+        from pipeline.features.tp_participation import adjust_tp as _tp_adjust
+        from pipeline.state_store import store as _store
+        from pipeline.features.vp_cache import get as _vp_get
+        from pipeline.features.atr import atr as _atr
+        _recent = _store().recent(symbol, primary_tf, 25)
+        _daily_vp = _vp_get(symbol, "daily")
+        _atr_val = _atr(_recent) if _recent else None
+        from execution.position_store import position_store as _pos_store
+        _pstore = _pos_store()
+        for _pos in _pstore.open_positions(symbol):
+            if _pos.tp is None or _atr_val is None:
+                continue
+            _new_tp, _reason = _tp_adjust(
+                position_id=_pos.position_id,
+                side=_pos.side,
+                bars=_recent,
+                current_tp=_pos.tp,
+                avg_entry=_pos.avg_entry,
+                atr_val=_atr_val,
+                daily_vp=_daily_vp,
+            )
+            if _new_tp != _pos.tp:
+                _pstore.adjust_tp(_pos.position_id, _new_tp, "tp_participation")
+                LOG.info(f"[cycle][tp_part] {symbol} pos={_pos.position_id} tp {_pos.tp:.2f}→{_new_tp:.2f} ({_reason})")
+    except Exception as e:
+        LOG.debug(f"[cycle] tp_participation failed: {e}")
 
     # SL trailing on favorable move (only profitable cycles trailed)
     try:

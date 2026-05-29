@@ -126,7 +126,7 @@ def _has_setup(bar: Bar, settings: dict[str, Any]) -> tuple[bool, str]:
         return False, f"delta {delta:.2f} below calibrated threshold {min_abs_delta:.1f} (n={cal.sample_size})"
     total_vol = fp.total_bid + fp.total_ask
     if min_delta_ratio > 0 and total_vol > 0 and (abs(delta) / total_vol) < min_delta_ratio:
-        return False, f"delta_ratio {abs(delta)/total_vol:.4f} below threshold {min_delta_ratio:.4f}"
+        return False, f"delta_ratio {abs(delta)/total_vol:.2f} below threshold {min_delta_ratio:.2f}"
     if require_stacked and not stacked:
         return False, "no stacked imbalances"
     if require_absorption and not absorptions:
@@ -211,13 +211,7 @@ def decide():
             "bar_id": latest.bar_id,
         })
 
-    _filt = settings.get("decide_filter") or {}
-    rr_floor = float(
-        (_filt.get("rr_floor_per_symbol") or {}).get(symbol)
-        or _filt.get("rr_floor")
-        or 1.5
-    )
-    validator_reason = validate(decision, rr_floor=rr_floor)
+    validator_reason = validate(decision)
     decision_id = log_decision(
         bar_id=latest.bar_id,
         symbol=symbol,

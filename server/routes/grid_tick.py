@@ -21,7 +21,7 @@ from flask import Blueprint, current_app, jsonify, request
 
 from execution.direction_engine import decide_direction
 from execution.router import dispatch_grid, _build_grid_plan
-from execution.position_store import position_store
+from execution.position_store import position_store, position_store_m2
 from llm.schema import Decision
 from pipeline.state_store import store
 
@@ -66,6 +66,7 @@ def grid_tick():
     symbols = body.get("symbols") or [settings["instrument"]["symbol"]]
     primary_tf = body.get("tf") or settings["instrument"]["primary_tf"]
     dry_run = bool(body.get("dry_run", False))
+    paper_ab = bool(body.get("paper_ab", False))  # M2 paper fills to isolated positions_m2.jsonl
     force = bool(body.get("force", False))
 
     results = []
@@ -86,7 +87,9 @@ def grid_tick():
             _last_bars[sym] = latest.bar_id
 
             # Same-direction guard (skip dispatch path; dry_run still runs engine)
-            same_dir_open = [] if dry_run else [p for p in position_store().open_positions(sym)]
+            # paper_ab uses isolated M2 store — never checks M1 live positions
+            _pstore = position_store_m2() if paper_ab else position_store()
+            same_dir_open = [] if dry_run else [p for p in _pstore.open_positions(sym)]
             if same_dir_open:
                 results.append({
                     "symbol": sym, "skipped": "cycle already open",
@@ -118,7 +121,11 @@ def grid_tick():
                     bias_strength=decision.bias_strength,
                 )
                 plan = _build_grid_plan(d, latest, settings)
-                dispatch_result = dispatch_grid(plan, latest, settings)
+                # paper_ab: force paper mode + isolated store (doesn't affect M1 live)
+                dispatch_settings = dict(settings)
+                if paper_ab:
+                    dispatch_settings = {**settings, "mode": "paper", "_m2_paper": True}
+                dispatch_result = dispatch_grid(plan, latest, dispatch_settings)
 
             _log_comparison(sym, decision, latest.bar_id, dry_run, dispatch_result)
 
@@ -135,7 +142,16 @@ def grid_tick():
                 "dispatched": dispatch_result,
                 "dry_run": dry_run,
             })
-            LOG.info(f"[grid_tick{'/dry' if dry_run else ''}] {sym} {decision.side} bias={decision.bias_strength} score={decision.score:.2f}")
+            disp_skip = (dispatch_result or {}).get("skipped") if dispatch_result else None
+            disp_err  = (dispatch_result or {}).get("error")   if dispatch_result else None
+            pos_id    = (dispatch_result or {}).get("opened") or (dispatch_result or {}).get("position_id")
+            outcome   = f"opened={pos_id}" if pos_id else (
+                f"SKIP={disp_skip}" if disp_skip else (
+                f"ERR={disp_err}" if disp_err else "noop"))
+            LOG.info(
+                f"[grid_tick{'/dry' if dry_run else ''}] {sym} {decision.side} "
+                f"bias={decision.bias_strength} score={decision.score:.2f} → {outcome}"
+            )
         except Exception as e:
             LOG.exception(f"[grid_tick] {sym} error: {e}")
             results.append({"symbol": sym, "error": str(e), "trace": traceback.format_exc().splitlines()[-3:]})

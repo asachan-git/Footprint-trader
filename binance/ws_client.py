@@ -1,15 +1,16 @@
-"""Binance Futures aggTrade WebSocket stream.
+"""Binance aggTrade WebSocket stream.
 
-Endpoint: wss://stream.binance.com:9443/ws/<symbol_lower>@aggTrade
-No auth needed. Free public stream.
+Endpoints:
+  spot    — wss://stream.binance.com:9443/ws/<symbol_lower>@aggTrade
+  futures — wss://fstream.binance.com/ws/<symbol_lower>@aggTrade
+
+No auth needed. Free public streams.
 
 aggTrade fields used:
   T  — trade time ms
   p  — price
   q  — quantity
   m  — isBuyerMaker: false = taker bought (Buy); true = taker sold (Sell)
-
-No signup, no API key, no rate limits for market data streams.
 """
 
 from __future__ import annotations
@@ -23,21 +24,28 @@ import websockets
 
 LOG = logging.getLogger(__name__)
 
-BASE = "wss://stream.binance.com:9443/ws"
+_BASES = {
+    "spot":    "wss://stream.binance.com:9443/ws",
+    "futures": "wss://fstream.binance.com/ws",
+}
 
 
 async def stream_trades(
     symbol: str,
     on_trade: Callable[[int, float, float, str], None],
     ping_interval: float = 20.0,
+    venue: str = "futures",
 ) -> None:
     """Stream aggTrade for `symbol`; dispatch (ts_ms, price, qty, side) per trade."""
-    url = f"{BASE}/{symbol.lower()}@aggTrade"
+    base = _BASES.get(venue)
+    if base is None:
+        raise ValueError(f"[binance] unknown venue {venue!r}, expected one of {list(_BASES)}")
+    url = f"{base}/{symbol.lower()}@aggTrade"
     backoff = 3.0
     while True:
         try:
             async with websockets.connect(url, ping_interval=ping_interval) as ws:
-                LOG.info(f"[binance] connected {url}")
+                LOG.info(f"[binance:{venue}] connected {url}")
                 backoff = 3.0
                 msg_count = 0
                 async for raw in ws:

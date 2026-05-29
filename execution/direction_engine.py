@@ -5,18 +5,19 @@ module casts a vote (-1=strong short, +1=strong long) with a strength weight.
 Aggregated vote → (side, bias_strength) consumed by grid_placer.
 
 Modules voting (in order of weight):
-  CVD trend          weight 1.0
-  VP shape (P/b/D)   weight 0.8
-  Market structure   weight 0.9
-  FVG fill pressure  weight 0.6
-  Wave direction     weight 0.7
-  Sweep signal       weight 0.7
-  Wick trap          weight 0.6
-  Absorption bias    weight 0.5
+  CVD trend          weight 0.65
+  VP shape (P/b/D)   weight 0.80
+  VP position        weight 0.60
+  FVG fill pressure  weight 0.80
+  Wave direction     weight 0.90
+  Sweep signal       weight 0.70
+  Confirmation       weight 0.85  (ABSORPTION/EXHAUSTION/CONTINUATION patterns)
 
-Final score = Σ(direction × strength) / Σ(strength)
-|score| < 0.30 → flat
-bias_strength = clamp(round(|score| × 5), 1, 5)
+ChoCh is used only for invalidation (cycle_manager), not direction voting.
+
+Final score = Σ(direction × strength) / Σ(strength) × shape_regime_agreement multiplier
+|score| < 0.35 → flat
+bias_strength = clamp(round(|score| × 4) + 1, 1, 5)
 """
 
 from __future__ import annotations
@@ -146,16 +147,29 @@ def _fvg_vote(bars: list[Bar]) -> Vote | None:
 
 def _wave_vote(symbol: str, primary_tf: str) -> Vote | None:
     try:
-        from pipeline.features.wave import from_store as wave_from_store
-        w = wave_from_store(symbol, primary_tf)
-        if w is None:
+        from pipeline.features.wave import from_store_15m
+        w = from_store_15m(symbol)
+        if w is None or w.phase == "unknown":
             return None
-        direction = getattr(w, "direction", "")
-        phase = getattr(w, "phase", "")
-        if direction == "up" and phase in ("impulse", "extension"):
-            return Vote("wave", 1.0, 0.7, f"wave up {phase}")
-        if direction == "down" and phase in ("impulse", "extension"):
-            return Vote("wave", -1.0, 0.7, f"wave down {phase}")
+        direction = w.direction
+        label = w.wave_label
+        impulse_dir = 1.0 if direction == "up" else -1.0
+
+        # Wave 3 in progress — highest confidence (strongest impulse leg)
+        if w.is_wave3:
+            return Vote("wave", impulse_dir, 0.90, f"{label} wave3_confirmed")
+
+        # In an impulse leg (w1/w3/w5) — trend continuation vote
+        if w.phase == "impulse" and label in ("w1", "w3", "w5"):
+            conf = 0.55 if w.is_wave5 else 0.75
+            note = f"{label} impulse{'_watch_exhaustion' if w.is_wave5 else ''}"
+            return Vote("wave", impulse_dir, conf, note)
+
+        # In a correction (w2/w4) — favour mean-reversion entry in trend direction
+        if w.phase == "correction" and label in ("w2", "w4"):
+            conf = 0.65 if w.cvd_quality == "holding" else 0.50
+            return Vote("wave", impulse_dir, conf, f"{label} pullback cvd={w.cvd_quality}")
+
     except Exception:
         pass
     return None
@@ -213,21 +227,60 @@ def _sweep_vote(symbol: str, primary_tf: str) -> Vote | None:
     return None
 
 
-def _wick_trap_vote(bars: list[Bar]) -> Vote | None:
+def _confirmation_vote(symbol: str, primary_tf: str) -> Vote | None:
+    """Weighted-score confirmation patterns (ABSORPTION/EXHAUSTION/CONTINUATION).
+
+    Uses confirmation.from_store() for absorption + exhaustion (direction-agnostic).
+    Fires the stronger of the two confirmed patterns as a vote.
+    """
     try:
-        from pipeline.features.wick_trap import wick_trap_signal
-        n = min(20, len(bars))
-        recent = bars[-n:]
-        fps = [build_fp(b) for b in recent]
-        t = wick_trap_signal(recent, fps, lookback=20)
-        if t is None or t.confidence < 0.40:
-            return None
-        if t.side == "bull_trap":
-            return Vote("wick_trap", 1.0, t.confidence * 0.6, "bull trap (shorts trapped)")
-        return Vote("wick_trap", -1.0, t.confidence * 0.6, "bear trap (longs trapped)")
+        from pipeline.features.confirmation import from_store as conf_from_store
+        absorption, exhaustion = conf_from_store(symbol, primary_tf)
+
+        best: tuple[float, str] | None = None
+        if absorption.fired:
+            dir_ = 1.0 if absorption.side == "long" else -1.0
+            if best is None or absorption.confidence > best[0]:
+                best = (absorption.confidence, absorption.side)
+                return Vote(
+                    "confirmation",
+                    dir_,
+                    min(absorption.confidence, 1.0) * 0.85,
+                    f"absorption({absorption.side}) conf={absorption.confidence:.2f}",
+                )
+        if exhaustion.fired:
+            dir_ = 1.0 if exhaustion.side == "long" else -1.0
+            return Vote(
+                "confirmation",
+                dir_,
+                min(exhaustion.confidence, 1.0) * 0.85,
+                f"exhaustion({exhaustion.side}) conf={exhaustion.confidence:.2f}",
+            )
     except Exception:
         pass
     return None
+
+
+def _shape_regime_agreement(vp_shape: str, regime_type: str) -> float:
+    """Multiplier [0.7, 1.2] based on VP shape × day_type agreement."""
+    agree = {
+        ("P", "trend_down"): 1.2,
+        ("b", "trend_up"): 1.2,
+        ("D", "range"): 1.1,
+        ("B", "uncertain"): 1.0,
+    }
+    key = (vp_shape, regime_type)
+    if key in agree:
+        return agree[key]
+    # Mismatch: cap directional conviction
+    if vp_shape in ("P", "b") and regime_type not in ("trend_down", "trend_up", "range"):
+        return 0.85
+    if vp_shape in ("P", "b") and (
+        (vp_shape == "P" and regime_type == "trend_up") or
+        (vp_shape == "b" and regime_type == "trend_down")
+    ):
+        return 0.7   # strong disagreement
+    return 1.0
 
 
 def collect_votes(symbol: str, primary_tf: str = "15m") -> list[Vote]:
@@ -243,11 +296,11 @@ def collect_votes(symbol: str, primary_tf: str = "15m") -> list[Vote]:
         _cvd_vote(bars),
         _vp_shape_vote(symbol),
         _vp_position_vote(symbol, current_close),
-        _structure_vote(symbol, primary_tf),
+        # _structure_vote dropped: ChoCh used only for invalidation in cycle_manager
         _fvg_vote(bars),
         _wave_vote(symbol, primary_tf),
         _sweep_vote(symbol, primary_tf),
-        _wick_trap_vote(bars),
+        _confirmation_vote(symbol, primary_tf),
     ]
     return [v for v in raw if v is not None]
 
@@ -272,11 +325,28 @@ def decide_direction(symbol: str, primary_tf: str = "15m") -> DirectionDecision:
                                  votes=[], note="no votes")
     weighted_sum = sum(v.direction * v.strength for v in votes)
     total_weight = sum(v.strength for v in votes) + 1e-9
-    score = weighted_sum / total_weight
+    raw_score = weighted_sum / total_weight
+
+    # Apply VP shape × regime agreement multiplier
+    multiplier = 1.0
+    try:
+        from pipeline.features.vp_cache import get as vp_get
+        from pipeline.features.day_type import classify as day_classify
+        from pipeline.state_store import store as _store
+        _bars = _store().recent(symbol, primary_tf, 100)
+        vp = vp_get(symbol, "daily")
+        vp_shape = (vp.get("shape") or "") if vp else ""
+        dt = day_classify(_bars, symbol) if _bars else None
+        if vp_shape and dt:
+            multiplier = _shape_regime_agreement(vp_shape, dt.type)
+    except Exception:
+        pass
+
+    score = raw_score * multiplier
     if abs(score) < FLAT_THRESHOLD:
-        return DirectionDecision(side="flat", bias_strength=1, score=score,
+        return DirectionDecision(side="flat", bias_strength=1, score=round(score, 3),
                                  votes=votes,
-                                 note=f"|score|={abs(score):.2f} < {FLAT_THRESHOLD}")
+                                 note=f"|score|={abs(score):.2f} < {FLAT_THRESHOLD} (mult={multiplier:.2f})")
     side = "long" if score > 0 else "short"
     # bias_strength: map |score| from FLAT_THRESHOLD..1.0 to 1..5
     span = 1.0 - FLAT_THRESHOLD
@@ -285,5 +355,5 @@ def decide_direction(symbol: str, primary_tf: str = "15m") -> DirectionDecision:
     return DirectionDecision(
         side=side, bias_strength=bs, score=round(score, 3),
         votes=votes,
-        note=f"votes={len(votes)} score={score:.2f} bias={bs}",
+        note=f"votes={len(votes)} score={score:.2f} mult={multiplier:.2f} bias={bs}",
     )

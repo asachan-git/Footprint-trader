@@ -123,7 +123,7 @@ def _mode2_vote_distribution(since: int) -> dict:
             else:
                 out[module]["abstain"] += 1
     # Track modules that NEVER voted across all rows
-    all_modules = {"cvd", "vp_shape", "vp_position", "structure", "fvg", "wave", "sweep", "wick_trap"}
+    all_modules = {"cvd", "vp_shape", "vp_position", "structure", "fvg", "wave", "sweep"}
     for m in all_modules:
         if m not in out:
             out[m] = {"long": 0, "short": 0, "abstain": 0}

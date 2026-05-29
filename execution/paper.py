@@ -13,7 +13,7 @@ from pathlib import Path
 from llm.schema import Decision
 from pipeline.types import Bar
 
-from .position_store import position_store
+from .position_store import position_store, position_store_m2, PositionStore
 
 LOG = logging.getLogger(__name__)
 
@@ -98,7 +98,10 @@ class PaperExecutor:
             invalidation_note=decision.invalidation_note,
         )
 
-        pos = store.open_position(filled_decision, bar.bar_id, bar.symbol, bar.tf)
+        _open_lots = _sim_lots(bar.symbol, filled_decision.entry, filled_decision.stop_loss,
+                               qty_pct=float(getattr(decision, "qty_pct", 1.0) or 1.0))
+        pos = store.open_position(filled_decision, bar.bar_id, bar.symbol, bar.tf,
+                                  lots=_open_lots)
         risk = abs(pos.avg_entry - pos.stop_loss)
         rr = abs(pos.take_profit - pos.avg_entry) / risk if risk > 0 else 0
         slip_note = f"(slippage {slippage:+.2f} from signal {decision.entry:.2f})"
@@ -136,16 +139,18 @@ class PaperExecutor:
             "rationale": decision.rationale,
         }
 
-    def submit_grid(self, plan, bar: Bar) -> dict:
+    def submit_grid(self, plan, bar: Bar, _store: PositionStore | None = None) -> dict:
         """Paper simulation of a 5-leg limit grid.
 
         MVP: fill leg 1 immediately at its limit price; legs 2-5 stored as
         pending in pending_orders.jsonl. cycle_manager will fill them as
         price reaches each leg (checked on every bar close).
+
+        _store: override position store (used by M2 paper A/B to isolate fills).
         """
         from execution.pending_orders import pending_store
 
-        store = position_store()
+        store = _store or position_store()
         open_for_symbol = store.open_positions(bar.symbol)
         if open_for_symbol:
             existing = open_for_symbol[0]
@@ -156,6 +161,16 @@ class PaperExecutor:
 
         # Leg 1 fills immediately as the entry anchor
         leg1 = plan.legs[0]
+        # Guard: TP must be on profit side of leg1 entry. Otherwise anchor opens
+        # with TP <= entry (long) or TP >= entry (short) → instant degenerate fill.
+        if plan.side == "long" and plan.take_profit <= leg1.price:
+            LOG.warning(f"[paper-grid] reject {bar.symbol} long: TP {plan.take_profit:.2f} <= leg1 {leg1.price:.2f}")
+            return {"mode": "paper", "skipped": "degenerate_tp_long",
+                    "tp": plan.take_profit, "leg1": leg1.price}
+        if plan.side == "short" and plan.take_profit >= leg1.price:
+            LOG.warning(f"[paper-grid] reject {bar.symbol} short: TP {plan.take_profit:.2f} >= leg1 {leg1.price:.2f}")
+            return {"mode": "paper", "skipped": "degenerate_tp_short",
+                    "tp": plan.take_profit, "leg1": leg1.price}
         from llm.schema import Decision as _D
         filled = _D(
             side=plan.side,
@@ -167,7 +182,8 @@ class PaperExecutor:
             grid_leg=1,
             bias_strength=plan.bias_strength,
         )
-        pos = store.open_position(filled, bar.bar_id, bar.symbol, bar.tf)
+        pos = store.open_position(filled, bar.bar_id, bar.symbol, bar.tf,
+                                  lots=float(leg1.lots or 0.0))
 
         # Legs 2-5 stored as pending
         ps = pending_store()
@@ -195,8 +211,8 @@ class PaperExecutor:
             pass
 
         LOG.info(
-            f"[paper-grid] OPEN {plan.side} {bar.symbol} leg1@{leg1.price:.4f} lots={leg1.lots} "
-            f"+ 4 pending legs, TP={plan.take_profit:.4f} ({plan.tp_source})"
+            f"[paper-grid] OPEN {plan.side} {bar.symbol} leg1@{leg1.price:.2f} lots={leg1.lots} "
+            f"+ 4 pending legs, TP={plan.take_profit:.2f} ({plan.tp_source})"
         )
 
         return {

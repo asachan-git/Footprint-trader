@@ -178,20 +178,67 @@ def _anchor_to_storage(anchor: SessionAnchor) -> int | dict:
     return int(anchor)
 
 
+def _shift_vp(vp: dict, offset: float) -> dict:
+    """Return a copy of vp dict with all price levels shifted by offset."""
+    if not offset:
+        return vp
+    shifted = dict(vp)
+    for field in ("poc", "vah", "val"):
+        if shifted.get(field) is not None:
+            shifted[field] = round(shifted[field] + offset, 4)
+    if shifted.get("naked_poc") is not None:
+        shifted["naked_poc"] = round(shifted["naked_poc"] + offset, 4)
+    if shifted.get("hvn_zones"):
+        shifted["hvn_zones"] = [
+            {"low": round(z["low"] + offset, 4), "high": round(z["high"] + offset, 4)}
+            for z in shifted["hvn_zones"]
+        ]
+    if shifted.get("lvn_zones"):
+        shifted["lvn_zones"] = [
+            {"low": round(z["low"] + offset, 4), "high": round(z["high"] + offset, 4)}
+            for z in shifted["lvn_zones"]
+        ]
+    return shifted
+
+
+def _compute_venue_offset(symbol: str, broker_symbol: str, bybit_last_close: float) -> float:
+    """Fetch Vantage mid and return (vantage_mid - bybit_close). Returns 0.0 on failure."""
+    try:
+        from execution.venue_translator import fetch_venue_quote
+        quote = fetch_venue_quote("vantage_mt5", broker_symbol)
+        if quote.get("ok") and quote.get("mid"):
+            offset = float(quote["mid"]) - bybit_last_close
+            LOG.info(f"[vp_cache] {symbol} venue offset: vantage_mid={quote['mid']:.2f} "
+                     f"bybit_close={bybit_last_close:.2f} → offset={offset:+.2f}")
+            return offset
+        LOG.info(f"[vp_cache] {symbol} venue quote unavailable ({quote.get('error')}) — offset=0")
+    except Exception as e:
+        LOG.info(f"[vp_cache] {symbol} venue offset fetch failed: {e} — offset=0")
+    return 0.0
+
+
 def build_and_save(
     symbols: list[str],
     primary_tf: str = "1m",
     session_start_utc: dict | None = None,
     vp_bin_size: dict | None = None,
+    venue_price_offset: dict | None = None,
+    symbol_map: dict | None = None,
 ) -> None:
     """Pre-compute last 5 days + last 2 weeks VP for each symbol. Save to cache.
 
-    session_start_utc: {symbol: anchor} — int (DST-naive) or {tz, hour} (DST-aware).
-    vp_bin_size:       {symbol: float} — tick-aligned bin width (e.g. {"XAUTUSDT": 0.5}).
+    session_start_utc:  {symbol: anchor} — int (DST-naive) or {tz, hour} (DST-aware).
+    vp_bin_size:        {symbol: float} — tick-aligned bin width (e.g. {"XAUTUSDT": 0.5}).
+    venue_price_offset: {symbol: float | "auto" | None} — shift all VP price levels to
+                        match execution venue (e.g. Vantage XAUUSD+ vs ByBit XAUTUSDT).
+                        "auto": compute from MT5 quote vs last ByBit close at build time.
+    symbol_map:         {symbol: broker_symbol} — used when offset="auto" to fetch MT5 quote.
     """
     from pipeline.state_store import store as _store
     session_cfg = session_start_utc or {}
     bin_cfg = vp_bin_size or {}
+    offset_cfg = venue_price_offset or {}
+    sym_map = symbol_map or {}
     cache = _load()
     now_ts = int(time.time())
 
@@ -208,6 +255,17 @@ def build_and_save(
         cache.setdefault(symbol, {"daily": {}, "weekly": {}, "session_start_utc": _anchor_to_storage(anchor)})  # type: ignore[union-attr]
         sym_cache: dict[str, _Any] = cache[symbol]  # type: ignore[assignment]
         sym_cache["session_start_utc"] = _anchor_to_storage(anchor)
+
+        # Venue price offset — compute or store
+        raw_offset = offset_cfg.get(symbol)
+        if raw_offset == "auto":
+            broker_sym = sym_map.get(symbol, symbol)
+            last_close = all_bars[-1].ohlc.c
+            computed_offset = _compute_venue_offset(symbol, broker_sym, last_close)
+            sym_cache["venue_price_offset"] = computed_offset
+        elif raw_offset is not None:
+            sym_cache["venue_price_offset"] = float(raw_offset)
+        # else: leave existing offset in cache untouched (or absent = 0)
         if bin_size is not None:
             sym_cache["bin_size"] = bin_size
         computed = 0
@@ -242,27 +300,36 @@ def build_and_save(
     LOG.info(f"[vp_cache] saved → {CACHE_FILE}")
 
 
+def _get_offset(sym: dict) -> float:
+    return float(sym.get("venue_price_offset") or 0.0)
+
+
 def get(symbol: str, period: str) -> dict | None:
-    """Get cached VP for symbol + period (today / this week)."""
+    """Get cached VP for symbol + period (today / this week), venue-offset applied."""
     cache = _load()
     sym = cache.get(symbol, {})
     now_ts = int(time.time())
     anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
+    offset = _get_offset(sym)
     if period == "daily":
         key = _session_day_key(now_ts, anchor)
-        return sym.get("daily", {}).get(key)
+        vp = sym.get("daily", {}).get(key)
     elif period == "weekly":
         key = _week_key(now_ts)
-        return sym.get("weekly", {}).get(key)
-    return None
+        vp = sym.get("weekly", {}).get(key)
+    else:
+        return None
+    return _shift_vp(vp, offset) if vp else None
 
 
 def get_history(symbol: str, period: str, n: int = 5) -> list[dict]:
-    """Get last N cached VP snapshots (newest last)."""
+    """Get last N cached VP snapshots (newest last), venue-offset applied."""
     cache = _load()
-    entries = cache.get(symbol, {}).get(period, {})
+    sym_cache = cache.get(symbol, {})
+    offset = _get_offset(sym_cache)
+    entries = sym_cache.get(period, {})
     sorted_keys = sorted(entries.keys())[-n:]
-    return [{"period_key": k, **entries[k]} for k in sorted_keys]
+    return [{"period_key": k, **_shift_vp(entries[k], offset)} for k in sorted_keys]
 
 
 def poc_sequence(symbol: str, period: str, n: int = 5) -> list[float | None]:

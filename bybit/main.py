@@ -24,7 +24,10 @@ from utils.logging_config import setup as _setup_logging; _setup_logging()
 LOG = logging.getLogger("bybit.main")
 
 
-def _post(flask_url: str, payload: dict) -> None:
+def _post(flask_url: str, payload: dict, symbol_as: str | None = None) -> None:
+    if symbol_as:
+        payload["bar_id"] = payload["bar_id"].replace(payload["symbol"], symbol_as, 1)
+        payload["symbol"] = symbol_as
     data = json.dumps(payload).encode()
     req = urlreq.Request(
         flask_url.rstrip("/") + "/ingest",
@@ -40,18 +43,19 @@ def _post(flask_url: str, payload: dict) -> None:
         LOG.warning(f"[bar→flask] POST failed: {e}")
 
 
-async def run(symbol: str, tf: str, flask_url: str, price_step: float, category: str, use_rest: bool = False) -> None:
+async def run(symbol: str, tf: str, flask_url: str, price_step: float, category: str, use_rest: bool = False, symbol_as: str | None = None) -> None:
     builder = FootprintBuilder(
         symbol=symbol,
         tf=tf,
-        on_bar_close=lambda payload: _post(flask_url, payload),
+        on_bar_close=lambda payload: _post(flask_url, payload, symbol_as=symbol_as),
         price_step=price_step,
     )
+    display = f"{symbol}→{symbol_as}" if symbol_as else symbol
     if use_rest:
-        LOG.info(f"[bybit] REST polling {symbol} {tf} ({category}) → {flask_url}/ingest (price_step={price_step})")
+        LOG.info(f"[bybit] REST polling {display} {tf} ({category}) → {flask_url}/ingest (price_step={price_step})")
         await rest_stream_trades(symbol, builder.on_tick, category=category)
     else:
-        LOG.info(f"[bybit] streaming {symbol} {tf} ({category}) → {flask_url}/ingest (price_step={price_step})")
+        LOG.info(f"[bybit] streaming {display} {tf} ({category}) → {flask_url}/ingest (price_step={price_step})")
         await ws_stream_trades(symbol, builder.on_tick, category=category)
 
 
@@ -66,8 +70,11 @@ def main() -> None:
                     help="linear=perpetuals (BTCUSDT), spot=spot pairs (PAXGUSDT)")
     ap.add_argument("--rest", action="store_true",
                     help="Use REST polling fallback instead of WebSocket (for geo-blocked regions)")
+    ap.add_argument("--symbol-as", default=None, dest="symbol_as",
+                    help="Remap symbol in bar payload (e.g. XAUUSDT→XAUTUSDT for ingest)")
     args = ap.parse_args()
-    asyncio.run(run(args.symbol, args.tf, args.flask, args.price_step, args.category, use_rest=args.rest))
+    asyncio.run(run(args.symbol, args.tf, args.flask, args.price_step, args.category,
+                    use_rest=args.rest, symbol_as=args.symbol_as))
 
 
 if __name__ == "__main__":

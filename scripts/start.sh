@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Single-command launcher — starts all services.
 # Usage:
-#   bash scripts/start.sh                  # BTC (Binance) + XAUT (Bybit)
+#   bash scripts/start.sh                  # BTC (Binance WS) + XAUT (Bybit linear REST)
 #   bash scripts/start.sh --exness         # also stream XAUUSDm via Exness
 
 set -euo pipefail
@@ -52,18 +52,19 @@ PYTHONPATH=. python3 -m server.app > logs/flask.log 2>&1 &
 PIDS+=($!)
 sleep 2
 
-# 2 — BTCUSDT via Binance spot WS (stream.binance.com:9443 works from India)
-echo "[start] BTCUSDT ingress (Binance spot WS)..."
+# 2 — BTCUSDT via Binance Futures REST poll (fstream WS geo-blocked from IN;
+#     fapi.binance.com REST works and delivers full aggTrade history)
+echo "[start] BTCUSDT ingress (Binance Futures REST)..."
 PYTHONPATH=. python3 -m binance.main \
-  --symbol BTCUSDT --tf 1m --price-step 10.0 \
-  > logs/bybit_btc.log 2>&1 &
+  --symbol BTCUSDT --tf 1m --price-step 10.0 --venue futures --rest \
+  > logs/binance_btc.log 2>&1 &
 PIDS+=($!)
 
-# 3 — XAUTUSDT via Bybit REST polling (WS geo-blocked; REST accessible from India)
-echo "[start] XAUTUSDT ingress (Bybit REST poll)..."
-PYTHONPATH=. python3 -m bybit.main \
-  --symbol XAUTUSDT --tf 1m --price-step 0.1 --category spot --rest \
-  > logs/bybit_xaut.log 2>&1 &
+# 3 — XAUTUSDT via Binance Futures XAUUSDT perp REST poll
+echo "[start] XAUTUSDT ingress (Binance Futures XAUUSDT REST)..."
+PYTHONPATH=. python3 -m binance.main \
+  --symbol XAUUSDT --symbol-as XAUTUSDT --tf 1m --price-step 0.1 --venue futures --rest \
+  > logs/binance_xaut.log 2>&1 &
 PIDS+=($!)
 
 # 4 — Exness XAUUSDm optional
@@ -135,7 +136,7 @@ for d in r.get('results', []):
 
 cross = r.get('cross_market_note', '')
 if cross: print(f'  🔗 {cross[:110]}')
-" 2>/dev/null || echo "  parse err")
+" 2>/dev/null || echo "  parse err: $(echo "$result" | head -c 200 | tr '\n' ' ')")
     echo "$ts | $note" | tee -a "$log"
   done
 }
@@ -144,14 +145,16 @@ export -f auto_decide_multi
 bash -c "auto_decide_multi '$FLASK_URL' '$DECIDE_INTERVAL' '$DECIDE_TF'" > logs/decide_multi.log 2>&1 &
 PIDS+=($!)
 
-# 5b — Mode 2 dry-run grid_tick alongside Mode 1 for A/B comparison
-auto_grid_tick_dry() {
+# 5b — Mode 2 paper grid_tick alongside Mode 1 for A/B comparison
+# paper_ab=true → isolated positions_m2.jsonl, never blocks M1 live positions
+# dry_run=true still appended for signal log (mode_compare.jsonl)
+auto_grid_tick_paper() {
   local flask="$1"
   local interval="$2"
   local tf="$3"
-  local log="logs/grid_tick_dry.log"
-  local offset=10  # 5s after auto_decide_multi so both fire on same bar
-  echo "[grid-tick/dry] started — Mode 2 dry-run every ${interval}s for A/B vs Mode 1"
+  local log="logs/grid_tick_paper.log"
+  local offset=10  # 10s after auto_decide_multi so both fire on same bar
+  echo "[grid-tick/paper] started — Mode 2 paper A/B every ${interval}s"
   while true; do
     local now next sleep_s
     now=$(date +%s)
@@ -166,7 +169,7 @@ auto_grid_tick_dry() {
     ts=$(date '+%Y-%m-%d %H:%M:%S')
     result=$(curl -s -X POST "${flask}/grid_tick" \
       -H "Content-Type: application/json" \
-      -d "{\"symbols\":[\"BTCUSDT\",\"XAUTUSDT\"],\"tf\":\"${tf}\",\"dry_run\":true}")
+      -d "{\"symbols\":[\"BTCUSDT\",\"XAUTUSDT\"],\"tf\":\"${tf}\",\"paper_ab\":true}")
     note=$(echo "$result" | python3 -c "
 import sys, json
 r = json.load(sys.stdin)
@@ -175,14 +178,16 @@ for d in r.get('results', []):
     side = d.get('side','-').upper()
     bs = d.get('bias_strength','-')
     sc = d.get('score','-')
+    disp = d.get('dispatched') or {}
+    fill = disp.get('position_id') or disp.get('skipped') or '-'
     icon = '📈' if side=='LONG' else '📉' if side=='SHORT' else '—'
-    print(f'  {icon} {sym:10} {side:6} bias={bs} score={sc}')
-" 2>/dev/null || echo "  parse err")
+    print(f'  {icon} {sym:10} {side:6} bias={bs} score={sc} fill={fill}')
+" 2>/dev/null || echo "  parse err: $(echo "$result" | head -c 200 | tr '\n' ' ')")
     echo "$ts | $note" | tee -a "$log"
   done
 }
-export -f auto_grid_tick_dry
-bash -c "auto_grid_tick_dry '$FLASK_URL' '$DECIDE_INTERVAL' '$DECIDE_TF'" > logs/grid_tick_dry.log 2>&1 &
+export -f auto_grid_tick_paper
+bash -c "auto_grid_tick_paper '$FLASK_URL' '$DECIDE_INTERVAL' '$DECIDE_TF'" > logs/grid_tick_paper.log 2>&1 &
 PIDS+=($!)
 
 echo ""
@@ -190,10 +195,10 @@ echo "[start] ✓ All services running. PIDs: ${PIDS[*]}"
 echo ""
 echo "  Logs:"
 echo "    Flask:           logs/flask.log"
-echo "    Bybit BTC:       logs/bybit_btc.log"
-echo "    Bybit XAUT:      logs/bybit_xaut.log"
+echo "    Binance BTC:     logs/binance_btc.log"
+echo "    Binance XAUT:    logs/binance_xaut.log"
 echo "    Multi-decide:    logs/decide_multi.log    (Mode 1: Claude)"
-echo "    Grid-tick dry:   logs/grid_tick_dry.log   (Mode 2: rules, A/B compare)"
+echo "    Grid-tick paper: logs/grid_tick_paper.log  (Mode 2: rules, isolated paper A/B)"
 echo "    History rebuild: logs/rebuild_history.log"
 [[ $EXNESS -eq 1 ]] && echo "    Exness:          logs/exness.log"
 echo ""

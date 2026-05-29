@@ -27,6 +27,7 @@ instrument:
   primary_tf: 1m           # decision fires on close of this TF; higher TFs join as-of
 
 claude:
+  mode: restricted           # full | restricted | off
   model: claude-sonnet-4-6
   fallback_model: claude-opus-4-7   # used when validator flags ambiguity
   cache: true
@@ -63,6 +64,13 @@ vp_cache:
   # Intra-day VP refresh — rebuild current day's POC/VAH/VAL/HVN/LVN every N
   # primary-TF bars. Default 5 = every 5 minutes at 1m primary TF. Set 0 to disable.
   intraday_refresh_bars: 5
+  # Venue price offset — shifts all VP levels (POC/VAH/VAL/HVN/LVN) to match execution venue.
+  # "auto": compute at build time from Vantage MT5 mid vs ByBit last close (requires MT5 reachable).
+  # <float>: static offset in price units applied directly (positive = Vantage trades higher than ByBit).
+  # null / omitted: no shift (ByBit prices used as-is).
+  venue_price_offset:
+    BTCUSDT: null
+    XAUTUSDT: "auto"
 
 # Execution venue (Vantage MT5 via MetaApi)
 execution:

@@ -92,3 +92,75 @@ CLAUDE_TOOL = {
         "required": ["side", "confidence", "rationale"],
     },
 }
+
+
+# ── Grid Plan Schema (v4 — used when claude.mode = full or restricted) ─────────
+
+class GridLegOrder(BaseModel):
+    leg_idx: int = Field(ge=1, le=5)
+    price: float
+    qty: float = Field(gt=0)
+    rationale: str = Field(default="", max_length=60)
+
+
+class PositionManagement(BaseModel):
+    tp_primary: float
+    tp_extended: float | None = None
+    sl: float
+    max_legs: int = Field(ge=1, le=5, default=3)
+    trail_after_r: float = Field(ge=0.0, default=2.0)
+    be_after_r: float = Field(ge=0.0, default=1.0)
+    tp_shrink_on_opposite_absorption: bool = True
+
+
+class GridDecision(BaseModel):
+    """Full grid plan returned by Claude in FULL or RESTRICTED mode."""
+    side: Side
+    confidence: float = Field(ge=0.0, le=1.0)
+    grid_orders: list[GridLegOrder] = Field(default_factory=list)
+    position_management: PositionManagement | None = None
+    invalidation_note: str = Field(default="", max_length=160)
+    rationale: str = Field(default="", max_length=300)
+
+
+GRID_PLAN_TOOL = {
+    "name": "submit_grid_plan",
+    "description": "Submit a full grid execution plan with leg prices, quantities, and position management.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "side": {"type": "string", "enum": ["long", "short", "flat"]},
+            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "grid_orders": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "leg_idx":   {"type": "integer", "minimum": 1, "maximum": 5},
+                        "price":     {"type": "number"},
+                        "qty":       {"type": "number", "minimum": 0.001},
+                        "rationale": {"type": "string", "maxLength": 60},
+                    },
+                    "required": ["leg_idx", "price", "qty"],
+                },
+                "description": "Empty array when side=flat.",
+            },
+            "position_management": {
+                "type": "object",
+                "properties": {
+                    "tp_primary":   {"type": "number"},
+                    "tp_extended":  {"type": ["number", "null"]},
+                    "sl":           {"type": "number"},
+                    "max_legs":     {"type": "integer", "minimum": 1, "maximum": 5},
+                    "trail_after_r":{"type": "number", "minimum": 0},
+                    "be_after_r":   {"type": "number", "minimum": 0},
+                    "tp_shrink_on_opposite_absorption": {"type": "boolean"},
+                },
+                "required": ["tp_primary", "sl", "max_legs"],
+            },
+            "invalidation_note": {"type": "string", "maxLength": 160},
+            "rationale": {"type": "string", "maxLength": 300},
+        },
+        "required": ["side", "confidence", "grid_orders"],
+    },
+}

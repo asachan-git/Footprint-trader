@@ -78,3 +78,96 @@ def nearest_fvg_below(fvgs: list[FVG], price: float, side: Literal["bull", "bear
     """Find highest FVG with high < price (next zone below)."""
     cand = [f for f in fvgs if f.high < price and (side is None or f.side == side)]
     return max(cand, key=lambda f: f.high) if cand else None
+
+
+# ── VP Context Annotation ─────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class AnnotatedFVG:
+    """FVG enriched with VP structural context.
+
+    inside_lvn: FVG zone overlaps an LVN (thin liquidity) — momentum kick likely.
+    above_hvn:  Nearest HVN is below the FVG — HVN acts as floor/support.
+    below_hvn:  Nearest HVN is above the FVG — HVN acts as ceiling/resistance.
+    hvn_zone:   The HVN zone dict if above_hvn or below_hvn.
+    """
+    fvg: FVG
+    inside_lvn: bool
+    above_hvn: dict | None      # HVN zone below this FVG (floor)
+    below_hvn: dict | None      # HVN zone above this FVG (ceiling)
+
+    @property
+    def side(self) -> str:
+        return self.fvg.side
+
+    @property
+    def low(self) -> float:
+        return self.fvg.low
+
+    @property
+    def high(self) -> float:
+        return self.fvg.high
+
+    @property
+    def mid(self) -> float:
+        return self.fvg.mid
+
+    @property
+    def momentum_boost(self) -> bool:
+        """True if FVG inside LVN — expects fast price movement through zone."""
+        return self.inside_lvn
+
+    @property
+    def confluence_with_hvn(self) -> bool:
+        """True if FVG is near an HVN that acts as structural support/resistance."""
+        return self.above_hvn is not None or self.below_hvn is not None
+
+
+def annotate_with_vp_context(
+    fvg: FVG,
+    hvn_zones: list[dict],
+    lvn_zones: list[dict],
+) -> AnnotatedFVG:
+    """Enrich an FVG with its relationship to HVN and LVN zones.
+
+    Args:
+        fvg:       The FVG to annotate.
+        hvn_zones: HVN zone list from vp_cache (each: {low, high, volume}).
+        lvn_zones: LVN zone list from vp_cache (each: {low, high, volume}).
+    """
+    # Check overlap with any LVN
+    inside_lvn = any(
+        z["low"] <= fvg.mid <= z["high"]
+        for z in lvn_zones
+        if isinstance(z, dict) and "low" in z and "high" in z
+    )
+
+    # Find nearest HVN below FVG (floor for bullish FVG)
+    above_hvn: dict | None = None
+    hvns_below = [z for z in hvn_zones
+                  if isinstance(z, dict) and "high" in z and z["high"] < fvg.low]
+    if hvns_below:
+        above_hvn = max(hvns_below, key=lambda z: z["high"])
+
+    # Find nearest HVN above FVG (ceiling for bearish FVG)
+    below_hvn: dict | None = None
+    hvns_above = [z for z in hvn_zones
+                  if isinstance(z, dict) and "low" in z and z["low"] > fvg.high]
+    if hvns_above:
+        below_hvn = min(hvns_above, key=lambda z: z["low"])
+
+    return AnnotatedFVG(
+        fvg=fvg,
+        inside_lvn=inside_lvn,
+        above_hvn=above_hvn,
+        below_hvn=below_hvn,
+    )
+
+
+def annotate_all(
+    fvgs: list[FVG],
+    hvn_zones: list[dict],
+    lvn_zones: list[dict],
+) -> list[AnnotatedFVG]:
+    """Annotate a list of FVGs with VP context. Returns AnnotatedFVG list."""
+    return [annotate_with_vp_context(f, hvn_zones, lvn_zones) for f in fvgs]

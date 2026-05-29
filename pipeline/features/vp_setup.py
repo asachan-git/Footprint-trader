@@ -1,4 +1,4 @@
-"""VP Setup Classifier — 4 institutional mean-reversion setups.
+"""VP Setup Classifier — 4 institutional trade setups.
 
 Classifies the current bar into one of four VP-based trade setups using
 the relationship between current price, daily VP (POC/VAH/VAL/HVN/LVN),
@@ -16,9 +16,7 @@ The 4 setups:
 
   poc_migration: Daily POC consistently migrating same direction ≥ 2 days.
                  Trend-follow setup. Wider target, max 2 legs.
-
-  acceptance:    Price closed outside VA and subsequent bar also outside.
-                 Breakout continuation. Tight grid (1-2 legs), trend follow.
+                 Powers trend-continuation grid signal.
 
   none:          No clear setup — flat bias.
 
@@ -189,37 +187,6 @@ def classify(
                 grid_mode="directional",
             )
 
-    # ── Setup 5: VAH/VAL Acceptance (breakout continuation) ─────────────────
-    if prev_bar_close is not None:
-        if prev_bar_close > vah and current_price > vah:
-            # Both bars above VAH — acceptance above value area
-            extension = current_price + va_range * 1.5
-            entry_zones = [current_price, vah + (current_price - vah) * 0.5]
-            return VPSetup(
-                setup_type="acceptance",
-                bias="long",
-                entry_zones=_filter_zones(entry_zones[:2]),
-                target_zones=[round(extension, 2)],
-                max_legs=2,
-                setup_strength=0.65,
-                reason=f"price accepted above VAH {vah:.2f} — breakout continuation long",
-                grid_mode="directional",
-            )
-        if prev_bar_close < val and current_price < val:
-            # Both bars below VAL — acceptance below value area
-            extension = current_price - va_range * 1.5
-            entry_zones = [current_price, val - (val - current_price) * 0.5]
-            return VPSetup(
-                setup_type="acceptance",
-                bias="short",
-                entry_zones=_filter_zones(entry_zones[:2]),
-                target_zones=[round(extension, 2)],
-                max_legs=2,
-                setup_strength=0.65,
-                reason=f"price accepted below VAL {val:.2f} — breakout continuation short",
-                grid_mode="directional",
-            )
-
     return _NO_SETUP
 
 
@@ -232,7 +199,7 @@ def _build_long_zones(val: float, poc: float, hvn_zones: list, wave) -> list[flo
     hvn_between = [z["low"] for z in hvn_zones if val < z["low"] < poc]
     zones.extend(sorted(hvn_between)[:2])
     # Use Fibonacci levels from wave if available
-    if wave and wave.fib_retrace and wave.phase in ("correction", "reversal"):
+    if wave and wave.fib_retrace and wave.phase == "correction":
         fib_50 = wave.fib_retrace.get(0.5)
         fib_618 = wave.fib_retrace.get(0.618)
         if fib_50 and val <= fib_50 <= poc: zones.insert(1, fib_50)
@@ -245,7 +212,7 @@ def _build_short_zones(vah: float, poc: float, hvn_zones: list, wave) -> list[fl
     zones = [vah]
     hvn_between = [z["high"] for z in hvn_zones if poc < z["high"] < vah]
     zones.extend(sorted(hvn_between, reverse=True)[:2])
-    if wave and wave.fib_retrace and wave.phase in ("correction", "reversal"):
+    if wave and wave.fib_retrace and wave.phase == "correction":
         fib_50 = wave.fib_retrace.get(0.5)
         fib_618 = wave.fib_retrace.get(0.618)
         if fib_50 and poc <= fib_50 <= vah: zones.insert(1, fib_50)

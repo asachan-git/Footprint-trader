@@ -97,7 +97,7 @@ def translate(
         if abs_legs and sum(l.lots for l in abs_legs) > 0 else anchor
     )
 
-    note = (f"[venue-translated] venue_anchor={anchor:.4f} "
+    note = (f"[venue-translated] venue_anchor={anchor:.2f} "
             f"(quote_ok={venue_quote.get('ok')}, tick={tick_size}, min_dist={min_distance}) | "
             f"{plan.note}")
 

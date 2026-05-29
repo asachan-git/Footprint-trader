@@ -228,6 +228,26 @@ def classify_outcomes(recent_bars: list, symbol: str) -> int:
     return updated
 
 
+def get_recent_events(symbol: str, tf: str, n: int = 20) -> list[BigTradeEvent]:
+    """Return last N BigTradeEvents for symbol/tf with resolved outcomes.
+
+    Reads from BIG_TRADES_LOG. Used by confirmation.py for mechanical scoring.
+    """
+    if not BIG_TRADES_LOG.exists():
+        return []
+    result: list[BigTradeEvent] = []
+    for line in BIG_TRADES_LOG.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            e = json.loads(line)
+            if e.get("symbol") == symbol and e.get("tf") == tf and e.get("outcome") != "pending":
+                result.append(BigTradeEvent(**{k: e[k] for k in BigTradeEvent.__dataclass_fields__ if k in e}))
+        except Exception:
+            pass
+    return result[-n:]
+
+
 def session_summary(symbol: str, current_price: float, n: int = 5) -> dict:
     """Return last N big trade events near current price for Claude context.
 
