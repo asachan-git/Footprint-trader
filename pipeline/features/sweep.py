@@ -28,11 +28,16 @@ SweepRegistry keeps events alive for 20 bars. Eviction on:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from threading import Lock
 from typing import Literal
 
 from pipeline.features.swing import SwingPoints, all_reference_levels
+
+SWEEP_LOG_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+_log_lock = Lock()
 
 # Volume at the extreme (top/bottom N% of bar range) vs bar average
 EXTREME_VOL_FRACTION = 0.10   # top/bottom 10% of bar range = "extreme zone"
@@ -58,6 +63,7 @@ class SweepSignal:
     vol_ratio: float       # volume_at_extreme / avg_level_volume
     reason: str
     delta_confirms: bool = True    # False → confidence × 0.5
+    rejection_pct: float = 0.0   # bar rejection fraction when sweep fired
     granularity: str = "candle"    # "candle" | "range" | "session"
     age_bars: int = 0              # bars since sweep fired
 
@@ -75,6 +81,8 @@ class SweepEvent:
     granularity: str
     age_bars: int = 0
     pattern: str = ""           # "" | "sweep_reclaim" | "sweep_acceptance"
+    classification: str = ""     # "reversal" | "liquidity_grab" | "stop_run" | "failed_sweep" | ""
+    rejection_pct: float = 0.0   # bar rejection fraction when sweep fired (used for classification)
     stale: bool = False
     _consecutive_fails: int = field(default=0, repr=False)
 
@@ -115,6 +123,22 @@ def _update_events(events: list[SweepEvent], current_bar) -> list[SweepEvent]:
                         ev.pattern = "sweep_reclaim"
                     elif close < ev.swept_level:
                         ev.pattern = "sweep_acceptance"
+                # Classify based on pattern + delta + rejection strength
+                if ev.classification == "":
+                    if ev.pattern == "sweep_acceptance":
+                        ev.classification = "failed_sweep"
+                    elif not ev.delta_confirms:
+                        # Opposite delta = stops cleared but no reversal participation
+                        ev.classification = "stop_run"
+                    elif ev.pattern == "sweep_reclaim" and ev.rejection_pct >= 0.55:
+                        # Strong delta + strong reclaim + deep rejection = real reversal
+                        ev.classification = "reversal"
+                    elif ev.level_label in ("prior_day_high", "prior_day_low",
+                                            "session_high", "session_low",
+                                            "equal_high", "equal_low"):
+                        ev.classification = "liquidity_grab"
+                    else:
+                        ev.classification = "reversal"  # default for delta-confirmed sweeps
         # Failure check: price closes back through swept level 2+ consecutive bars
         if ev.sweep_type == "sweep_high" and close > ev.swept_level:
             ev._consecutive_fails += 1
@@ -145,6 +169,7 @@ def _register_new_sweep(symbol: str, sig: SweepSignal) -> None:
             initial_close=sig.bar_close,
             confidence=sig.confidence,
             delta_confirms=sig.delta_confirms,
+            rejection_pct=sig.rejection_pct,
             granularity=sig.granularity,
         ))
         _registry[symbol] = evs
@@ -234,6 +259,90 @@ def _close_rejection_pct(bar, direction: str) -> float:
         return (bar.ohlc.c - bar.ohlc.l) / bar_range
 
 
+# ── Candle engulf sweep ────────────────────────────────────────────────────────
+
+def detect_candle_engulf(bar, prev_bar) -> SweepSignal:
+    """Single-bar candle sweep: wick sweeps prior H/L AND close engulfs prior body.
+
+    Sweep HIGH: bar.high > prev.high AND bar.close < prev.low  (bearish engulf after sweep)
+    Sweep LOW:  bar.low  < prev.low  AND bar.close > prev.high (bullish engulf after sweep)
+
+    Returns _NONE if neither condition met.
+    """
+    if prev_bar is None:
+        return _NONE
+    bar_range = bar.ohlc.h - bar.ohlc.l
+    if bar_range <= 0 or bar_range / max(bar.ohlc.c, 0.01) < MIN_BAR_RANGE_PCT:
+        return _NONE
+
+    prev_body_high = max(prev_bar.ohlc.o, prev_bar.ohlc.c)
+    prev_body_low  = min(prev_bar.ohlc.o, prev_bar.ohlc.c)
+
+    # Sweep HIGH + bearish engulf: wicks above prev high, closes below prev body low
+    if bar.ohlc.h > prev_bar.ohlc.h and bar.ohlc.c < prev_body_low:
+        rejection_pct = _close_rejection_pct(bar, "high")
+        vol_extreme, avg_vol = _extreme_volume(bar, "high")
+        vol_ratio = vol_extreme / avg_vol if avg_vol > 0 else 0.0
+        delta_ok = _delta_confirms_sweep(bar, "sweep_high")
+        conf = _sweep_confidence(rejection_pct, vol_ratio, "candle_engulf_high")
+        if not delta_ok:
+            conf = round(conf * 0.5, 2)
+        sig = SweepSignal(
+            type="sweep_high",
+            swept_level=prev_bar.ohlc.h,
+            level_label="candle_engulf_high",
+            wick_extreme=bar.ohlc.h,
+            bar_close=bar.ohlc.c,
+            confidence=conf,
+            volume_at_extreme=vol_extreme,
+            avg_level_volume=avg_vol,
+            vol_ratio=round(vol_ratio, 3),
+            reason=(
+                f"engulf: swept prev_high={prev_bar.ohlc.h:.2f}, "
+                f"close={bar.ohlc.c:.2f} < prev_body_low={prev_body_low:.2f}, "
+                f"rejection={rejection_pct*100:.0f}%"
+            ),
+            delta_confirms=delta_ok,
+            rejection_pct=rejection_pct,
+            granularity="candle",
+        )
+        _register_new_sweep(bar.symbol if hasattr(bar, "symbol") else "", sig)
+        return sig
+
+    # Sweep LOW + bullish engulf: wicks below prev low, closes above prev body high
+    if bar.ohlc.l < prev_bar.ohlc.l and bar.ohlc.c > prev_body_high:
+        rejection_pct = _close_rejection_pct(bar, "low")
+        vol_extreme, avg_vol = _extreme_volume(bar, "low")
+        vol_ratio = vol_extreme / avg_vol if avg_vol > 0 else 0.0
+        delta_ok = _delta_confirms_sweep(bar, "sweep_low")
+        conf = _sweep_confidence(rejection_pct, vol_ratio, "candle_engulf_low")
+        if not delta_ok:
+            conf = round(conf * 0.5, 2)
+        sig = SweepSignal(
+            type="sweep_low",
+            swept_level=prev_bar.ohlc.l,
+            level_label="candle_engulf_low",
+            wick_extreme=bar.ohlc.l,
+            bar_close=bar.ohlc.c,
+            confidence=conf,
+            volume_at_extreme=vol_extreme,
+            avg_level_volume=avg_vol,
+            vol_ratio=round(vol_ratio, 3),
+            reason=(
+                f"engulf: swept prev_low={prev_bar.ohlc.l:.2f}, "
+                f"close={bar.ohlc.c:.2f} > prev_body_high={prev_body_high:.2f}, "
+                f"rejection={rejection_pct*100:.0f}%"
+            ),
+            delta_confirms=delta_ok,
+            rejection_pct=rejection_pct,
+            granularity="candle",
+        )
+        _register_new_sweep(bar.symbol if hasattr(bar, "symbol") else "", sig)
+        return sig
+
+    return _NONE
+
+
 # ── Core detection ─────────────────────────────────────────────────────────────
 
 def detect(bar, swing_pts: SwingPoints, prev_bars: list | None = None) -> SweepSignal:
@@ -282,6 +391,7 @@ def detect(bar, swing_pts: SwingPoints, prev_bars: list | None = None) -> SweepS
                         f"vol_ratio={vol_ratio:.2f}× delta_confirms={delta_ok}"
                     ),
                     delta_confirms=delta_ok,
+                    rejection_pct=rejection_pct,
                     granularity="candle",
                 )
 
@@ -315,11 +425,19 @@ def detect(bar, swing_pts: SwingPoints, prev_bars: list | None = None) -> SweepS
                         f"vol_ratio={vol_ratio:.2f}× delta_confirms={delta_ok}"
                     ),
                     delta_confirms=delta_ok,
+                    rejection_pct=rejection_pct,
                     granularity="candle",
                 )
 
     if best.type != "none":
         _register_new_sweep(swing_pts.symbol, best)
+
+    # Also check candle engulf — if stronger, use it instead
+    if prev_bars:
+        prev_bar = prev_bars[-1]
+        engulf = detect_candle_engulf(bar, prev_bar)
+        if engulf.type != "none" and engulf.confidence > best.confidence:
+            return engulf  # already registered inside detect_candle_engulf
 
     return best
 
@@ -328,15 +446,122 @@ def _sweep_confidence(rejection_pct: float, vol_ratio: float, level_label: str) 
     rejection_score = min(1.0, (rejection_pct - MIN_REJECTION_PCT) / (1.0 - MIN_REJECTION_PCT))
     vol_score = min(1.0, (vol_ratio - 1.0) / 3.0) if vol_ratio >= 1.0 else 0.0
     label_bonus = {
-        "prior_day_high": 0.15,
-        "prior_day_low":  0.15,
-        "vah":            0.10,
-        "val":            0.10,
-        "session_high":   0.05,
-        "session_low":    0.05,
+        "equal_high":        0.20,   # EQH stop cluster — highest priority target
+        "equal_low":         0.20,
+        "prior_day_high":    0.15,
+        "prior_day_low":     0.15,
+        "vah":               0.10,
+        "val":               0.10,
+        "session_high":      0.05,
+        "session_low":       0.05,
+        "candle_engulf_high": 0.12,
+        "candle_engulf_low":  0.12,
     }.get(level_label, 0.0)
     raw = 0.50 * rejection_score + 0.35 * vol_score + label_bonus
     return round(min(0.92, max(0.35, 0.30 + raw * 0.70)), 2)
+
+
+def _sweep_log_path(symbol: str, tf: str = "1m") -> Path:
+    return SWEEP_LOG_DIR / f"sweeps_{symbol}_{tf}.jsonl"
+
+
+def _classify_signal(sig: SweepSignal) -> str:
+    """Derive sweep classification from signal fields (same logic as registry age_bars==1)."""
+    if not sig.delta_confirms:
+        return "stop_run"
+    if sig.rejection_pct >= 0.55:
+        return "reversal"
+    if sig.level_label in ("prior_day_high", "prior_day_low", "session_high", "session_low",
+                           "equal_high", "equal_low"):
+        return "liquidity_grab"
+    return "reversal"
+
+
+def log_sweep(symbol: str, sig: SweepSignal, bar_ts: int, tf: str = "1m") -> None:
+    """Append a detected sweep to the per-symbol per-TF JSONL log."""
+    entry = {
+        "ts": bar_ts,
+        "type": sig.type,
+        "swept_level": round(sig.swept_level, 4),
+        "level_label": sig.level_label,
+        "wick_extreme": round(sig.wick_extreme, 4),
+        "bar_close": round(sig.bar_close, 4),
+        "confidence": round(sig.confidence, 3),
+        "delta_confirms": sig.delta_confirms,
+        "rejection_pct": round(sig.rejection_pct, 3),
+        "granularity": sig.granularity,
+        "classification": _classify_signal(sig),
+    }
+    with _log_lock:
+        with _sweep_log_path(symbol, tf).open("a") as fh:
+            fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+
+
+def read_sweep_log(symbol: str, since_ts: int = 0, tf: str = "1m") -> list[dict]:
+    """Return all logged sweeps for symbol/TF since since_ts."""
+    p = _sweep_log_path(symbol, tf)
+    if not p.exists():
+        return []
+    out = []
+    try:
+        with p.open() as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                    if e.get("ts", 0) >= since_ts:
+                        out.append(e)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return out
+
+
+_TF_BARS_PER_DAY: dict[str, int] = {
+    "1m": 1440, "3m": 480, "5m": 288, "15m": 96, "30m": 48, "1h": 24,
+}
+
+
+def backfill_registry(symbol: str, primary_tf: str, days: int = 5) -> int:
+    """Replay stored bars through sweep detector to populate registry and log.
+
+    TF-aware: uses bars_per_day from _TF_BARS_PER_DAY.
+    Builds rolling SwingPoints per bar with structural pivots.
+    Skips timestamps already in log to avoid duplicates.
+    Returns count of sweeps detected.
+    """
+    import time
+    from pipeline.state_store import store as _store
+    from pipeline.features.swing import build as swing_build
+
+    bars_per_day = _TF_BARS_PER_DAY.get(primary_tf, 1440)
+    since_ts = int(time.time()) - days * 86400
+    s = _store()
+    bars = s.recent(symbol, primary_tf, days * bars_per_day + 50)
+    bars = [b for b in bars if b.close_ts >= since_ts]
+    if len(bars) < 10:
+        return 0
+
+    # Load already-logged timestamps to avoid duplicates
+    existing = {e["ts"] for e in read_sweep_log(symbol, since_ts=since_ts, tf=primary_tf)}
+
+    n_detected = 0
+    window = min(200, max(50, bars_per_day // 4))   # TF-scaled lookback window
+    for i, bar in enumerate(bars):
+        session_slice = bars[max(0, i - window): i + 1]
+        sp = swing_build(symbol, primary_tf, session_slice)
+        prev = bars[max(0, i - window): i]
+        sig = detect(bar, sp, prev_bars=prev)
+        tick_registry(symbol, bar)
+        if sig.type != "none":
+            if bar.close_ts not in existing:
+                log_sweep(symbol, sig, bar.close_ts, tf=primary_tf)
+                existing.add(bar.close_ts)
+            n_detected += 1
+    return n_detected
 
 
 def from_store(symbol: str, primary_tf: str) -> SweepSignal:

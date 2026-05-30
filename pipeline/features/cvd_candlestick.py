@@ -50,41 +50,75 @@ _NONE_SIGNAL = CVDSignal(pattern="none", side="neutral", confidence=0.0,
 SWING_LOOKBACK = 20   # bars for CVD swing high/low detection
 
 
-def build_cvd_candles(bars: list) -> list[CVDCandle]:
-    """Build CVD OHLC candle series from bars.
+def _session_start_for(close_ts: int, symbol: str) -> int:
+    """Return UTC ts of the session start for the bar containing close_ts.
+    BTC sessions = UTC 00:00 (24h). XAU sessions = UTC 22:00 (CME). Falls
+    back to UTC midnight for unknown symbols.
+    """
+    if symbol.startswith("XAU"):
+        sess_hr = 22
+    else:
+        sess_hr = 0
+    sec_per_day = 86400
+    # Anchor at most recent UTC date's sess_hr; if bar before that today,
+    # use yesterday's anchor.
+    day = (close_ts // sec_per_day) * sec_per_day
+    cand = day + sess_hr * 3600
+    if close_ts < cand:
+        cand -= sec_per_day
+    return cand
 
-    Each bar's delta = net CVD change for that bar.
-    Intra-bar extremes approximated from price direction + delta sign.
+
+def build_cvd_candles(bars: list) -> list[CVDCandle]:
+    """Build CVD OHLC candle series from bars. CVD resets to 0 at each session
+    start (BTC: UTC 00:00; XAU: UTC 22:00).
     """
     if not bars:
         return []
 
     candles: list[CVDCandle] = []
     running_cvd = 0.0
+    session_anchor = 0.0
+    current_session_start: int | None = None
+    symbol = bars[0].symbol if bars else ""
 
     for bar in bars:
         delta = bar.delta or 0.0
-        cvd_open = running_cvd
-        cvd_close = running_cvd + delta
+        sess_start = _session_start_for(bar.close_ts, bar.symbol)
+        new_session = sess_start != current_session_start
+        if new_session:
+            current_session_start = sess_start
+            # Reset display anchor: subsequent values measured from this point
+            # Real path: anchor = bar.cvd_open at session-start bar
+            # Fallback: anchor = running_cvd (reset display to 0)
+            if bar.cvd_open is not None:
+                session_anchor = bar.cvd_open
+            else:
+                session_anchor = running_cvd
 
-        price_bull = bar.ohlc.c >= bar.ohlc.o
-        delta_positive = delta > 0
-
-        if price_bull and delta_positive:
-            # Classic bull bar: CVD rose throughout
-            cvd_high, cvd_low = cvd_close, cvd_open
-        elif not price_bull and not delta_positive:
-            # Classic bear bar: CVD fell throughout
-            cvd_high, cvd_low = cvd_open, cvd_close
-        elif price_bull and not delta_positive:
-            # Divergence: price up, CVD down (hidden selling / distribution)
-            # CVD oscillated — conservative estimate: min/max of open+close
-            cvd_high = max(cvd_open, cvd_close)
-            cvd_low = min(cvd_open, cvd_close)
+        # Prefer real intra-bar CVD path from live builder (gives true wicks).
+        has_real = (bar.cvd_open is not None and bar.cvd_high is not None
+                    and bar.cvd_low is not None and bar.cvd_close is not None)
+        if has_real:
+            cvd_open  = bar.cvd_open  - session_anchor
+            cvd_high  = bar.cvd_high  - session_anchor
+            cvd_low   = bar.cvd_low   - session_anchor
+            cvd_close = bar.cvd_close - session_anchor
+            running_cvd = bar.cvd_close
         else:
-            # Divergence: price down, CVD up (hidden buying / absorption)
-            cvd_high = max(cvd_open, cvd_close)
-            cvd_low = min(cvd_open, cvd_close)
+            cvd_open = running_cvd - session_anchor
+            cvd_close_abs = running_cvd + delta
+            cvd_close = cvd_close_abs - session_anchor
+            price_bull = bar.ohlc.c >= bar.ohlc.o
+            delta_positive = delta > 0
+            if price_bull and delta_positive:
+                cvd_high, cvd_low = cvd_close, cvd_open
+            elif not price_bull and not delta_positive:
+                cvd_high, cvd_low = cvd_open, cvd_close
+            else:
+                cvd_high = max(cvd_open, cvd_close)
+                cvd_low = min(cvd_open, cvd_close)
+            running_cvd = cvd_close_abs
 
         candles.append(CVDCandle(
             bar_id=bar.bar_id,
@@ -97,7 +131,6 @@ def build_cvd_candles(bars: list) -> list[CVDCandle]:
             price_open=bar.ohlc.o,
             price_close=bar.ohlc.c,
         ))
-        running_cvd = cvd_close
 
     return candles
 

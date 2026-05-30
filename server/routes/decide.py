@@ -13,11 +13,12 @@ import traceback
 
 from flask import Blueprint, current_app, jsonify, request
 
-from execution.router import dispatch
+from execution.router import dispatch, dispatch_grid
 from execution.position_store import position_store
 from execution.grid_manager import should_add_leg, active_grid_summary
 from pipeline.features.session import current_session
 from pipeline.features.threshold_calibrator import get as get_thresholds
+from pipeline.features.atr import atr_from_store
 from llm.client import ClaudeClient, ClientConfig
 from llm.logger import log_decision
 from llm.validator import validate
@@ -26,7 +27,9 @@ from pipeline.features import bar_delta, stacked_imbalances, detect_absorption
 from pipeline.state_store import store
 from pipeline.types import Bar
 from typing import Any
-from prompts.builder import active_version, cached_prefix, variable_suffix
+from prompts.builder import active_version, cached_prefix, build_cached_prefix, variable_suffix
+from llm.validator import validate_grid_plan
+from execution.grid_placer import grid_decision_to_plan
 
 bp = Blueprint("decide", __name__)
 LOG = logging.getLogger(__name__)
@@ -92,20 +95,15 @@ def _same_direction_cooldown(symbol: str, cooldown_bars: int = 3) -> tuple[bool,
 
 
 def _has_setup(bar: Bar, settings: dict[str, Any]) -> tuple[bool, str]:
-    """Pre-filter: only call Claude if local features show a candidate setup."""
+    """Pre-filter: only call Claude if local features show a candidate setup.
+
+    Delegates to execution.pre_filter which is shared with grid_tick (M2 path).
+    Legacy delta/stacked/absorption checks preserved for backwards compat with
+    settings that don't set require_structural_setup=true.
+    """
     filt: dict[str, Any] = settings.get("decide_filter") or {}
-    min_confidence = float(filt.get("min_confidence") or 0)
-    require_stacked = bool(filt.get("require_stacked", False))
-    require_absorption = bool(filt.get("require_absorption", False))
     cooldown_bars = int(filt.get("same_direction_cooldown", 3))
     primary_tf = str(settings.get("instrument", {}).get("primary_tf", "1m"))
-
-    # Auto-calibrated delta threshold from live bar history
-    cal = get_thresholds(bar.symbol, primary_tf, bar.tf)
-    config_min = float(filt.get("min_abs_delta") or 0)
-    # Use calibrated if sample is sufficient, else fall back to config
-    min_abs_delta = cal.min_abs_delta if cal.sample_size >= 8 else config_min
-    min_delta_ratio = cal.min_delta_ratio if cal.sample_size >= 8 else 0.0
 
     # Time filter
     active, time_reason = _in_active_hours(filt, bar.close_ts, symbol=bar.symbol)
@@ -117,21 +115,16 @@ def _has_setup(bar: Bar, settings: dict[str, Any]) -> tuple[bool, str]:
     if blocked:
         return False, cooldown_reason
 
-    fp = build_fp(bar)
-    delta = bar_delta(fp)
-    stacked = stacked_imbalances(fp)
-    absorptions = detect_absorption(bar, fp)
+    # Structural pre-filter (shared with M2 grid_tick path)
+    try:
+        from execution.pre_filter import check as _pf_check
+        pf = _pf_check(bar, settings)
+        if not pf.passed:
+            return False, pf.reason
+    except Exception as e:
+        LOG.debug(f"[decide] pre_filter failed, allowing: {e}")
 
-    if abs(delta) < min_abs_delta:
-        return False, f"delta {delta:.2f} below calibrated threshold {min_abs_delta:.1f} (n={cal.sample_size})"
-    total_vol = fp.total_bid + fp.total_ask
-    if min_delta_ratio > 0 and total_vol > 0 and (abs(delta) / total_vol) < min_delta_ratio:
-        return False, f"delta_ratio {abs(delta)/total_vol:.2f} below threshold {min_delta_ratio:.2f}"
-    if require_stacked and not stacked:
-        return False, "no stacked imbalances"
-    if require_absorption and not absorptions:
-        return False, "no absorption detected"
-    return True, f"filter passed (delta={delta:.1f} thresh={min_abs_delta:.1f} n={cal.sample_size})"
+    return True, "filter passed"
 
 
 @bp.post("/decide")
@@ -147,6 +140,15 @@ def decide():
     latest = s.latest(symbol, primary_tf)
     if latest is None:
         return jsonify({"ok": False, "error": f"no bars stored for {symbol} {primary_tf}"}), 404
+
+    disabled = (settings.get("decide_filter") or {}).get("disabled_symbols") or []
+    if symbol in disabled and not force:
+        return jsonify({
+            "ok": True,
+            "skipped": True,
+            "reason": f"{symbol} disabled for M1 (Claude). M2 rules engine handles this symbol.",
+            "bar_id": latest.bar_id,
+        })
 
     if not force:
         passed, reason = _has_setup(latest, settings)
@@ -168,8 +170,12 @@ def decide():
 
     trading_mode = str(settings.get("trading_mode") or "buy_sell_only")
 
-    # Grid context only injected when trading_mode=grid
-    prefix = cached_prefix(settings["prompt"]["few_shot_count"])
+    # In grid mode Claude designs the full 5-leg plan via submit_grid_plan
+    # (v4 prompt). buy_sell_only uses submit_decision; mechanical placer fills legs.
+    if trading_mode == "grid":
+        prefix = build_cached_prefix(settings["prompt"]["few_shot_count"])
+    else:
+        prefix = cached_prefix(settings["prompt"]["few_shot_count"])
     suffix_base = variable_suffix(recent, higher)
     import json as _json
     suffix_dict = _json.loads(suffix_base)
@@ -195,7 +201,25 @@ def decide():
 
     try:
         client = ClaudeClient(cfg)
-        decision = client.decide(prefix, suffix)
+        if trading_mode == "grid":
+            grid_decision = client.decide_grid(prefix, suffix)
+            # Synthesize a thin Decision for legacy log/confidence paths.
+            from llm.schema import Decision as _Dec
+            decision = _Dec(
+                side=grid_decision.side,
+                entry=grid_decision.grid_orders[0].price if grid_decision.grid_orders else None,
+                stop_loss=(grid_decision.position_management.sl
+                           if grid_decision.position_management else None),
+                take_profit=(grid_decision.position_management.tp_primary
+                             if grid_decision.position_management else None),
+                confidence=grid_decision.confidence,
+                rationale=grid_decision.rationale,
+                invalidation_note=grid_decision.invalidation_note,
+                bias_strength=max(1, min(5, int(round(grid_decision.confidence * 5)))),
+            )
+        else:
+            grid_decision = None
+            decision = client.decide(prefix, suffix)
     except Exception as e:
         tb = traceback.format_exc()
         LOG.error(f"Claude call failed: {e}\n{tb}")
@@ -211,7 +235,16 @@ def decide():
             "bar_id": latest.bar_id,
         })
 
-    validator_reason = validate(decision)
+    if grid_decision is not None:
+        _atr15 = atr_from_store(symbol, "15m", period=14) or 0.0
+        if _atr15 <= 0:
+            _atr15 = max(abs(latest.ohlc.h - latest.ohlc.l), 1e-6) * 5
+        validator_reason = validate_grid_plan(
+            grid_decision, current_price=float(latest.ohlc.c), atr=_atr15,
+        )
+    else:
+        validator_reason = validate(decision)
+
     decision_id = log_decision(
         bar_id=latest.bar_id,
         symbol=symbol,
@@ -224,7 +257,11 @@ def decide():
 
     dispatch_result = None
     if validator_reason is None and decision.side != "flat":
-        dispatch_result = dispatch(decision, latest, settings)
+        if grid_decision is not None:
+            plan = grid_decision_to_plan(grid_decision, latest, settings)
+            dispatch_result = dispatch_grid(plan, latest, settings)
+        else:
+            dispatch_result = dispatch(decision, latest, settings)
 
     return jsonify({
         "ok": True,

@@ -29,6 +29,12 @@ POSITIONS_LOG = ROOT / "data" / "positions.jsonl"
 
 EventType = Literal["open", "add_leg", "close", "invalidate", "sl_adjust"]
 
+# Source tags written to every open/add_leg event.
+# m1_claude  — leg1 triggered by Claude direction decision
+# m2_rules   — leg1 triggered by M2 rules engine decision
+# mechanical_grid — legs 2-5 filled by cycle_manager price touch
+SourceTag = Literal["m1_claude", "m2_rules", "mechanical_grid"]
+
 
 @dataclass
 class GridLeg:
@@ -41,6 +47,7 @@ class GridLeg:
     confidence: float
     rationale: str
     lots: float = 0.0   # actual fill qty; 0.0 = unknown (older events / live fills)
+    source: str = ""    # m1_claude | m2_rules | mechanical_grid
 
 
 @dataclass
@@ -56,6 +63,7 @@ class GridPosition:
     closed_ts: int = 0
     close_reason: str = ""
     broker_ticket: str = ""   # MetaApi positionId — empty for paper
+    source: str = ""          # m1_claude | m2_rules (from leg1 open event)
 
     @property
     def avg_entry(self) -> float:
@@ -97,6 +105,7 @@ class PositionStore:
         etype = event["type"]
         pid = event["position_id"]
         if etype == "open":
+            src = event.get("source", "")
             leg = GridLeg(
                 leg=1,
                 entry=event["entry"],
@@ -107,6 +116,7 @@ class PositionStore:
                 confidence=event.get("confidence", 0),
                 rationale=event.get("rationale", ""),
                 lots=float(event.get("lots", 0.0) or 0.0),
+                source=src,
             )
             self._positions[pid] = GridPosition(
                 position_id=pid,
@@ -116,6 +126,7 @@ class PositionStore:
                 legs=[leg],
                 opened_ts=event["ts"],
                 broker_ticket=event.get("broker_ticket", ""),
+                source=src,
             )
         elif etype == "add_leg" and pid in self._positions:
             leg = GridLeg(
@@ -128,6 +139,7 @@ class PositionStore:
                 confidence=event.get("confidence", 0),
                 rationale=event.get("rationale", ""),
                 lots=float(event.get("lots", 0.0) or 0.0),
+                source=str(event.get("source") or "mechanical_grid"),  # type: ignore[arg-type]
             )
             self._positions[pid].legs.append(leg)
         elif etype in ("close", "invalidate") and pid in self._positions:
@@ -162,6 +174,7 @@ class PositionStore:
         broker_ticket: str = "",
         fill_type: str = "paper_simulated",
         lots: float = 0.0,
+        source: str = "",
     ) -> GridPosition:
         import uuid
         pid = uuid.uuid4().hex[:12]
@@ -182,11 +195,12 @@ class PositionStore:
                 "broker_ticket": broker_ticket,
                 "fill_type": fill_type,
                 "lots": float(lots or 0.0),
+                "source": source,
             })
         return self._positions[pid]
 
     def add_leg(self, position_id: str, decision: Decision, bar_id: str,
-                lots: float = 0.0) -> None:
+                lots: float = 0.0, source: str = "mechanical_grid") -> None:
         with self._lock:
             pos = self._positions.get(position_id)
             if not pos or pos.status != "open":
@@ -201,6 +215,7 @@ class PositionStore:
                 "rationale": decision.rationale,
                 "bar_id": bar_id,
                 "lots": float(lots or 0.0),
+                "source": source,
             })
 
     def close_position(self, position_id: str, reason: str, realized_r: float) -> bool:

@@ -34,3 +34,8 @@ class Bar:
     ask_ladder: tuple[Level, ...]
     poc: float | None = None
     delta: float | None = None
+    # Intra-bar CVD path (live builder populates; None for historical/synthetic).
+    cvd_open: float | None = None
+    cvd_high: float | None = None
+    cvd_low: float | None = None
+    cvd_close: float | None = None

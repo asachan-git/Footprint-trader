@@ -20,8 +20,8 @@ from typing import Literal
 from pipeline.types import Bar
 
 
-FIB_LADDER = (1, 1, 2, 3, 5)
-N_LEGS = 5
+FIB_LADDER = (1, 1, 2, 3, 5, 8, 13)
+N_LEGS = 7
 
 
 @dataclass(frozen=True)
@@ -155,13 +155,13 @@ def plan_grid(
         regime_label = "regime_unknown"
 
     # ── Collect zones ──────────────────────────────────────────────────────
-    # Confluence-driven grid: request 2× legs from zone_collector so we have
-    # candidates after dropping anchor-adjacent and weak ones.
-    min_gap = max(atr_15m * 0.10, 0.1)
+    # Confluence-driven grid: request 3× legs candidates with relaxed min_gap
+    # so L2..L5 actually pend. Tight gap previously starved grid to L1 only.
+    min_gap = max(atr_15m * 0.05, 0.05)
     try:
         from execution.zone_collector import collect as _collect
         zones = _collect(symbol, direction, anchor, htf_bars=htf_bars or [],
-                         n=max(n_legs * 2, 8), min_gap=min_gap)
+                         n=max(n_legs * 3, 12), min_gap=min_gap)
     except Exception:
         zones = []
 
@@ -201,14 +201,15 @@ def plan_grid(
     # In RANGE mode: TP at next major HVN/POC (minimum distance = 1.5×ATR)
     # In TREND mode (with trend): TP at next HTF FVG / swept level (1.5×ATR)
     # In CAUTIOUS: tight TP (0.5×ATR) to lock quick exits
+    # Bumped TP min distance: prior 1.5/0.5×ATR yielded +0.17R avg trades.
+    # Targeting 2.0×ATR (range/directional) and 1.0×ATR (cautious) so single-leg
+    # exits clear ~0.5R minimum even before grid DCA.
     if grid_mode_label == "directional":
-        # Push TP further — trending move can extend
-        tp_min_mult = max(min_tp_distance_mult, 1.5)
+        tp_min_mult = max(min_tp_distance_mult, 2.5)
     elif grid_mode_label == "cautious":
-        tp_min_mult = min(min_tp_distance_mult, 0.5)
+        tp_min_mult = max(min_tp_distance_mult, 1.0)
     else:
-        # Range / default — moderate TP, shrinker will tighten as legs fill
-        tp_min_mult = max(min_tp_distance_mult, 1.5)
+        tp_min_mult = max(min_tp_distance_mult, 2.0)
     # Anchor TP off leg1 price (the immediate fill), not avg_entry.
     # avg_entry assumes all 5 legs filled, but leg1 anchor fills first — if TP
     # is closer to leg1 than min_distance, anchor opens with TP <= entry.
@@ -247,6 +248,51 @@ def plan_grid(
         bias_strength=bias_strength, safety_sl=safety_sl,
         note=(f"regime={regime_label} mode={grid_mode_label} legs={n_legs} "
               f"bias={bias_strength}/5 avg={avg_entry:.2f} tp={tp_price:.2f}({tp_source}) | {sources_summary}"),
+        anchor_price=anchor,
+        leg_offsets_pct=leg_offsets_pct,
+        tp_offset_pct=tp_offset_pct,
+        safety_sl_offset_pct=safety_sl_offset_pct,
+    )
+
+
+def grid_decision_to_plan(gd, bar, settings: dict) -> GridPlan:
+    """Convert a Claude GridDecision (price + qty per leg) into a GridPlan
+    that dispatch_grid() can consume directly. Bypasses mechanical zone/Fib
+    placement — Claude is the source of truth.
+    """
+    exec_cfg = settings.get("execution", {}) or {}
+    broker_symbol = (exec_cfg.get("symbol_map") or {}).get(bar.symbol, bar.symbol)
+    anchor = float(bar.ohlc.c) or 1e-9
+
+    legs_sorted = sorted(gd.grid_orders, key=lambda x: x.leg_idx)
+    legs: list[GridLegPlan] = [
+        GridLegPlan(
+            leg_idx=g.leg_idx,
+            price=float(g.price),
+            lots=float(g.qty),
+            side=gd.side,
+            source=(g.rationale or "claude_grid")[:40],
+        )
+        for g in legs_sorted
+    ]
+    avg_entry = sum(l.price for l in legs) / len(legs) if legs else 0.0
+    pm = gd.position_management
+    tp_price = float(pm.tp_primary) if pm is not None else (legs[0].price if legs else anchor)
+    safety_sl = float(pm.sl) if (pm is not None and pm.sl is not None) else None
+
+    leg_offsets_pct = tuple((l.price - anchor) / anchor for l in legs)
+    tp_offset_pct = (tp_price - anchor) / anchor
+    safety_sl_offset_pct = ((safety_sl - anchor) / anchor) if safety_sl is not None else None
+
+    bias_strength = max(1, min(5, int(round(float(gd.confidence) * 5))))
+
+    return GridPlan(
+        symbol=bar.symbol, broker_symbol=broker_symbol,
+        side=gd.side, legs=legs,
+        avg_entry_on_full_fill=avg_entry,
+        take_profit=tp_price, tp_source="claude_grid",
+        bias_strength=bias_strength, safety_sl=safety_sl,
+        note=f"claude_grid: {(gd.rationale or '')[:120]}",
         anchor_price=anchor,
         leg_offsets_pct=leg_offsets_pct,
         tp_offset_pct=tp_offset_pct,

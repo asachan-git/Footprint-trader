@@ -29,6 +29,45 @@ DECISIONS_LOG = ROOT / "data" / "decisions.jsonl"
 POSITIONS_LOG = ROOT / "data" / "positions.jsonl"
 POSITIONS_LOG_M2 = ROOT / "data" / "positions_m2.jsonl"
 
+# Big-trade JSONL cache — keyed by file path. Stores parsed events per symbol
+# + the last byte offset, so subsequent calls only read appended bytes.
+_BT_CACHE: dict = {"path": None, "size": 0, "by_symbol": {}, "mtime": 0.0}
+
+def _big_trade_raw_cached(path, symbol: str) -> list[dict]:
+    """Return cached raw events for `symbol`. Re-parses only newly-appended bytes."""
+    import json as _json
+    if not path.exists():
+        return []
+    st = path.stat()
+    cur_size, cur_mtime = st.st_size, st.st_mtime
+    # Invalidate cache if file shrank / rotated / different path
+    if (_BT_CACHE["path"] != str(path) or cur_size < _BT_CACHE["size"]
+            or cur_mtime < _BT_CACHE["mtime"]):
+        _BT_CACHE["path"] = str(path)
+        _BT_CACHE["size"] = 0
+        _BT_CACHE["by_symbol"] = {}
+    start = _BT_CACHE["size"]
+    if cur_size > start:
+        with path.open("rb") as fh:
+            fh.seek(start)
+            tail = fh.read().decode(errors="ignore")
+        # If we resumed mid-line (unlikely with line-buffered appends) drop it
+        if start > 0 and not tail.startswith("\n") and "\n" in tail:
+            tail = tail[tail.index("\n") + 1:]
+        for line in tail.splitlines():
+            if not line.strip():
+                continue
+            try:
+                e = _json.loads(line)
+            except Exception:
+                continue
+            sym = e.get("symbol") or ""
+            _BT_CACHE["by_symbol"].setdefault(sym, []).append(e)
+        _BT_CACHE["size"] = cur_size
+        _BT_CACHE["mtime"] = cur_mtime
+    return _BT_CACHE["by_symbol"].get(symbol, [])
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _latest_m1_decision(symbol: str) -> dict | None:
@@ -167,20 +206,26 @@ def _build_detections(symbol: str, tf: str) -> dict:
         except Exception:
             pass
 
-        # Sweep
+        # Sweep — detect on latest bar using cached swing points (rebuild if cache cold)
         try:
-            from pipeline.features.sweep import detect
-            sw = detect(bars, symbol)
-            if sw and sw.type != "none":
-                detections["sweep"] = {
-                    "type": sw.type,
-                    "wick_extreme": sw.wick_extreme,
-                    "level_label": sw.level_label,
-                    "confidence": round(sw.confidence, 2),
-                    "pattern": sw.pattern,
-                    "age_bars": sw.age_bars,
-                    "granularity": getattr(sw, "granularity", ""),
-                }
+            from pipeline.features.sweep import detect as _sw_detect
+            from pipeline.features.swing import get as _swing_get, build as _swing_build
+            _sp = _swing_get(symbol)
+            if _sp is None:
+                _sp = _swing_build(symbol, tf, bars[-100:])
+            if _sp is not None:
+                sw = _sw_detect(latest, _sp, bars[-100:])
+                if sw and sw.type != "none":
+                    detections["sweep"] = {
+                        "type": sw.type,
+                        "wick_extreme": sw.wick_extreme,
+                        "level_label": sw.level_label,
+                        "confidence": round(sw.confidence, 2),
+                        "pattern": getattr(sw, "pattern", ""),
+                        "age_bars": getattr(sw, "age_bars", 0),
+                        "granularity": getattr(sw, "granularity", "candle"),
+                        "classification": getattr(sw, "classification", ""),
+                    }
         except Exception:
             pass
 
@@ -226,6 +271,13 @@ def _build_detections(symbol: str, tf: str) -> dict:
         except Exception:
             pass
 
+        # VA width regime — expanding/contracting across last 3 sessions
+        try:
+            from pipeline.features.vp_cache import get_va_regime as _va_regime
+            detections["va_regime"] = _va_regime(symbol, "daily", n=3)
+        except Exception:
+            pass
+
         # Active sweep registry (all live sweeps, not just the latest detect())
         try:
             from pipeline.features.sweep import active_sweeps
@@ -241,6 +293,7 @@ def _build_detections(symbol: str, tf: str) -> dict:
                     "granularity":   ev.granularity,
                     "age_bars":      ev.age_bars,
                     "pattern":       ev.pattern,
+                    "classification": ev.classification,
                     "stale":         ev.stale,
                 }
                 for ev in (active_sweeps(symbol) or [])
@@ -248,24 +301,55 @@ def _build_detections(symbol: str, tf: str) -> dict:
         except Exception:
             pass
 
-        # Big-trade events with resolved outcomes (last N)
+        # Big-trade events — cached merged dict per (symbol). File is append-only,
+        # so we incrementally parse new bytes since last read instead of re-reading
+        # the full JSONL on every poll (~23k lines → 2s+ scan).
         try:
-            from pipeline.features.big_trade import get_recent_events
-            detections["big_trades"] = [
-                {
-                    "ts":              ev.ts,
-                    "price":           round(ev.price, 4),
-                    "volume":          round(ev.volume, 4),
-                    "aggressor":       ev.aggressor,
-                    "vp_context":      ev.vp_context,
-                    "outcome":         ev.outcome,
-                    "price_moved_pct": round(ev.price_moved_pct, 4),
-                    "sweep_associated": ev.sweep_associated,
-                }
-                for ev in (get_recent_events(symbol, tf, n=20) or [])
-            ]
-        except Exception:
-            pass
+            from pipeline.features.big_trade import BIG_TRADES_LOG
+            import json as _json
+            raw = _big_trade_raw_cached(BIG_TRADES_LOG, symbol)
+            # Server-side merge is TIGHT (1-minute × 1-tick) so per-minute
+            # granularity preserved. Client re-merges visually by zoom level.
+            tbin = 60
+            _ref_px = float(raw[-1].get("price") or 0) if raw else 0.0
+            tick = _infer_tick(symbol, _ref_px) if _ref_px else (10.0 if symbol.startswith("BTC") else 0.1)
+            pbin = max(tick, 1e-9)
+            buckets: dict[tuple, dict] = {}
+            for e in raw:
+                ts = int(e.get("ts") or 0)
+                px = float(e.get("price") or 0)
+                key = (ts // tbin, round(px / pbin), e.get("aggressor"))
+                cur = buckets.get(key)
+                if cur is None:
+                    buckets[key] = {
+                        "ts":              ts,
+                        "price":           round(px, 4),
+                        "volume":          float(e.get("volume") or 0),
+                        "aggressor":       e.get("aggressor"),
+                        "vp_context":      e.get("vp_context"),
+                        "outcome":         e.get("outcome") or "pending",
+                        "price_moved_pct": float(e.get("price_moved_pct") or 0),
+                        "sweep_associated": bool(e.get("sweep_associated")),
+                        "merged_count":    1,
+                    }
+                else:
+                    cur["volume"] += float(e.get("volume") or 0)
+                    cur["merged_count"] += 1
+                    # Keep most-progressed outcome
+                    rank = {"pending": 0, "pushed": 2, "absorbed": 1, "exhausted": 1}
+                    if rank.get(e.get("outcome") or "pending", 0) > rank.get(cur["outcome"], 0):
+                        cur["outcome"] = e.get("outcome")
+                    if abs(float(e.get("price_moved_pct") or 0)) > abs(cur["price_moved_pct"]):
+                        cur["price_moved_pct"] = float(e.get("price_moved_pct") or 0)
+                    if e.get("sweep_associated"):
+                        cur["sweep_associated"] = True
+            merged = sorted(buckets.values(), key=lambda x: x["ts"])
+            for m in merged:
+                m["volume"] = round(m["volume"], 4)
+                m["price_moved_pct"] = round(m["price_moved_pct"], 4)
+            detections["big_trades"] = merged[-3000:]
+        except Exception as e:
+            LOG.debug(f"[dashboard] big_trades read failed: {e}")
 
     except Exception as e:
         LOG.warning(f"[dashboard] detections failed: {e}")
@@ -341,8 +425,54 @@ def _live_ladders(binance_sym: str, open_ms: int, symbol: str, ref_price: float,
     return _serialize(bid), _serialize(ask)
 
 
+# Short-TTL cache for live REST calls — many concurrent polls hit cache
+_LIVE_CACHE: dict = {}   # key=(symbol,tf,include_ladder) -> (ts, payload)
+_LIVE_TTL = 3.5          # seconds — > poll cadence so warm cache served
+_REQUEST_LOG: dict = {}  # key -> last_request_ts (lazy prefetch tracking)
+_PREFETCH_STARTED = False
+
+def _start_lazy_prefetch():
+    """Refresh ONLY the live keys requested in the last 30s. Avoids speculative
+    prefetching of stale combos. Route NEVER blocks on REST when prefetcher
+    is running — always served from cache."""
+    global _PREFETCH_STARTED
+    if _PREFETCH_STARTED:
+        return
+    _PREFETCH_STARTED = True
+    import threading, time as _time
+    def _loop():
+        while True:
+            now = _time.time()
+            keys = [k for k, ts in list(_REQUEST_LOG.items()) if now - ts < 30]
+            for sym, tf, lad in keys:
+                try:
+                    _live_bar_fetch(sym, tf, lad)
+                except Exception:
+                    pass
+            _time.sleep(1.5)
+    t = threading.Thread(target=_loop, name="live-prefetch", daemon=True)
+    t.start()
+
 def _live_bar(symbol: str, tf: str, include_ladder: bool = False) -> dict | None:
-    """Fetch the current open (incomplete) kline from Binance Futures REST."""
+    """Return cached live bar. On cache miss returns stale data if available,
+    else does a one-shot fetch. Prefetcher keeps cache warm."""
+    import time as _time
+    cache_key = (symbol, tf, include_ladder)
+    now = _time.time()
+    cached = _LIVE_CACHE.get(cache_key)
+    if cached and (now - cached[0] < _LIVE_TTL):
+        return cached[1]
+    if cached:
+        # Return stale rather than block route on REST. Prefetcher refreshes async.
+        return cached[1]
+    return _live_bar_fetch(symbol, tf, include_ladder)
+
+
+def _live_bar_fetch(symbol: str, tf: str, include_ladder: bool = False) -> dict | None:
+    """Actual REST fetch — used by prefetcher and one-shot cold-cache fallback."""
+    import time as _time
+    cache_key = (symbol, tf, include_ladder)
+    now = _time.time()
     binance_sym = _BINANCE_SYM_MAP.get(symbol, symbol)
     interval = tf  # 1m / 5m / 15m map 1:1
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={binance_sym}&interval={interval}&limit=2"
@@ -382,6 +512,7 @@ def _live_bar(symbol: str, tf: str, include_ladder: bool = False) -> dict | None
                 totals[lvl["p"]] = totals.get(lvl["p"], 0.0) + lvl["v"]
             if totals:
                 out["poc"] = max(totals.items(), key=lambda kv: kv[1])[0]
+        _LIVE_CACHE[cache_key] = (now, out)
         return out
     except Exception as e:
         LOG.debug(f"[dashboard] live_bar failed: {e}")
@@ -390,15 +521,11 @@ def _live_bar(symbol: str, tf: str, include_ladder: bool = False) -> dict | None
 
 # ── routes ───────────────────────────────────────────────────────────────────
 
-@bp.get("/dashboard/state")
-def dashboard_state():
-    settings = current_app.config["FB_SETTINGS"]
-    symbol = request.args.get("symbol") or settings["instrument"]["symbol"]
-    tf = request.args.get("tf") or "1m"
-    minutes = int(request.args.get("minutes", 120))
-    minutes = max(5, min(minutes, 1440))
-    include_fp = request.args.get("footprint") == "true"
-    session_align = request.args.get("session") == "today"
+def _build_snapshot(settings: dict, symbol: str, tf: str, minutes: int,
+                    include_fp: bool, session_align: bool) -> dict:
+    """Build the full dashboard snapshot dict. Shared by /dashboard/state
+    (JSON poll) and /dashboard/stream (SSE)."""
+    _start_lazy_prefetch()
 
     # Bars — fetch enough closed bars to cover the window
     s = _state_store()
@@ -441,7 +568,9 @@ def dashboard_state():
             bar_data["ask_ladder"] = [{"p": round(lvl.price, 4), "v": round(lvl.vol, 4)} for lvl in b.ask_ladder]
         bars.append(bar_data)
 
-    # Append live (in-progress) bar
+    # Append live (in-progress) bar — also tag this key for lazy prefetcher
+    import time as _t_now
+    _REQUEST_LOG[(symbol, tf, include_fp)] = _t_now.time()
     live = _live_bar(symbol, tf, include_ladder=include_fp)
     if live and (not bars or live["ts"] > bars[-1]["ts"]):
         bars.append(live)
@@ -495,6 +624,24 @@ def dashboard_state():
     prior_vp_list = vp_cache.get_history(symbol, "daily", n=2)
     prior_vp = prior_vp_list[-2] if len(prior_vp_list) >= 2 else {}
 
+    # Multi-session naked POCs — untested prior-session POCs as TP magnets
+    naked_pocs_out: list[dict] = []
+    try:
+        from pipeline.features.naked_poc import get_naked_pocs as _get_npoc
+        _ref_price = float(daily_vp.get("poc") or (bars[-1]["c"] if bars else 0))
+        naked_pocs_out = [
+            {
+                "price":        n.price,
+                "session":      n.session,
+                "age_sessions": n.age_sessions,
+                "period_key":   n.period_key,
+                "distance":     round(n.distance, 4),
+            }
+            for n in _get_npoc(symbol, _ref_price)
+        ]
+    except Exception:
+        pass
+
     # M2 direction (calls all module voters — cheap, no Claude)
     primary_tf = settings["instrument"].get("primary_tf", "15m")
     m2_decision = decide_direction(symbol, primary_tf)
@@ -517,16 +664,12 @@ def dashboard_state():
     # Detections
     detections = _build_detections(symbol, tf)
 
-    # Open positions
-    open_pos = position_store().open_positions()
-    positions_out = []
-    # Mechanical lots ladder used by grid_placer (FIB scaled by base_lot + bias)
+    # Open positions — merge M1 + M2 with `mode` tag
     _FIB = (1, 1, 2, 3, 5)
     _base_lots_cfg = (settings.get("execution", {}).get("default_lots") or {})
     base_lot = float(_base_lots_cfg.get(symbol, 0.01))
-    for p in open_pos:
-        if p.symbol != symbol:
-            continue
+
+    def _serialize_open(p, mode: str) -> dict:
         leg_prices = [leg.entry for leg in p.legs]
         legs_detail = []
         for leg in p.legs:
@@ -544,49 +687,66 @@ def dashboard_state():
                 "confidence":  round(leg.confidence, 2),
                 "rationale":   leg.rationale,
             })
-        total_lots = round(sum(l["lots"] for l in legs_detail), 4)
-        positions_out.append({
+        return {
             "position_id": p.position_id,
-            "symbol": p.symbol,
-            "side": p.side,
-            "avg_entry": round(p.avg_entry, 4),
+            "symbol":      p.symbol,
+            "side":        p.side,
+            "mode":        mode,
+            "source":      p.source or mode,
+            "avg_entry":   round(p.avg_entry, 4),
             "take_profit": round(p.take_profit, 4),
-            "stop_loss": round(p.stop_loss, 4),
+            "stop_loss":   round(p.stop_loss, 4),
             "legs_filled": p.leg_count,
-            "leg_prices": leg_prices,
-            "legs": legs_detail,
-            "total_lots": total_lots,
-            "opened_ts": p.opened_ts,
-        })
+            "leg_prices":  leg_prices,
+            "legs":        legs_detail,
+            "total_lots":  round(sum(l["lots"] for l in legs_detail), 4),
+            "opened_ts":   p.opened_ts,
+        }
 
-    # Closed positions for this symbol (last 50). Used for chart trade-history.
+    def _serialize_closed(p, mode: str) -> dict:
+        leg_prices = [leg.entry for leg in p.legs]
+        last_leg = p.legs[-1] if p.legs else None
+        reason = (p.close_reason or "").lower()
+        if "tp" in reason and last_leg:
+            exit_price = last_leg.take_profit
+        elif ("sl" in reason or "stop" in reason) and last_leg:
+            exit_price = last_leg.stop_loss
+        else:
+            exit_price = last_leg.entry if last_leg else p.avg_entry
+        return {
+            "position_id": p.position_id,
+            "side":         p.side,
+            "mode":         mode,
+            "source":       p.source or mode,
+            "avg_entry":    round(p.avg_entry, 4),
+            "exit_price":   round(exit_price, 4),
+            "stop_loss":    round(p.stop_loss, 4),
+            "take_profit":  round(p.take_profit, 4),
+            "leg_prices":   leg_prices,
+            "opened_ts":    p.opened_ts,
+            "closed_ts":    p.closed_ts,
+            "close_reason": p.close_reason,
+            "realized_r":   round(p.realized_r, 4),
+            "status":       p.status,
+        }
+
+    positions_out = []
+    for p in position_store().open_positions():
+        if p.symbol == symbol:
+            positions_out.append(_serialize_open(p, "m1"))
+    try:
+        for p in position_store_m2().open_positions():
+            if p.symbol == symbol:
+                positions_out.append(_serialize_open(p, "m2"))
+    except Exception as e:
+        LOG.debug(f"[dashboard] m2 open_positions failed: {e}")
+
     closed_out: list[dict] = []
     try:
         for p in position_store().closed_positions(symbol, n=50):
-            leg_prices = [leg.entry for leg in p.legs]
-            last_leg = p.legs[-1] if p.legs else None
-            # Exit price = last-leg TP or SL depending on close_reason
-            reason = (p.close_reason or "").lower()
-            if "tp" in reason and last_leg:
-                exit_price = last_leg.take_profit
-            elif ("sl" in reason or "stop" in reason) and last_leg:
-                exit_price = last_leg.stop_loss
-            else:
-                exit_price = last_leg.entry if last_leg else p.avg_entry
-            closed_out.append({
-                "position_id": p.position_id,
-                "side":         p.side,
-                "avg_entry":    round(p.avg_entry, 4),
-                "exit_price":   round(exit_price, 4),
-                "stop_loss":    round(p.stop_loss, 4),
-                "take_profit":  round(p.take_profit, 4),
-                "leg_prices":   leg_prices,
-                "opened_ts":    p.opened_ts,
-                "closed_ts":    p.closed_ts,
-                "close_reason": p.close_reason,
-                "realized_r":   round(p.realized_r, 4),
-                "status":       p.status,
-            })
+            closed_out.append(_serialize_closed(p, "m1"))
+        for p in position_store_m2().closed_positions(symbol, n=50):
+            closed_out.append(_serialize_closed(p, "m2"))
     except Exception as e:
         LOG.debug(f"[dashboard] closed_positions failed: {e}")
 
@@ -653,13 +813,61 @@ def dashboard_state():
     all_symbols = list({p.symbol for p in position_store()._positions.values()} | {"BTCUSDT", "XAUTUSDT"})
     ab_stats = _ab_stats(all_symbols)
 
-    # CORS for Vite dev server
-    resp = jsonify({
+    # Historical sweeps — read from TF-specific JSONL log, filter to chart window
+    historical_sweeps: list[dict] = []
+    try:
+        from pipeline.features.sweep import read_sweep_log as _read_sweep_log
+        _since = bars[0]["ts"] if bars else 0
+        historical_sweeps = _read_sweep_log(symbol, since_ts=_since, tf=tf)
+    except Exception:
+        pass
+
+    # Swing points — up to 8 most-recent structural pivots per side
+    # TF-aware lookback; EQH/EQL flagged for chart highlighting
+    swing_points: list[dict] = []
+    try:
+        from pipeline.features.wave import detect_swing_points as _dsp
+        if raw_bars:
+            _lb_map = {"1m": 3, "3m": 3, "5m": 4, "15m": 5, "30m": 6, "1h": 7}
+            _lookback = _lb_map.get(tf, 3)
+            _sh, _sl = _dsp(raw_bars, lookback=_lookback)
+            # Most-recent 8 per side (detect_swing_points returns ascending index order)
+            _sh8 = list(reversed(_sh))[:8]
+            _sl8 = list(reversed(_sl))[:8]
+            _EQL_TOL = 0.0015
+            def _is_eq(price, prices):
+                return any(
+                    abs(price - p) / max(p, 0.01) <= _EQL_TOL
+                    for p in prices if abs(p - price) > 1e-9
+                )
+            _sh_px = [p for _, p in _sh8]
+            _sl_px = [p for _, p in _sl8]
+            for _idx, _price in _sh8:
+                if 0 <= _idx < len(raw_bars):
+                    swing_points.append({
+                        "ts": raw_bars[_idx].close_ts,
+                        "price": round(_price, 4),
+                        "side": "high",
+                        "is_equal": _is_eq(_price, _sh_px),
+                    })
+            for _idx, _price in _sl8:
+                if 0 <= _idx < len(raw_bars):
+                    swing_points.append({
+                        "ts": raw_bars[_idx].close_ts,
+                        "price": round(_price, 4),
+                        "side": "low",
+                        "is_equal": _is_eq(_price, _sl_px),
+                    })
+    except Exception as _e:
+        LOG.warning(f"[dashboard] swing_points failed: {_e}")
+
+    return {
         "symbol": symbol,
         "tf": tf,
         "bars": bars,
         "daily_vp": daily_vp,
         "prior_vp": prior_vp,
+        "naked_pocs": naked_pocs_out,
         "detections": detections,
         "latest_m1": latest_m1,
         "latest_m2": latest_m2,
@@ -668,6 +876,118 @@ def dashboard_state():
         "cvd_signal": cvd_signal,
         "zones": zones_out,
         "ab_stats": ab_stats,
-    })
+        "historical_sweeps": historical_sweeps,
+        "swing_points": swing_points,
+    }
+
+
+@bp.get("/dashboard/state")
+def dashboard_state():
+    settings = current_app.config["FB_SETTINGS"]
+    symbol = request.args.get("symbol") or settings["instrument"]["symbol"]
+    tf = request.args.get("tf") or "1m"
+    minutes = max(5, min(int(request.args.get("minutes", 120)), 7200))
+    include_fp = request.args.get("footprint") == "true"
+    session_align = request.args.get("session") == "today"
+    snap = _build_snapshot(settings, symbol, tf, minutes, include_fp, session_align)
+    resp = jsonify(snap)
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
+
+
+@bp.get("/dashboard/stream")
+def dashboard_stream():
+    """SSE endpoint — server-pushed snapshots. Replaces client polling.
+    Query params identical to /dashboard/state.
+    """
+    from flask import Response, stream_with_context
+    settings = current_app.config["FB_SETTINGS"]
+    symbol = request.args.get("symbol") or settings["instrument"]["symbol"]
+    tf = request.args.get("tf") or "1m"
+    minutes = max(5, min(int(request.args.get("minutes", 120)), 7200))
+    include_fp = request.args.get("footprint") == "true"
+    session_align = request.args.get("session") == "today"
+    interval = float(request.args.get("interval", 1.5))
+    interval = max(0.5, min(interval, 10.0))
+
+    @stream_with_context
+    def _gen():
+        import time as _time
+        last_bar_ts = 0
+        last_bt_count = 0
+        last_pos_sig = ""
+        # Initial snapshot on connect
+        try:
+            snap = _build_snapshot(settings, symbol, tf, minutes, include_fp, session_align)
+            yield f"event: snapshot\ndata: {json.dumps(snap)}\n\n"
+            last_bar_ts = snap["bars"][-1]["ts"] if snap.get("bars") else 0
+            last_bt_count = len(snap.get("detections", {}).get("big_trades", []))
+            last_pos_sig = _pos_signature(snap.get("positions", {}))
+        except Exception as e:
+            yield f"event: error\ndata: {json.dumps({'msg': str(e)[:200]})}\n\n"
+            return
+        while True:
+            _time.sleep(interval)
+            try:
+                snap = _build_snapshot(settings, symbol, tf, minutes, include_fp, session_align)
+                cur_bar_ts = snap["bars"][-1]["ts"] if snap.get("bars") else 0
+                cur_bt_count = len(snap.get("detections", {}).get("big_trades", []))
+                cur_pos_sig = _pos_signature(snap.get("positions", {}))
+                # Always emit "tick" with live bar; rest only when changed
+                # to avoid client doing heavy rerender every cycle
+                if (cur_bar_ts != last_bar_ts or cur_bt_count != last_bt_count
+                        or cur_pos_sig != last_pos_sig):
+                    yield f"event: snapshot\ndata: {json.dumps(snap)}\n\n"
+                    last_bar_ts, last_bt_count, last_pos_sig = cur_bar_ts, cur_bt_count, cur_pos_sig
+                else:
+                    # Send just the live bar so chart stays live without resending VP/bubbles/etc
+                    live_only = {
+                        "live_bar": snap["bars"][-1] if snap.get("bars") else None,
+                        "ts": int(_time.time()),
+                    }
+                    yield f"event: tick\ndata: {json.dumps(live_only)}\n\n"
+            except GeneratorExit:
+                return
+            except Exception as e:
+                yield f"event: error\ndata: {json.dumps({'msg': str(e)[:200]})}\n\n"
+
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Access-Control-Allow-Origin": "*",
+        "Connection": "keep-alive",
+    }
+    return Response(_gen(), headers=headers)
+
+
+def _pos_signature(pos: dict) -> str:
+    """Cheap diff key for positions block. Changes when open/closed sets shift."""
+    open_ids = sorted(p.get("position_id", "") for p in pos.get("open", []))
+    closed_ids = sorted(p.get("position_id", "") for p in pos.get("closed", []))
+    pending_ids = sorted(p.get("pending_id", "") for p in pos.get("pending", []))
+    return f"{len(open_ids)}|{open_ids[-3:]}|{len(closed_ids)}|{closed_ids[-3:]}|{len(pending_ids)}|{pending_ids[-3:]}"
+
+
+@bp.post("/dashboard/reload_stores")
+def reload_stores():
+    """Force-reload position_store and position_store_m2 from JSONL.
+
+    Call after patching positions.jsonl / cycles.jsonl (e.g. bar_verify_outcomes.py)
+    without restarting the server.
+    """
+    import execution.position_store as _ps_mod
+    import threading
+
+    with _ps_mod._store_lock:
+        _ps_mod._store = None
+        _ps_mod._store_m2 = None
+
+    # Re-instantiate immediately
+    _ps_mod.position_store()
+    _ps_mod.position_store_m2()
+
+    n_m1 = len(list(_ps_mod.position_store()._positions.values()))
+    n_m2 = len(list(_ps_mod.position_store_m2()._positions.values()))
+    LOG.info(f"[dashboard] stores reloaded: m1={n_m1} positions, m2={n_m2} positions")
+    return jsonify({"ok": True, "m1_positions": n_m1, "m2_positions": n_m2})

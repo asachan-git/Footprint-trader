@@ -212,6 +212,22 @@ def classify(session_bars, daily_vp=None) -> DayType:
         range_score += 1.0
         reasons.append("VA rotation: price returning inside VA after edge tests")
 
+    # 5 — VA width regime (cross-session expansion/contraction)
+    try:
+        if session_bars:
+            from pipeline.features.vp_cache import get_va_regime as _va_regime
+            _sym = session_bars[0].symbol
+            _va = _va_regime(_sym, "daily", n=3)
+            if _va["confidence"] >= 0.4:
+                if _va["regime"] == "expanding":
+                    trend_score += 1.0
+                    reasons.append(f"VA expanding +{_va['pct_change']:.0f}% (trend developing)")
+                elif _va["regime"] == "contracting":
+                    range_score += 1.0
+                    reasons.append(f"VA contracting {_va['pct_change']:.0f}% (compression→mean-revert)")
+    except Exception:
+        pass
+
     # --- Classify ---
     total = trend_score + range_score
     if total == 0:
@@ -283,7 +299,7 @@ def is_blocked_by_regime(
 def grid_shape_for_regime(regime: DayType, side: _Literal["long", "short"]) -> dict:
     """Return grid placement parameters for the current regime + side."""
     out = {
-        "n_legs": 5,
+        "n_legs": 7,
         "step_mult": 0.5,
         "mode": "mean_reversion",
         "tighter_spacing": False,
@@ -294,7 +310,7 @@ def grid_shape_for_regime(regime: DayType, side: _Literal["long", "short"]) -> d
                      (regime.type == "trend_down" and side == "short")
         if with_trend:
             out.update({
-                "n_legs": 3,
+                "n_legs": 5,
                 "step_mult": 0.35,
                 "mode": "directional",
                 "tighter_spacing": True,
@@ -302,7 +318,7 @@ def grid_shape_for_regime(regime: DayType, side: _Literal["long", "short"]) -> d
             })
     elif regime.type == "uncertain":
         out.update({
-            "n_legs": 2,
+            "n_legs": 3,
             "step_mult": 0.5,
             "mode": "cautious",
             "tighter_spacing": False,

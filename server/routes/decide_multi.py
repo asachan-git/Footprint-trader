@@ -104,6 +104,26 @@ def decide_multi():
     symbols = body.get("symbols") or ["BTCUSDT", "XAUTUSDT"]
     tf = body.get("tf") or settings["instrument"]["primary_tf"]
 
+    # In grid mode, fan out to per-symbol /decide path (Claude submit_grid_plan).
+    # decide_multi's MULTI_TOOL schema is buy_sell_only — not suitable for grid.
+    trading_mode = str(settings.get("trading_mode") or "buy_sell_only")
+    if trading_mode == "grid":
+        import urllib.request as _req
+        import json as _j
+        host = request.host_url.rstrip("/")
+        force = bool(body.get("force", False))
+        results = []
+        for sym in symbols:
+            try:
+                payload = _j.dumps({"symbol": sym, "tf": tf, "force": force}).encode()
+                r = _req.Request(f"{host}/decide", data=payload,
+                                 headers={"Content-Type": "application/json"}, method="POST")
+                with _req.urlopen(r, timeout=settings["claude"]["timeout_s"] + 5) as resp:
+                    results.append({"symbol": sym, **_j.loads(resp.read().decode())})
+            except Exception as e:
+                results.append({"symbol": sym, "ok": False, "error": str(e)[:160]})
+        return jsonify({"ok": True, "mode": "grid_fanout", "results": results})
+
     force = bool(body.get("force", False))
     contexts = {}
     for sym in symbols:

@@ -109,7 +109,9 @@ def detect_events(bar, recent_bars: list, daily_vp: dict | None = None) -> list[
         return []
 
     events: list[BigTradeEvent] = []
-    now_ts = int(time.time())
+    # Use bar close_ts so backfilled / historical detections retain correct
+    # timestamps. Fall back to wall-clock only if bar has no close_ts.
+    now_ts = int(getattr(bar, "close_ts", 0)) or int(time.time())
 
     # Use existing absorption detector to find significant prints
     try:

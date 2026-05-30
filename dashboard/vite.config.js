@@ -6,7 +6,8 @@ export default defineConfig({
   server: {
     port: 3000,
     proxy: {
-      "/dashboard/state": "http://localhost:5000",
+      "/dashboard/state":  "http://localhost:5000",
+      "/dashboard/stream": { target: "http://localhost:5000", changeOrigin: true, ws: false },
     },
   },
   build: {
