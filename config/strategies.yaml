@@ -1,0 +1,21 @@
+# Deployed strategies — the StrategyManager loads every enabled entry here.
+#
+# Each entry:
+#   name     : must match a key in strategies/registry.py REGISTRY
+#   enabled  : false = registered but not deployed
+#   config   : strategy-specific overrides (passed to the Strategy ctor)
+#
+# Data layout:
+#   COMMON       : data/footprint/*, config/, logs/   (shared by all strategies)
+#   PER-STRATEGY : data/strategies/<name>/{positions,cycles,decisions,equity}.jsonl
+#
+# Results are reported per strategy via GET /strategies/<name>/results.
+
+strategies:
+  - name: democracy
+    enabled: true
+    config:
+      # Symbols this strategy trades. Omit to inherit vp_cache.symbols / instrument.
+      symbols: [BTCUSDT, XAUTUSDT]
+      # Timeframe the vote panel evaluates structure on (independent of feed TF).
+      vote_tf: 15m

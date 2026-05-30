@@ -24,6 +24,7 @@ from .routes.heatmap import bp as heatmap_bp
 from .routes.options_ingest import bp as options_ingest_bp
 from .routes.options_decide import bp as options_decide_bp
 from .routes.dashboard import bp as dashboard_bp
+from .routes.strategies import bp as strategies_bp
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -109,6 +110,7 @@ def create_app() -> Flask:
     app.register_blueprint(options_ingest_bp)
     app.register_blueprint(options_decide_bp)
     app.register_blueprint(dashboard_bp)
+    app.register_blueprint(strategies_bp)
     return app
 
 

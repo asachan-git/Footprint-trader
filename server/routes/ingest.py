@@ -489,6 +489,17 @@ def ingest():
             import logging as _l
             _l.getLogger(__name__).warning(f"[ingest][cycle] tick failed: {e}")
 
+    # Strategy manager fan-out — run deployed strategies (e.g. democracy) on the
+    # decide TF. Manage scoped exits + maybe enter, all into per-strategy stores.
+    try:
+        _strat_tf = str((settings.get("decide_on_bar_close") or {}).get("tf", "15m"))
+        if bar.tf == _strat_tf:
+            from strategies.manager import get_manager
+            get_manager(settings).tick(bar.symbol, bar.tf, bar, settings)
+    except Exception as e:
+        import logging as _l
+        _l.getLogger(__name__).warning(f"[ingest][strategies] tick failed: {e}")
+
     return jsonify({
         "ok": True,
         "bar_id": bar.bar_id,
