@@ -31,6 +31,13 @@ LOG = logging.getLogger(__name__)
 class Republic(Democracy):
     name = "republic"
 
+    def settings_override(self, settings: dict) -> dict:
+        """Enable the hard-SL exit (so the tighter SL actually closes cycles) and
+        disable Claude hedge-eval (keep the paper A/B deterministic + free)."""
+        cyc = {**(settings.get("cycle") or {}),
+               "hard_sl_exit": True, "hedge_eval_enabled": False}
+        return {**settings, "cycle": cyc}
+
     def adjust_plan(self, plan, bar: Bar, settings: dict):
         sl_atr_mult = float(self.config.get("sl_atr_mult", 1.5))
         atr15 = self._atr15(bar.symbol)
@@ -42,15 +49,19 @@ class Republic(Democracy):
         dist = sl_atr_mult * atr15
         new_sl = anchor - dist if plan.side == "long" else anchor + dist
 
-        # Only tighten — never loosen past the disaster floor.
-        if plan.side == "long":
+        # Only tighten — never loosen past the disaster floor. If the plan has no
+        # safety_sl (None), the tightened SL is unconditionally the stop.
+        if plan.safety_sl is None:
+            pass
+        elif plan.side == "long":
             new_sl = max(new_sl, plan.safety_sl)
         else:
             new_sl = min(new_sl, plan.safety_sl)
 
+        _prev = f"{plan.safety_sl:.2f}" if plan.safety_sl is not None else "none"
         LOG.info(
             f"[republic] {bar.symbol} {plan.side} SL tightened "
-            f"{plan.safety_sl:.2f} → {new_sl:.2f} ({sl_atr_mult}×ATR={dist:.2f})"
+            f"{_prev} → {new_sl:.2f} ({sl_atr_mult}×ATR={dist:.2f})"
         )
         # GridPlan is frozen — return a copy with the tightened SL (+ its offset_pct
         # kept consistent for live venue translation).

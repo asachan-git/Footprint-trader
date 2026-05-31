@@ -51,7 +51,15 @@ class StrategyManager:
         return c
 
     # ── main loop ──────────────────────────────────────────────────────────────
-    def tick(self, symbol: str, tf: str, bar: Bar, settings: dict) -> list[StrategyResult]:
+    def tick(self, symbol: str, tf: str, bar: Bar, settings: dict,
+             allow_entry: bool = True) -> list[StrategyResult]:
+        """Run each strategy for this bar.
+
+        allow_entry=False → manage-only (exits/leg fills) without opening new
+        cycles. Call every primary-TF bar with allow_entry=False so exits are
+        checked as often as the legacy cycle loop, and once on the decide-TF bar
+        with allow_entry=True so entries fire on the intended timeframe.
+        """
         results: list[StrategyResult] = []
         for strat in self.strategies:
             if symbol not in strat.symbols(settings):
@@ -59,7 +67,8 @@ class StrategyManager:
             ctx = self.ctx(strat.name)
             try:
                 with ctx.scope():
-                    results.append(self._run_one(strat, ctx, symbol, tf, bar, settings))
+                    results.append(self._run_one(strat, ctx, symbol, tf, bar,
+                                                 settings, allow_entry))
             except Exception as e:
                 LOG.exception(f"[manager] {strat.name}/{symbol} error: {e}")
                 results.append(StrategyResult(
@@ -69,27 +78,33 @@ class StrategyManager:
         return results
 
     def _run_one(self, strat: Strategy, ctx: StrategyContext, symbol: str,
-                 tf: str, bar: Bar, settings: dict) -> StrategyResult:
+                 tf: str, bar: Bar, settings: dict,
+                 allow_entry: bool = True) -> StrategyResult:
+        # Per-strategy execution settings (e.g. hard-SL exit, no Claude hedge).
+        eff_settings = strat.settings_override(settings)
+
         # 1. MANAGE existing cycles (shared exit engine, scoped to this strategy)
         try:
-            cycle_manager.on_bar_close(symbol, tf, bar, settings)
+            cycle_manager.on_bar_close(symbol, tf, bar, eff_settings)
         except Exception as e:
             LOG.warning(f"[manager] {strat.name}/{symbol} manage failed: {e}")
         self._record_equity(ctx, symbol)
 
-        # 2. ENTER — one cycle per symbol at a time
+        # 2. ENTER — one cycle per symbol at a time (skipped on manage-only ticks)
         open_pos = ctx.pstore.open_positions(symbol)
         if open_pos:
             return StrategyResult(strat.name, symbol, "skipped",
                                   {"reason": "cycle already open",
                                    "position_id": open_pos[0].position_id})
+        if not allow_entry:
+            return StrategyResult(strat.name, symbol, "managed", {})
 
-        decision = strat.decide(symbol, tf, bar, settings)
+        decision = strat.decide(symbol, tf, bar, eff_settings)
         if decision is None or decision.side == "flat":
             return StrategyResult(strat.name, symbol, "flat", {})
 
-        plan = _build_grid_plan(decision, bar, settings)
-        plan = strat.adjust_plan(plan, bar, settings)   # strategy execution-policy hook
+        plan = _build_grid_plan(decision, bar, eff_settings)
+        plan = strat.adjust_plan(plan, bar, eff_settings)   # strategy execution-policy hook
         # No store args needed: ctx.scope() redirects position_store()/cycle_store()
         # at this strategy's stores, so submit_grid's internal getters land there.
         fill = PaperExecutor().submit_grid(plan, bar)
@@ -108,7 +123,12 @@ class StrategyManager:
                               {"side": decision.side, "position_id": pos_id, "fill": fill})
 
     def _record_equity(self, ctx: StrategyContext, symbol: str) -> None:
-        """Append an equity point when this strategy's cumulative realized R moves."""
+        """Append an equity point when this strategy's cumulative realized R moves.
+
+        Realized R comes from position_store closes (positions.jsonl) — the only
+        source written by the live exit path (cycle_store.close_cycle is not called
+        live; cycles.jsonl is offline-only). results.py reads the same source.
+        """
         closed = ctx.pstore.closed_positions(n=10_000)
         cum = round(sum(p.realized_r for p in closed), 6)
         prev = self._last_cum_r.get(ctx.name)
@@ -117,7 +137,6 @@ class StrategyManager:
             return
         if cum != prev:
             delta = cum - prev
-            # newest close gives the reason/symbol
             newest = max(closed, key=lambda p: p.closed_ts or 0, default=None)
             ctx.log_equity(
                 symbol=(newest.symbol if newest else symbol),

@@ -1,13 +1,16 @@
-"""Per-strategy results — stats + equity curve from a strategy's own cycles.jsonl.
+"""Per-strategy results — stats + equity curve from a strategy's own positions.
 
 Same metric set as the global SYSTEM_REPORT (WR, avg R, payoff, profit factor,
-buy/sell split, exit reasons, equity curve) but scoped to one strategy's files,
+buy/sell split, exit reasons, equity curve) but scoped to one strategy's data,
 so strategies are compared apples-to-apples on isolated data.
+
+Source: the strategy's PositionStore closes (positions.jsonl) — the only place
+realized R is written by the live exit path. (cycle_store.close_cycle is not
+called live; cycles.jsonl is populated only by offline backfill scripts.)
 """
 
 from __future__ import annotations
 
-import json
 from collections import Counter
 
 from .base import StrategyContext
@@ -36,30 +39,16 @@ def _stat(rows: list[dict]) -> dict | None:
     }
 
 
-def _load_cycles(ctx: StrategyContext) -> list[dict]:
-    path = ctx.cstore._log_path
-    if not path.exists():
-        return []
-    opens, closes = {}, []
-    for line in path.read_text().splitlines():
-        try:
-            d = json.loads(line)
-        except Exception:
-            continue
-        if d.get("type") == "open":
-            opens[d["cycle_id"]] = d
-        elif d.get("type") in ("close", "circuit"):
-            closes.append(d)
-    rows = []
-    for c in closes:
-        o = opens.get(c["cycle_id"], {})
-        rows.append({
-            "sym": o.get("symbol", "?"),
-            "dir": o.get("direction", "?"),
-            "pnl": c.get("realized_pnl", 0.0),
-            "reason": c.get("reason", "?"),
-            "ts": c.get("ts", 0),
-        })
+def _load_trades(ctx: StrategyContext) -> list[dict]:
+    """Closed positions for this strategy, oldest first, as flat stat rows."""
+    closed = ctx.pstore.closed_positions(n=10_000)
+    rows = [{
+        "sym": p.symbol,
+        "dir": p.side,
+        "pnl": p.realized_r,
+        "reason": p.close_reason or "?",
+        "ts": p.closed_ts or 0,
+    } for p in closed]
     rows.sort(key=lambda r: r["ts"])
     return rows
 
@@ -85,7 +74,7 @@ def _ascii_equity(curve: list[float], width: int = 48, height: int = 12) -> str:
 
 
 def compute(ctx: StrategyContext) -> dict:
-    rows = _load_cycles(ctx)
+    rows = _load_trades(ctx)
     syms = sorted(set(r["sym"] for r in rows))
     cum, curve = 0.0, []
     for r in rows:

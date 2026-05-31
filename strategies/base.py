@@ -135,3 +135,12 @@ class Strategy(abc.ABC):
         without touching the shared grid placer. Return the (possibly modified) plan.
         """
         return plan
+
+    def settings_override(self, settings: dict) -> dict:
+        """Per-strategy settings for this tick (manage + enter).
+
+        Returned as a shallow-merged dict so a strategy can change cycle-management
+        behavior (e.g. enable a hard-SL exit, disable Claude hedge-eval) without
+        mutating the shared settings. Default: unchanged.
+        """
+        return settings
