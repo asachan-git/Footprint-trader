@@ -1,12 +1,12 @@
 # FootprintBiot — Strategy Plan
 
-Last updated: 2026-05-28
+Last updated: 2026-05-31
 
 ---
 
 ## Account
 
-**Vantage USC** — nano lot sizing, $99k balance, 500× leverage.  
+**Vantage USC** — nano lot sizing, $99k balance, 500× leverage.
 Edge: nano lots allow holding drawdown through chop and exiting on recovery. No hard SL needed.
 
 ---
@@ -33,7 +33,7 @@ Grid recovery. Entry → 5-leg Fib grid. No hard SL.
 | XAUTUSDT | M2 rules (CVD + structure + FVG + sweep) | Paper (A/B) | 73% WR vs M1's 42% in backtest |
 | BTCUSDT | M1 Claude | Live | 75% WR, acceptable |
 
-Decision: after 2 weeks of M2 paper data, compare `data/positions_m2.jsonl` vs `data/positions.jsonl`.  
+Decision: after 2 weeks of M2 paper data, compare `data/positions_m2.jsonl` vs `data/positions.jsonl`.
 If M2 outperforms on XAUT → switch XAUT to M2 live.
 
 ---
@@ -68,30 +68,53 @@ Max open:  1 cycle / symbol
 | Leg 1 TP hit | Book partial (~0.3R), trail legs 2–5 to next VP level |
 | All legs filled, no ChoCh | Hold. Recovery grid is working as intended. |
 
+### Scale-out / partial booking — BUILT behind flag (2026-05-30, default OFF)
+
+`cycle.scale_out.enabled` (settings.yaml). On first bounce ≥`profit_buf_atr`×ATR beyond avg_entry: bank the deep large-lot legs (filled cheap → in profit), keep `keep_near`(=2) nearest legs, move them to break-even. Converts bounce-then-die cycles into scratches.
+
+Validated on `scripts/grid_sim.py` (faithful multi-leg sim, real M2 signals): vs hold-all → WR 74%→89%, escapes 50→25, timeouts 49→12, exposure ~halved, peak inventory down; total R −33% (caps runners). Risk-reducer, not return-improver — matches "consistent profit + avoid adverse markets."
+
+Code: `position_store.scale_out_position()` (+ `scale_out` event, `scaled_out` flag, replay-tested), `cycle_manager._check_scale_out()` (in `on_bar_close`). Partial R = cycle denom (avg−SL) × banked-leg fraction, additive with close R. **TODO before live enable:** MetaAPI broker partial-close sync (current path = store/paper only). A/B on paper first.
+
+Other 2026-05-30 findings: footprint stacked-imbalance has no edge (`stacked_edge_scan.py`); adverse-regime gate built then REFUTED on real signals (counter-trend = best M2 trades) and disabled (`ADVERSE_GATE_ENABLED=False`, `gate_test.py`).
+
 ---
 
 ## Key Learnings (from M1 vs M2 A/B, 2026-05-28)
 
-### What the data showed
+### What the data showed (bar-verified, sentinel bug fixed 2026-05-30)
 
-| | BTCUSDT | XAUTUSDT |
-|---|---|---|
-| M1 total RR | +2.68 | **-13.02** |
-| M1 win rate | 75% | 42% |
-| M2 sim total RR | +7.02 | +1.81 |
-| M2 sim win rate | 73% | **73%** |
+**Previous -13R XAUT figure was a data bug** — every `sl_hit` stored as -1.0R sentinel regardless of
+trailing SL position. `bar_verify_outcomes.py` walked 1m bars to recompute actual exit R.
 
-### Root causes of M1 XAUT failure
-1. **Direction quality** — Claude called wrong direction 58% of the time on XAUT
-2. **Over-trading** — 57 entries during chop where M2 stayed flat
-3. **Fixed ATR TP too tight** — 16 timeout trades (stalled between entry and TP for 5hrs)
-4. **Wide SL** — 24 SL hits at -1.0R each; 5×ATR_15m SL correct but direction was wrong
+| | BTCUSDT | XAUTUSDT | Combined |
+|---|---|---|---|
+| M1 bar-verified total R | +1.39 | +4.41 | **+5.80** |
+| M1 bar-verified WR | 94% | 96% | **95%** |
+| M1 avg R/trade | +0.045 | +0.056 | **+0.053** |
+| M2 synthetic total R (same period) | +11.21 | +16.38 | **+27.59** |
+| M2 synthetic WR | 74% | 87% | **79%** |
+| M2 avg R/trade | +0.078 | +0.155 | **+0.110** |
+
+Note: M2 synthetic has 67/250 trades `hit=open` (valued at bar-data cutoff close — slight upward bias).
+M2 fired 250 signals vs M1's 110 in the same 3-day window (May 28–30).
+
+### Root causes of apparent M1 underperformance (now known to be data artifact)
+1. **Sentinel bug** — `sl_hit` events wrote -1.0R flat; 40 positions affected; actual avg = +0.026R
+2. **Post-fix period only** — data covers May 28–30 after disaster-floor SL + TP fixes applied
+3. **Grid never activated** — 93.5% single-leg; grid architecture is dead weight
+
+### Remaining real problems (from MAE/MFE analysis)
+- **Entry quality weak** — avg MFE 0.124R; 71% of trades peak below 0.15R (noise entries)
+- **TP capture low** — 54% capture ratio on wins; avg MFE 0.125R but avg realized 0.068R
+- **BTC worst** — avg MFE 0.079R, 68% noise entries
+- **M2 avg R 2.1× higher** than M1 — M2 direction + TP targeting meaningfully better
 
 ### Implications for USC strategy
-- Direction quality dominates. If you enter the wrong way, grid recovery just defers the loss.
-- With no hard SL: the question shifts to "how many wrong-direction entries before ChoCh?"
-- VP-anchored TP is essential — price gravitates to POC, not to fixed ATR distances.
-- XAUT needs M2 direction. M1 Claude lacks the structural pattern recognition for gold.
+- Sentinel data bug masked real performance — M1 post-fix is actually +95% WR, +5.80R/3 days
+- M2 direction + TP resolution still better per-trade; switch XAUT to M2 paper → live is the right path
+- Entry filter is now the biggest lever: 71% noise entries → Tier 1.6 / 2B.1 first
+- Grid is dead (93.5% single-leg) → Tier 6 architecture review after entry filter lands
 
 ---
 
@@ -173,7 +196,8 @@ Existing data only. Answers which problem is real before any new code.
 
 Protects everything downstream. Unblocks fast iteration. Required before more features.
 
-- [ ] **1.1** Hard equity kill switch in `router.py` — refuse dispatch if today's sum_R < −5R, manual reset only (1h)
+- [x] **1.1** Hard equity kill switch in `router.py` — refuse dispatch if today's sum_R < −5R, manual reset only (1h)
+  — implemented router.py:219-241, floor=-4R from settings.yaml risk.daily.max_dd_r
 - [x] **1.2** Pending order JSONL persistence — `data/pending_orders.jsonl` writes confirmed (2h)
 - [x] **1.3** Disable cycle_tp shrinker for single-leg trades — gated `cycle_manager.py:89` (`leg_count >= 2`) (2h)
 - [~] **1.4** `scripts/replay.py` — scaffolded; not run yet (2-3d) — **unblocks all future feature work**
@@ -186,24 +210,46 @@ Protects everything downstream. Unblocks fast iteration. Required before more fe
 
 #### Tier 2A — If TP problem dominant
 
-- [ ] **2A.1** POC-trail TP in `tp_resolver.py` — trail TP toward POC as cycle ages instead of shrink-on-fill (1d)
+- [x] **2A.1** POC-trail TP in `tp_resolver.py` — trail TP toward POC as cycle ages instead of shrink-on-fill (1d)
+  — extended poc_trail in cycle_manager.py: now trails both directions (tighten if POC closer, extend if POC drifted farther, capped at poc_trail_max_ext_atr_mult×ATR=3.0)
 - [ ] **2A.2** Re-measure 1 week, target avg win ≥ 0.8R (passive)
+- [~] **2A.3** Partial profit-booking / scale-out — SIMULATED, decision pending (2026-05-30)
+  — `scripts/grid_sim.py` (grid-aware multi-leg cycle sim: Fib legs avg-down, disaster SL, progressive TP, trend-escape; walks real 1m paths) + `scripts/partial_tp_test.py` (single-entry proxy). Tested on real M2 signals (mode_compare, 268 cycles). Partial booking is a **risk-reducer, not a return-improver**:
+    - baseline (hold all): WR74% avgR+0.115 totR+30.9 avgLoss−0.152 peakLots6.7 bars335 | tp169 esc50 to49
+    - conservative 33% (book frac of every leg on bounce): WR76% avgR+0.100 totR+26.9 — barely changes outcomes, not worth it.
+    - **aggressive keep2** (dump deep large-lot legs on bounce + remainder to break-even): WR89% avgR+0.077 totR+20.5 avgLoss−0.187 peakLots5.8 bars162 | tp99 esc25 to12 be132. Converts adverse-market deaths→break-even (escape 50→25, timeout 49→12), halves exposure time, cuts inventory. Cost: caps runners → −33% total R.
+  - Tradeoff: baseline = max money/fattest losses/most blowups; aggressive keep2 = max consistency+survival at ⅓ less return. Matches stated aim (consistent profit + avoid adverse markets). Caveats: BE-stop assumes clean fills; one favorable epoch (May 28-30); idealized one-shot bounce timing. NOT yet wired into `cycle_manager` — decision pending.
 
 #### Tier 2B — If direction problem dominant
 
-- [ ] **2B.1** `pipeline/features/stacked_imbalance.py` — walk ladder, `N ≥ 3` consecutive levels with `ask/bid ≥ 2.5`. Wire as **hard gate** in `direction_engine` (1d)
-- [ ] **2B.2** Validate 2B.1 on replay tester before paper (hours)
-- [ ] **2B.3** `pipeline/features/delta_divergence.py` — bar delta vs swing structure HH/HL/LL/LH (1d)
-- [ ] **2B.4** `pipeline/features/unfinished_auction.py` — single-print at bar extreme detection (1d)
+- [x] **2B.1** `pipeline/features/stacked_imbalance.py` — walk ladder, N≥10 consecutive levels with ask/bid ≥ 2.5, proximity ≤1×ATR, span ≥0.15×ATR
+  — initial hard gate broken (wrong side labels). Demoted to vote (weight 0.60) after replay showed hard gate blocked 47% signals with no WR discrimination.
+- [x] **2B.2** Validate on replay tester (hours)
+  — combined_gates replay + M2 signal cross-reference done. Hard gate: pass=WR68% vs veto=WR68% (useless). Vote (tightened): pass=WR70%/+0.067R vs influenced=WR64%/+0.036R. BTC: influenced avgR=−0.027R (negative — real signal).
+- [x] **2B.3** `pipeline/features/delta_divergence.py` — price breaks 15-bar window high/low, delta fails to confirm; weight 0.50 vote in direction_engine
+- [x] **2B.4** `pipeline/features/unfinished_auction.py` — single-print at bar extreme, min_ratio=8; weight 0.40 vote in direction_engine (up→bullish, down→bearish)
 - [ ] **2B.5** `pipeline/features/poc_drift.py` — intraday per-bar POC migration. Replaces static `vp_shape` vote (1d)
 - [ ] **2B.6** Volume confirmation gate in `decision_validator.py` — entry zone vol ≥ 1.5× 10-bar avg (0.5d)
+- [~] **2B.7** Adverse-regime gate in `direction_engine.py` — BUILT then DISABLED, REFUTED on real signals (2026-05-30)
+  — `_trend_regime()` + counter-trend veto coded behind `ADVERSE_GATE_ENABLED` (now False). Synthetic all-bars scan said counter-trend loses; `scripts/gate_test.py` on REAL M2 signals (mode_compare, 263 trades) showed the opposite — counter-trend = best trades (WR82% +0.123R vs kept +0.038R), gate made avgR WORSE (+0.049→+0.038). M2 already handles regime via votes; `grid_modes.py` has an explicit counter-trend-exhaustion mode. Lesson: validate gates on real signals, not all-bars. Do NOT re-enable without real-signal re-validation.
+
+**Stacked-imbalance investigation — CLOSED (2026-05-30, `scripts/stacked_edge_scan.py`):**
+Re-bucketed stored $0.1 ladders to candidate cell widths (no re-ingest), 11d agg 15m, both symbols.
+- **Granularity hypothesis REFUTED.** BTC footprint already $10 cells (not 0.1 — only XAU is $0.1). Coarsening (BTC $25 / XAU $1) made discrimination *worse*; native already best.
+- **Acceptance filter (close-beyond-zone) shows NO edge.** Rejected ≥ accepted in every granularity AND every regime cell. On BTC, acceptance is a consistent *anti*-signal. The observed "reaction" was a ~0.08 ATR scalp skew that washes out / flips sign under regime slicing → noise.
+- **Only stable edge = regime alignment** (with-trend vs counter-trend, n=40–65/cell):
+  - with-trend: BTC +0.014R (WR74%) · XAU +0.082R (WR80%)
+  - counter-trend: BTC −0.052R · XAU −0.040R  ← the adverse market to gate
+- Action: stacked/delta/unfinished votes stay demoted (already weak weights); built 2B.7 adverse gate instead. Caveat: 11d, one regime epoch, n thin — counter-trend=bad is the robust (negative) finding; act by *avoiding*, confirm with-trend magnitude on more live data.
 
 ---
 
 ### TIER 3 — VP/Sweep upgrades
 
-- [~] **3.1** `pipeline/features/naked_poc.py` — file created; not wired as TP magnet yet (0.5d)
-- [ ] **3.2** Upgrade `sweep.py` classification — `reversal_high/low` / `liquidity_grab` / `failed_sweep` / `stop_run`. Each gets different downstream action (1d)
+- [x] **3.1** `pipeline/features/naked_poc.py` — file created; not wired as TP magnet yet (0.5d)
+  — file exists, wired in tp_resolver.py:26-35 as TP candidate source
+- [x] **3.2** Upgrade `sweep.py` classification — `reversal_high/low` / `liquidity_grab` / `failed_sweep` / `stop_run`. Each gets different downstream action (1d)
+  — reversal/liquidity_grab/stop_run/failed_sweep implemented in sweep.py
 - [ ] **3.3** VA width tracking in `vp_cache.py` — 3-bar expansion/contraction = regime classifier (0.5d)
 - [ ] **3.4** `pipeline/features/lvn_trade.py` — LVN traverse + same-side delta + vol > avg = continuation entry (1d)
 - [ ] **3.5** Combo gate layer above feature layer — patterns from VP playbook (continuation, exhaustion, reversion, breakout, trap) as gates, single-pattern hits get vetoed (2-3d)
@@ -271,15 +317,33 @@ After Tier 0-3 prove the signal.
 
 ---
 
+### TIER 8 — Multi-strategy manager (built 2026-05-31, PR #1 merged)
+
+Framework to deploy many strategies on one shared data feed with isolated
+per-strategy results. See `STRATEGIES.md`. Shipped: `StrategyManager` (in-process
+fan-out, manage→enter→record), `scope()` store redirection via contextvars,
+`Strategy.adjust_plan`/`settings_override` hooks, routes (`/strategies`,
+`/strategies/<name>/results`, `/strategies/tick`), wired into ingest bar-close.
+
+- [x] **8.1** StrategyManager + Strategy/StrategyContext + per-strategy stores under `data/strategies/<name>/`
+- [x] **8.2** `democracy` — wraps M2 weighted-vote engine (disaster-floor SL, existing behavior)
+- [x] **8.3** `republic` — democracy's signal + hard 1.5×ATR SL (opt-in `cycle.hard_sl_exit`); A/B for WR-vs-RR
+- [x] **8.4** SYSTEM_REPORT §1b — true-RR analysis (R vs disaster floor ≈ ×12 the TP distance → headline understates edge ~12×)
+- [ ] **8.5** Run democracy vs republic live ≥ 2 weeks, then decide the WR-vs-RR tradeoff. **Gate:** if republic avg-R/trade > democracy AND republic max-DD ≤ 1.5× democracy → promote a real hard SL to the core grid. Else keep disaster-floor. (passive — needs live data)
+- [ ] **8.6** Wire true-RR into `results.py` / `scripts/gen_system_report.py` — report R against a configurable real-risk denominator (TP-distance or tight %SL), not only the disaster floor. §1b is static prose today; recompute it. (0.5d)
+- [ ] **8.7** Per-strategy equity-curve view in dashboard — read `data/strategies/<name>/equity.jsonl` (0.5d)
+
 ### Recommended next 10 days
 
 ```
-Day 1     : 0.1 (M2 counterfactual) + 0.3 (cycles aggregate) + 5.1/5.2 (cuts)
-Day 2     : 0.2 (MAE/MFE backfill) + 0.4 (rationale clustering)
-Day 3     : 1.1 (kill switch) + 1.2 (pending persistence) + 1.3 (TP shrink gate)
-Day 4-6   : 1.4 (replay tester)
-Day 7     : 1.5 (/health) + 1.6 (cost pre-filter)
-Day 8-10  : Branch to Tier 2A or 2B based on Day 2 MAE/MFE result
+Updated 2026-05-30 (post Tier 0 analysis):
+  Done  : 1.1 kill switch, 1.2 pending persistence, 1.3 TP shrink gate,
+           1.5 /health, 1.6 pre-filter, 3.1 naked_poc, 3.2 sweep classification
+  Next  : 5.2 remove wave.py (30 min)
+           2B.1 stacked_imbalance hard gate in direction_engine (1d)
+           2A.1 POC-trail TP in tp_resolver (1d)
+           1.4 replay.py — run against footprint data (2-3d, unblocks feature dev)
+  Skip  : M2 switch not warranted yet — M1 bar-verified +5.80R same period
 ```
 
 End of 10 days: validated foundation, can't blow up, iterating features in hours, one feature shipped with empirical justification.
