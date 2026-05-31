@@ -19,3 +19,13 @@ strategies:
       symbols: [BTCUSDT, XAUTUSDT]
       # Timeframe the vote panel evaluates structure on (independent of feed TF).
       vote_tf: 15m
+
+  # republic = democracy's signal + a real hard stop (constitution).
+  # Same votes as democracy; clamps grid safety_sl to sl_atr_mult×ATR instead of
+  # the far disaster floor. A/B for the WR-vs-RR tradeoff. See STRATEGIES.md §3.
+  - name: republic
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      vote_tf: 15m
+      sl_atr_mult: 1.5      # hard SL distance from anchor, in ATR_15m units

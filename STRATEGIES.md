@@ -71,6 +71,39 @@ strategies:
       vote_tf: 15m          # TF the vote panel evaluates structure on
 ```
 
+### `republic` — democracy's signal + a constitution (hard SL)
+
+Subclasses `democracy`, so the **signal is identical**. Only the execution policy
+differs: instead of the disaster floor (~5×ATR, which fired 0× in 108 trades and
+makes the R-denominator ~4× the TP distance — see SYSTEM_REPORT §1b), `republic`
+clamps the grid `safety_sl` to `sl_atr_mult × ATR_15m` from the anchor (default
+1.5×ATR) via the `adjust_plan` hook.
+
+This is a deliberate **A/B for the WR-vs-RR tradeoff** on the same live signal:
+
+| | democracy | republic |
+|---|---|---|
+| Signal | weighted vote | same |
+| Stop | disaster floor (~5×ATR) | hard 1.5×ATR |
+| Expected WR | high (~94%) | lower (stop gets hit) |
+| Expected realized RR | tiny per win | larger per win |
+
+```yaml
+  - name: republic
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      vote_tf: 15m
+      sl_atr_mult: 1.5      # hard SL distance from anchor, in ATR_15m units
+```
+
+Compare `data/strategies/democracy/` vs `data/strategies/republic/` after both
+have run to see which side of the tradeoff wins on real data.
+
+> **`adjust_plan` hook:** any strategy may override `adjust_plan(plan, bar,
+> settings)` to mutate the built `GridPlan` before fill (SL, TP, legs) without
+> touching the shared grid placer. Default is a no-op.
+
 ---
 
 ## 4. API

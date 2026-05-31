@@ -127,3 +127,11 @@ class Strategy(abc.ABC):
     def decide(self, symbol: str, tf: str, bar: Bar, settings: dict) -> Decision | None:
         """Return an entry Decision, or None for no trade this bar."""
         raise NotImplementedError
+
+    def adjust_plan(self, plan, bar: Bar, settings: dict):
+        """Hook to mutate the built GridPlan before it's filled (default: no-op).
+
+        Lets a strategy override execution policy — e.g. a tighter structural SL —
+        without touching the shared grid placer. Return the (possibly modified) plan.
+        """
+        return plan

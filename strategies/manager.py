@@ -89,6 +89,7 @@ class StrategyManager:
             return StrategyResult(strat.name, symbol, "flat", {})
 
         plan = _build_grid_plan(decision, bar, settings)
+        plan = strat.adjust_plan(plan, bar, settings)   # strategy execution-policy hook
         # No store args needed: ctx.scope() redirects position_store()/cycle_store()
         # at this strategy's stores, so submit_grid's internal getters land there.
         fill = PaperExecutor().submit_grid(plan, bar)
