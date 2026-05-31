@@ -29,6 +29,12 @@ POSITIONS_LOG = ROOT / "data" / "positions.jsonl"
 
 EventType = Literal["open", "add_leg", "close", "invalidate", "sl_adjust"]
 
+# Source tags written to every open/add_leg event.
+# m1_claude  — leg1 triggered by Claude direction decision
+# m2_rules   — leg1 triggered by M2 rules engine decision
+# mechanical_grid — legs 2-5 filled by cycle_manager price touch
+SourceTag = Literal["m1_claude", "m2_rules", "mechanical_grid"]
+
 
 @dataclass
 class GridLeg:
@@ -41,6 +47,7 @@ class GridLeg:
     confidence: float
     rationale: str
     lots: float = 0.0   # actual fill qty; 0.0 = unknown (older events / live fills)
+    source: str = ""    # m1_claude | m2_rules | mechanical_grid
 
 
 @dataclass
@@ -56,6 +63,8 @@ class GridPosition:
     closed_ts: int = 0
     close_reason: str = ""
     broker_ticket: str = ""   # MetaApi positionId — empty for paper
+    source: str = ""          # m1_claude | m2_rules (from leg1 open event)
+    scaled_out: bool = False  # True after a scale_out (deep legs banked, rest at BE)
 
     @property
     def avg_entry(self) -> float:
@@ -97,6 +106,7 @@ class PositionStore:
         etype = event["type"]
         pid = event["position_id"]
         if etype == "open":
+            src = event.get("source", "")
             leg = GridLeg(
                 leg=1,
                 entry=event["entry"],
@@ -107,6 +117,7 @@ class PositionStore:
                 confidence=event.get("confidence", 0),
                 rationale=event.get("rationale", ""),
                 lots=float(event.get("lots", 0.0) or 0.0),
+                source=src,
             )
             self._positions[pid] = GridPosition(
                 position_id=pid,
@@ -116,6 +127,7 @@ class PositionStore:
                 legs=[leg],
                 opened_ts=event["ts"],
                 broker_ticket=event.get("broker_ticket", ""),
+                source=src,
             )
         elif etype == "add_leg" and pid in self._positions:
             leg = GridLeg(
@@ -128,6 +140,7 @@ class PositionStore:
                 confidence=event.get("confidence", 0),
                 rationale=event.get("rationale", ""),
                 lots=float(event.get("lots", 0.0) or 0.0),
+                source=str(event.get("source") or "mechanical_grid"),  # type: ignore[arg-type]
             )
             self._positions[pid].legs.append(leg)
         elif etype in ("close", "invalidate") and pid in self._positions:
@@ -138,6 +151,20 @@ class PositionStore:
             # Bucket realized R by the IST calendar date of the close
             day = datetime.fromtimestamp(event["ts"], tz=_IST).strftime("%Y-%m-%d")
             self._daily_r_by_date[day] = self._daily_r_by_date.get(day, 0.0) + event.get("realized_r", 0.0)
+        elif etype == "scale_out" and pid in self._positions:
+            pos = self._positions[pid]
+            drop = set(event.get("drop_legs") or [])
+            pos.legs = [l for l in pos.legs if l.leg not in drop]
+            # remaining legs ride to break-even
+            new_sl = event.get("new_sl")
+            if new_sl is not None and pos.legs:
+                for l in pos.legs:
+                    l.stop_loss = new_sl
+            pos.scaled_out = True
+            pr = event.get("realized_r", 0.0)
+            pos.realized_r += pr
+            day = datetime.fromtimestamp(event["ts"], tz=_IST).strftime("%Y-%m-%d")
+            self._daily_r_by_date[day] = self._daily_r_by_date.get(day, 0.0) + pr
         elif etype == "sl_adjust" and pid in self._positions:
             if self._positions[pid].legs:
                 self._positions[pid].legs[-1].stop_loss = event["new_sl"]
@@ -162,6 +189,7 @@ class PositionStore:
         broker_ticket: str = "",
         fill_type: str = "paper_simulated",
         lots: float = 0.0,
+        source: str = "",
     ) -> GridPosition:
         import uuid
         pid = uuid.uuid4().hex[:12]
@@ -182,11 +210,12 @@ class PositionStore:
                 "broker_ticket": broker_ticket,
                 "fill_type": fill_type,
                 "lots": float(lots or 0.0),
+                "source": source,
             })
         return self._positions[pid]
 
     def add_leg(self, position_id: str, decision: Decision, bar_id: str,
-                lots: float = 0.0) -> None:
+                lots: float = 0.0, source: str = "mechanical_grid") -> None:
         with self._lock:
             pos = self._positions.get(position_id)
             if not pos or pos.status != "open":
@@ -201,6 +230,7 @@ class PositionStore:
                 "rationale": decision.rationale,
                 "bar_id": bar_id,
                 "lots": float(lots or 0.0),
+                "source": source,
             })
 
     def close_position(self, position_id: str, reason: str, realized_r: float) -> bool:
@@ -250,6 +280,30 @@ class PositionStore:
                 "reason": reason,
             })
 
+    def scale_out_position(self, position_id: str, drop_legs: list[int],
+                           exit_price: float, realized_r: float,
+                           new_sl: float, reason: str) -> bool:
+        """Partial close: bank `drop_legs` at exit_price (realized_r added to cycle +
+        daily R), move remaining legs' stop to break-even (new_sl). One-shot per cycle.
+        No-op if already scaled, closed, or it would drop all legs."""
+        with self._lock:
+            pos = self._positions.get(position_id)
+            if not pos or pos.status != "open" or pos.scaled_out:
+                return False
+            remaining = [l for l in pos.legs if l.leg not in set(drop_legs)]
+            if not drop_legs or not remaining:
+                return False
+            self._write({
+                "type": "scale_out",
+                "position_id": position_id,
+                "drop_legs": list(drop_legs),
+                "exit_price": exit_price,
+                "realized_r": realized_r,
+                "new_sl": new_sl,
+                "reason": reason,
+            })
+            return True
+
     def open_positions(self, symbol: str | None = None) -> list[GridPosition]:
         with self._lock:
             return [
@@ -291,8 +345,32 @@ _store_lock = Lock()
 
 POSITIONS_LOG_M2 = ROOT / "data" / "positions_m2.jsonl"
 
+# Context-scoped override — set by the strategy manager so that shared execution
+# code (cycle_manager, paper executor) transparently reads/writes a *per-strategy*
+# PositionStore without any changes to those call sites. Defaults to the global
+# singleton when no override is active.
+import contextvars as _contextvars
+from contextlib import contextmanager as _contextmanager
+
+_override: "_contextvars.ContextVar[PositionStore | None]" = _contextvars.ContextVar(
+    "position_store_override", default=None
+)
+
+
+@_contextmanager
+def use_store(store: "PositionStore"):
+    """Within this block, position_store() returns `store` (per-strategy isolation)."""
+    token = _override.set(store)
+    try:
+        yield store
+    finally:
+        _override.reset(token)
+
 
 def position_store() -> PositionStore:
+    ov = _override.get()
+    if ov is not None:
+        return ov
     global _store
     if _store is None:
         with _store_lock:

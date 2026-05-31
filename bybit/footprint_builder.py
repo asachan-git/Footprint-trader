@@ -39,13 +39,22 @@ class _AccumBar:
     high: float = float("-inf")
     low: float = float("inf")
     trades: int = 0
+    # Intra-bar CVD path tracking (real wicks for CVD candle pane).
+    cvd_open: float | None = None
+    cvd_high: float = float("-inf")
+    cvd_low: float = float("inf")
+    cvd_close: float = 0.0
 
-    def add(self, price: float, size: float, side: str) -> None:
+    def add(self, price: float, size: float, side: str, running_cvd: float) -> None:
         if self.first_price is None:
             self.first_price = price
+            self.cvd_open = running_cvd
         self.last_price = price
         self.high = max(self.high, price)
         self.low = min(self.low, price)
+        self.cvd_high = max(self.cvd_high, running_cvd)
+        self.cvd_low = min(self.cvd_low, running_cvd)
+        self.cvd_close = running_cvd
         self.trades += 1
         if side == "Buy":
             self.ask_at_price[price] += size
@@ -80,6 +89,10 @@ class _AccumBar:
             "sellvolume": total_bid,
             "poc": poc,
             "trades": self.trades,
+            "cvd_open":  self.cvd_open if self.cvd_open is not None else 0.0,
+            "cvd_high":  self.cvd_high if self.cvd_high != float("-inf") else 0.0,
+            "cvd_low":   self.cvd_low  if self.cvd_low  != float("inf")  else 0.0,
+            "cvd_close": self.cvd_close,
         }
 
 
@@ -93,6 +106,8 @@ class FootprintBuilder:
         self.on_bar_close = on_bar_close
         self.price_step = price_step
         self._current: _AccumBar | None = None
+        # Running CVD across all bars — feeds intra-bar high/low for CVD wicks.
+        self._running_cvd: float = 0.0
 
     def _bucket_price(self, p: float) -> float:
         if self.price_step <= 0:
@@ -109,7 +124,8 @@ class FootprintBuilder:
             self.on_bar_close(self._current.to_payload())
             self._current = _AccumBar(self.symbol, self.tf, close_ts)
 
-        self._current.add(self._bucket_price(price), size, side)
+        self._running_cvd += size if side == "Buy" else -size
+        self._current.add(self._bucket_price(price), size, side, self._running_cvd)
 
     def flush(self) -> None:
         if self._current is not None and self._current.trades > 0:

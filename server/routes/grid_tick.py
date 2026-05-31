@@ -98,6 +98,18 @@ def grid_tick():
                 })
                 continue
 
+            # Pre-filter: skip M2 direction engine on noise bars
+            if not force:
+                from execution.pre_filter import check as _pf_check
+                _pf = _pf_check(latest, settings)
+                if not _pf.passed:
+                    results.append({
+                        "symbol": sym, "skipped": "pre_filter",
+                        "reason": _pf.reason, "checks": _pf.checks,
+                        "dry_run": dry_run,
+                    })
+                    continue
+
             decision = decide_direction(sym, primary_tf)
             if decision.side == "flat":
                 _log_comparison(sym, decision, latest.bar_id, dry_run, None)

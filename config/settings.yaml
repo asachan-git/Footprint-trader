@@ -1,5 +1,5 @@
 mode: paper              # journal | paper | live  (live also needs env ALLOW_LIVE=1)
-trading_mode: buy_sell_only   # buy_sell_only | grid  (buy_sell_only: Claude picks direction; mechanical 5-leg Fib grid; ChoCh+VA invalidation)
+trading_mode: grid            # buy_sell_only | grid  (grid: Claude designs full 5-leg plan via submit_grid_plan; buy_sell_only: mechanical Fib placer)
 
 # Standardized data window across all analysis modules (sweep, delta_div, wick_trap, cvd_vote)
 analysis:
@@ -14,6 +14,7 @@ cycle:
   trend_escape:
     bars: 3              # K consecutive bars against
     atr_mult: 1.5        # N x ATR adverse from avg_entry
+  poc_trail_min_atr_mult: 0.5   # TP must stay ≥ 0.5×ATR from avg_entry when trailing to POC
 
 # Event-driven decide trigger — fires Mode 1 + Mode 2 instantly when a new TF
 # bar is emitted by mtf_aggregator (replaces wall-clock cron loops in start.sh).
@@ -139,9 +140,16 @@ decide_filter:
   min_confidence: 0.60      # reject Claude decisions below this confidence
   require_stacked: false
   require_absorption: false
+  require_structural_setup: true   # pre-filter: skip if no stacked+sweep+va_touch+delta
+  va_touch_atr_mult: 0.3           # price within 0.3×ATR of VAH/VAL/POC = va_touch
+  min_delta_atr_ratio: 0.0         # |delta|/ATR floor (0=disabled, tune after 50 cycles)
+  min_stack_atr_pct: 0.15          # stacked zone must span ≥ 15% of ATR (filters XAU micro-stacks)
   active_hours_utc: ""      # e.g. "07:00-17:00" to skip Asian dead zone (empty = always on)
   same_direction_cooldown: 3  # block if last 2 non-flat decisions same direction (0=disabled)
   rr_floor: 1.5             # default R:R floor (overridden per-symbol below)
   rr_floor_per_symbol:
     XAUTUSDT: 1.2           # gold 15m ranges are structurally tighter — 52% WR at 1.1-1.4
     BTCUSDT: 1.5
+  # Tier 5.1 — symbols where Claude (M1) is disabled. Direction handled by M2 rules only.
+  # XAUTUSDT cut 2026-05-29 (M1: 42% WR / -3.03R; M2 paper: 73% WR).
+  disabled_symbols: [XAUTUSDT]

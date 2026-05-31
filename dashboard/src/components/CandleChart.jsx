@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createChart, CrosshairMode, LineStyle } from "lightweight-charts";
 
 const COLORS = {
@@ -85,6 +85,134 @@ function drawVP(canvas, chart, candleSeries, dailyVp, bars) {
     ctx.fillRect(0, y - 1, bidW, 2);
     ctx.fillStyle = isPoc ? "rgba(255,215,0,0.55)" : "rgba(239,83,80,0.30)";
     ctx.fillRect(bidW, y - 1, askW, 2);
+  }
+}
+
+// ── Big-trade bubble overlay ─────────────────────────────────────────────────
+function drawBubbles(canvas, chart, candleSeries, bigTrades, show, bars, hitsOut) {
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const rect = canvas.getBoundingClientRect();
+  const W = Math.round(rect.width)  || canvas.parentElement?.clientWidth  || 800;
+  const H = Math.round(rect.height) || canvas.parentElement?.clientHeight || 400;
+  if (canvas.width !== W)  canvas.width  = W;
+  if (canvas.height !== H) canvas.height = H;
+  ctx.clearRect(0, 0, W, H);
+  if (!show || !chart || !candleSeries || !bigTrades?.length || !bars?.length) return;
+
+  const MAX_R = 24, MIN_R = 8;
+  // Use logical index → coordinate (more reliable than timeToCoordinate which
+  // returns null when chart was hidden / freshly mounted / time gaps exist).
+  const sortedBars = [...bars].sort((a, b) => a.ts - b.ts);
+  const barTs = sortedBars.map(b => b.ts);
+  // Strict visible-only: render bubbles only for bars currently in view.
+  const vr = chart.timeScale().getVisibleRange();
+  const tFrom = vr?.from ?? barTs[0];
+  const tTo   = vr?.to   ?? barTs[barTs.length - 1];
+  // Bubble's owning bar = smallest barTs >= bubble.ts (bar that closes at/after ts).
+  // Within TF window only. Returns -1 if no visible bar owns this bubble.
+  let typTF = Infinity;
+  for (let i = 1; i < Math.min(barTs.length, 10); i++) {
+    typTF = Math.min(typTF, barTs[i] - barTs[i - 1]);
+  }
+  if (!Number.isFinite(typTF) || typTF <= 0) typTF = 60;
+  const owningLogical = (ts) => {
+    let lo = 0, hi = barTs.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (barTs[mid] < ts) lo = mid + 1; else hi = mid;
+    }
+    if (lo >= barTs.length) {
+      // Allow up to 2× TF — XAU has no Binance live bar so events fall past
+      // last closed bar between server snapshots.
+      const last = barTs[barTs.length - 1];
+      return (ts - last) < (typTF * 2) ? barTs.length - 1 : -1;
+    }
+    return (barTs[lo] - ts) <= typTF ? lo : -1;
+  };
+  const X_CELL = 28, Y_CELL = MAX_R * 1.6;
+  const mergeMap = new Map();
+  for (const bt of bigTrades) {
+    if (bt.ts < tFrom || bt.ts > tTo + typTF * 2) continue;
+    const logical = owningLogical(bt.ts);
+    if (logical < 0) continue;
+    let x = chart.timeScale().logicalToCoordinate(logical);
+    if (x == null) {
+      x = chart.timeScale().timeToCoordinate(barTs[logical]);
+    }
+    if (x == null) continue;
+    const y = candleSeries.priceToCoordinate(bt.price);
+    if (y == null) continue;
+    const key = `${Math.round(x / X_CELL)}|${Math.round(y / Y_CELL)}|${bt.aggressor}`;
+    const cur = mergeMap.get(key);
+    if (!cur) {
+      mergeMap.set(key, { x, y, volume: bt.volume || 0,
+        aggressor: bt.aggressor, outcome: bt.outcome, count: 1,
+        ts: bt.ts, price: bt.price, barIdx: logical });
+    } else {
+      cur.volume += bt.volume || 0;
+      cur.count += 1;
+      cur.x = (cur.x * (cur.count - 1) + x) / cur.count;
+      cur.y = (cur.y * (cur.count - 1) + y) / cur.count;
+      if (bt.ts > cur.ts) cur.ts = bt.ts;  // newest ts of cluster
+      const rank = { pending: 0, absorbed: 1, exhausted: 1, pushed: 2 };
+      if ((rank[bt.outcome] || 0) > (rank[cur.outcome] || 0)) cur.outcome = bt.outcome;
+    }
+  }
+  let visible = [...mergeMap.values()];
+  if (!visible.length) return;
+  // Quintile-based sizing: rank by volume, map to 5 discrete radii.
+  const _sorted = [...visible].sort((a, b) => (a.volume || 0) - (b.volume || 0));
+  const _quintileR = [MIN_R, 12, 16, 20, MAX_R];
+  const _quintileMap = new Map();
+  for (let i = 0; i < _sorted.length; i++) {
+    const q = Math.min(4, Math.floor((i / Math.max(_sorted.length, 1)) * 5));
+    _quintileMap.set(_sorted[i], _quintileR[q]);
+  }
+
+  if (hitsOut) hitsOut.length = 0;
+  for (const bt of visible) {
+    const r = _quintileMap.get(bt) || MIN_R;
+    if (hitsOut) hitsOut.push({ x: bt.x, y: bt.y, r, bt });
+    const isBuy = bt.aggressor === "buy";
+    const baseRgb = isBuy ? "38,166,154" : "239,83,80";
+    const grad = ctx.createRadialGradient(bt.x, bt.y, 0, bt.x, bt.y, r);
+    grad.addColorStop(0, `rgba(${baseRgb},0.9)`);
+    grad.addColorStop(1, `rgba(${baseRgb},0.15)`);
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(bt.x, bt.y, r, 0, Math.PI * 2);
+    ctx.fill();
+    const outcomeBorder = {
+      pushed:    { color: `rgba(${baseRgb},1.0)`,  dash: [] },
+      absorbed:  { color: "rgba(255,255,255,0.9)", dash: [3, 3] },
+      exhausted: { color: "rgba(140,140,140,0.9)", dash: [1, 2] },
+      pending:   { color: "rgba(255,215,0,0.9)",   dash: [4, 2] },
+    }[bt.outcome] || { color: `rgba(${baseRgb},0.9)`, dash: [] };
+    ctx.save();
+    ctx.setLineDash(outcomeBorder.dash);
+    ctx.strokeStyle = outcomeBorder.color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(bt.x, bt.y, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+    if (r >= 10) {
+      const v = bt.volume || 0;
+      const vLbl = v >= 1000 ? (v / 1000).toFixed(1) + "k" : v >= 100 ? v.toFixed(0) : v.toFixed(1);
+      const cLbl = bt.count > 1 ? `×${bt.count}` : "";
+      ctx.font = `bold ${Math.min(11, Math.max(8, r * 0.5))}px JetBrains Mono, monospace`;
+      ctx.fillStyle = "#fff";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      if (cLbl) {
+        ctx.fillText(vLbl, bt.x, bt.y - 4);
+        ctx.font = `bold ${Math.min(9, Math.max(7, r * 0.38))}px JetBrains Mono, monospace`;
+        ctx.fillText(cLbl, bt.x, bt.y + 5);
+      } else {
+        ctx.fillText(vLbl, bt.x, bt.y);
+      }
+    }
   }
 }
 
@@ -332,10 +460,23 @@ function drawFootprintWithRetry(canvas, chart, candleSeries, bars, attempt = 0) 
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-export default function CandleChart({ bars, dailyVp, priorVp, detections, positions, symbol, chartMode }) {
+export default function CandleChart({ bars, dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, symbol, chartMode, indicators }) {
   const containerRef = useRef(null);
   const vpCanvasRef  = useRef(null);
   const fpCanvasRef  = useRef(null);
+  const bbCanvasRef  = useRef(null);
+  const [showBubbles, setShowBubbles] = useState(() => {
+    try { return localStorage.getItem("fb_show_bubbles") !== "0"; } catch { return true; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("fb_show_bubbles", showBubbles ? "1" : "0"); } catch {}
+  }, [showBubbles]);
+  const bubbleHitsRef = useRef([]);
+  const [hoverBubble, setHoverBubble] = useState(null);  // {bt, x, y}
+  const bigTradesRef = useRef([]);
+  const showBubblesRef = useRef(showBubbles);
+  useEffect(() => { bigTradesRef.current = detections?.big_trades || []; }, [detections]);
+  useEffect(() => { showBubblesRef.current = showBubbles; }, [showBubbles]);
   const chartRef     = useRef(null);
   const candleRef    = useRef(null);
   const deltaRef     = useRef(null);
@@ -413,15 +554,45 @@ export default function CandleChart({ bars, dailyVp, priorVp, detections, positi
     const redrawAll = () => {
       drawVP(vpCanvasRef.current, chart, candleSeries, dailyVpRef.current, barsRef.current);
       drawFootprint(fpCanvasRef.current, chart, candleSeries, barsRef.current);
+      drawBubbles(bbCanvasRef.current, chart, candleSeries, bigTradesRef.current, showBubblesRef.current, barsRef.current, bubbleHitsRef.current);
     };
     chart.timeScale().subscribeVisibleLogicalRangeChange(redrawAll);
     chart.subscribeCrosshairMove(redrawAll);
+
+    // Catch all drags (x-pan, y-axis scale, x-axis scale). subscribeCrosshairMove
+    // only fires when cursor is over plot; axis-drag may not move crosshair.
+    // mousemove on container covers every interaction.
+    const onMouseMoveAny = (e) => {
+      redrawAll();
+      // Hit-test bubble hover. e coords relative to container; canvas is full overlay
+      // so same rect → use container's getBoundingClientRect.
+      if (!bbCanvasRef.current) return;
+      const rect = bbCanvasRef.current.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      let hit = null;
+      for (const h of bubbleHitsRef.current) {
+        if (Math.hypot(mx - h.x, my - h.y) <= h.r + 2) { hit = h; break; }
+      }
+      setHoverBubble(prev => {
+        if (!hit && !prev) return prev;
+        if (hit && prev && prev.bt === hit.bt) return { ...prev, x: mx, y: my };
+        return hit ? { bt: hit.bt, x: mx, y: my } : null;
+      });
+    };
+    const onMouseLeave = () => setHoverBubble(null);
+    const onMouseWheel = () => redrawAll();
+    if (containerRef.current) {
+      containerRef.current.addEventListener("mousemove", onMouseMoveAny);
+      containerRef.current.addEventListener("mouseleave", onMouseLeave);
+      containerRef.current.addEventListener("wheel",     onMouseWheel, { passive: true });
+    }
 
     const ro = new ResizeObserver(() => {
       if (!containerRef.current) return;
       const { clientWidth: w, clientHeight: h } = containerRef.current;
       chart.applyOptions({ width: w, height: h });
-      for (const c of [vpCanvasRef.current, fpCanvasRef.current]) {
+      for (const c of [vpCanvasRef.current, fpCanvasRef.current, bbCanvasRef.current]) {
         if (c) { c.width = w; c.height = h; }
       }
       redrawAll();
@@ -431,6 +602,11 @@ export default function CandleChart({ bars, dailyVp, priorVp, detections, positi
     return () => {
       ro.disconnect();
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(redrawAll);
+      if (containerRef.current) {
+        containerRef.current.removeEventListener("mousemove", onMouseMoveAny);
+        containerRef.current.removeEventListener("mouseleave", onMouseLeave);
+        containerRef.current.removeEventListener("wheel",     onMouseWheel);
+      }
       chart.remove();
     };
   }, []);
@@ -460,11 +636,28 @@ export default function CandleChart({ bars, dailyVp, priorVp, detections, positi
     }
 
     drawVP(vpCanvasRef.current, chartRef.current, candleRef.current, dailyVp, bars);
+    // Defer bubble draw a frame so chart's internal coordinate mapping is
+    // up-to-date with the just-applied setData call.
+    requestAnimationFrame(() => {
+      drawBubbles(bbCanvasRef.current, chartRef.current, candleRef.current,
+                  detections?.big_trades || [], showBubbles, bars, bubbleHitsRef.current);
+    });
 
     if (chartMode === "footprint") {
       drawFootprintWithRetry(fpCanvasRef.current, chartRef.current, candleRef.current, bars);
     }
-  }, [bars, symbol]);
+  }, [bars, symbol, detections, showBubbles]);
+
+  // On mode flip into OHLC, force a bubble redraw — chart may have stale
+  // coordinate mapping while hidden (visibility:hidden); a frame after
+  // becoming visible re-resolves it.
+  useEffect(() => {
+    if (chartMode !== "ohlc") return;
+    requestAnimationFrame(() => {
+      drawBubbles(bbCanvasRef.current, chartRef.current, candleRef.current,
+                  bigTradesRef.current, showBubblesRef.current, barsRef.current, bubbleHitsRef.current);
+    });
+  }, [chartMode]);
 
   // Dim/restore candlestick and redraw footprint on mode change.
   // Keep series visible so the price scale stays anchored — priceToCoordinate
@@ -472,37 +665,9 @@ export default function CandleChart({ bars, dailyVp, priorVp, detections, positi
   useEffect(() => {
     if (!candleRef.current || !chartRef.current) return;
 
-    if (chartMode === "footprint") {
-      candleRef.current.applyOptions({
-        upColor:         "rgba(38,166,154,0.10)",
-        downColor:       "rgba(239,83,80,0.10)",
-        borderUpColor:   "rgba(38,166,154,0.20)",
-        borderDownColor: "rgba(239,83,80,0.20)",
-        wickUpColor:     "rgba(38,166,154,0.30)",
-        wickDownColor:   "rgba(239,83,80,0.30)",
-      });
-      chartRef.current.timeScale().applyOptions({ barSpacing: 60, minBarSpacing: 20 });
-      const c = fpCanvasRef.current;
-      if (c && c.parentElement) {
-        c.width  = c.parentElement.clientWidth;
-        c.height = c.parentElement.clientHeight;
-      }
-      requestAnimationFrame(() => {
-        drawFootprintWithRetry(fpCanvasRef.current, chartRef.current, candleRef.current, barsRef.current);
-      });
-    } else {
-      candleRef.current.applyOptions({
-        upColor:         COLORS.up,
-        downColor:       COLORS.down,
-        borderUpColor:   COLORS.up,
-        borderDownColor: COLORS.down,
-        wickUpColor:     COLORS.up,
-        wickDownColor:   COLORS.down,
-      });
-      chartRef.current.timeScale().applyOptions({ barSpacing: 6, minBarSpacing: 0.5 });
-      const c = fpCanvasRef.current;
-      if (c) c.getContext("2d").clearRect(0, 0, c.width, c.height);
-    }
+    // FP mode is rendered by FootprintPane (separate component in App.jsx);
+    // CandleChart always renders OHLC. Skip mode-driven dim/barSpacing
+    // overrides that were resetting user zoom on every bars update.
   }, [chartMode, bars]);
 
   // Redraw VP when dailyVp changes
@@ -525,27 +690,12 @@ export default function CandleChart({ bars, dailyVp, priorVp, detections, positi
       }));
     };
 
+    // ── Essential: always on ─────────────────────────────────────────────────
     if (dailyVp) {
       addLine(dailyVp.poc, COLORS.poc, "POC");
       addLine(dailyVp.vah, COLORS.vah, "VAH", LineStyle.Dashed);
       addLine(dailyVp.val, COLORS.val, "VAL", LineStyle.Dashed);
-      if (dailyVp.naked_poc) addLine(dailyVp.naked_poc, COLORS.poc, "nPOC", LineStyle.Dotted);
     }
-    if (priorVp) {
-      addLine(priorVp.poc, "rgba(255,215,0,0.35)", "pPOC", LineStyle.Dotted);
-      addLine(priorVp.vah, "rgba(0,188,212,0.25)",  "pVAH", LineStyle.Dotted);
-      addLine(priorVp.val, "rgba(224,64,251,0.25)",  "pVAL", LineStyle.Dotted);
-    }
-    if (detections?.sweep?.type !== "none" && detections?.sweep) {
-      const sw = detections.sweep;
-      addLine(sw.wick_extreme, sw.type === "sweep_high" ? COLORS.down : COLORS.up,
-              `sw:${sw.level_label}`, LineStyle.Dotted);
-    }
-    (detections?.fvgs || []).forEach(fvg => {
-      const c = fvg.side === "bull" ? "rgba(38,166,154,0.6)" : "rgba(239,83,80,0.6)";
-      addLine(fvg.high, c, fvg.side === "bull" ? "FVG↑" : "FVG↓", LineStyle.Dotted);
-      addLine(fvg.low,  c, "", LineStyle.Dotted);
-    });
     positions.forEach(pos => {
       const lc = pos.side === "long" ? COLORS.legFilled : COLORS.down;
       (pos.leg_prices || []).forEach((price, i) => {
@@ -555,34 +705,112 @@ export default function CandleChart({ bars, dailyVp, priorVp, detections, positi
       if (pos.stop_loss)   addLine(pos.stop_loss,   COLORS.sl, "SL", LineStyle.Dashed);
     });
 
+    // ── Toggleable ────────────────────────────────────────────────────────────
+    if (indicators?.nakedPocs !== false) {
+      (nakedPocs || []).forEach(n => {
+        const alpha = Math.max(0.25, 0.75 - n.age_sessions * 0.1);
+        addLine(n.price, `rgba(255,215,0,${alpha.toFixed(2)})`,
+                `nPOC-${n.session[0]}${n.age_sessions}`, LineStyle.Dotted);
+      });
+    }
+    if (indicators?.priorPoc !== false && priorVp?.poc) {
+      addLine(priorVp.poc, "rgba(255,215,0,0.35)", "pPOC", LineStyle.Dotted);
+    }
+    if (indicators?.priorVa !== false && priorVp) {
+      addLine(priorVp.vah, "rgba(0,188,212,0.2)",  "pVAH", LineStyle.Dotted);
+      addLine(priorVp.val, "rgba(224,64,251,0.2)", "pVAL", LineStyle.Dotted);
+    }
+    if (indicators?.liveSweep !== false && detections?.sweep?.type && detections.sweep.type !== "none") {
+      const sw = detections.sweep;
+      addLine(sw.wick_extreme,
+        sw.type === "sweep_high" ? "rgba(239,83,80,0.4)" : "rgba(38,166,154,0.4)",
+        "", LineStyle.Dotted);
+    }
+    if (indicators?.fvgLines !== false) {
+      (detections?.fvgs || []).forEach(fvg => {
+        const c = fvg.side === "bull" ? "rgba(38,166,154,0.5)" : "rgba(239,83,80,0.5)";
+        addLine(fvg.high, c, fvg.side === "bull" ? "FVG↑" : "FVG↓", LineStyle.Dotted);
+        addLine(fvg.low,  c, "", LineStyle.Dotted);
+      });
+    }
+
     const markers = [];
-    if (bars.length > 0) {
-      const lastTs = bars[bars.length - 1].ts;
-      if (detections?.sweep?.type && detections.sweep.type !== "none") {
-        const sw = detections.sweep;
+
+    // Sweep arrows — REV + LG only
+    if (indicators?.sweepArrows !== false) {
+      (historicalSweeps || []).forEach(sw => {
+        const cls = sw.classification || "";
+        if (cls !== "reversal" && cls !== "liquidity_grab") return;
+        const isHi = sw.type === "sweep_high";
+        const color = cls === "liquidity_grab"
+          ? (isHi ? "#ff9800" : "#ffb74d")
+          : (isHi ? COLORS.down : COLORS.up);
         markers.push({
-          time: lastTs,
-          position: sw.type === "sweep_high" ? "aboveBar" : "belowBar",
-          color:    sw.type === "sweep_high" ? COLORS.down : COLORS.up,
-          shape:    sw.type === "sweep_high" ? "arrowDown" : "arrowUp",
-          text:     `SW ${sw.level_label}`,
-          size:     1,
+          time: sw.ts, position: isHi ? "aboveBar" : "belowBar",
+          color, shape: isHi ? "arrowDown" : "arrowUp",
+          text: cls === "liquidity_grab" ? "LG" : "REV",
+          size: sw.confidence >= 0.7 ? 2 : 1,
         });
-      }
+      });
+    }
+
+    // SR/FS sweeps — small dimmed markers with hover text
+    if (indicators?.srFsSweeps !== false) {
+      (historicalSweeps || []).forEach(sw => {
+        const cls = sw.classification || "";
+        if (cls !== "stop_run" && cls !== "failed_sweep") return;
+        const isHi = sw.type === "sweep_high";
+        markers.push({
+          time: sw.ts, position: isHi ? "aboveBar" : "belowBar",
+          color: cls === "stop_run" ? "rgba(120,120,120,0.6)" : "rgba(156,39,176,0.6)",
+          shape: isHi ? "arrowDown" : "arrowUp",
+          text: cls === "stop_run" ? "SR" : "FS",
+          size: 1,
+        });
+      });
+    }
+
+    // Absorption circles on last bar
+    if (indicators?.absorptions !== false && bars.length > 0) {
+      const lastTs = bars[bars.length - 1].ts;
       (detections?.absorptions || []).forEach(a => {
         markers.push({
           time: lastTs,
           position: a.side === "buy" ? "belowBar" : "aboveBar",
           color:    a.side === "buy" ? COLORS.up : COLORS.down,
           shape:    "circle",
-          text:     `ABS ${a.side}`,
+          text:     `ABS ${a.price}`,
           size:     1,
         });
       });
     }
+
+    // EQH/EQL: dashed price line + arrow marker
+    if (indicators?.eqLevels !== false) {
+      (swingPoints || []).filter(sp => sp.is_equal).forEach(sp => {
+        const isHi = sp.side === "high";
+        addLine(sp.price, "rgba(255,152,0,0.65)", isHi ? "EQH" : "EQL", LineStyle.Dashed);
+        markers.push({
+          time: sp.ts, position: isHi ? "aboveBar" : "belowBar",
+          color: "rgba(255,152,0,0.9)", shape: isHi ? "arrowDown" : "arrowUp",
+          text: `${isHi ? "EQH" : "EQL"} ${sp.price}`, size: 2,
+        });
+      });
+    }
+
+    // Non-EQ pivot dashed lines only (no arrows, no text)
+    if (indicators?.pivotLines !== false) {
+      (swingPoints || []).filter(sp => !sp.is_equal).forEach(sp => {
+        const isHi = sp.side === "high";
+        addLine(sp.price,
+          isHi ? "rgba(239,83,80,0.15)" : "rgba(38,166,154,0.15)", "", LineStyle.Dashed);
+      });
+    }
+
+    markers.sort((a, b) => a.time - b.time);
     if (markers.length) try { cs.setMarkers(markers); } catch {}
 
-  }, [dailyVp, priorVp, detections, positions, bars]);
+  }, [dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, bars, indicators]);
 
   function resetView() {
     if (chartRef.current) chartRef.current.timeScale().fitContent();
@@ -598,12 +826,68 @@ export default function CandleChart({ bars, dailyVp, priorVp, detections, positi
     <div style={{ width: "100%", height: "100%", position: "relative" }}>
       <div ref={containerRef} style={{ width: "100%", height: "100%" }} />
       {/* VP overlay — always shown */}
-      <canvas ref={vpCanvasRef} style={canvasStyle} />
+      <canvas ref={vpCanvasRef} style={{ ...canvasStyle, zIndex: 5 }} />
+      {/* Bubble overlay — always rendered; visibility gated inside drawBubbles */}
+      <canvas ref={bbCanvasRef} style={{ ...canvasStyle, zIndex: 6 }} />
       {/* Footprint overlay — FP mode only */}
       <canvas
         ref={fpCanvasRef}
         style={{ ...canvasStyle, display: chartMode === "footprint" ? "block" : "none" }}
       />
+      {/* Bubble hover tooltip */}
+      {hoverBubble && (() => {
+        const bt = hoverBubble.bt;
+        const r = (n, dp = 2) => Number.isFinite(n) ? n.toFixed(dp) : "—";
+        const isBuy = bt.aggressor === "buy";
+        const color = isBuy ? COLORS.up : COLORS.down;
+        const W = 230, H = 100;
+        const wrapRect = containerRef.current?.getBoundingClientRect() || { width: 800, height: 400 };
+        let tx = hoverBubble.x + 12;
+        let ty = hoverBubble.y + 12;
+        if (tx + W > wrapRect.width)  tx = hoverBubble.x - W - 12;
+        if (ty + H > wrapRect.height) ty = hoverBubble.y - H - 12;
+        const tIst = bt.ts ? (() => {
+          const d = new Date((bt.ts + 19800) * 1000);
+          return `${String(d.getUTCHours()).padStart(2,"0")}:${String(d.getUTCMinutes()).padStart(2,"0")} IST`;
+        })() : "";
+        return (
+          <div style={{
+            position: "absolute", left: tx, top: ty,
+            background: "rgba(13,13,13,0.92)", border: "1px solid #2a2a2a",
+            borderRadius: 3, padding: "6px 8px", pointerEvents: "none",
+            zIndex: 20, minWidth: W, fontFamily: "JetBrains Mono, monospace",
+            fontSize: 11, color: "#bbb", lineHeight: 1.5,
+          }}>
+            <div style={{ color, fontWeight: 700 }}>
+              BIG {isBuy ? "BUY" : "SELL"}{bt.count > 1 ? ` ×${bt.count}` : ""}
+            </div>
+            <div><span style={{ color: "#888" }}>price </span><span>{r(bt.price)}</span>
+              <span style={{ color: "#888" }}>  vol </span><span>{r(bt.volume, 2)}</span></div>
+            <div><span style={{ color: "#888" }}>outcome </span><span>{bt.outcome || "—"}</span></div>
+            {tIst && <div><span style={{ color: "#888" }}>at </span><span>{tIst}</span></div>}
+          </div>
+        );
+      })()}
+      {/* TV-style indicator list — top-left */}
+      <div style={{
+        position: "absolute", top: 6, left: 6, zIndex: 10,
+        display: "flex", flexDirection: "column", gap: 4,
+        fontFamily: "monospace", fontSize: 11,
+      }}>
+        <button
+          onClick={() => setShowBubbles(b => !b)}
+          title="Toggle big-trade bubbles"
+          style={{
+            background: "rgba(26,26,26,0.85)",
+            border: `1px solid ${showBubbles ? "#ffd700" : "#2a2a2a"}`,
+            color: showBubbles ? "#ffd700" : "#666",
+            padding: "2px 7px", cursor: "pointer",
+            borderRadius: 3, lineHeight: 1.4, textAlign: "left",
+          }}
+        >
+          {showBubbles ? "● BUBBLES" : "○ bubbles"}
+        </button>
+      </div>
       <button
         onClick={resetView}
         title="Reset view"

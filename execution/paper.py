@@ -101,7 +101,7 @@ class PaperExecutor:
         _open_lots = _sim_lots(bar.symbol, filled_decision.entry, filled_decision.stop_loss,
                                qty_pct=float(getattr(decision, "qty_pct", 1.0) or 1.0))
         pos = store.open_position(filled_decision, bar.bar_id, bar.symbol, bar.tf,
-                                  lots=_open_lots)
+                                  lots=_open_lots, source="m1_claude")
         risk = abs(pos.avg_entry - pos.stop_loss)
         rr = abs(pos.take_profit - pos.avg_entry) / risk if risk > 0 else 0
         slip_note = f"(slippage {slippage:+.2f} from signal {decision.entry:.2f})"
@@ -182,8 +182,9 @@ class PaperExecutor:
             grid_leg=1,
             bias_strength=plan.bias_strength,
         )
+        src = "m2_rules" if _store is not None else "m1_claude"
         pos = store.open_position(filled, bar.bar_id, bar.symbol, bar.tf,
-                                  lots=float(leg1.lots or 0.0))
+                                  lots=float(leg1.lots or 0.0), source=src)
 
         # Legs 2-5 stored as pending
         ps = pending_store()

@@ -149,12 +149,16 @@ def _save(cache: dict) -> None:
 def _vp_to_dict(vp) -> dict | None:
     if vp is None:
         return None
+    va_width = None
+    if vp.vah is not None and vp.val is not None:
+        va_width = round(vp.vah - vp.val, 4)
     return {
         "poc": vp.poc, "vah": vp.vah, "val": vp.val,
         "shape": vp.shape, "current_position": vp.current_position,
         "hvn_zones": vp.hvn_zones, "lvn_zones": vp.lvn_zones,
         "naked_poc": vp.naked_poc, "total_volume": vp.total_volume,
         "price_range": vp.price_range, "bar_count": vp.bar_count,
+        "va_width": va_width,
     }
 
 
@@ -168,7 +172,11 @@ def _compute_period_vp(
         return None
     latest_close = period_bars[-1].ohlc.c
     vp = compute(period_bars, "cached", latest_close, bin_size=bin_size)
-    return _vp_to_dict(vp)
+    d = _vp_to_dict(vp)
+    if d is not None:
+        d["price_range_high"] = round(max(b.ohlc.h for b in period_bars), 4)
+        d["price_range_low"] = round(min(b.ohlc.l for b in period_bars), 4)
+    return d
 
 
 def _anchor_to_storage(anchor: SessionAnchor) -> int | dict:
@@ -334,3 +342,64 @@ def get_history(symbol: str, period: str, n: int = 5) -> list[dict]:
 
 def poc_sequence(symbol: str, period: str, n: int = 5) -> list[float | None]:
     return [e.get("poc") for e in get_history(symbol, period, n)]
+
+
+def get_va_regime(
+    symbol: str,
+    period: str = "daily",
+    n: int = 3,
+) -> dict:
+    """Classify VA width trend across last N sessions.
+
+    Returns:
+        {
+          "regime":    "expanding" | "contracting" | "neutral",
+          "widths":    [float, ...],   # va_width per session, oldest first
+          "pct_change": float,         # (newest - oldest) / oldest × 100
+          "confidence": float,         # 0.0 – 1.0 (monotonic trend = higher)
+        }
+
+    Expanding VA = trend developing (breakout bias).
+    Contracting VA = compression → mean-reversion to POC bias.
+    Neutral = no clear direction.
+
+    Uses va_width stored in each cached VP snapshot.
+    Falls back to (vah - val) if va_width key absent (old cache entries).
+    """
+    snaps = get_history(symbol, period, n=n)
+    widths = []
+    for s in snaps:
+        w = s.get("va_width")
+        if w is None:
+            vah, val = s.get("vah"), s.get("val")
+            if vah is not None and val is not None:
+                w = round(vah - val, 4)
+        if w is not None and w > 0:
+            widths.append(w)
+
+    if len(widths) < 2:
+        return {"regime": "neutral", "widths": widths, "pct_change": 0.0, "confidence": 0.0}
+
+    oldest, newest = widths[0], widths[-1]
+    pct_change = round((newest - oldest) / oldest * 100, 2) if oldest else 0.0
+
+    # Monotonicity: all steps same direction = high confidence
+    steps = [widths[i + 1] - widths[i] for i in range(len(widths) - 1)]
+    all_up   = all(s > 0 for s in steps)
+    all_down = all(s < 0 for s in steps)
+    monotonic = all_up or all_down
+    confidence = round(min(0.90, abs(pct_change) / 20 * (1.3 if monotonic else 1.0)), 2)
+
+    if pct_change >= 5.0:
+        regime = "expanding"
+    elif pct_change <= -5.0:
+        regime = "contracting"
+    else:
+        regime = "neutral"
+
+    return {
+        "regime":     regime,
+        "widths":     widths,
+        "pct_change": pct_change,
+        "confidence": confidence,
+    }

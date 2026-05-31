@@ -7,18 +7,65 @@ import { useEffect, useRef, useState } from "react";
 // - Drag: pan Y.
 // - Bars width fixed (configurable). Auto-fits to viewport from the right.
 
-const COLORS = {
-  bg:    "#0d0d0d",
-  text:  "#888",
-  textDim: "#555",
-  grid:  "#1a1a1a",
-  up:    "#26a69a",
-  down:  "#ef5350",
-  poc:   "rgba(255,215,0,0.35)",
-  pocBorder: "rgba(255,215,0,0.95)",
-  vah:   "#00bcd4",
-  val:   "#e040fb",
-  axis:  "#2a2a2a",
+const THEMES = {
+  dark: {
+    bg:    "#0d0d0d",
+    text:  "#888",
+    textDim: "#555",
+    grid:  "#1a1a1a",
+    up:    "#26a69a",
+    down:  "#ef5350",
+    poc:   "rgba(255,215,0,0.35)",
+    pocBorder: "rgba(255,215,0,0.95)",
+    vah:   "#00bcd4",
+    val:   "#e040fb",
+    axis:  "#2a2a2a",
+    panelBg:  "rgba(26,26,26,0.85)",
+    panelBdr: "#2a2a2a",
+    hvn:   "rgba(66,165,245,0.22)",
+    hvnBdr: "rgba(66,165,245,0.6)",
+    lvn:   "rgba(255,152,0,0.22)",
+    lvnBdr: "rgba(255,152,0,0.6)",
+    bidTxt: "#ffd6d6",
+    askTxt: "#d4ffe1",
+    neutralTxt: "#ececec",
+    imbAskBright: "rgba(38,255,200,1.0)",
+    imbAskFaint:  "rgba(38,166,154,0.65)",
+    imbBidBright: "rgba(255,90,90,1.0)",
+    imbBidFaint:  "rgba(239,83,80,0.65)",
+    candleBdr: "rgba(0,0,0,0.6)",
+    barSep:    "#222",
+    crosshair: "#888",
+  },
+  light: {
+    bg:    "#f7f7f7",
+    text:  "#333",
+    textDim: "#777",
+    grid:  "#e5e5e5",
+    up:    "#0a8a7d",
+    down:  "#c0392b",
+    poc:   "rgba(200,140,0,0.30)",
+    pocBorder: "rgba(180,120,0,0.95)",
+    vah:   "#0097a7",
+    val:   "#7b1fa2",
+    axis:  "#bbbbbb",
+    panelBg:  "rgba(245,245,245,0.92)",
+    panelBdr: "#cccccc",
+    hvn:   "rgba(33,118,210,0.18)",
+    hvnBdr: "rgba(33,118,210,0.7)",
+    lvn:   "rgba(230,120,0,0.18)",
+    lvnBdr: "rgba(230,120,0,0.75)",
+    bidTxt: "#7a0a0a",
+    askTxt: "#0a5a3a",
+    neutralTxt: "#1a1a1a",
+    imbAskBright: "rgba(0,140,90,1.0)",
+    imbAskFaint:  "rgba(10,138,125,0.75)",
+    imbBidBright: "rgba(180,0,30,1.0)",
+    imbBidFaint:  "rgba(192,57,43,0.75)",
+    candleBdr: "rgba(255,255,255,0.6)",
+    barSep:    "#d4d4d4",
+    crosshair: "#444",
+  },
 };
 
 const BAR_W_DEFAULT = 100;  // default px per bar
@@ -52,8 +99,8 @@ function inferTickSize(bars) {
 }
 
 export default function FootprintPane({
-  bars, dailyVp, priorVp, detections, positions, pendingOrders,
-  closedPositions, cvd, cvdSignal, zones, latestM2, symbol,
+  bars, dailyVp, priorVp, detections, positions, pendingOrders, nakedPocs,
+  closedPositions, cvd, cvdSignal, zones, latestM2, historicalSweeps, swingPoints, symbol, indicators,
 }) {
   const canvasRef = useRef(null);
   const wrapRef   = useRef(null);
@@ -74,7 +121,19 @@ export default function FootprintPane({
   const [hoverBarIdx, setHoverBarIdx] = useState(null); // index in `bars` of crosshaired bar
   const [showTrades, setShowTrades] = useState(true);   // toggle trade-history overlay
   const [selectedPosId, setSelectedPosId] = useState(null);
+  const [hoverPos, setHoverPos] = useState(null);  // {posId, x, y} for trade tooltip
+  const [showBubbles, setShowBubbles] = useState(() => {
+    try { return localStorage.getItem("fb_show_bubbles") !== "0"; } catch { return true; }
+  });
+  useEffect(() => { try { localStorage.setItem("fb_show_bubbles", showBubbles ? "1" : "0"); } catch {} }, [showBubbles]);
+  const [theme, setTheme] = useState(() => {
+    try { return localStorage.getItem("fb_theme") || "dark"; } catch { return "dark"; }
+  });
+  useEffect(() => { try { localStorage.setItem("fb_theme", theme); } catch {} }, [theme]);
+  const COLORS = THEMES[theme] || THEMES.dark;
   const markerHitsRef = useRef([]);  // [{x, y, r, posId}] populated each draw
+  const detHitsRef    = useRef([]);  // [{x, y, r, type, payload}] detection markers
+  const [hoverDet, setHoverDet] = useState(null);  // {type, payload, x, y}
   const cvdPaneRef    = useRef(null);
 
   // Reset view when instrument changes — refit to its market range
@@ -200,16 +259,23 @@ export default function FootprintPane({
     const slotOfBar     = (globalIdx) => globalIdx - rightBarIdx + (fitN - 1);
     const xCenterOfBar  = (globalIdx) => xCenterOfSlot(slotOfBar(globalIdx));
     const tsToVisibleX = (ts) => {
-      if (!slots.length) return 0;
-      if (ts <= slots[0].bar.ts) return 0;
-      const lastSlot = slots[slots.length - 1];
-      if (ts >= lastSlot.bar.ts) return xCenterOfSlot(lastSlot.slot);
-      const hit = slots.find(s => s.bar.ts >= ts);
-      return hit ? xCenterOfSlot(hit.slot) : plotW;
+      if (!bars.length) return -9999;
+      // Binary-search nearest bar across FULL bars[] (not just visible slots)
+      // so past bubbles map to their correct (possibly off-canvas) x when user
+      // pans. x is then naturally culled by `x < -MAX_BUBBLE_R` check.
+      if (ts <= bars[0].ts) return xCenterOfBar(0);
+      if (ts >= bars[bars.length - 1].ts) return xCenterOfBar(bars.length - 1);
+      let lo = 0, hi = bars.length - 1;
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >> 1;
+        if (bars[mid].ts <= ts) lo = mid; else hi = mid;
+      }
+      const nearest = (ts - bars[lo].ts) < (bars[hi].ts - ts) ? lo : hi;
+      return xCenterOfBar(nearest);
     };
 
-    // HVN / LVN bands (full plot width, faint)
-    const drawZoneBand = (lo, hi, fill) => {
+    // HVN / LVN bands — labeled rectangle with dashed border
+    const drawVpZone = (lo, hi, fill, bdr, label) => {
       const yTop = yOfPrice(hi);
       const yBot = yOfPrice(lo);
       if (yBot < PAD_TOP || yTop > PAD_TOP + plotH) return;
@@ -218,9 +284,23 @@ export default function FootprintPane({
       if (yB <= yA) return;
       ctx.fillStyle = fill;
       ctx.fillRect(0, yA, plotW, yB - yA);
+      ctx.save();
+      ctx.strokeStyle = bdr;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(0, yA); ctx.lineTo(plotW, yA);
+      ctx.moveTo(0, yB); ctx.lineTo(plotW, yB);
+      ctx.stroke();
+      ctx.restore();
+      ctx.fillStyle = bdr;
+      ctx.font = "bold 9px JetBrains Mono, monospace";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "top";
+      ctx.fillText(label, 4, yA + 2);
     };
-    (dailyVp?.hvn_zones || []).forEach(z => drawZoneBand(z.low, z.high, "rgba(66,165,245,0.07)"));
-    (dailyVp?.lvn_zones || []).forEach(z => drawZoneBand(z.low, z.high, "rgba(255,152,0,0.07)"));
+    (dailyVp?.hvn_zones || []).forEach(z => drawVpZone(z.low, z.high, COLORS.hvn, COLORS.hvnBdr, "HVN"));
+    (dailyVp?.lvn_zones || []).forEach(z => drawVpZone(z.low, z.high, COLORS.lvn, COLORS.lvnBdr, "LVN"));
 
     // FVG zones (rectangle from formed_at_ts → right edge)
     (detections?.fvgs || []).forEach(f => {
@@ -268,6 +348,13 @@ export default function FootprintPane({
       drawLevel(dailyVp.vah, COLORS.vah, "VAH", true);
       drawLevel(dailyVp.val, COLORS.val, "VAL", true);
       if (dailyVp.naked_poc) drawLevel(dailyVp.naked_poc, COLORS.pocBorder, "nPOC", true);
+      // Multi-session naked POCs — fading dotted lines, older = more transparent
+      (nakedPocs || []).forEach(n => {
+        const alpha = Math.max(0.25, 0.75 - n.age_sessions * 0.1);
+        const color = `rgba(255,215,0,${alpha.toFixed(2)})`;
+        const label = `nPOC-${n.session[0]}${n.age_sessions}`;
+        drawLevel(n.price, color, label, true);
+      });
     }
     if (priorVp) {
       drawLevel(priorVp.poc, "rgba(255,215,0,0.35)", "pPOC", true);
@@ -321,109 +408,9 @@ export default function FootprintPane({
       ctx.fillText(`P L${po.leg_idx}`, 4, y - 2);
     });
 
-    // Trade history overlays: closed cycles (MT5-style entry→exit) + open
-    // positions. Gated on showTrades toggle.
+    // Reset marker hit-test array; actual trade overlay draws are placed
+    // AFTER bars + bubbles below so they sit on top (z-order).
     markerHitsRef.current = [];
-
-    if (showTrades) (closedPositions || []).forEach(pos => {
-      if (!pos.opened_ts || !pos.closed_ts) return;
-      const xEntry = tsToVisibleX(pos.opened_ts);
-      const xExit  = tsToVisibleX(pos.closed_ts);
-      const yEntry = yOfPrice(pos.avg_entry);
-      const yExit  = yOfPrice(pos.exit_price);
-      if (yEntry < PAD_TOP || yEntry > PAD_TOP + plotH) return;
-      if (yExit  < PAD_TOP || yExit  > PAD_TOP + plotH) return;
-      const profit = (pos.realized_r || 0) >= 0;
-      const lineColor = profit ? "rgba(38,166,154,0.85)" : "rgba(239,83,80,0.85)";
-      // Connecting line entry → exit
-      ctx.save();
-      ctx.strokeStyle = lineColor;
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([4, 3]);
-      ctx.beginPath();
-      ctx.moveTo(xEntry, yEntry);
-      ctx.lineTo(xExit,  yExit);
-      ctx.stroke();
-      ctx.restore();
-      // Entry marker (small filled square)
-      const entryColor = pos.side === "long" ? COLORS.up : COLORS.down;
-      ctx.fillStyle = entryColor;
-      ctx.fillRect(xEntry - 4, yEntry - 4, 8, 8);
-      ctx.strokeStyle = "rgba(0,0,0,0.6)";
-      ctx.lineWidth = 1;
-      ctx.strokeRect(xEntry - 4, yEntry - 4, 8, 8);
-      // Exit marker (X glyph)
-      ctx.strokeStyle = lineColor;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(xExit - 5, yExit - 5); ctx.lineTo(xExit + 5, yExit + 5);
-      ctx.moveTo(xExit + 5, yExit - 5); ctx.lineTo(xExit - 5, yExit + 5);
-      ctx.stroke();
-      // R label near exit
-      ctx.fillStyle = lineColor;
-      ctx.font = "bold 10px JetBrains Mono, monospace";
-      ctx.textAlign = "left";
-      ctx.textBaseline = "middle";
-      const rLbl = `${profit ? "+" : ""}${(pos.realized_r || 0).toFixed(2)}R`;
-      ctx.fillText(rLbl, xExit + 8, yExit);
-      markerHitsRef.current.push({ x: xEntry, y: yEntry, r: 6, posId: pos.position_id });
-    });
-
-    if (showTrades) (positions || []).forEach(pos => {
-      const color = pos.side === "long" ? COLORS.up : COLORS.down;
-      const xStart = pos.opened_ts ? tsToVisibleX(pos.opened_ts) : 0;
-      const drawHLine = (price, style, lbl) => {
-        if (price == null) return;
-        const y = yOfPrice(price);
-        if (y < PAD_TOP || y > PAD_TOP + plotH) return;
-        ctx.save();
-        if (style === "dashed") ctx.setLineDash([4, 3]);
-        ctx.strokeStyle = style === "dashed" ? color
-                        : style === "tp"     ? "rgba(255,215,0,0.9)"
-                        : "rgba(239,83,80,0.9)";
-        ctx.lineWidth = style === "tp" || style === "sl" ? 1.5 : 1;
-        ctx.beginPath();
-        ctx.moveTo(xStart, y);
-        ctx.lineTo(plotW, y);
-        ctx.stroke();
-        ctx.restore();
-        ctx.fillStyle = ctx.strokeStyle;
-        ctx.font = "10px JetBrains Mono, monospace";
-        ctx.textAlign = "left";
-        ctx.textBaseline = "bottom";
-        ctx.fillText(lbl, xStart + 4, y - 2);
-      };
-      (pos.leg_prices || []).forEach((price, i) => {
-        if (price != null) drawHLine(price, "dashed", `L${i + 1}`);
-      });
-      drawHLine(pos.take_profit, "tp", "TP");
-      drawHLine(pos.stop_loss,   "sl", "SL");
-
-      // Entry-marker diamond at (xStart, avg_entry). Hit-testable.
-      const yEntry = yOfPrice(pos.avg_entry);
-      if (yEntry >= PAD_TOP && yEntry <= PAD_TOP + plotH && xStart >= 0 && xStart <= plotW) {
-        const isSelected = selectedPosId === pos.position_id;
-        const sz = isSelected ? 8 : 6;
-        ctx.fillStyle   = color;
-        ctx.strokeStyle = "rgba(255,255,255,0.9)";
-        ctx.lineWidth   = isSelected ? 2 : 1;
-        ctx.beginPath();
-        ctx.moveTo(xStart, yEntry - sz);
-        ctx.lineTo(xStart + sz, yEntry);
-        ctx.lineTo(xStart, yEntry + sz);
-        ctx.lineTo(xStart - sz, yEntry);
-        ctx.closePath();
-        ctx.fill();
-        ctx.stroke();
-        // Side glyph (▲/▼)
-        ctx.fillStyle = "#fff";
-        ctx.font = "bold 9px JetBrains Mono, monospace";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillText(pos.side === "long" ? "▲" : "▼", xStart, yEntry);
-        markerHitsRef.current.push({ x: xStart, y: yEntry, r: sz + 2, posId: pos.position_id });
-      }
-    });
 
     // Auto-fallback: when bars are too narrow OR cells too thin, footprint
     // becomes illegible. Render plain candlesticks instead.
@@ -539,39 +526,36 @@ export default function FootprintPane({
         const xAskL = xCenter + CANDLE_W / 2;
         const xAskR = xCenter + halfBar;
 
-        // Cell backgrounds — vary by display mode
+        // Cell backgrounds — gamma>1 curve so LOW shares stay faint and
+        // HIGH shares hit near-full saturation. Wide dynamic range.
+        const sat = (s) => Math.pow(Math.max(0, Math.min(1, s)), 1.6);
         if (cellMode === "bidask") {
           if (bid > 0) {
-            ctx.fillStyle = `rgba(239,83,80,${0.30 + bidShare * 0.60})`;
+            ctx.fillStyle = `rgba(239,83,80,${0.08 + sat(bidShare) * 0.92})`;
             ctx.fillRect(xBidL, y - cellH / 2, cellSide, cellH);
           }
           if (ask > 0) {
-            ctx.fillStyle = `rgba(38,166,154,${0.30 + askShare * 0.60})`;
+            ctx.fillStyle = `rgba(38,166,154,${0.08 + sat(askShare) * 0.92})`;
             ctx.fillRect(xAskL, y - cellH / 2, cellSide, cellH);
           }
         } else if (cellMode === "total") {
-          // Gray gradient by total share, both columns
           const totalShare = (bid + ask) / maxVol;
-          ctx.fillStyle = `rgba(180,180,180,${0.10 + totalShare * 0.55})`;
+          ctx.fillStyle = `rgba(180,180,180,${0.05 + sat(totalShare) * 0.90})`;
           ctx.fillRect(xBidL, y - cellH / 2, cellSide, cellH);
           ctx.fillRect(xAskL, y - cellH / 2, cellSide, cellH);
         } else { // delta
-          // Left col = total vol gray gradient; right col = signed delta gradient
           const totalShare = (bid + ask) / maxVol;
-          ctx.fillStyle = `rgba(180,180,180,${0.10 + totalShare * 0.55})`;
+          ctx.fillStyle = `rgba(180,180,180,${0.05 + sat(totalShare) * 0.90})`;
           ctx.fillRect(xBidL, y - cellH / 2, cellSide, cellH);
           const d = ask - bid;
           const dShare = Math.abs(d) / maxAbsDelta;
           ctx.fillStyle = d >= 0
-            ? `rgba(38,166,154,${0.20 + dShare * 0.70})`
-            : `rgba(239,83,80,${0.20 + dShare * 0.70})`;
+            ? `rgba(38,166,154,${0.08 + sat(dShare) * 0.92})`
+            : `rgba(239,83,80,${0.08 + sat(dShare) * 0.92})`;
           ctx.fillRect(xAskL, y - cellH / 2, cellSide, cellH);
         }
 
-        ctx.strokeStyle = "rgba(0,0,0,0.55)";
-        ctx.lineWidth = 1;
-        ctx.strokeRect(xBidL, y - cellH / 2, cellSide, cellH);
-        ctx.strokeRect(xAskL, y - cellH / 2, cellSide, cellH);
+        // Cell borders intentionally hidden — rely on color fills.
 
         if (isPoc) {
           ctx.fillStyle = COLORS.poc;
@@ -591,44 +575,48 @@ export default function FootprintPane({
         }
 
         if (askImb[r]) {
-          ctx.fillStyle = askStack.has(r) ? "rgba(38,166,154,0.95)" : "rgba(38,166,154,0.55)";
+          ctx.fillStyle = askStack.has(r) ? COLORS.imbAskBright : COLORS.imbAskFaint;
           ctx.fillRect(xAskR - 3, y - cellH / 2, 3, cellH);
         }
         if (bidImb[r]) {
-          ctx.fillStyle = bidStack.has(r) ? "rgba(239,83,80,0.95)" : "rgba(239,83,80,0.55)";
+          ctx.fillStyle = bidStack.has(r) ? COLORS.imbBidBright : COLORS.imbBidFaint;
           ctx.fillRect(xBidL, y - cellH / 2, 3, cellH);
         }
 
         if (showText) {
-          ctx.font = `${Math.min(10, cellH - 2)}px JetBrains Mono, monospace`;
+          const baseSz = Math.min(10, cellH - 2);
+          const baseFont   = `${baseSz}px JetBrains Mono, monospace`;
+          const boldFont   = `bold ${Math.min(11, cellH - 1)}px JetBrains Mono, monospace`;
+          ctx.font = baseFont;
           ctx.textBaseline = "middle";
           const fmt = (n) => Math.abs(n) >= 100 ? n.toFixed(0) : n.toFixed(2);
           if (cellMode === "bidask") {
             if (bid > 0) {
-              ctx.fillStyle = "rgba(255,210,210,0.95)";
+              ctx.font = bidImb[r] ? boldFont : baseFont;
+              ctx.fillStyle = bidImb[r] ? (bidStack.has(r) ? COLORS.imbBidBright : COLORS.imbBidFaint) : COLORS.bidTxt;
               ctx.textAlign = "right";
               ctx.fillText(fmt(bid), xBidR - 2, y);
             }
             if (ask > 0) {
-              ctx.fillStyle = "rgba(210,255,230,0.95)";
+              ctx.font = askImb[r] ? boldFont : baseFont;
+              ctx.fillStyle = askImb[r] ? (askStack.has(r) ? COLORS.imbAskBright : COLORS.imbAskFaint) : COLORS.askTxt;
               ctx.textAlign = "left";
               ctx.fillText(fmt(ask), xAskL + 2, y);
             }
           } else if (cellMode === "delta") {
-            // Left col = total vol, right col = signed delta
             const t = bid + ask;
             const d = ask - bid;
             if (t > 0) {
-              ctx.fillStyle = "rgba(230,230,230,0.95)";
+              ctx.fillStyle = COLORS.neutralTxt;
               ctx.textAlign = "right";
               ctx.fillText(fmt(t), xBidR - 2, y);
             }
-            ctx.fillStyle = d >= 0 ? "rgba(210,255,230,0.95)" : "rgba(255,210,210,0.95)";
+            ctx.fillStyle = d >= 0 ? COLORS.askTxt : COLORS.bidTxt;
             ctx.textAlign = "left";
             ctx.fillText((d >= 0 ? "+" : "") + fmt(d), xAskL + 2, y);
           } else { // total
             const t = bid + ask;
-            ctx.fillStyle = "rgba(230,230,230,0.95)";
+            ctx.fillStyle = COLORS.neutralTxt;
             ctx.textAlign = "center";
             ctx.fillText(fmt(t), xCenter, y);
           }
@@ -654,11 +642,11 @@ export default function FootprintPane({
       const bodyHeight = Math.max(1, Math.abs(yO - yC));
       ctx.fillStyle = candleColor;
       ctx.fillRect(xCenter - CANDLE_W / 2, bodyTop, CANDLE_W, bodyHeight);
-      ctx.strokeStyle = "rgba(0,0,0,0.6)";
+      ctx.strokeStyle = COLORS.candleBdr;
       ctx.strokeRect(xCenter - CANDLE_W / 2, bodyTop, CANDLE_W, bodyHeight);
 
       // Bar separator
-      ctx.strokeStyle = COLORS.axis;
+      ctx.strokeStyle = COLORS.barSep;
       ctx.beginPath();
       ctx.moveTo(xLeft + barW, PAD_TOP);
       ctx.lineTo(xLeft + barW, PAD_TOP + plotH);
@@ -666,17 +654,22 @@ export default function FootprintPane({
 
     });
 
-    // Sweep markers — single-sweep arrow + all active-sweep secondary markers
+    detHitsRef.current = [];
+    // Sweep markers — compact arrow + tiny "SW" pill; hover for full info.
     const drawSweepMarker = (ev, primary) => {
       if (!ev || !ev.type) return;
       const age = ev.age_bars || 0;
       const targetGlobalIdx = bars.length - 1 - age;
       const slot = slotOfBar(targetGlobalIdx);
-      if (slot < -1 || slot > fitN) return;       // off visible range
+      if (slot < -1 || slot > fitN) return;
       const xC    = xCenterOfBar(targetGlobalIdx);
       const isHi  = ev.type === "sweep_high";
       const yWick = yOfPrice(ev.wick_extreme);
-      const color = isHi ? COLORS.down : COLORS.up;
+      const cls   = ev.classification || "";
+      const color = cls === "stop_run"     ? "#888888"
+                  : cls === "failed_sweep" ? "#9c27b0"
+                  : cls === "liquidity_grab" ? (isHi ? "#ff9800" : "#ffb74d")
+                  : isHi ? COLORS.down : COLORS.up;
       const arrowY = isHi ? yWick - 14 : yWick + 14;
       const tipY   = isHi ? yWick - 2  : yWick + 2;
       ctx.fillStyle = color;
@@ -689,17 +682,17 @@ export default function FootprintPane({
       ctx.fill();
       ctx.globalAlpha = 1.0;
       if (primary) {
-        const gran  = ev.granularity ? ev.granularity.toUpperCase() : "";
-        const conf  = ev.confidence != null ? ` ${(ev.confidence * 100).toFixed(0)}%` : "";
-        const patt  = ev.pattern ? ` ${ev.pattern}` : "";
-        const lvl   = ev.level_label ? ` ${ev.level_label}` : "";
-        const label = `SW ${gran}${lvl}${patt}${conf}`.trim();
-        ctx.font = "bold 10px JetBrains Mono, monospace";
-        const labelW = ctx.measureText(label).width + 8;
-        const labelH = 14;
-        const labelX = Math.min(Math.max(xC - labelW / 2, 2), plotW - labelW - 2);
-        const labelY = isHi ? arrowY - labelH - 2 : arrowY + 4;
-        ctx.fillStyle = "rgba(13,13,13,0.85)";
+        const label = cls === "reversal"      ? "REV"
+                    : cls === "liquidity_grab" ? "LG"
+                    : cls === "stop_run"       ? "SR"
+                    : cls === "failed_sweep"   ? "FS"
+                    : "SW";
+        ctx.font = "bold 9px JetBrains Mono, monospace";
+        const labelW = ctx.measureText(label).width + 6;
+        const labelH = 12;
+        const labelX = xC - labelW / 2;
+        const labelY = isHi ? arrowY - labelH - 1 : arrowY + 2;
+        ctx.fillStyle = COLORS.panelBg;
         ctx.fillRect(labelX, labelY, labelW, labelH);
         ctx.strokeStyle = color;
         ctx.lineWidth = 1;
@@ -707,7 +700,12 @@ export default function FootprintPane({
         ctx.fillStyle = color;
         ctx.textAlign = "left";
         ctx.textBaseline = "middle";
-        ctx.fillText(label, labelX + 4, labelY + labelH / 2);
+        ctx.fillText(label, labelX + 3, labelY + labelH / 2);
+        detHitsRef.current.push({
+          x: labelX + labelW / 2, y: labelY + labelH / 2,
+          r: Math.max(labelW, labelH) / 2 + 3,
+          type: "sweep", payload: ev,
+        });
       }
     };
     // Active registry — faint secondary arrows for non-primary sweeps
@@ -715,30 +713,184 @@ export default function FootprintPane({
       if (ev.stale) return;
       // Reuse primary slot for the latest sweep (matches detections.sweep below)
       drawSweepMarker({
-        type:          ev.sweep_type,
-        wick_extreme:  ev.wick_extreme,
-        age_bars:      ev.age_bars,
+        type:           ev.sweep_type,
+        wick_extreme:   ev.wick_extreme,
+        age_bars:       ev.age_bars,
+        classification: ev.classification,
       }, false);
     });
     drawSweepMarker(detections?.sweep && detections.sweep.type !== "none" ? detections.sweep : null, true);
 
-    // Absorption markers (latest bar in dataset, if it's currently visible)
-    if (bars.length) {
+    // Historical sweep markers — REV + LG only, toggleable
+    if (indicators?.sweepArrows !== false) {
+      (historicalSweeps || []).forEach(sw => {
+        const cls = sw.classification || "";
+        if (cls !== "reversal" && cls !== "liquidity_grab") return;
+        const isHi = sw.type === "sweep_high";
+        const xC   = tsToVisibleX(sw.ts);
+        if (xC < -barW || xC > plotW + barW) return;
+        const yWick = yOfPrice(sw.wick_extreme);
+        if (yWick < PAD_TOP || yWick > PAD_TOP + plotH) return;
+        const color = cls === "liquidity_grab"
+          ? (isHi ? "#ff9800" : "#ffb74d")
+          : (isHi ? COLORS.down : COLORS.up);
+        const label = cls === "liquidity_grab" ? "LG" : "REV";
+        const arrowY = isHi ? yWick - 14 : yWick + 14;
+        const tipY   = isHi ? yWick - 2  : yWick + 2;
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.75;
+        ctx.beginPath();
+        ctx.moveTo(xC, tipY);
+        ctx.lineTo(xC - 5, arrowY);
+        ctx.lineTo(xC + 5, arrowY);
+        ctx.closePath();
+        ctx.fill();
+        ctx.font = "bold 9px JetBrains Mono, monospace";
+        const labelW = ctx.measureText(label).width + 6;
+        const labelH = 12;
+        const labelX = xC - labelW / 2;
+        const labelY2 = isHi ? arrowY - labelH - 1 : arrowY + 2;
+        ctx.fillStyle = COLORS.panelBg;
+        ctx.fillRect(labelX, labelY2, labelW, labelH);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(labelX, labelY2, labelW, labelH);
+        ctx.fillStyle = color;
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        ctx.fillText(label, labelX + 3, labelY2 + labelH / 2);
+        ctx.globalAlpha = 1.0;
+        detHitsRef.current.push({ x: xC, y: yWick, r: 8, type: "sweep", payload: sw });
+      });
+    }
+
+    // Swing point levels — dashed line + triangle; EQH/EQL and normal pivot lines are separate toggles
+    (swingPoints || []).forEach(sp => {
+      const isEq = sp.is_equal;
+      if (isEq  && indicators?.eqLevels   === false) return;
+      if (!isEq && indicators?.pivotLines === false) return;
+      const xC  = tsToVisibleX(sp.ts);
+      if (xC < -barW || xC > plotW + barW) return;
+      const y   = yOfPrice(sp.price);
+      if (y < PAD_TOP || y > PAD_TOP + plotH) return;
+      const isHi = sp.side === "high";
+      const baseRgb = isEq ? "255,152,0" : (isHi ? "239,83,80" : "38,166,154");
+
+      // Dashed horizontal line: pivot bar → right edge of plot
+      ctx.save();
+      ctx.setLineDash([3, 4]);
+      ctx.strokeStyle = `rgba(${baseRgb},${isEq ? 0.55 : 0.28})`;
+      ctx.lineWidth = isEq ? 1.5 : 0.8;
+      ctx.beginPath();
+      ctx.moveTo(xC, y);
+      ctx.lineTo(plotW, y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+
+      // Triangle marker at pivot bar (pointing toward price level)
+      const triH = 7, triW = 5;
+      ctx.globalAlpha = isEq ? 0.95 : 0.75;
+      ctx.fillStyle = `rgba(${baseRgb},${isEq ? 0.95 : 0.85})`;
+      ctx.beginPath();
+      if (isHi) {
+        const ty = y - 3;
+        ctx.moveTo(xC, ty + triH);
+        ctx.lineTo(xC - triW, ty);
+        ctx.lineTo(xC + triW, ty);
+      } else {
+        const ty = y + 3;
+        ctx.moveTo(xC, ty - triH);
+        ctx.lineTo(xC - triW, ty);
+        ctx.lineTo(xC + triW, ty);
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.globalAlpha = 1.0;
+
+      // Label at pivot bar (left anchor of line) — EQH/EQL prominent, normal pivots price only
+      ctx.font = isEq ? "bold 9px JetBrains Mono, monospace" : "9px JetBrains Mono, monospace";
+      ctx.fillStyle = `rgba(${baseRgb},${isEq ? 0.9 : 0.55})`;
+      ctx.textAlign = "left";
+      ctx.textBaseline = isHi ? "bottom" : "top";
+      const pivotLabel = isEq ? `${isHi ? "EQH" : "EQL"} ${sp.price.toFixed(2)}` : sp.price.toFixed(2);
+      ctx.fillText(pivotLabel, xC + triW + 3, y - (isHi ? 3 : -3));
+
+      // Right-edge label for EQH/EQL (reinforces the level across wide chart)
+      if (isEq) {
+        ctx.font = "bold 9px JetBrains Mono, monospace";
+        ctx.fillStyle = `rgba(${baseRgb},0.7)`;
+        ctx.textAlign = "right";
+        ctx.textBaseline = "middle";
+        ctx.fillText(`${isHi ? "EQH" : "EQL"}`, plotW - 2, y);
+      }
+    });
+
+    // SR/FS sweeps — small dim arrows with hover detail
+    if (indicators?.srFsSweeps !== false) {
+      (historicalSweeps || []).forEach(sw => {
+        const cls = sw.classification || "";
+        if (cls !== "stop_run" && cls !== "failed_sweep") return;
+        const isHi = sw.type === "sweep_high";
+        const xC = tsToVisibleX(sw.ts);
+        if (xC < -barW || xC > plotW + barW) return;
+        const yWick = yOfPrice(sw.wick_extreme);
+        if (yWick < PAD_TOP || yWick > PAD_TOP + plotH) return;
+        const color = cls === "stop_run" ? "#666" : "#7b1fa2";
+        const label = cls === "stop_run" ? "SR" : "FS";
+        const arrowY = isHi ? yWick - 9 : yWick + 9;
+        const tipY   = isHi ? yWick - 2 : yWick + 2;
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.45;
+        ctx.beginPath();
+        ctx.moveTo(xC, tipY);
+        ctx.lineTo(xC - 3, arrowY);
+        ctx.lineTo(xC + 3, arrowY);
+        ctx.closePath();
+        ctx.fill();
+        ctx.font = "8px JetBrains Mono, monospace";
+        ctx.fillStyle = color;
+        ctx.textAlign = "center";
+        ctx.textBaseline = isHi ? "bottom" : "top";
+        ctx.fillText(label, xC, isHi ? arrowY - 1 : arrowY + 1);
+        ctx.globalAlpha = 1.0;
+        detHitsRef.current.push({ x: xC, y: yWick, r: 7, type: "sweep", payload: sw });
+      });
+    }
+
+    // Absorption — compact "AB" pill near last bar; hover for full info.
+    if (indicators?.absorptions !== false && bars.length) {
       const latestGlobalIdx = bars.length - 1;
       const lastXC = xCenterOfBar(latestGlobalIdx);
       (detections?.absorptions || []).forEach(a => {
         const y = yOfPrice(a.price);
         if (y < PAD_TOP || y > PAD_TOP + plotH) return;
         const color = a.side === "buy" ? COLORS.up : COLORS.down;
+        const x = lastXC + barW / 2 + 6;
         ctx.fillStyle = color;
         ctx.beginPath();
-        ctx.arc(lastXC + barW / 2 + 6, y, 4, 0, Math.PI * 2);
+        ctx.arc(x, y, 3, 0, Math.PI * 2);
         ctx.fill();
-        ctx.font = "9px JetBrains Mono, monospace";
+        const label = "AB";
+        ctx.font = "bold 9px JetBrains Mono, monospace";
+        const labelW = ctx.measureText(label).width + 6;
+        const labelH = 12;
+        const labelX = x + 6;
+        const labelY = y - labelH / 2;
+        ctx.fillStyle = COLORS.panelBg;
+        ctx.fillRect(labelX, labelY, labelW, labelH);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(labelX, labelY, labelW, labelH);
+        ctx.fillStyle = color;
         ctx.textAlign = "left";
         ctx.textBaseline = "middle";
-        ctx.fillStyle = color;
-        ctx.fillText(`ABS ${a.side} ${a.volume}`, lastXC + barW / 2 + 12, y);
+        ctx.fillText(label, labelX + 3, labelY + labelH / 2);
+        detHitsRef.current.push({
+          x: labelX + labelW / 2, y: y,
+          r: Math.max(labelW, labelH) / 2 + 3,
+          type: "absorption", payload: a,
+        });
       });
     }
 
@@ -746,17 +898,81 @@ export default function FootprintPane({
     // Side colors: buy = green family, sell = red family. Outcome encoded as
     // border (pushed=bright, absorbed=dashed, exhausted=gray, pending=dotted).
     const MAX_BUBBLE_R = 26;
-    const MIN_BUBBLE_R = 4;
-    const bigTrades = detections?.big_trades || [];
+    const MIN_BUBBLE_R = 8;
+    const bigTrades = showBubbles ? (detections?.big_trades || []) : [];
     if (bigTrades.length) {
-      const maxVol = bigTrades.reduce((m, bt) => Math.max(m, bt.volume || 0), 0.001);
+      // Merge by (barIdx, y-cell, aggressor) — collapses stacked prints on the
+      // same bar/price into one bubble.
+      const Y_CELL = Math.max(MAX_BUBBLE_R * 1.6, 14);
+      // Strict visible-only: build a set of visible bar ts. Bubbles snap to
+      // their bar; only render if that bar is in the current slot range.
+      const visibleBarTs = new Map();   // ts → barIdx
+      slots.forEach(({ bar }, i) => visibleBarTs.set(bar.ts, i));
+      // Bubble's owning bar = the bar whose [close_ts - TF, close_ts] window
+      // contains bubble.ts. For each bubble find smallest slot.bar.ts >= bt.ts
+      // within TF window. If none → bubble not on a visible bar.
+      const _tfSec = slots.length >= 2 ? slots[1].bar.ts - slots[0].bar.ts : 60;
+      const slotsTsSorted = slots.map(s => s.bar.ts);
+      const _owningVisibleBar = (ts) => {
+        if (!slotsTsSorted.length) return -1;
+        // Find smallest barTs >= ts (the bar that closes at/after ts)
+        let lo = 0, hi = slotsTsSorted.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (slotsTsSorted[mid] < ts) lo = mid + 1; else hi = mid;
+        }
+        if (lo >= slotsTsSorted.length) {
+          // ts after last visible bar — XAU's live bar isn't fetched from
+          // Binance (no XAUUSDT on fapi), so live bubbles fall past last bar.
+          // Allow up to 2× TF to catch live-period bubbles before next snapshot.
+          const last = slotsTsSorted[slotsTsSorted.length - 1];
+          return (ts - last) < (_tfSec * 2) ? last : -1;
+        }
+        // Bar at lo: window is (lo.ts - tfSec, lo.ts]
+        const cand = slotsTsSorted[lo];
+        return (cand - ts) <= _tfSec ? cand : -1;
+      };
+      const mergeMap = new Map();
       for (const bt of bigTrades) {
-        const x = tsToVisibleX(bt.ts);
+        const owningTs = _owningVisibleBar(bt.ts);
+        if (owningTs < 0) continue;
+        const x = tsToVisibleX(owningTs);
+        if (x < -MAX_BUBBLE_R || x > plotW + MAX_BUBBLE_R) continue;
         const y = yOfPrice(bt.price);
         if (y < PAD_TOP || y > PAD_TOP + plotH) continue;
-        if (x < -MAX_BUBBLE_R || x > plotW + MAX_BUBBLE_R) continue;
-        const share = Math.sqrt((bt.volume || 0) / maxVol);   // sqrt for area scaling
-        const r = MIN_BUBBLE_R + share * (MAX_BUBBLE_R - MIN_BUBBLE_R);
+        const barIdx = visibleBarTs.get(owningTs) ?? -1;
+        const key = `${barIdx}|${Math.round(y / Y_CELL)}|${bt.aggressor}`;
+        const cur = mergeMap.get(key);
+        if (!cur) {
+          mergeMap.set(key, { x, y, volume: bt.volume || 0,
+            aggressor: bt.aggressor, outcome: bt.outcome, count: 1,
+            ts: bt.ts, price: bt.price, vp_context: bt.vp_context, barIdx });
+        } else {
+          cur.volume += bt.volume || 0;
+          cur.count += 1;
+          // average x/y so cluster centers
+          cur.x = (cur.x * (cur.count - 1) + x) / cur.count;
+          cur.y = (cur.y * (cur.count - 1) + y) / cur.count;
+          const rank = { pending: 0, absorbed: 1, exhausted: 1, pushed: 2 };
+          if ((rank[bt.outcome] || 0) > (rank[cur.outcome] || 0)) cur.outcome = bt.outcome;
+        }
+      }
+      let visible = [...mergeMap.values()];
+      // Quintile-based sizing: rank by volume, map to 5 discrete radii.
+      // Clearer visual hierarchy than continuous sqrt-scaling.
+      const _sorted = [...visible].sort((a, b) => (a.volume || 0) - (b.volume || 0));
+      const _quintileR = [8, 12, 16, 20, 24];
+      const _quintileMap = new Map();
+      for (let i = 0; i < _sorted.length; i++) {
+        const q = Math.min(4, Math.floor((i / Math.max(_sorted.length, 1)) * 5));
+        _quintileMap.set(_sorted[i], _quintileR[q]);
+      }
+      for (const bt of visible) {
+        const x = bt.x;
+        const y = bt.y;
+        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+        const r = _quintileMap.get(bt) || MIN_BUBBLE_R;
+        if (!Number.isFinite(r) || r <= 0) continue;
         const isBuy = bt.aggressor === "buy";
         const baseRgb = isBuy ? "38,166,154" : "239,83,80";
         // Radial gradient: bright center → faint edge
@@ -782,18 +998,144 @@ export default function FootprintPane({
         ctx.arc(x, y, r, 0, Math.PI * 2);
         ctx.stroke();
         ctx.restore();
-        // Volume value text
-        if (r >= 9) {
+        // Volume value + merge count (when >1 prints clustered here)
+        if (r >= 10) {
           const v = bt.volume || 0;
-          const label = v >= 1000 ? (v / 1000).toFixed(1) + "k" : v >= 100 ? v.toFixed(0) : v.toFixed(1);
+          const vLbl = v >= 1000 ? (v / 1000).toFixed(1) + "k" : v >= 100 ? v.toFixed(0) : v.toFixed(1);
+          const cLbl = bt.count > 1 ? `×${bt.count}` : "";
           ctx.font = `bold ${Math.min(11, Math.max(8, r * 0.5))}px JetBrains Mono, monospace`;
           ctx.fillStyle = "#fff";
           ctx.textAlign = "center";
           ctx.textBaseline = "middle";
-          ctx.fillText(label, x, y);
+          if (cLbl) {
+            ctx.fillText(vLbl, x, y - 4);
+            ctx.font = `bold ${Math.min(9, Math.max(7, r * 0.38))}px JetBrains Mono, monospace`;
+            ctx.fillText(cLbl, x, y + 5);
+          } else {
+            ctx.fillText(vLbl, x, y);
+          }
         }
+        detHitsRef.current.push({
+          x, y, r: Math.max(r, 5),
+          type: "big_trade", payload: bt,
+        });
       }
     }
+
+    // Trade-history overlays — drawn AFTER bars/bubbles so they sit on top.
+    if (showTrades) (closedPositions || []).forEach(pos => {
+      if (!pos.opened_ts || !pos.closed_ts) return;
+      const xEntry = tsToVisibleX(pos.opened_ts);
+      const xExit  = tsToVisibleX(pos.closed_ts);
+      const yEntry = yOfPrice(pos.avg_entry);
+      const yExit  = yOfPrice(pos.exit_price);
+      if (yEntry < PAD_TOP || yEntry > PAD_TOP + plotH) return;
+      if (yExit  < PAD_TOP || yExit  > PAD_TOP + plotH) return;
+      const profit = (pos.realized_r || 0) >= 0;
+      const isM2 = pos.mode === "m2";
+      const alpha = isM2 ? 0.5 : 0.85;
+      const lineColor = profit ? `rgba(38,166,154,${alpha})` : `rgba(239,83,80,${alpha})`;
+      ctx.save();
+      ctx.strokeStyle = lineColor;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      ctx.moveTo(xEntry, yEntry);
+      ctx.lineTo(xExit,  yExit);
+      ctx.stroke();
+      ctx.restore();
+      const entryColor = pos.side === "long" ? COLORS.up : COLORS.down;
+      ctx.fillStyle = entryColor;
+      ctx.fillRect(xEntry - 4, yEntry - 4, 8, 8);
+      ctx.strokeStyle = "rgba(0,0,0,0.6)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(xEntry - 4, yEntry - 4, 8, 8);
+      ctx.strokeStyle = lineColor;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(xExit - 5, yExit - 5); ctx.lineTo(xExit + 5, yExit + 5);
+      ctx.moveTo(xExit + 5, yExit - 5); ctx.lineTo(xExit - 5, yExit + 5);
+      ctx.stroke();
+      ctx.fillStyle = lineColor;
+      ctx.font = "bold 10px JetBrains Mono, monospace";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      const rLbl = `${profit ? "+" : ""}${(pos.realized_r || 0).toFixed(2)}R${isM2 ? " M2" : ""}`;
+      ctx.fillText(rLbl, xExit + 8, yExit);
+      markerHitsRef.current.push({ x: xEntry, y: yEntry, r: 6, posId: pos.position_id });
+    });
+
+    if (showTrades) (positions || []).forEach(pos => {
+      const isM2 = pos.mode === "m2";
+      const color = pos.side === "long" ? COLORS.up : COLORS.down;
+      const xStart = pos.opened_ts ? tsToVisibleX(pos.opened_ts) : 0;
+      const drawHLine = (price, style, lbl) => {
+        if (price == null) return;
+        const y = yOfPrice(price);
+        if (y < PAD_TOP || y > PAD_TOP + plotH) return;
+        ctx.save();
+        if (style === "dashed") ctx.setLineDash([4, 3]);
+        ctx.strokeStyle = style === "dashed" ? color
+                        : style === "tp"     ? "rgba(255,215,0,0.9)"
+                        : "rgba(239,83,80,0.9)";
+        ctx.lineWidth = style === "tp" || style === "sl" ? 1.5 : 1;
+        ctx.beginPath();
+        ctx.moveTo(xStart, y);
+        ctx.lineTo(plotW, y);
+        ctx.stroke();
+        ctx.restore();
+        ctx.fillStyle = ctx.strokeStyle;
+        ctx.font = "10px JetBrains Mono, monospace";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "bottom";
+        ctx.fillText(lbl, xStart + 4, y - 2);
+      };
+      const tag = isM2 ? " M2" : "";
+      (pos.leg_prices || []).forEach((price, i) => {
+        if (price != null) drawHLine(price, "dashed", `L${i + 1}${tag}`);
+      });
+      drawHLine(pos.take_profit, "tp", `TP${tag}`);
+      // SL only drawn when within disaster floor (the only level that will fire).
+      // Tight SLs are skipped by ingest gate → no chart line so user not confused.
+      {
+        const floorPct = (pos.symbol || "").startsWith("BTC") ? 0.03 : 0.015;
+        const risk = Math.abs((pos.avg_entry || 0) - (pos.stop_loss || 0));
+        const isDisaster = risk >= (pos.avg_entry || 0) * floorPct;
+        if (isDisaster) drawHLine(pos.stop_loss, "sl", `SL-DISASTER${tag}`);
+      }
+
+      const yEntry = yOfPrice(pos.avg_entry);
+      if (yEntry >= PAD_TOP && yEntry <= PAD_TOP + plotH && xStart >= 0 && xStart <= plotW) {
+        const isSelected = selectedPosId === pos.position_id;
+        const sz = isSelected ? 8 : 6;
+        ctx.fillStyle   = color;
+        ctx.globalAlpha = isM2 ? 0.55 : 1.0;
+        ctx.strokeStyle = isM2 ? "rgba(120,180,255,0.95)" : "rgba(255,255,255,0.9)";
+        ctx.lineWidth   = isSelected ? 2 : 1;
+        ctx.beginPath();
+        ctx.moveTo(xStart, yEntry - sz);
+        ctx.lineTo(xStart + sz, yEntry);
+        ctx.lineTo(xStart, yEntry + sz);
+        ctx.lineTo(xStart - sz, yEntry);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 9px JetBrains Mono, monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(pos.side === "long" ? "▲" : "▼", xStart, yEntry);
+        ctx.globalAlpha = 1.0;
+        if (isM2) {
+          ctx.fillStyle = "rgba(120,180,255,0.95)";
+          ctx.font = "bold 9px JetBrains Mono, monospace";
+          ctx.textAlign = "left";
+          ctx.textBaseline = "middle";
+          ctx.fillText("M2", xStart + sz + 4, yEntry);
+        }
+        markerHitsRef.current.push({ x: xStart, y: yEntry, r: sz + 2, posId: pos.position_id });
+      }
+    });
 
     // Daily VP histogram on the right strip (aggregated from session bars).
     // Uses all loaded bars (not just visible) for accuracy.
@@ -915,6 +1257,7 @@ export default function FootprintPane({
       ctx.beginPath();
       ctx.rect(0, volTop, plotW, VOL_STRIP_H - 2);
       ctx.clip();
+      const _fmtV = (v) => v >= 1000 ? (v / 1000).toFixed(1) + "k" : v >= 100 ? v.toFixed(0) : v.toFixed(1);
       for (const { slot, bar } of slots) {
         const xLeft = slot * barW - subBarPx;
         if (xLeft + barW < 0 || xLeft > plotW) continue;
@@ -923,7 +1266,16 @@ export default function FootprintPane({
         const isUp = bar.c >= bar.o;
         ctx.fillStyle = isUp ? "rgba(38,166,154,0.7)" : "rgba(239,83,80,0.7)";
         const bw = Math.max(1, barW * 0.6);
-        ctx.fillRect(xLeft + barW / 2 - bw / 2, volBot - h, bw, h);
+        const xC = xLeft + barW / 2;
+        ctx.fillRect(xC - bw / 2, volBot - h, bw, h);
+        // Numeric value above the bar when bar wide enough to fit a label
+        if (barW >= 24 && total > 0) {
+          ctx.fillStyle = COLORS.text;
+          ctx.font = "9px JetBrains Mono, monospace";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "bottom";
+          ctx.fillText(_fmtV(total), xC, volBot - h - 1);
+        }
       }
       ctx.restore();
       ctx.fillStyle = COLORS.textDim;
@@ -1141,7 +1493,7 @@ export default function FootprintPane({
         lastLabelX = xC;
       }
     }
-  }, [bars, dailyVp, priorVp, detections, positions, pendingOrders, closedPositions, cvd, cvdSignal, zones, view, cellMode, selectedPosId, showTrades]);
+  }, [bars, dailyVp, priorVp, detections, positions, pendingOrders, closedPositions, cvd, cvdSignal, zones, view, cellMode, selectedPosId, showTrades, showBubbles, theme]);
 
   // Resize observer → trigger re-render
   useEffect(() => {
@@ -1235,9 +1587,16 @@ export default function FootprintPane({
     // Detect drag on CVD divider (top edge of CVD pane). cvdHeight may be 0.
     const cvdHeight = (cvd && cvd.length) ? Math.max(30, Math.min(300, view.cvdH || 70)) : 0;
     const cvdTopY   = PAD_TOP + (plotH - cvdHeight);   // top edge of CVD pane
+    const cvdBotY   = PAD_TOP + plotH;                 // bottom edge (above time axis)
     const dividerHit = cvdHeight > 0 && localY >= cvdTopY - 6 && localY <= cvdTopY + 4 && localX < priceAxisLeft;
+    // Drag inside CVD body (below divider, above time-axis, left of price axis)
+    const insideCvd = cvdHeight > 0 && localY > cvdTopY + 4 && localY <= cvdBotY && localX < priceAxisLeft;
+    // CVD's own price-axis strip — drag here = zoom CVD only
+    const insideCvdYAxis = cvdHeight > 0 && localY >= cvdTopY && localY <= cvdBotY && localX >= priceAxisLeft;
     let mode = "pan";
     if (dividerHit)                       mode = "resizeCvd";
+    else if (insideCvdYAxis)              mode = "scaleCvdY";
+    else if (insideCvd)                   mode = "panCvd";
     else if (localX >= priceAxisLeft)     mode = "scaleY";
     else if (localY >= PAD_TOP + plotH)   mode = "scaleX";
     // Seed from displayed (fit) values when autoFit is on
@@ -1266,6 +1625,38 @@ export default function FootprintPane({
       const rect = wrap.getBoundingClientRect();
       const localX = e.clientX - rect.left;
       const localY = e.clientY - rect.top;
+      // Trade marker hover-test (skip while dragging)
+      if (!dragRef.current) {
+        let hit = null;
+        for (const m of markerHitsRef.current) {
+          if (Math.hypot(localX - m.x, localY - m.y) <= m.r + 2) {
+            hit = { posId: m.posId, x: localX, y: localY };
+            break;
+          }
+        }
+        setHoverPos(prev => {
+          if (!hit && !prev) return prev;
+          if (hit && prev && prev.posId === hit.posId) {
+            return { ...prev, x: hit.x, y: hit.y };
+          }
+          return hit;
+        });
+        // Detection-marker hover-test
+        let dhit = null;
+        for (const m of detHitsRef.current) {
+          if (Math.hypot(localX - m.x, localY - m.y) <= m.r + 2) {
+            dhit = { type: m.type, payload: m.payload, x: localX, y: localY };
+            break;
+          }
+        }
+        setHoverDet(prev => {
+          if (!dhit && !prev) return prev;
+          if (dhit && prev && prev.type === dhit.type && prev.payload === dhit.payload) {
+            return { ...prev, x: dhit.x, y: dhit.y };
+          }
+          return dhit;
+        });
+      }
       const meta = sliceMetaRef.current;
       const plotWGuess = rect.width - PRICE_AXIS - VP_WIDTH_PX;
       if (localY >= PAD_TOP && localY <= rect.height - TIME_AXIS && localX >= 0 && localX <= plotWGuess) {
@@ -1309,6 +1700,25 @@ export default function FootprintPane({
       setView(v => ({
         ...v,
         cvdH: Math.max(30, Math.min(300, drag.cvdH - dy)),
+      }));
+      return;
+    }
+    if (drag.mode === "panCvd") {
+      // Pan CVD pane only — dx still pans X (shared time axis), dy pans CVD-Y only
+      const dBars = dx / view.barW;
+      setView(v => ({
+        ...v,
+        offsetBars: drag.offsetBars + dBars,
+        cvdPan:     drag.cvdPan + dy,
+      }));
+      return;
+    }
+    if (drag.mode === "scaleCvdY") {
+      // Drag down → zoom in (bigger cvdZoom)
+      const factor = Math.exp(dy * 0.01);
+      setView(v => ({
+        ...v,
+        cvdZoom: Math.max(0.2, Math.min(8, drag.cvdZoom * factor)),
       }));
       return;
     }
@@ -1363,7 +1773,8 @@ export default function FootprintPane({
     const ageOfHover = (bars.length - 1) - hoverBarIdx;
     (detections?.active_sweeps || []).forEach(ev => {
       if (!ev.stale && ev.age_bars === ageOfHover) {
-        lines.push(`sweep:${ev.sweep_type === "sweep_high" ? "HIGH" : "LOW"}(${ev.level_label || "?"})`);
+        const cls = ev.classification || "?";
+        lines.push(`sweep:${ev.sweep_type === "sweep_high" ? "HIGH" : "LOW"} [${cls}](${ev.level_label || "?"})`);
       }
     });
     if (hoverBarIdx === bars.length - 1) {
@@ -1399,12 +1810,177 @@ export default function FootprintPane({
       onMouseDown={onMouseDown}
       onMouseMove={onMouseMove}
       onMouseUp={onMouseUp}
-      onMouseLeave={() => { onMouseUp(); setHoverBarIdx(null); }}
+      onMouseLeave={() => { onMouseUp(); setHoverBarIdx(null); setHoverPos(null); setHoverDet(null); }}
     >
       <canvas ref={canvasRef} style={{ display: "block", cursor: dragRef.current ? "grabbing" : "grab" }} />
 
-      {/* Wave / day_type badge */}
-      {(detections?.wave || detections?.day_type) && (
+      {/* Hover trade tooltip — appears on marker hover (open + closed) */}
+      {hoverPos && (() => {
+        const allPos = [...(positions || []), ...(closedPositions || [])];
+        const pos = allPos.find(p => p.position_id === hoverPos.posId);
+        if (!pos) return null;
+        const r = (n, dp = 2) => Number.isFinite(n) ? n.toFixed(dp) : "—";
+        const tIst = (ts) => {
+          if (!ts) return "?";
+          const d = new Date((ts + 19800) * 1000);
+          return `${String(d.getUTCHours()).padStart(2,"0")}:${String(d.getUTCMinutes()).padStart(2,"0")}`;
+        };
+        const sideColor = pos.side === "long" ? COLORS.up : COLORS.down;
+        const isClosed = pos.closed_ts != null;
+        const realized = pos.realized_r;
+        const rColor = (realized || 0) >= 0 ? COLORS.up : COLORS.down;
+        // Position tooltip near cursor without bleeding off-screen
+        const wrap = wrapRef.current;
+        const rect = wrap ? wrap.getBoundingClientRect() : { width: 800, height: 600 };
+        const W = 250, H = 130;
+        let tx = hoverPos.x + 12;
+        let ty = hoverPos.y + 12;
+        if (tx + W > rect.width) tx = hoverPos.x - W - 12;
+        if (ty + H > rect.height) ty = hoverPos.y - H - 12;
+        return (
+          <div style={{
+            ...badgeBox,
+            position: "absolute", left: tx, top: ty,
+            minWidth: W, fontSize: 11, lineHeight: 1.5,
+            padding: "6px 8px", pointerEvents: "none", zIndex: 20,
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span style={{ color: sideColor, fontWeight: 700 }}>
+                {pos.side === "long" ? "▲ LONG" : "▼ SHORT"} {pos.mode === "m2" ? "M2" : "M1"}
+              </span>
+              <span style={{ color: "#888" }}>{pos.position_id.slice(0,8)}</span>
+            </div>
+            <div style={{ color: "#999", marginTop: 2 }}>
+              {tIst(pos.opened_ts)}{isClosed ? ` → ${tIst(pos.closed_ts)}` : " (open)"}
+            </div>
+            <div style={{ marginTop: 4 }}>
+              <span style={{ color: "#888" }}>entry </span><span>{r(pos.avg_entry)}</span>
+              {isClosed && <>
+                <span style={{ color: "#888" }}>  exit </span><span>{r(pos.exit_price)}</span>
+              </>}
+            </div>
+            <div>
+              <span style={{ color: "#888" }}>TP </span><span style={{ color: "#ffd700" }}>{r(pos.take_profit)}</span>
+              <span style={{ color: "#888" }}>  SL </span><span style={{ color: COLORS.down }}>{r(pos.stop_loss)}</span>
+            </div>
+            {isClosed ? (
+              <div style={{ marginTop: 3 }}>
+                <span style={{ color: "#888" }}>R </span>
+                <span style={{ color: rColor, fontWeight: 700 }}>
+                  {(realized || 0) >= 0 ? "+" : ""}{r(realized, 3)}
+                </span>
+                {pos.close_reason && (
+                  <span style={{ color: "#888", marginLeft: 6 }}>{pos.close_reason}</span>
+                )}
+              </div>
+            ) : (
+              <div style={{ marginTop: 3 }}>
+                <span style={{ color: "#888" }}>legs </span>
+                <span>{pos.legs_filled}/{(pos.legs || pos.leg_prices || []).length}</span>
+                {pos.total_lots != null && <>
+                  <span style={{ color: "#888" }}>  Σqty </span><span>{r(pos.total_lots, 2)}</span>
+                </>}
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      {/* Detection-marker hover tooltip (sweep / absorption / big_trade) */}
+      {hoverDet && (() => {
+        const p = hoverDet.payload || {};
+        const r = (n, dp = 2) => Number.isFinite(n) ? n.toFixed(dp) : "—";
+        const wrap = wrapRef.current;
+        const rect = wrap ? wrap.getBoundingClientRect() : { width: 800, height: 600 };
+        const W = 240, H = 110;
+        let tx = hoverDet.x + 12;
+        let ty = hoverDet.y + 12;
+        if (tx + W > rect.width)  tx = hoverDet.x - W - 12;
+        if (ty + H > rect.height) ty = hoverDet.y - H - 12;
+        let header = "", body = null;
+        if (hoverDet.type === "sweep") {
+          const isHi = p.type === "sweep_high";
+          const color = isHi ? COLORS.down : COLORS.up;
+          header = (<span style={{ color, fontWeight: 700 }}>
+            SWEEP {isHi ? "HIGH" : "LOW"} {p.granularity ? `· ${String(p.granularity).toUpperCase()}` : ""}
+          </span>);
+          body = (<>
+            <div><span style={{ color: "#888" }}>level </span><span>{p.level_label || "—"}</span></div>
+            <div><span style={{ color: "#888" }}>pattern </span><span>{p.pattern || "—"}</span></div>
+            <div><span style={{ color: "#888" }}>wick </span><span>{r(p.wick_extreme)}</span>
+              {p.confidence != null && <>
+                <span style={{ color: "#888" }}>  conf </span>
+                <span>{(p.confidence * 100).toFixed(0)}%</span>
+              </>}
+            </div>
+            <div><span style={{ color: "#888" }}>age </span><span>{p.age_bars ?? 0} bar(s)</span></div>
+          </>);
+        } else if (hoverDet.type === "absorption") {
+          const color = p.side === "buy" ? COLORS.up : COLORS.down;
+          header = (<span style={{ color, fontWeight: 700 }}>ABSORPTION {String(p.side || "").toUpperCase()}</span>);
+          body = (<>
+            <div><span style={{ color: "#888" }}>price </span><span>{r(p.price)}</span></div>
+            <div><span style={{ color: "#888" }}>vol </span><span>{r(p.volume, 2)}</span>
+              {p.bar_pct != null && <>
+                <span style={{ color: "#888" }}>  share </span>
+                <span>{(p.bar_pct * 100).toFixed(0)}%</span>
+              </>}
+            </div>
+            {p.reason && <div style={{ color: "#aaa", marginTop: 2 }}>{p.reason}</div>}
+          </>);
+        } else if (hoverDet.type === "big_trade") {
+          const isBuy = p.aggressor === "buy";
+          const color = isBuy ? COLORS.up : COLORS.down;
+          header = (<span style={{ color, fontWeight: 700 }}>BIG {isBuy ? "BUY" : "SELL"}</span>);
+          body = (<>
+            <div><span style={{ color: "#888" }}>price </span><span>{r(p.price)}</span>
+              <span style={{ color: "#888" }}>  vol </span><span>{r(p.volume, 2)}</span>
+            </div>
+            <div><span style={{ color: "#888" }}>outcome </span><span>{p.outcome || "—"}</span></div>
+            {p.ts && (() => {
+              const d = new Date((p.ts + 19800) * 1000);
+              return <div><span style={{ color: "#888" }}>at </span>
+                <span>{String(d.getUTCHours()).padStart(2,"0")}:{String(d.getUTCMinutes()).padStart(2,"0")} IST</span>
+              </div>;
+            })()}
+          </>);
+        }
+        return (
+          <div style={{
+            ...badgeBox,
+            position: "absolute", left: tx, top: ty,
+            minWidth: W, fontSize: 11, lineHeight: 1.5,
+            padding: "6px 8px", pointerEvents: "none", zIndex: 21,
+          }}>
+            <div>{header}</div>
+            <div style={{ marginTop: 3 }}>{body}</div>
+          </div>
+        );
+      })()}
+
+      {/* TV-style indicator list — top-left, right of wave badge */}
+      <div style={{
+        position: "absolute", top: 6, left: 200, zIndex: 11,
+        display: "flex", flexDirection: "column", gap: 4,
+        fontFamily: "monospace", fontSize: 11,
+      }}>
+        <button
+          onClick={() => setShowBubbles(b => !b)}
+          title="Toggle big-trade bubbles"
+          style={{
+            background: COLORS.panelBg,
+            border: `1px solid ${showBubbles ? "#ffd700" : COLORS.panelBdr}`,
+            color: showBubbles ? "#ffd700" : COLORS.textDim,
+            padding: "2px 7px", cursor: "pointer",
+            borderRadius: 3, lineHeight: 1.4, textAlign: "left",
+          }}
+        >
+          {showBubbles ? "● BUBBLES" : "○ bubbles"}
+        </button>
+      </div>
+
+      {/* Wave / day_type / va_regime badge */}
+      {(detections?.wave || detections?.day_type || detections?.va_regime) && (
         <div style={{ ...badgeBox, top: 6, left: 6, minWidth: 180 }}>
           {detections?.wave && (
             <div>
@@ -1418,6 +1994,20 @@ export default function FootprintPane({
               <span style={{ color: "#888" }}>DAY </span>
               <span style={{ color: "#ddd" }}>{detections.day_type.type}</span>
               <span style={{ color: "#666" }}> grid={detections.day_type.grid_mode}</span>
+            </div>
+          )}
+          {detections?.va_regime && (
+            <div>
+              <span style={{ color: "#888" }}>VA </span>
+              <span style={{
+                color: detections.va_regime.regime === "expanding"   ? "#ff9800"
+                     : detections.va_regime.regime === "contracting" ? "#26a69a"
+                     : "#888"
+              }}>{detections.va_regime.regime.toUpperCase()}</span>
+              <span style={{ color: "#666" }}>
+                {" "}{detections.va_regime.pct_change > 0 ? "+" : ""}{detections.va_regime.pct_change.toFixed(0)}%
+                {" "}({(detections.va_regime.confidence * 100).toFixed(0)}%)
+              </span>
             </div>
           )}
         </div>
@@ -1635,12 +2225,24 @@ export default function FootprintPane({
         title="Cell display mode"
         style={{
           position: "absolute", top: 6, right: PRICE_AXIS + 38,
-          background: "rgba(26,26,26,0.85)", border: "1px solid #2a2a2a",
-          color: "#ccc", fontSize: 11, padding: "2px 7px", cursor: "pointer",
+          background: COLORS.panelBg, border: `1px solid ${COLORS.panelBdr}`,
+          color: COLORS.text, fontSize: 11, padding: "2px 7px", cursor: "pointer",
           fontFamily: "monospace", borderRadius: 3, zIndex: 10, lineHeight: 1.4,
         }}
       >
         {cellMode === "bidask" ? "BID×ASK" : cellMode === "delta" ? "Δ" : "ΣVOL"}
+      </button>
+      <button
+        onClick={() => setTheme(t => t === "dark" ? "light" : "dark")}
+        title="Toggle light / dark theme"
+        style={{
+          position: "absolute", top: 6, right: PRICE_AXIS + 138,
+          background: COLORS.panelBg, border: `1px solid ${COLORS.panelBdr}`,
+          color: COLORS.text, fontSize: 11, padding: "2px 7px", cursor: "pointer",
+          fontFamily: "monospace", borderRadius: 3, zIndex: 10, lineHeight: 1.4,
+        }}
+      >
+        {theme === "dark" ? "☾ DARK" : "☀ LIGHT"}
       </button>
     </div>
   );

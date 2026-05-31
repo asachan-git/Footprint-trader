@@ -9,7 +9,6 @@ Modules voting (in order of weight):
   VP shape (P/b/D)   weight 0.80
   VP position        weight 0.60
   FVG fill pressure  weight 0.80
-  Wave direction     weight 0.90
   Sweep signal       weight 0.70
   Confirmation       weight 0.85  (ABSORPTION/EXHAUSTION/CONTINUATION patterns)
 
@@ -298,7 +297,7 @@ def collect_votes(symbol: str, primary_tf: str = "15m") -> list[Vote]:
         _vp_position_vote(symbol, current_close),
         # _structure_vote dropped: ChoCh used only for invalidation in cycle_manager
         _fvg_vote(bars),
-        _wave_vote(symbol, primary_tf),
+        # _wave_vote dropped 2026-05-29 (Tier 5.2): Elliott Wave subjective, no WR evidence.
         _sweep_vote(symbol, primary_tf),
         _confirmation_vote(symbol, primary_tf),
     ]

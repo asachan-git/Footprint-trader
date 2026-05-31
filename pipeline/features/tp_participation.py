@@ -228,32 +228,25 @@ def adjust_tp(
 
     ps = compute(side, bars, current_tp, avg_entry, atr_val, daily_vp)
 
-    if ps.immediate_shrink:
-        # Bypass hysteresis — immediate shrink
-        new_tp = _shrink_tp(side, current_tp, avg_entry, atr_val, daily_vp)
-        state.bars_since_last_shift = 0
-        state.last_action = "shrink"
-        return new_tp, f"immediate_shrink opp_absorption_at_tp"
+    # Tier 2A (2026-05-30): shrink direction disabled.
+    # Data showed tp_participation shrink (score < -0.30) was the primary cause
+    # of M1 median R collapsing to 0.052R vs M2 synthetic 0.164R.
+    # Only extend is kept — let winning trades run to VP/FVG zone.
+    # Shrink re-evaluation deferred to Tier 4 after 50+ post-fix cycles.
 
     if state.bars_since_last_shift < LOCK_BARS:
         return current_tp, f"locked ({state.bars_since_last_shift}/{LOCK_BARS})"
 
-    if ps.action == "hold":
+    if ps.action != "extend":
         return current_tp, ps.reason
 
-    # Direction lock — can't reverse within DIRECTION_LOCK_BARS
+    # Direction lock on extend
     if (ps.action != state.last_action and state.last_action != "hold"
             and state.bars_since_direction_change < DIRECTION_LOCK_BARS):
         return current_tp, f"direction_locked ({state.bars_since_direction_change}/{DIRECTION_LOCK_BARS})"
 
-    if ps.action == "extend":
-        new_tp = _extend_tp(side, current_tp, atr_val, daily_vp)
-        changed = new_tp != current_tp
-    else:
-        new_tp = _shrink_tp(side, current_tp, avg_entry, atr_val, daily_vp)
-        changed = new_tp != current_tp
-
-    if changed:
+    new_tp = _extend_tp(side, current_tp, atr_val, daily_vp)
+    if new_tp != current_tp:
         if ps.action != state.last_action and state.last_action != "hold":
             state.bars_since_direction_change = 0
         state.last_action = ps.action

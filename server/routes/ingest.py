@@ -113,6 +113,19 @@ def _aggregate_mtf(bar, settings) -> None:
             s.put(synth)
             if enabled and tf == decide_tf:
                 _trigger_decide_on_bar_close(bar.symbol, tf, synth.bar_id)
+            # Sweep detection for synthetic bars (e.g. 15m)
+            try:
+                from pipeline.features.sweep import detect as _sw_det2, tick_registry as _sw_tick2, log_sweep as _sw_log2
+                from pipeline.features.swing import update as _sw_upd2, get as _sw_get2, build as _sw_bld2
+                _sp2 = _sw_get2(synth.symbol) or _sw_bld2(synth.symbol, tf, s.recent(synth.symbol, tf, 100))
+                if _sp2 is not None:
+                    _prev2 = s.recent(synth.symbol, tf, 20)
+                    _sig2 = _sw_det2(synth, _sp2, prev_bars=_prev2[:-1])
+                    if _sig2.type != "none":
+                        _sw_log2(synth.symbol, _sig2, synth.close_ts, tf)
+                _sw_tick2(synth.symbol, synth)
+            except Exception:
+                pass
 
 
 MIN_HOLD_SECS   = 180   # seconds a position must be open before invalidation/hedge fires
@@ -159,15 +172,19 @@ def _check_positions(bar, settings) -> list[dict]:
             (pos.side == "short" and bar.ohlc.l <= pos.take_profit)
         )
 
-        # 1. Hard SL hit — if same bar hits both SL and TP, SL wins (conservative)
+        # 1. Hard SL hit — if same bar hits both SL and TP, SL wins (conservative).
+        # Realized R against DISASTER-FLOOR initial risk (3% BTC / 1.5% XAU)
+        # so trailed SLs that lock profit show +R, not hardcoded -1R.
         if sl_hit:
-            realized_r = -1.0  # always exactly -1R by definition
+            disaster_risk = pos.avg_entry * _floor_pct or risk or 1e-9
             if pos.side == "long":
+                realized_r = (pos.stop_loss - pos.avg_entry) / disaster_risk
                 ps.close_position(pos.position_id, f"sl_hit @ {bar.ohlc.l:.2f} ≤ SL {pos.stop_loss:.2f}", realized_r)
-                LOG.info(f"[ingest] SL hit {pos.position_id} long bar_low={bar.ohlc.l:.2f} sl={pos.stop_loss:.2f}")
+                LOG.info(f"[ingest] SL hit {pos.position_id} long bar_low={bar.ohlc.l:.2f} sl={pos.stop_loss:.2f} R={realized_r:+.2f}")
             else:
+                realized_r = (pos.avg_entry - pos.stop_loss) / disaster_risk
                 ps.close_position(pos.position_id, f"sl_hit @ {bar.ohlc.h:.2f} ≥ SL {pos.stop_loss:.2f}", realized_r)
-                LOG.info(f"[ingest] SL hit {pos.position_id} short bar_high={bar.ohlc.h:.2f} sl={pos.stop_loss:.2f}")
+                LOG.info(f"[ingest] SL hit {pos.position_id} short bar_high={bar.ohlc.h:.2f} sl={pos.stop_loss:.2f} R={realized_r:+.2f}")
             exits.append({"position_id": pos.position_id, "exit": "sl_hit", "realized_r": realized_r,
                           "bar_extreme": bar.ohlc.l if pos.side == "long" else bar.ohlc.h,
                           "sl": pos.stop_loss})
@@ -432,13 +449,33 @@ def ingest():
         except Exception:
             pass
 
-    # Tick sweep registry (age tracking + reclaim/acceptance follow-up patterns)
+    # Sweep detection per-bar — populates registry + persistent log
     if bar.tf == primary_tf:
         try:
-            from pipeline.features.sweep import tick_registry as _sweep_tick
+            from pipeline.features.sweep import detect as _sweep_detect, tick_registry as _sweep_tick, log_sweep as _log_sweep
+            from pipeline.features.swing import get as _swing_get
+            _sp = _swing_get(bar.symbol)
+            if _sp is not None:
+                _sw = _sweep_detect(bar, _sp, recent_bars)
+                if _sw.type != "none":
+                    _log_sweep(bar.symbol, _sw, bar.close_ts, bar.tf)
             _sweep_tick(bar.symbol, bar)
         except Exception:
             pass
+
+    # Big-trade detection — log on bar close so dashboard can render bubbles
+    if bar.tf == primary_tf:
+        try:
+            from pipeline.features.big_trade import detect_events as _bt_detect, log_events as _bt_log
+            from pipeline.features.vp_cache import get as _vp_get
+            _recent = store().recent(bar.symbol, primary_tf, 30)
+            _vp = _vp_get(bar.symbol, "daily") or {}
+            _bt_events = _bt_detect(bar, _recent, _vp)
+            if _bt_events:
+                _bt_log(_bt_events)
+        except Exception as e:
+            import logging as _l
+            _l.getLogger(__name__).debug(f"[ingest][big_trade] skipped: {e}")
 
     # Cycle manager heartbeat (fills pending legs, checks TP, ChoCh + VA invalidation, hedge eval)
     if bar.tf == primary_tf:
@@ -451,6 +488,21 @@ def ingest():
         except Exception as e:
             import logging as _l
             _l.getLogger(__name__).warning(f"[ingest][cycle] tick failed: {e}")
+
+    # Strategy manager fan-out — manage scoped exits every primary-TF bar (same
+    # cadence as the legacy cycle loop), and allow new entries only on the decide
+    # TF. All reads/writes land in per-strategy stores.
+    try:
+        _strat_tf = str((settings.get("decide_on_bar_close") or {}).get("tf", "15m"))
+        if bar.tf in (primary_tf, _strat_tf):
+            from strategies.manager import get_manager
+            get_manager(settings).tick(
+                bar.symbol, bar.tf, bar, settings,
+                allow_entry=(bar.tf == _strat_tf),
+            )
+    except Exception as e:
+        import logging as _l
+        _l.getLogger(__name__).warning(f"[ingest][strategies] tick failed: {e}")
 
     return jsonify({
         "ok": True,

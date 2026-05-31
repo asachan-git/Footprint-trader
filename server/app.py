@@ -24,6 +24,7 @@ from .routes.heatmap import bp as heatmap_bp
 from .routes.options_ingest import bp as options_ingest_bp
 from .routes.options_decide import bp as options_decide_bp
 from .routes.dashboard import bp as dashboard_bp
+from .routes.strategies import bp as strategies_bp
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -65,6 +66,32 @@ def _precompute_vp(settings: dict) -> None:
         LOG.warning(f"[startup] observation snapshot failed (non-fatal): {e}")
 
 
+def _backfill_sweeps(settings: dict) -> None:
+    """Replay last 5 days of bars through sweep detector on startup."""
+    import logging
+    import threading
+    LOG = logging.getLogger(__name__)
+    vp_cfg = settings.get("vp_cache", {})
+    symbols = vp_cfg.get("symbols", [settings["instrument"]["symbol"]])
+    primary_tf = settings["instrument"]["primary_tf"]
+
+    # Backfill both primary TF and 15m so dashboard has sweeps at both granularities
+    extra_tfs = ["15m"] if primary_tf != "15m" else []
+
+    def _run():
+        from pipeline.features.sweep import backfill_registry
+        for sym in symbols:
+            for tf in [primary_tf] + extra_tfs:
+                try:
+                    n = backfill_registry(sym, tf, days=5)
+                    LOG.info(f"[startup] sweep backfill {sym}/{tf}: {n} sweeps detected")
+                except Exception as e:
+                    LOG.warning(f"[startup] sweep backfill {sym}/{tf} failed: {e}")
+
+    # Run in background thread so server starts immediately
+    threading.Thread(target=_run, daemon=True, name="sweep-backfill").start()
+
+
 def create_app() -> Flask:
     load_dotenv(ROOT / ".env")
     static_dir = str(ROOT / "static")
@@ -72,6 +99,7 @@ def create_app() -> Flask:
     settings = load_settings()
     app.config["FB_SETTINGS"] = settings
     _precompute_vp(settings)
+    _backfill_sweeps(settings)
     app.register_blueprint(health_bp)
     app.register_blueprint(ingest_bp)
     app.register_blueprint(decide_bp)
@@ -82,6 +110,7 @@ def create_app() -> Flask:
     app.register_blueprint(options_ingest_bp)
     app.register_blueprint(options_decide_bp)
     app.register_blueprint(dashboard_bp)
+    app.register_blueprint(strategies_bp)
     return app
 
 

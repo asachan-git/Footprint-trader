@@ -15,7 +15,7 @@ rebuilds from state_store bars on server restart).
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field as _field
 from threading import Lock
 
 from pipeline.features.wave import detect_swing_points
@@ -32,6 +32,8 @@ class SwingPoints:
     val: float | None                # value area low (daily VP)
     cvd_swing_highs: list[float]     # CVD-confirmed local swing highs
     cvd_swing_lows:  list[float]     # CVD-confirmed local swing lows
+    eq_highs: list[float] = _field(default_factory=list)  # equal highs (stop clusters)
+    eq_lows:  list[float] = _field(default_factory=list)  # equal lows  (stop clusters)
     updated_ts: int = 0
 
 
@@ -60,6 +62,52 @@ def _extract_vah_val(symbol: str) -> tuple[float | None, float | None]:
     return None, None
 
 
+_TF_LOOKBACK: dict[str, int] = {
+    "1m": 3, "3m": 3, "5m": 4, "15m": 5, "30m": 6, "1h": 7,
+}
+_MAX_STRUCT_PIVOTS = 8   # keep only the N most recent structural pivots per side
+_EQL_TOL = 0.0015        # two pivots within 0.15% = equal highs/lows (stop cluster)
+
+
+def _structural_pivots(
+    bars: list, tf: str = "1m"
+) -> tuple[list[float], list[float]]:
+    """Return (swing_highs, swing_lows) as deduplicated structural pivot prices.
+
+    Uses ±lookback bar window appropriate for the TF.
+    Keeps at most _MAX_STRUCT_PIVOTS most-recent pivots per side.
+    Deduplicates within 0.1% of price to avoid near-duplicate levels.
+    """
+    lookback = _TF_LOOKBACK.get(tf, 3)
+    s_highs, s_lows = detect_swing_points(bars, lookback=lookback)
+
+    def _dedup(pts: list[tuple[int, float]], ref_price: float) -> list[float]:
+        tol = ref_price * 0.001  # 0.1% tolerance
+        out: list[float] = []
+        for _, price in reversed(pts):   # most recent first
+            if all(abs(price - p) > tol for p in out):
+                out.append(price)
+            if len(out) >= _MAX_STRUCT_PIVOTS:
+                break
+        return out
+
+    ref = bars[-1].ohlc.c if bars else 1.0
+    return _dedup(s_highs, ref), _dedup(s_lows, ref)
+
+
+def _find_equal_levels(prices: list[float], tol: float = _EQL_TOL) -> list[float]:
+    """Prices that have at least one near-duplicate — these are EQH/EQL stop clusters."""
+    equal: list[float] = []
+    n = len(prices)
+    for i in range(n):
+        for j in range(n):
+            if i != j and abs(prices[i] - prices[j]) / max(prices[j], 0.01) <= tol:
+                if prices[i] not in equal:
+                    equal.append(prices[i])
+                break
+    return equal
+
+
 def build(symbol: str, primary_tf: str, session_bars: list) -> SwingPoints:
     """Build SwingPoints from current session bars + VP cache data."""
     session_high = max((b.ohlc.h for b in session_bars), default=None)
@@ -68,13 +116,15 @@ def build(symbol: str, primary_tf: str, session_bars: list) -> SwingPoints:
     prior_high, prior_low = _extract_prior_day(symbol)
     vah, val = _extract_vah_val(symbol)
 
-    # CVD-confirmed swing points from wave module's swing detector
-    cvd_highs: list[float] = []
-    cvd_lows:  list[float] = []
+    # Structural swing pivots — deduplicated, TF-appropriate lookback
+    struct_highs: list[float] = []
+    struct_lows:  list[float] = []
     if len(session_bars) >= 6:
-        s_highs, s_lows = detect_swing_points(session_bars)
-        cvd_highs = [p for _, p in s_highs]
-        cvd_lows  = [p for _, p in s_lows]
+        struct_highs, struct_lows = _structural_pivots(session_bars, primary_tf)
+
+    # Equal highs/lows — stop clusters targeted by institutional sweeps
+    eq_highs = _find_equal_levels(struct_highs)
+    eq_lows  = _find_equal_levels(struct_lows)
 
     return SwingPoints(
         symbol=symbol,
@@ -84,8 +134,10 @@ def build(symbol: str, primary_tf: str, session_bars: list) -> SwingPoints:
         prior_day_low=prior_low,
         vah=vah,
         val=val,
-        cvd_swing_highs=cvd_highs,
-        cvd_swing_lows=cvd_lows,
+        cvd_swing_highs=struct_highs,
+        cvd_swing_lows=struct_lows,
+        eq_highs=eq_highs,
+        eq_lows=eq_lows,
         updated_ts=int(time.time()),
     )
 
@@ -106,10 +158,12 @@ def all_reference_levels(sp: SwingPoints) -> list[tuple[str, float]]:
     ]:
         if val is not None:
             levels.append((label, val))
+    eq_h_set = set(sp.eq_highs)
+    eq_l_set = set(sp.eq_lows)
     for p in sp.cvd_swing_highs:
-        levels.append(("cvd_swing_high", p))
+        levels.append(("equal_high" if p in eq_h_set else "cvd_swing_high", p))
     for p in sp.cvd_swing_lows:
-        levels.append(("cvd_swing_low", p))
+        levels.append(("equal_low" if p in eq_l_set else "cvd_swing_low", p))
     return sorted(levels, key=lambda x: x[1], reverse=True)
 
 

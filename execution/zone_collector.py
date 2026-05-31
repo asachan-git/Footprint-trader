@@ -66,6 +66,30 @@ def collect(
     except Exception:
         pass
 
+    # ── Prior-session VP levels (last 3 daily + last 2 weekly sessions) ────
+    # Needed to supply enough zones for 7-leg grids. Prior POC/HVN = proven S/R.
+    try:
+        from pipeline.features.vp_cache import get_history as vp_hist
+        for period, n_hist in (("daily", 3), ("weekly", 2)):
+            for snap in vp_hist(symbol, period, n=n_hist + 1)[:-1]:  # exclude current
+                for key, s in (("poc", 0.85), ("vah", 0.70), ("val", 0.70), ("naked_poc", 0.90)):
+                    v = snap.get(key)
+                    if isinstance(v, (int, float)) and v > 0:
+                        raw.append(Zone(price=float(v), source=f"prior_{key}_{period}", strength=s))
+                for hvn in snap.get("hvn_zones") or []:
+                    mid = (hvn["low"] + hvn["high"]) / 2
+                    raw.append(Zone(price=mid, source=f"prior_hvn_{period}", strength=0.90))
+    except Exception:
+        pass
+
+    # ── Naked POCs — untested prior-session POCs ──────────────────────────
+    try:
+        from pipeline.features.naked_poc import get_naked_pocs
+        for _n in get_naked_pocs(symbol, current_price=anchor):
+            raw.append(Zone(price=_n.price, source=f"naked_poc_{_n.session}", strength=0.92))
+    except Exception:
+        pass
+
     # ── Swing levels ───────────────────────────────────────────────────────
     try:
         from pipeline.features.swing import get as swing_get, all_reference_levels
@@ -162,6 +186,19 @@ def _all_zones(
     except Exception:
         pass
     try:
+        from pipeline.features.vp_cache import get_history as vp_hist
+        for period, n_hist in (("daily", 3), ("weekly", 2)):
+            for snap in vp_hist(symbol, period, n=n_hist + 1)[:-1]:
+                for key, s in (("poc", 0.85), ("vah", 0.70), ("val", 0.70), ("naked_poc", 0.90)):
+                    v = snap.get(key)
+                    if isinstance(v, (int, float)) and v > 0:
+                        out.append(Zone(price=float(v), source=f"prior_{key}_{period}", strength=s))
+                for hvn in snap.get("hvn_zones") or []:
+                    mid = (hvn["low"] + hvn["high"]) / 2
+                    out.append(Zone(price=mid, source=f"prior_hvn_{period}", strength=0.90))
+    except Exception:
+        pass
+    try:
         from pipeline.features.swing import get as swing_get, all_reference_levels
         sp = swing_get(symbol)
         if sp:
@@ -177,6 +214,14 @@ def _all_zones(
                 out.append(Zone(price=float(price), source=f"fvg_{fvg.side}", strength=0.70))
         except Exception:
             pass
+    # Naked POCs — untested prior-session POCs, high-probability magnets
+    try:
+        from pipeline.features.naked_poc import get_naked_pocs
+        _ref = out[0].price if out else 0.0
+        for n in get_naked_pocs(symbol, current_price=_ref):
+            out.append(Zone(price=n.price, source=f"naked_poc_{n.session}", strength=0.92))
+    except Exception:
+        pass
     return out
 
 

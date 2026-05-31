@@ -23,6 +23,18 @@ class TPCandidate:
     source: str  # "vp_poc_daily" | "vp_vah_weekly" | "fvg_bull_15m" | "swing_high" | ...
 
 
+def _naked_poc_levels(symbol: str, anchor: float) -> list[TPCandidate]:
+    """Untested prior-session POCs — high-probability draw targets."""
+    out: list[TPCandidate] = []
+    try:
+        from pipeline.features.naked_poc import get_naked_pocs
+        for n in get_naked_pocs(symbol, current_price=anchor):
+            out.append(TPCandidate(price=n.price, source=f"naked_poc_{n.session}_age{n.age_sessions}"))
+    except Exception:
+        pass
+    return out
+
+
 def _vp_levels(symbol: str) -> list[TPCandidate]:
     out: list[TPCandidate] = []
     try:
@@ -97,6 +109,7 @@ def resolve_tp(
     Returns None if no valid candidate.
     """
     candidates: list[TPCandidate] = []
+    candidates.extend(_naked_poc_levels(symbol, anchor))
     candidates.extend(_vp_levels(symbol))
     candidates.extend(_swing_levels(symbol))
     if htf_bars:

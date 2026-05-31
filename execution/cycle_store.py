@@ -56,18 +56,19 @@ class TradeCycle:
 
 
 class CycleStore:
-    def __init__(self) -> None:
+    def __init__(self, log_path: Path | None = None) -> None:
         self._lock = Lock()
         self._cycles: dict[str, TradeCycle] = {}
-        CYCLES_LOG.parent.mkdir(parents=True, exist_ok=True)
+        self._log_path = log_path or CYCLES_LOG
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
         self._replay()
 
     # ── persistence ──────────────────────────────────────────────────────────
 
     def _replay(self) -> None:
-        if not CYCLES_LOG.exists():
+        if not self._log_path.exists():
             return
-        for line in CYCLES_LOG.read_text().splitlines():
+        for line in self._log_path.read_text().splitlines():
             try:
                 self._apply(json.loads(line))
             except Exception:
@@ -107,7 +108,7 @@ class CycleStore:
         now = int(time.time())
         event["ts"] = now
         event["ts_ist"] = _ts_ist(now)
-        with CYCLES_LOG.open("a") as fh:
+        with self._log_path.open("a") as fh:
             fh.write(json.dumps(event) + "\n")
         self._apply(event)
 
@@ -216,8 +217,30 @@ class CycleStore:
 _store: CycleStore | None = None
 _store_lock = Lock()
 
+# Context-scoped override — mirrors position_store.use_store. Lets the strategy
+# manager point shared exit code (cycle_manager) at a per-strategy CycleStore.
+import contextvars as _contextvars
+from contextlib import contextmanager as _contextmanager
+
+_override: "_contextvars.ContextVar[CycleStore | None]" = _contextvars.ContextVar(
+    "cycle_store_override", default=None
+)
+
+
+@_contextmanager
+def use_cycle_store(store: "CycleStore"):
+    """Within this block, cycle_store() returns `store` (per-strategy isolation)."""
+    token = _override.set(store)
+    try:
+        yield store
+    finally:
+        _override.reset(token)
+
 
 def cycle_store() -> CycleStore:
+    ov = _override.get()
+    if ov is not None:
+        return ov
     global _store
     if _store is None:
         with _store_lock:

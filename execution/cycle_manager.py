@@ -79,27 +79,55 @@ def _fill_pending_legs(symbol: str, latest: Bar) -> list[dict]:
         ps.mark_filled(po.pending_id)
         filled.append({"position_id": po.position_id, "leg": po.leg_idx, "price": po.limit_price})
         LOG.info(f"[cycle] fill leg{po.leg_idx} {po.symbol} {po.side} @ {po.limit_price:.2f}")
-        # Shrink TP toward avg (book profit at consistent interval on adverse fills)
+        # Progressive TP shrink on adverse fill (2026-05-30).
+        # Each leg fill = confirmed adverse move. Tighten TP toward nearest
+        # profit-zone so recovery exits faster. Floor shrinks as more legs fill.
+        # Different from old shrinker: fires ONLY on leg fills (not every bar).
+        _leg_count = pos_store.get_position(po.position_id).leg_count if hasattr(pos_store, "get_position") else 0
         try:
-            updated_pos = next((p for p in pos_store.open_positions(po.symbol) if p.position_id == po.position_id), None)
-            if updated_pos:
+            _pos_now = next((p for p in pos_store.open_positions(po.symbol) if p.position_id == po.position_id), None)
+            if _pos_now is not None:
+                _leg_count = _pos_now.leg_count
+        except Exception:
+            _leg_count = 0
+        if _leg_count >= 2:
+            try:
                 from execution.zone_collector import nearest_strong_zone_toward
-                from pipeline.state_store import store as _store
-                htf_bars = _store().recent(po.symbol, "15m", 200)
-                old_tp = updated_pos.take_profit
-                new_zone = nearest_strong_zone_toward(
-                    po.symbol, current_tp=old_tp, avg_entry=updated_pos.avg_entry,
-                    side=po.side, htf_bars=htf_bars,
-                )
-                if new_zone is not None:
-                    pos_store.adjust_tp(po.position_id, new_zone.price,
-                                        f"shrink leg{po.leg_idx}_fill avg={updated_pos.avg_entry:.2f} "
-                                        f"src={new_zone.source}")
-                    LOG.info(f"[cycle] TP shrunk {po.position_id} {old_tp:.2f} → "
-                             f"{new_zone.price:.2f} (toward avg {updated_pos.avg_entry:.2f}, "
-                             f"src={new_zone.source})")
-        except Exception as _e:
-            LOG.debug(f"[cycle] TP shrink skipped: {_e}")
+                from pipeline.features.atr import atr_from_store
+                from pipeline.features.vp_cache import get as _vp_get
+                from pipeline.state_store import store as _pstate
+                _atr = atr_from_store(po.symbol, "15m", period=14) or atr_from_store(po.symbol, "1m", period=14) * 15 or 1.0
+                # Floor shrinks as more legs fill — deeper adverse = closer recovery target
+                _floor_mult = {2: 1.0, 3: 0.7, 4: 0.5}.get(_leg_count, 0.3)
+                _htf = _pstate().recent(po.symbol, "15m", 200)
+                _pos_now2 = next((p for p in pos_store.open_positions(po.symbol) if p.position_id == po.position_id), None)
+                if _pos_now2 is not None:
+                    _zone = nearest_strong_zone_toward(
+                        po.symbol,
+                        current_tp=_pos_now2.take_profit,
+                        avg_entry=_pos_now2.avg_entry,
+                        side=po.side,
+                        htf_bars=_htf,
+                        min_strength=0.6,
+                    )
+                    _floor_tp = (
+                        _pos_now2.avg_entry + _floor_mult * _atr if po.side == "long"
+                        else _pos_now2.avg_entry - _floor_mult * _atr
+                    )
+                    _viable = _zone is not None and (
+                        (po.side == "long" and _zone.price >= _floor_tp) or
+                        (po.side == "short" and _zone.price <= _floor_tp)
+                    )
+                    if _viable and _zone is not None and _zone.price != _pos_now2.take_profit:
+                        pos_store.adjust_tp(
+                            po.position_id, _zone.price,
+                            f"adverse_shrink:leg{_leg_count} floor={_floor_mult:.1f}×ATR zone={_zone.source}@{_zone.price:.2f}",
+                        )
+                        LOG.info(f"[cycle][adverse_shrink] {po.position_id} leg{_leg_count} "
+                                 f"tp {_pos_now2.take_profit:.2f}→{_zone.price:.2f} "
+                                 f"floor={_floor_mult:.1f}×ATR ({_zone.source})")
+            except Exception as _e:
+                LOG.debug(f"[cycle][adverse_shrink] skipped: {_e}")
     return filled
 
 
@@ -143,6 +171,38 @@ def _check_cycle_tp(symbol: str, latest: Bar) -> list[dict]:
             _va_state.pop(pos.position_id, None)
             closed.append({"position_id": pos.position_id, "realized_r": round(realized_r, 3)})
             LOG.info(f"[cycle] TP HIT {pos.position_id} {pos.side} @ {tp:.2f} R={realized_r:.2f}")
+    return closed
+
+
+def _check_hard_sl(symbol: str, latest: Bar) -> list[dict]:
+    """Close any open cycle whose stop_loss was crossed by the latest bar.
+
+    Opt-in (caller gates on settings.cycle.hard_sl_exit). Realized R is measured
+    against the cycle's own risk denominator (avg_entry − stop_loss); a clean
+    stop-out at the SL is ≈ −1R. Legs are filled BEFORE this runs, so stop_loss
+    reflects the latest leg.
+    """
+    from execution.pending_orders import pending_store
+    from execution.position_store import position_store
+    closed = []
+    pos_store = position_store()
+    for pos in pos_store.open_positions(symbol):
+        sl = pos.stop_loss
+        if not sl:
+            continue
+        hit = (pos.side == "long" and latest.ohlc.l <= sl) or \
+              (pos.side == "short" and latest.ohlc.h >= sl)
+        if not hit:
+            continue
+        risk = abs(pos.avg_entry - sl) or 1e-9
+        adverse = (pos.avg_entry - sl) if pos.side == "long" else (sl - pos.avg_entry)
+        realized_r = -abs(adverse) / risk
+        if pos_store.close_position(pos.position_id, reason="hard_sl", realized_r=realized_r):
+            pending_store().cancel_for_position(pos.position_id)
+            _va_state.pop(pos.position_id, None)
+            _trend_escape_state.pop(pos.position_id, None)
+            closed.append({"position_id": pos.position_id, "realized_r": round(realized_r, 3)})
+            LOG.info(f"[cycle] HARD-SL {pos.position_id} {pos.side} @ {sl:.2f} R={realized_r:.2f}")
     return closed
 
 
@@ -215,6 +275,60 @@ def _trail_sl_on_favorable_move(symbol: str, latest: Bar) -> list[dict]:
     return trailed
 
 
+def _check_scale_out(symbol: str, latest: Bar, settings: dict | None = None) -> list[dict]:
+    """Aggressive scale-out (grid_sim.py 'aggressive keep2'). On first bounce
+    PROFIT_BUF×ATR beyond avg_entry, bank the deep large-lot legs (filled cheap →
+    now in profit), keep `keep_near` nearest legs, move them to break-even. One-shot
+    per cycle. DEFAULT OFF — gated on cycle.scale_out.enabled.
+
+    Partial R is reported in the cycle's existing denominator (avg_entry − stop_loss),
+    scaled by the fraction of legs banked, so it stays additive with the eventual
+    close R. Paper-path: this is a store event; live broker partial-close sync is a
+    separate reconciler concern (TODO before live enable)."""
+    cfg = (settings or {}).get("cycle", {}).get("scale_out", {})
+    if not cfg.get("enabled", False):
+        return []
+    keep_near = int(cfg.get("keep_near", 2))
+    profit_buf = float(cfg.get("profit_buf_atr", 0.5))
+
+    from execution.position_store import position_store
+    from pipeline.features.atr import atr_from_store
+    atr15 = atr_from_store(symbol, "15m", period=14) or 0.0
+    if atr15 <= 0:
+        return []
+
+    pos_store = position_store()
+    done = []
+    for pos in pos_store.open_positions(symbol):
+        if pos.scaled_out or pos.leg_count <= keep_near:
+            continue
+        avg = pos.avg_entry
+        c = latest.ohlc.c
+        in_profit = (c > avg + profit_buf * atr15) if pos.side == "long" \
+            else (c < avg - profit_buf * atr15)
+        if not in_profit:
+            continue
+        # nearest-first by distance from leg1 (anchor); keep nearest, drop the deep
+        legs_sorted = sorted(pos.legs, key=lambda L: abs(L.entry - pos.legs[0].entry))
+        keep, drop = legs_sorted[:keep_near], legs_sorted[keep_near:]
+        if not drop:
+            continue
+        avg_drop = sum(L.entry for L in drop) / len(drop)
+        risk = abs(avg - pos.stop_loss) or 1e-9
+        sign = 1 if pos.side == "long" else -1
+        frac = len(drop) / pos.leg_count
+        partial_r = sign * (c - avg_drop) / risk * frac
+        be = sum(L.entry for L in keep) / len(keep)   # break-even = remaining avg
+        if pos_store.scale_out_position(pos.position_id, [L.leg for L in drop],
+                                        exit_price=c, realized_r=partial_r,
+                                        new_sl=be, reason="scale_out_bounce"):
+            done.append({"position_id": pos.position_id, "banked_legs": len(drop),
+                         "partial_r": round(partial_r, 3), "be": round(be, 2)})
+            LOG.info(f"[cycle] SCALE-OUT {pos.position_id} {pos.side} banked {len(drop)} "
+                     f"legs @ {c:.2f} R={partial_r:+.3f}, {len(keep)} legs → BE {be:.2f}")
+    return done
+
+
 def _check_catastrophic_trend_escape(symbol: str, latest: Bar, settings: dict | None = None) -> list[dict]:
     """Force-close cycles when price runs K consecutive bars against avg
     WITHOUT a bounce (no leg fill, no favorable reversal close) AND moved
@@ -273,10 +387,17 @@ def _check_catastrophic_trend_escape(symbol: str, latest: Bar, settings: dict | 
             st["bars_against"] = 0
 
         if st["bars_against"] >= K_bars and adverse_distance >= N_atr * atr_15:
+            # Disaster floor: require adverse move ≥ 3 % (BTC) / 1.5 % (XAU)
+            # of avg_entry before forcing close. Within floor → hold and let
+            # grid DCA / pending legs recover the cycle.
+            _floor_pct = 0.03 if symbol.startswith("BTC") else 0.015
+            if adverse_distance < pos.avg_entry * _floor_pct:
+                continue
             risk = abs(pos.avg_entry - pos.stop_loss) or 1e-9
             realized_r = -adverse_distance / risk
-            reason = (f"trend-escape: {st['bars_against']} bars against, "
-                      f"{adverse_distance:.2f}pts ≥ {N_atr:.1f}×ATR ({N_atr * atr_15:.2f})")
+            reason = (f"trend-escape (disaster): {st['bars_against']} bars against, "
+                      f"{adverse_distance:.2f}pts ≥ {N_atr:.1f}×ATR ({N_atr * atr_15:.2f}) "
+                      f"+ ≥ {_floor_pct*100:.1f}% disaster floor")
             if pos_store.close_position(pos.position_id, reason=reason, realized_r=realized_r):
                 pending_store().cancel_for_position(pos.position_id)
                 _va_state.pop(pos.position_id, None)
@@ -499,10 +620,25 @@ def on_bar_close(symbol: str, primary_tf: str, latest: Bar, settings: dict | Non
         LOG.exception(f"[cycle] fill_pending failed: {e}")
         actions["filled_error"] = str(e)
     try:
+        actions["scaled_out"] = _check_scale_out(symbol, latest, settings)
+    except Exception as e:
+        LOG.exception(f"[cycle] scale_out failed: {e}")
+        actions["scale_out_error"] = str(e)
+    try:
         actions["closed_tp"] = _check_cycle_tp(symbol, latest)
     except Exception as e:
         LOG.exception(f"[cycle] check_tp failed: {e}")
         actions["tp_error"] = str(e)
+
+    # Hard-SL exit — OPT-IN (settings.cycle.hard_sl_exit). Default OFF preserves
+    # the no-hard-SL / disaster-floor-only policy. When on (e.g. the `republic`
+    # strategy), close a cycle the bar its low/high crosses pos.stop_loss.
+    if (settings or {}).get("cycle", {}).get("hard_sl_exit"):
+        try:
+            actions["closed_sl"] = _check_hard_sl(symbol, latest)
+        except Exception as e:
+            LOG.exception(f"[cycle] hard_sl check failed: {e}")
+            actions["hard_sl_error"] = str(e)
 
     # TP participation adjustment — extend/shrink TP based on live order-flow score
     try:
@@ -533,12 +669,73 @@ def on_bar_close(symbol: str, primary_tf: str, latest: Bar, settings: dict | Non
     except Exception as e:
         LOG.debug(f"[cycle] tp_participation failed: {e}")
 
-    # SL trailing on favorable move (only profitable cycles trailed)
+    # POC-trail TP — as intraday POC migrates toward avg_entry, trail TP to it.
+    # Prevents cycles from sitting locked to a static VP level while price has
+    # already rotated to a different equilibrium. Only trails CLOSER (not farther).
+    # Floor: TP must stay ≥ poc_trail_min_atr_mult × ATR from avg_entry.
     try:
-        actions["sl_trailed"] = _trail_sl_on_favorable_move(symbol, latest)
+        from pipeline.features.vp_cache import get as _vp_get2
+        from pipeline.features.atr import atr as _atr2
+        from pipeline.state_store import store as _store2
+        from execution.position_store import position_store as _pstore2_factory
+        _pstore2 = _pstore2_factory()
+        _recent2 = _store2().recent(symbol, primary_tf, 20)
+        _atr2_val = _atr2(_recent2) if _recent2 else None
+        _vp2 = _vp_get2(symbol, "daily")
+        _poc2 = float(_vp2["poc"]) if _vp2 and _vp2.get("poc") else None
+        _poc_trail_mult = float(
+            (settings.get("cycle") or {}).get("poc_trail_min_atr_mult", 0.5)
+        )
+        if _poc2 is not None and _atr2_val:
+            _max_ext_mult = float(
+                (settings.get("cycle") or {}).get("poc_trail_max_ext_atr_mult", 3.0)
+            )
+            for _pos2 in _pstore2.open_positions(symbol):
+                if _pos2.tp is None:
+                    continue
+                _min_dist = _poc_trail_mult * _atr2_val
+                _max_ext  = _max_ext_mult * _atr2_val
+                if _pos2.side == "long":
+                    _floor2 = _pos2.avg_entry + _min_dist
+                    _ext_cap = _pos2.avg_entry + _max_ext
+                    if _floor2 < _poc2 < _pos2.tp:
+                        # POC migrated closer — tighten TP
+                        _pstore2.adjust_tp(_pos2.position_id, _poc2, "poc_trail")
+                        LOG.info(
+                            f"[cycle][poc_trail] {symbol} pos={_pos2.position_id} "
+                            f"tp {_pos2.tp:.2f}→{_poc2:.2f} (poc tighter)"
+                        )
+                    elif _poc2 > _pos2.tp and _poc2 <= _ext_cap:
+                        # POC drifted farther — extend TP to capture more
+                        _pstore2.adjust_tp(_pos2.position_id, _poc2, "poc_trail_extend")
+                        LOG.info(
+                            f"[cycle][poc_trail_extend] {symbol} pos={_pos2.position_id} "
+                            f"tp {_pos2.tp:.2f}→{_poc2:.2f} (poc drifted up)"
+                        )
+                else:
+                    _floor2 = _pos2.avg_entry - _min_dist
+                    _ext_cap = _pos2.avg_entry - _max_ext
+                    if _pos2.tp < _poc2 < _floor2:
+                        # POC migrated closer — tighten TP
+                        _pstore2.adjust_tp(_pos2.position_id, _poc2, "poc_trail")
+                        LOG.info(
+                            f"[cycle][poc_trail] {symbol} pos={_pos2.position_id} "
+                            f"tp {_pos2.tp:.2f}→{_poc2:.2f} (poc tighter)"
+                        )
+                    elif _poc2 < _pos2.tp and _poc2 >= _ext_cap:
+                        # POC drifted farther — extend TP to capture more
+                        _pstore2.adjust_tp(_pos2.position_id, _poc2, "poc_trail_extend")
+                        LOG.info(
+                            f"[cycle][poc_trail_extend] {symbol} pos={_pos2.position_id} "
+                            f"tp {_pos2.tp:.2f}→{_poc2:.2f} (poc drifted down)"
+                        )
     except Exception as e:
-        LOG.exception(f"[cycle] sl_trail failed: {e}")
-        actions["sl_trail_error"] = str(e)
+        LOG.debug(f"[cycle] poc_trail failed: {e}")
+
+    # SL trailing DISABLED — no-SL cycle policy. Trailing tightens stop_loss
+    # toward current price; once tight enough, intra-bar moves fire it within
+    # disaster floor. Cycle manages itself via scaled future orders + TP.
+    actions["sl_trailed"] = []
 
     # Catastrophic-trend escape — force-close cycles running away against
     try:
@@ -557,7 +754,11 @@ def on_bar_close(symbol: str, primary_tf: str, latest: Bar, settings: dict | Non
     except Exception as e:
         LOG.exception(f"[cycle] choch check failed: {e}")
 
-    if invalidated and settings:
+    # Hedge-eval makes a live Claude call. Default ON (legacy). Scoped strategy
+    # ticks set settings.cycle.hedge_eval_enabled=False so a paper A/B stays
+    # deterministic and free.
+    _hedge_enabled = (settings or {}).get("cycle", {}).get("hedge_eval_enabled", True)
+    if invalidated and settings and _hedge_enabled:
         hedge_results = []
         for pid in set(invalidated):
             try:

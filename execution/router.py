@@ -17,7 +17,6 @@ from .base import Executor
 from .journal import JournalExecutor
 from .paper import PaperExecutor
 from .live.broker_base import BrokerAdapter
-from .live.mt5_adapter import MT5Adapter
 
 
 class LiveTripwireError(RuntimeError):
@@ -127,6 +126,7 @@ def _live(broker: str = "vantage_mt5") -> Executor:
     if broker == "dhan":
         from .live.dhan_adapter import DhanAdapter
         return LiveExecutor(DhanAdapter())
+    from .live.mt5_adapter import MT5Adapter
     return LiveExecutor(MT5Adapter())
 
 
@@ -216,6 +216,30 @@ def dispatch_grid(plan, bar: Bar, settings: dict, parent_position_id: str | None
 
 
 def dispatch(decision: Decision, bar: Bar, settings: dict) -> dict:
+    # Tier 1.1 — hard equity kill switch.
+    # Halts ALL new entries if today's realized R drops below daily_loss_floor.
+    # Manual reset: restart server or clear today's closed positions.
+    # force=True in /decide body bypasses (for testing only).
+    try:
+        _floor = -abs(float(((settings.get("risk") or {}).get("daily") or {}).get("max_dd_r", 5.0)))
+        from .position_store import position_store as _ps
+        _daily_r = _ps().daily_realized_r()
+        if _daily_r <= _floor and decision.side != "flat":
+            import logging as _l
+            _l.getLogger(__name__).warning(
+                f"[router][kill_switch] HALT — daily_R={_daily_r:.2f} ≤ floor={_floor:.1f}. "
+                f"No new entries until manual reset (server restart)."
+            )
+            return {
+                "mode": settings.get("mode", "paper"),
+                "skipped": f"kill_switch:daily_R={_daily_r:.2f}≤{_floor:.1f}",
+                "daily_r": _daily_r,
+                "floor": _floor,
+            }
+    except Exception as _ke:
+        import logging as _l
+        _l.getLogger(__name__).debug(f"[router] kill_switch check failed: {_ke}")
+
     trading_mode = str(settings.get("trading_mode") or "buy_sell_only")
 
     # Grid path: trading_mode in {buy_sell_only, grid} → fire mechanical 5-leg grid
