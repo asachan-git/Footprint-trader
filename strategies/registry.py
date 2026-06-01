@@ -15,6 +15,7 @@ import yaml
 from .base import Strategy
 from .democracy import Democracy
 from .republic import Republic
+from .coup import Coup
 
 LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
@@ -24,6 +25,7 @@ STRATEGIES_YAML = ROOT / "config" / "strategies.yaml"
 REGISTRY: dict[str, type[Strategy]] = {
     "democracy": Democracy,
     "republic": Republic,
+    "coup": Coup,
 }
 
 

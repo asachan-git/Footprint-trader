@@ -8,3 +8,9 @@ export async function fetchState(symbol, tf, minutes, footprint = false) {
   const { data } = await axios.get("/dashboard/state", { params });
   return data;
 }
+
+export async function fetchStrategyTrades(name, symbol, tf, source = "all") {
+  const params = { symbol, tf, source };
+  const { data } = await axios.get(`/strategies/${name}/trades`, { params });
+  return data?.trades ?? [];
+}

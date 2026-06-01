@@ -29,3 +29,28 @@ strategies:
       symbols: [BTCUSDT, XAUTUSDT]
       vote_tf: 15m
       sl_atr_mult: 1.5      # hard SL distance from anchor, in ATR_15m units
+
+  # coup = pure-footprint absorption→continuation. A high-vol/high-delta candle
+  # absorbs its extreme aggressor (buyers@top / sellers@low); we join the winner
+  # once it aggresses with result. Single tactical entry, structural SL beyond the
+  # trigger extreme, exit when the winner side is in turn absorbed (flip). Phase 1:
+  # entry at candle close. BTC only — Binance gold flow too thin. See STRATEGIES.md.
+  - name: coup
+    enabled: true
+    config:
+      symbols: [BTCUSDT]
+      decide_tf: 15m
+      lookback: 6           # bars back to search for an un-acted trigger
+      vol_mult: 1.8         # trigger bar total vol ≥ this × 20-bar median
+      delta_ratio: 0.35     # trigger |delta| / total vol floor
+      confirm_within: 3     # bars after trigger to confirm winner aggression
+      entry_mode: range     # close | imbalance | lvn | range. range best across all SL
+      range_pct: 0.5        # entry_mode=range: retrace into trigger candle (0.5=mid)
+      sl_mode: imbalance    # candle | swing | imbalance
+      #   ^ tuned via scripts/coup_backtest.py (BTCUSDT 15m) after the entry/SL guard +
+      #     same-bar-wait + 2R-TP fixes. range+imbalance: 65% fill, 77% win, +0.79R avg.
+      #     PROVISIONAL — n≈13, rankings unstable at this sample; unfilled limits may
+      #     bias fill-rate. Re-sweep as the footprint store grows.
+      sl_buffer_pct: 0.10   # buffer beyond the chosen level, × trigger candle range
+      swing_lookback: 3     # ±bars for swing pivots (sl_mode=swing)
+      flip_exit: true

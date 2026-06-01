@@ -156,7 +156,7 @@ def main() -> None:
 
         # Find the bar this signal was computed on
         # bar_id = "SYMBOL|15m|close_ts" — parse close_ts
-        bar_id_ts = int(sig["bar_id"].split("|")[-1])
+        bar_id_ts = int(sig["bar_id"].split("|")[2])
         bar = idx_15m.get(sym, {}).get(bar_id_ts)
         if bar is None:
             skipped += 1

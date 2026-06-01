@@ -655,6 +655,51 @@ export default function FootprintPane({
     });
 
     detHitsRef.current = [];
+
+    // VP level hit regions (drawn earlier, registered here after the clear)
+    const pushLevelHit = (price, label, desc) => {
+      if (price == null) return;
+      const y = yOfPrice(price);
+      if (y < PAD_TOP || y > PAD_TOP + plotH) return;
+      detHitsRef.current.push({ x: 25, y: y - 7, r: 14, type: "vp_level", payload: { label, price, desc } });
+    };
+    if (dailyVp) {
+      pushLevelHit(dailyVp.poc, "POC", "Point of Control — price with highest traded volume in current session");
+      pushLevelHit(dailyVp.vah, "VAH", "Value Area High — upper bound where 70% of session volume was traded");
+      pushLevelHit(dailyVp.val, "VAL", "Value Area Low — lower bound where 70% of session volume was traded");
+      if (dailyVp.naked_poc) pushLevelHit(dailyVp.naked_poc, "nPOC", "Naked POC — current-session untested prior POC; strong magnet level");
+      (nakedPocs || []).forEach(n => {
+        const lbl = `nPOC-${n.session[0]}${n.age_sessions}`;
+        pushLevelHit(n.price, lbl, `Naked POC from ${n.session} session, ${n.age_sessions} session(s) untested — magnet for mean reversion`);
+      });
+    }
+    if (priorVp?.poc) pushLevelHit(priorVp.poc, "pPOC", "Prior session Point of Control — highest-volume node from the previous session");
+
+    // Zone tick hit regions
+    const zoneDescMap = {
+      H: "HVN — High Volume Node: price stalls, strong support/resistance",
+      P: "VP Level — Volume Profile anchor (POC / VA boundary)",
+      S: "Swing/Session level — structural pivot or key session extreme",
+      F: "FVG — Fair Value Gap: imbalance zone, often filled on retest",
+      W: "Sweep level — liquidity wick extreme from a prior sweep",
+      C: "CVD level — cumulative delta structural pivot",
+      L: "LVN — Low Volume Node: price typically accelerates through",
+    };
+    (zones?.long  || []).forEach(z => {
+      const y = yOfPrice(z.price);
+      if (y < PAD_TOP || y > PAD_TOP + plotH) return;
+      const ch = zoneTypeChar(z.source);
+      detHitsRef.current.push({ x: plotW - 6, y, r: 9, type: "zone_tick",
+        payload: { price: z.price, source: z.source, side: "long",  char: ch, desc: zoneDescMap[ch] || z.source } });
+    });
+    (zones?.short || []).forEach(z => {
+      const y = yOfPrice(z.price);
+      if (y < PAD_TOP || y > PAD_TOP + plotH) return;
+      const ch = zoneTypeChar(z.source);
+      detHitsRef.current.push({ x: plotW - 6, y, r: 9, type: "zone_tick",
+        payload: { price: z.price, source: z.source, side: "short", char: ch, desc: zoneDescMap[ch] || z.source } });
+    });
+
     // Sweep markers — compact arrow + tiny "SW" pill; hover for full info.
     const drawSweepMarker = (ev, primary) => {
       if (!ev || !ev.type) return;
@@ -765,6 +810,7 @@ export default function FootprintPane({
     }
 
     // Swing point levels — dashed line + triangle; EQH/EQL and normal pivot lines are separate toggles
+    // Line extends from pivot bar → first bar that takes out the level (or right edge if still active)
     (swingPoints || []).forEach(sp => {
       const isEq = sp.is_equal;
       if (isEq  && indicators?.eqLevels   === false) return;
@@ -776,14 +822,24 @@ export default function FootprintPane({
       const isHi = sp.side === "high";
       const baseRgb = isEq ? "255,152,0" : (isHi ? "239,83,80" : "38,166,154");
 
-      // Dashed horizontal line: pivot bar → right edge of plot
+      // Find first bar after pivot that takes out the level
+      let takeoutTs = null;
+      for (const b of bars) {
+        if (b.ts <= sp.ts) continue;
+        if (isHi ? b.high > sp.price : b.low < sp.price) { takeoutTs = b.ts; break; }
+      }
+      const xEnd = takeoutTs != null
+        ? Math.min(tsToVisibleX(takeoutTs), plotW)
+        : plotW;
+
+      // Dashed horizontal line: pivot bar → takeout bar (or right edge if active)
       ctx.save();
       ctx.setLineDash([3, 4]);
       ctx.strokeStyle = `rgba(${baseRgb},${isEq ? 0.55 : 0.28})`;
       ctx.lineWidth = isEq ? 1.5 : 0.8;
       ctx.beginPath();
       ctx.moveTo(xC, y);
-      ctx.lineTo(plotW, y);
+      ctx.lineTo(xEnd, y);
       ctx.stroke();
       ctx.setLineDash([]);
       ctx.restore();
@@ -816,8 +872,16 @@ export default function FootprintPane({
       const pivotLabel = isEq ? `${isHi ? "EQH" : "EQL"} ${sp.price.toFixed(2)}` : sp.price.toFixed(2);
       ctx.fillText(pivotLabel, xC + triW + 3, y - (isHi ? 3 : -3));
 
-      // Right-edge label for EQH/EQL (reinforces the level across wide chart)
-      if (isEq) {
+      // Hover hit region for all pivot labels
+      detHitsRef.current.push({
+        x: xC, y,
+        r: isEq ? 12 : 8,
+        type: "pivot_label",
+        payload: { side: sp.side, price: sp.price, is_equal: isEq, active: takeoutTs === null },
+      });
+
+      // Right-edge label for EQH/EQL only when level is still active (not taken out)
+      if (isEq && takeoutTs === null) {
         ctx.font = "bold 9px JetBrains Mono, monospace";
         ctx.fillStyle = `rgba(${baseRgb},0.7)`;
         ctx.textAlign = "right";
@@ -1493,7 +1557,7 @@ export default function FootprintPane({
         lastLabelX = xC;
       }
     }
-  }, [bars, dailyVp, priorVp, detections, positions, pendingOrders, closedPositions, cvd, cvdSignal, zones, view, cellMode, selectedPosId, showTrades, showBubbles, theme]);
+  }, [bars, dailyVp, priorVp, detections, positions, pendingOrders, closedPositions, cvd, cvdSignal, zones, view, cellMode, selectedPosId, showTrades, showBubbles, theme, swingPoints, indicators, historicalSweeps, nakedPocs]);
 
   // Resize observer → trigger re-render
   useEffect(() => {
@@ -1915,6 +1979,23 @@ export default function FootprintPane({
             </div>
             <div><span style={{ color: "#888" }}>age </span><span>{p.age_bars ?? 0} bar(s)</span></div>
           </>);
+        } else if (hoverDet.type === "vp_level") {
+          const colorMap = { POC: COLORS.pocBorder, VAH: COLORS.vah, VAL: COLORS.val };
+          const color = colorMap[p.label] || "rgba(255,215,0,0.8)";
+          header = (<span style={{ color, fontWeight: 700 }}>{p.label}</span>);
+          body = (<>
+            <div><span style={{ color: "#888" }}>price </span><span>{r(p.price)}</span></div>
+            {p.desc && <div style={{ color: "#aaa", marginTop: 2 }}>{p.desc}</div>}
+          </>);
+        } else if (hoverDet.type === "zone_tick") {
+          const color = p.side === "long" ? COLORS.up : COLORS.down;
+          header = (<span style={{ color, fontWeight: 700 }}>{p.char} ZONE — {p.side.toUpperCase()}</span>);
+          body = (<>
+            <div><span style={{ color: "#888" }}>price </span><span>{r(p.price)}</span>
+              <span style={{ color: "#888" }}>  src </span><span style={{ color: "#aaa" }}>{p.source}</span>
+            </div>
+            {p.desc && <div style={{ color: "#aaa", marginTop: 2 }}>{p.desc}</div>}
+          </>);
         } else if (hoverDet.type === "absorption") {
           const color = p.side === "buy" ? COLORS.up : COLORS.down;
           header = (<span style={{ color, fontWeight: 700 }}>ABSORPTION {String(p.side || "").toUpperCase()}</span>);
@@ -1927,6 +2008,21 @@ export default function FootprintPane({
               </>}
             </div>
             {p.reason && <div style={{ color: "#aaa", marginTop: 2 }}>{p.reason}</div>}
+          </>);
+        } else if (hoverDet.type === "pivot_label") {
+          const isHi = p.side === "high";
+          const color = p.is_equal ? "#ff9800" : (isHi ? COLORS.down : COLORS.up);
+          const tag = p.is_equal ? (isHi ? "EQH" : "EQL") : (isHi ? "SWING HIGH" : "SWING LOW");
+          header = (<span style={{ color, fontWeight: 700 }}>{tag}</span>);
+          body = (<>
+            <div><span style={{ color: "#888" }}>price </span><span>{r(p.price)}</span>
+              <span style={{ color: "#888" }}>  status </span>
+              <span style={{ color: p.active ? COLORS.up : "#888" }}>{p.active ? "active" : "swept"}</span>
+            </div>
+            {p.is_equal
+              ? <div style={{ color: "#aaa", marginTop: 2 }}>Retail stop cluster — two+ pivots within 0.15%. Prime institutional sweep target before reversal.</div>
+              : <div style={{ color: "#aaa", marginTop: 2 }}>Structural swing {isHi ? "high" : "low"} — local price extreme. Line ends when level is taken out.</div>
+            }
           </>);
         } else if (hoverDet.type === "big_trade") {
           const isBuy = p.aggressor === "buy";

@@ -206,6 +206,45 @@ def _check_hard_sl(symbol: str, latest: Bar) -> list[dict]:
     return closed
 
 
+def _check_absorption_flip(symbol: str, latest: Bar) -> list[dict]:
+    """Close any open cycle whose winner side gets absorbed at an extreme — the
+    mirror of the entry trigger, now against us (the `coup` strategy's exit).
+
+    Long position → canonical absorption side=="sell" (buyers absorbed at top).
+    Short position → canonical absorption side=="buy" (sellers absorbed at low).
+    Opt-in (caller gates on settings.cycle.coup_flip_exit). Realized R is marked to
+    the bar close against the cycle's own risk denominator (avg_entry − stop_loss).
+    """
+    from execution.pending_orders import pending_store
+    from execution.position_store import position_store
+    from pipeline.footprint import build as _build_fp
+    from pipeline.features.absorption import detect_canonical_absorption
+
+    closed: list[dict] = []
+    absorbs = detect_canonical_absorption(latest, _build_fp(latest))
+    if not absorbs:
+        return closed
+    sides = {a.side for a in absorbs}
+
+    pos_store = position_store()
+    c = latest.ohlc.c
+    for pos in pos_store.open_positions(symbol):
+        flip = (pos.side == "long" and "sell" in sides) or \
+               (pos.side == "short" and "buy" in sides)
+        if not flip:
+            continue
+        risk = abs(pos.avg_entry - (pos.stop_loss or 0)) or 1e-9
+        pnl = (c - pos.avg_entry) if pos.side == "long" else (pos.avg_entry - c)
+        realized_r = pnl / risk
+        if pos_store.close_position(pos.position_id, reason="absorption_flip", realized_r=realized_r):
+            pending_store().cancel_for_position(pos.position_id)
+            _va_state.pop(pos.position_id, None)
+            _trend_escape_state.pop(pos.position_id, None)
+            closed.append({"position_id": pos.position_id, "realized_r": round(realized_r, 3)})
+            LOG.info(f"[cycle] ABSORPTION-FLIP {pos.position_id} {pos.side} @ {c:.2f} R={realized_r:.2f}")
+    return closed
+
+
 def _sweep_continuation_active(symbol: str, side: Literal["long", "short"]) -> bool:
     """True if there is a fresh sweep_reclaim event that aligns with cycle direction.
 
@@ -639,6 +678,17 @@ def on_bar_close(symbol: str, primary_tf: str, latest: Bar, settings: dict | Non
         except Exception as e:
             LOG.exception(f"[cycle] hard_sl check failed: {e}")
             actions["hard_sl_error"] = str(e)
+
+    # Absorption-flip exit — OPT-IN (settings.cycle.coup_flip_exit). The `coup`
+    # strategy exits when its winner side gets absorbed at an extreme (the entry
+    # trigger mirrored against the open position). Default OFF; other strategies
+    # untouched.
+    if (settings or {}).get("cycle", {}).get("coup_flip_exit"):
+        try:
+            actions["closed_flip"] = _check_absorption_flip(symbol, latest)
+        except Exception as e:
+            LOG.exception(f"[cycle] absorption_flip check failed: {e}")
+            actions["flip_error"] = str(e)
 
     # TP participation adjustment — extend/shrink TP based on live order-flow score
     try:

@@ -1,0 +1,306 @@
+"""Coup — a purely footprint absorption→continuation strategy.
+
+Named for the mechanic: a regime change at one decisive candle. The extreme
+aggressor of a high-volume / high-delta bar gets *absorbed* (buyers trapped at
+the top, or sellers trapped at the bottom). The trapped side is overthrown; we
+join the side that did the absorbing — the new winner — and ride it for
+continuation. Unlike democracy/republic (a weighted vote panel), coup is a
+single decisive event off the footprint, not a poll.
+
+Thesis (per user):
+  1. TRIGGER  — high-vol + high-|delta| 15m candle, extreme aggressor absorbed.
+                buyers absorbed at top  → canonical Absorption.side=="sell" → winner SHORT
+                sellers absorbed at low → canonical Absorption.side=="buy"  → winner LONG
+  2. CONFIRM  — wait (≤ confirm_within bars) for the winner side to aggress *with
+                result*: a new same-side stacked imbalance, or a CVD pattern in
+                the winner direction.
+  3. ENTRY    — single tactical entry at the current candle close (Phase 1).
+                Structural SL just beyond the trigger candle's absorbed extreme.
+  4. EXIT     — the winner side in turn getting absorbed at an extreme (the mirror
+                of the trigger, against us) → cycle_manager._check_absorption_flip,
+                enabled by the `coup_flip_exit` flag this strategy turns on. Plus
+                the structural hard SL.
+
+Execution policy (settings_override + adjust_plan): single leg (no grid
+averaging), hard-SL exit on (so the structural stop closes the cycle), Claude
+hedge-eval off, absorption-flip exit on.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import replace
+from statistics import median
+
+from llm.schema import Decision
+from pipeline.types import Bar
+from pipeline.state_store import store
+from pipeline.footprint import build as build_fp
+from pipeline.features.absorption import detect_canonical_absorption
+from pipeline.features.stacked_imbalance import stacked_imbalances
+from pipeline.features.cvd_candlestick import detect as cvd_detect
+
+from .base import Strategy
+
+LOG = logging.getLogger(__name__)
+
+_CVD_LONG = {"breakout_long", "reclaim", "hidden_buying"}
+_CVD_SHORT = {"breakout_short", "wick_trap", "hidden_selling"}
+
+
+class Coup(Strategy):
+    name = "coup"
+
+    def __init__(self, config: dict | None = None) -> None:
+        super().__init__(config)
+        # de-dup: last trigger close_ts already entered on, per symbol.
+        self._acted: dict[str, int] = {}
+        # structural SL + 2R TP handed from decide() to adjust_plan(), per symbol.
+        self._pending_sl: dict[str, float] = {}
+        self._pending_tp: dict[str, float] = {}
+
+    # ── execution policy ─────────────────────────────────────────────────────
+    def settings_override(self, settings: dict) -> dict:
+        """Hard-SL exit on (structural stop must close the cycle), absorption-flip
+        exit on, Claude hedge-eval off (deterministic + free paper A/B)."""
+        cyc = {**(settings.get("cycle") or {}),
+               "hard_sl_exit": True,
+               "hedge_eval_enabled": False,
+               "coup_flip_exit": True}
+        return {**settings, "cycle": cyc}
+
+    def adjust_plan(self, plan, bar: Bar, settings: dict):
+        """Force a single tactical entry (drop grid legs 2-N) and clamp the safety
+        SL to the structural level from decide() (just beyond the trigger extreme)."""
+        if not plan.legs:
+            return plan
+        leg1 = plan.legs[0]
+        anchor = plan.anchor_price or leg1.price
+        offs = plan.leg_offsets_pct[:1] if plan.leg_offsets_pct else ()
+        new = replace(
+            plan,
+            legs=[leg1],
+            avg_entry_on_full_fill=leg1.price,
+            leg_offsets_pct=offs,
+        )
+        sl = self._pending_sl.get(bar.symbol)
+        if sl is not None and anchor > 0:
+            new = replace(new, safety_sl=sl, safety_sl_offset_pct=(sl - anchor) / anchor)
+            LOG.info(f"[coup] {bar.symbol} {plan.side} single-leg, structural SL → {sl:.2f}")
+        # Force coup's 2R TP — overrides plan_grid's VP-anchored TP so live exits
+        # match the backtested 2R target (the cycle TP, not the disaster floor).
+        tp = self._pending_tp.get(bar.symbol)
+        if tp is not None and anchor > 0:
+            new = replace(new, take_profit=tp, tp_source="coup_2R",
+                          tp_offset_pct=(tp - anchor) / anchor)
+            LOG.info(f"[coup] {bar.symbol} {plan.side} TP → {tp:.2f} (2R)")
+        return new
+
+    # ── signal ─────────────────────────────────────────────────────────────────
+    def decide(self, symbol: str, tf: str, bar: Bar, settings: dict) -> Decision | None:
+        cfg = self.config
+        decide_tf = str(cfg.get("decide_tf") or "15m")
+        lookback = int(cfg.get("lookback", 6))
+        vol_mult = float(cfg.get("vol_mult", 1.8))
+        delta_ratio = float(cfg.get("delta_ratio", 0.35))
+        confirm_within = int(cfg.get("confirm_within", 3))
+        sl_mode = str(cfg.get("sl_mode", "candle"))          # candle | swing | imbalance
+        sl_buffer_pct = float(cfg.get("sl_buffer_pct", 0.10))  # × trigger range
+        swing_lookback = int(cfg.get("swing_lookback", 3))
+        entry_mode = str(cfg.get("entry_mode", "close"))     # close | imbalance | lvn | range
+        range_pct = float(cfg.get("range_pct", 0.5))         # entry_mode=range: pullback into candle
+
+        bars = store().recent(symbol, decide_tf, 25)
+        if len(bars) < 8:
+            return None
+
+        # rolling median of total bar volume over the last 20 bars.
+        totals = [t for t in (self._total_vol(b) for b in bars[-20:]) if t > 0]
+        med = median(totals) if totals else 0.0
+        if med <= 0:
+            return None
+
+        # ── 1. TRIGGER — most recent high-vol/high-delta absorption in window ──
+        trigger = self._find_trigger(bars, lookback, vol_mult * med, delta_ratio)
+        if trigger is None:
+            return None
+        t_idx, winner, t_bar = trigger
+
+        if self._acted.get(symbol) == t_bar.close_ts:
+            return None  # already entered on this trigger
+
+        # ── 2. CONFIRM — winner aggression with result, AFTER the trigger ──
+        # Require ≥1 post bar: the thesis is the opposite side becoming aggressor
+        # *after* the trap, so never confirm on the trigger bar itself.
+        post = bars[t_idx + 1:]
+        if not post or len(post) > confirm_within:
+            return None  # not yet, or trigger went stale
+        if not self._confirm(winner, post, bars):
+            return None
+
+        # ── 3. ENTRY — single tactical entry; price per entry_mode ──
+        # close = market at bar close; imbalance/lvn/range = limit into the trigger
+        # candle (leg1 fills on price touch via cycle_manager). Falls back to close.
+        entry = self._entry_price(winner, t_bar, entry_mode, range_pct, bar.ohlc.c)
+        buf = max(t_bar.ohlc.h - t_bar.ohlc.l, 1e-9) * sl_buffer_pct
+        sl = self._compute_sl(winner, t_bar, bars, entry, sl_mode, buf, swing_lookback)
+        # Guard: a cross-mode SL (e.g. range entry + imbalance SL) can land on the
+        # wrong side of entry → ~0 risk, instant stop-out, blown R math. Clamp the
+        # stop strictly beyond entry by at least `buf`.
+        if winner == "long":
+            sl = min(sl, entry - buf)
+            risk = entry - sl
+            tp = entry + 2.0 * risk
+        else:
+            sl = max(sl, entry + buf)
+            risk = sl - entry
+            tp = entry - 2.0 * risk
+
+        dr = abs(t_bar.delta or 0) / max(self._total_vol(t_bar), 1e-9)
+        bias = 3 + round(2 * _clamp((dr - delta_ratio) / max(1 - delta_ratio, 1e-9), 0.0, 1.0))
+        bias = int(_clamp(bias, 1, 5))
+
+        self._acted[symbol] = t_bar.close_ts
+        self._pending_sl[symbol] = sl
+        self._pending_tp[symbol] = tp
+
+        LOG.info(f"[coup] {symbol} {winner.upper()} trigger@{t_bar.ohlc.c:.2f} "
+                 f"delta_ratio={dr:.2f} confirmed bias={bias} SL={sl:.2f} ({sl_mode})")
+        return Decision(
+            side=winner,
+            entry=entry,
+            stop_loss=sl,
+            take_profit=tp,
+            confidence=_clamp(0.5 + (dr - delta_ratio), 0.0, 1.0),
+            bias_strength=bias,
+            rationale=(
+                f"coup: {winner} continuation — trigger candle absorbed "
+                f"({'buyers@top' if winner == 'short' else 'sellers@low'}) "
+                f"vol≥{vol_mult}×median, |delta|/vol={dr:.2f}; winner aggression confirmed. "
+                f"SL[{sl_mode}] @ {sl:.2f}."
+            ),
+            invalidation_note="winner side absorbed at extreme (flip), or structural SL hit",
+        )
+
+    # ── helpers ─────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _total_vol(b: Bar) -> float:
+        fp = build_fp(b)
+        return fp.total_bid + fp.total_ask
+
+    def _find_trigger(self, bars: list[Bar], lookback: int, vol_floor: float,
+                      delta_ratio: float):
+        """Return (idx, winner_side, trigger_bar) for the most recent qualifying
+        trigger in the lookback window, else None."""
+        scan = bars[-lookback:]
+        base = len(bars) - len(scan)
+        found = None
+        for off, b in enumerate(scan):
+            total = self._total_vol(b)
+            if total < vol_floor:
+                continue
+            if b.delta is None or abs(b.delta) / max(total, 1e-9) < delta_ratio:
+                continue
+            for a in detect_canonical_absorption(b, build_fp(b)):
+                winner = "short" if a.side == "sell" else "long"
+                found = (base + off, winner, b)  # keep the most recent
+        return found
+
+    @staticmethod
+    def _confirm(winner: str, post: list[Bar], bars: list[Bar]) -> bool:
+        """Winner side aggresses with result after the trigger."""
+        target = "buy" if winner == "long" else "sell"
+        for b in post:
+            zones = stacked_imbalances(build_fp(b), min_stack=3)
+            if any(z.side == target for z in zones):
+                return True
+        sig = cvd_detect(bars[-20:])
+        if winner == "long" and sig.pattern in _CVD_LONG:
+            return True
+        if winner == "short" and sig.pattern in _CVD_SHORT:
+            return True
+        return False
+
+    # ── entry variants (A/B which fill is best) ──────────────────────────────────
+    def _entry_price(self, winner: str, t_bar: Bar, mode: str, range_pct: float,
+                     fallback: float) -> float:
+        """Entry level on the trigger candle. Falls back to `close` (market).
+          close     — current bar close (market)
+          imbalance — winner-side stacked-imbalance zone edge (limit into the zone)
+          lvn       — low-volume node between the absorbed extreme and POC (vacuum)
+          range     — range_pct retrace into the trigger candle (0.5 = midpoint)
+        """
+        if mode == "imbalance":
+            lvl = self._imbalance_edge(winner, t_bar, "near")
+            return lvl if lvl is not None else fallback
+        if mode == "lvn":
+            lvl = self._lvn_level(winner, build_fp(t_bar))
+            return lvl if lvl is not None else fallback
+        if mode == "range":
+            lo, hi = t_bar.ohlc.l, t_bar.ohlc.h
+            rng = max(hi - lo, 1e-9)
+            return (lo + range_pct * rng) if winner == "long" else (hi - range_pct * rng)
+        return fallback  # close
+
+    @staticmethod
+    def _lvn_level(winner: str, fp):
+        """Low-volume node between the absorbed extreme and POC — the vacuum price
+        tends to retrace into."""
+        if not fp.cells:
+            return None
+        poc = fp.poc_price
+        if poc is None:
+            return None
+        region = [c for c in fp.cells if (c.price <= poc if winner == "long" else c.price >= poc)]
+        region = [c for c in region if c.total > 0]
+        if len(region) < 2:
+            return None
+        return min(region, key=lambda c: c.total).price
+
+    # ── SL variants (A/B which protects best) ───────────────────────────────────
+    def _compute_sl(self, winner: str, t_bar: Bar, bars: list[Bar], entry: float,
+                    mode: str, buf: float, swing_lb: int) -> float:
+        """Structural stop. Variants fall back to `candle` if their level is absent.
+          candle    — beyond the trigger candle's absorbed extreme
+          swing     — beyond the nearest swing low/high (wave.detect_swing_points)
+          imbalance — beyond the far edge of the trigger's winner-side imbalance zone
+        """
+        lvl = None
+        if mode == "swing":
+            lvl = self._swing_level(winner, bars, entry, swing_lb)
+        elif mode == "imbalance":
+            lvl = self._imbalance_edge(winner, t_bar, "far")
+        if lvl is None:                       # candle (default + fallback)
+            lvl = t_bar.ohlc.l if winner == "long" else t_bar.ohlc.h
+        return (lvl - buf) if winner == "long" else (lvl + buf)
+
+    @staticmethod
+    def _swing_level(winner: str, bars: list[Bar], entry: float, lookback: int):
+        from pipeline.features.wave import detect_swing_points
+        highs, lows = detect_swing_points(bars, lookback=lookback)
+        if winner == "long":
+            below = [p for _, p in lows if p < entry]
+            return max(below) if below else None    # nearest swing low below entry
+        above = [p for _, p in highs if p > entry]
+        return min(above) if above else None        # nearest swing high above entry
+
+    @staticmethod
+    def _imbalance_edge(winner: str, t_bar: Bar, edge: str):
+        """Edge of the trigger candle's strongest winner-side stacked-imbalance zone.
+          near — the edge facing price (limit ENTRY: buy the top of a buy-zone on a
+                 pullback / sell the bottom of a sell-zone).
+          far  — the edge beyond the zone (structural SL).
+        """
+        target = "buy" if winner == "long" else "sell"
+        zones = [z for z in stacked_imbalances(build_fp(t_bar), min_stack=3)
+                 if z.side == target]
+        if not zones:
+            return None
+        z = max(zones, key=lambda z: z.count)   # strongest stack
+        if winner == "long":
+            return z.price_high if edge == "near" else z.price_low
+        return z.price_low if edge == "near" else z.price_high
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))

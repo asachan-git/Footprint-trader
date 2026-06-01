@@ -5,6 +5,7 @@ import VoteBreakdown from "./components/VoteBreakdown.jsx";
 import DecisionCards from "./components/DecisionCards.jsx";
 import Positions from "./components/Positions.jsx";
 import ABStats from "./components/ABStats.jsx";
+import { fetchStrategyTrades } from "./api.js";
 
 const SYMBOLS  = ["BTCUSDT", "XAUTUSDT"];
 const TFS      = ["1m", "5m", "15m"];
@@ -15,19 +16,21 @@ const LS_IND_KEY  = "fb_indicators_v1";
 const DEFAULT_IND = {
   sweepArrows: true,  eqLevels: true,   pivotLines: false, nakedPocs: true,  priorPoc: true,
   liveSweep:   true,  srFsSweeps: false, fvgLines:  false,  priorVa:   false, absorptions: false,
+  coupTrades:  true,
 };
 
 const IND_ITEMS = [
-  { key: "sweepArrows",  label: "Sweep Arrows (REV/LG)" },
-  { key: "srFsSweeps",   label: "SR / FS Sweeps" },
-  { key: "liveSweep",    label: "Live Sweep Level" },
-  { key: "eqLevels",     label: "EQH / EQL" },
-  { key: "pivotLines",   label: "Pivot Lines" },
-  { key: "nakedPocs",    label: "Naked POCs" },
-  { key: "priorPoc",     label: "Prior POC" },
-  { key: "priorVa",      label: "Prior VA (H/L)" },
-  { key: "fvgLines",     label: "FVGs" },
-  { key: "absorptions",  label: "Absorptions" },
+  { key: "sweepArrows",  label: "Sweep Arrows (REV/LG)", tip: "Reversal & Liquidity Grab — delta-confirmed sweeps of key levels; high institutional signal" },
+  { key: "srFsSweeps",   label: "SR / FS Sweeps",        tip: "Stop Run & Failed Sweep — lower-confidence sweeps without clear delta confirmation" },
+  { key: "liveSweep",    label: "Live Sweep Level",       tip: "Current bar wick extreme — live price level being swept right now" },
+  { key: "eqLevels",     label: "EQH / EQL",             tip: "Equal Highs/Lows — two+ pivots within 0.15% form a retail stop cluster; prime institutional sweep target" },
+  { key: "pivotLines",   label: "Pivot Lines",            tip: "Structural swing highs/lows — local price extremes (TF-aware lookback). Line ends when level is taken out" },
+  { key: "nakedPocs",    label: "Naked POCs",             tip: "Naked Point of Control — prior-session POCs price has never returned to test; strong magnet levels" },
+  { key: "priorPoc",     label: "Prior POC",              tip: "Prior session Point of Control — high-volume node from yesterday's session" },
+  { key: "priorVa",      label: "Prior VA (H/L)",         tip: "Prior session Value Area High/Low — 70% of prior-day volume traded between these two levels" },
+  { key: "fvgLines",     label: "FVGs",                   tip: "Fair Value Gaps — 3-bar imbalance zones where price moved too fast; often filled on retest" },
+  { key: "absorptions",  label: "Absorptions",            tip: "Absorption — large passive volume at price extreme with minimal bar movement; potential reversal signal" },
+  { key: "coupTrades",   label: "Coup Trades",            tip: "coup strategy entries/exits (15m). Backtest + live: entry/exit arrows, SL/TP segments, win/loss colored" },
 ];
 
 function LayersToggle({ indicators, onChange }) {
@@ -61,6 +64,7 @@ function LayersToggle({ indicators, onChange }) {
               <div
                 key={item.key}
                 onClick={() => onChange(item.key, !on)}
+                title={item.tip}
                 style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 12px",
                   cursor: "pointer", color: on ? "#ccc" : "#444", userSelect: "none" }}
                 onMouseEnter={e => e.currentTarget.style.background = "#1a1a1a"}
@@ -143,7 +147,18 @@ export default function App() {
   const [data,      setData]      = useState(null);
   const [stale,     setStale]     = useState(false);
   const [lastTs,    setLastTs]    = useState(null);
+  const [coupTrades, setCoupTrades] = useState([]);
   const esRef = useRef(null);
+
+  // coup trades for the chart overlay (backtest + live). Backend filters by
+  // symbol/tf; trade ts only align to 15m bars, so the overlay shows on 15m.
+  useEffect(() => {
+    let cancel = false;
+    fetchStrategyTrades("coup", symbol, tf, "all")
+      .then(t => { if (!cancel) setCoupTrades(t); })
+      .catch(() => { if (!cancel) setCoupTrades([]); });
+    return () => { cancel = true; };
+  }, [symbol, tf]);
   // Shared visible-time-range across FP ↔ Candle. Each pane writes on pan,
   // reads on becoming visible. Ref, not state, so no re-render loops.
   const rangeRef = useRef(null);  // {from: ts, to: ts} | null
@@ -294,6 +309,7 @@ export default function App() {
             nakedPocs={data?.naked_pocs ?? []}
             historicalSweeps={data?.historical_sweeps ?? []}
             swingPoints={data?.swing_points ?? []}
+            coupTrades={tf === "15m" && indicators.coupTrades !== false ? coupTrades : []}
             symbol={symbol}
             chartMode={chartMode}
             indicators={indicators}
