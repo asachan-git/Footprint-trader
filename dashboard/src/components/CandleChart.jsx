@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createChart, CrosshairMode, LineStyle } from "lightweight-charts";
 
 const COLORS = {
@@ -460,7 +460,19 @@ function drawFootprintWithRetry(canvas, chart, candleSeries, bars, attempt = 0) 
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-export default function CandleChart({ bars, dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, symbol, chartMode, indicators }) {
+export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, coupTrades = [], symbol, chartMode, indicators }) {
+  // lightweight-charts setData asserts strictly-asc UNIQUE timestamps. Long
+  // windows (5D) can emit duplicate/out-of-order ts → crash. Sort asc + dedupe
+  // by ts (keep last) once, feed everywhere downstream.
+  const bars = useMemo(() => {
+    const arr = (rawBars || []).slice().sort((a, b) => a.ts - b.ts);
+    const out = [];
+    for (const b of arr) {
+      if (out.length && out[out.length - 1].ts === b.ts) out[out.length - 1] = b;
+      else out.push(b);
+    }
+    return out;
+  }, [rawBars]);
   const containerRef = useRef(null);
   const vpCanvasRef  = useRef(null);
   const fpCanvasRef  = useRef(null);
@@ -481,7 +493,10 @@ export default function CandleChart({ bars, dailyVp, priorVp, detections, positi
   const candleRef    = useRef(null);
   const deltaRef     = useRef(null);
   const cvdRef       = useRef(null);
-  const linesRef     = useRef([]);
+  const linesRef       = useRef([]);
+  const pivotSeriesRef = useRef([]);
+  const markersRef   = useRef([]);
+  const [hoverMarker, setHoverMarker] = useState(null);
   const barsRef      = useRef(bars);
   const dailyVpRef   = useRef(dailyVp);
   const prevSymbol   = useRef(symbol);
@@ -558,6 +573,11 @@ export default function CandleChart({ bars, dailyVp, priorVp, detections, positi
     };
     chart.timeScale().subscribeVisibleLogicalRangeChange(redrawAll);
     chart.subscribeCrosshairMove(redrawAll);
+    chart.subscribeCrosshairMove(param => {
+      if (!param.time || !param.point) { setHoverMarker(null); return; }
+      const hit = markersRef.current.find(m => m.time === param.time);
+      setHoverMarker(hit ? { ...hit, x: param.point.x, y: param.point.y } : null);
+    });
 
     // Catch all drags (x-pan, y-axis scale, x-axis scale). subscribeCrosshairMove
     // only fires when cursor is over plot; axis-drag may not move crosshair.
@@ -682,6 +702,8 @@ export default function CandleChart({ bars, dailyVp, priorVp, detections, positi
 
     linesRef.current.forEach(l => { try { cs.removePriceLine(l); } catch {} });
     linesRef.current = [];
+    pivotSeriesRef.current.forEach(s => { try { chartRef.current?.removeSeries(s); } catch {} });
+    pivotSeriesRef.current = [];
 
     const addLine = (price, color, title, style = LineStyle.Solid) => {
       if (!price) return;
@@ -785,11 +807,39 @@ export default function CandleChart({ bars, dailyVp, priorVp, detections, positi
       });
     }
 
-    // EQH/EQL: dashed price line + arrow marker
+    // Bounded pivot lines — extend only until level is taken out
+    const findTakeout = (sp) => {
+      const isHi = sp.side === "high";
+      for (const b of bars) {
+        if (b.ts <= sp.ts) continue;
+        if (isHi ? b.high > sp.price : b.low < sp.price) return b.ts;
+      }
+      return null;
+    };
+    const addBoundedLine = (sp, color, lineWidth = 1) => {
+      if (!chartRef.current) return;
+      const toTs = findTakeout(sp);
+      const endTs = toTs ?? (bars.length ? bars[bars.length - 1].ts : null);
+      if (!endTs || endTs <= sp.ts) return;
+      const s = chartRef.current.addLineSeries({
+        color, lineWidth, lineStyle: LineStyle.Dashed,
+        crosshairMarkerVisible: false, priceLineVisible: false,
+        lastValueVisible: false, autoscaleInfoProvider: () => null,
+      });
+      s.setData([{ time: sp.ts, value: sp.price }, { time: endTs, value: sp.price }]);
+      pivotSeriesRef.current.push(s);
+      return toTs; // null = still active
+    };
+
+    // EQH/EQL: bounded dashed line + arrow marker; active levels also get axis label via priceLine
     if (indicators?.eqLevels !== false) {
       (swingPoints || []).filter(sp => sp.is_equal).forEach(sp => {
         const isHi = sp.side === "high";
-        addLine(sp.price, "rgba(255,152,0,0.65)", isHi ? "EQH" : "EQL", LineStyle.Dashed);
+        const takenOut = addBoundedLine(sp, "rgba(255,152,0,0.65)", 1);
+        if (takenOut === null) {
+          // Still active — add axis label via priceLine
+          addLine(sp.price, "rgba(255,152,0,0.0)", isHi ? "EQH" : "EQL", LineStyle.Dashed);
+        }
         markers.push({
           time: sp.ts, position: isHi ? "aboveBar" : "belowBar",
           color: "rgba(255,152,0,0.9)", shape: isHi ? "arrowDown" : "arrowUp",
@@ -798,19 +848,56 @@ export default function CandleChart({ bars, dailyVp, priorVp, detections, positi
       });
     }
 
-    // Non-EQ pivot dashed lines only (no arrows, no text)
+    // Non-EQ pivot bounded dashed lines only (no arrows, no text)
     if (indicators?.pivotLines !== false) {
       (swingPoints || []).filter(sp => !sp.is_equal).forEach(sp => {
         const isHi = sp.side === "high";
-        addLine(sp.price,
-          isHi ? "rgba(239,83,80,0.15)" : "rgba(38,166,154,0.15)", "", LineStyle.Dashed);
+        addBoundedLine(sp, isHi ? "rgba(239,83,80,0.20)" : "rgba(38,166,154,0.20)");
       });
     }
 
+    // ── Coup strategy trades (backtest + live) ───────────────────────────────
+    // entry/exit arrows + entry/SL/TP segments spanning entry_ts→exit_ts only
+    // (time-bounded line series, like pivots — not full-width price lines).
+    const lastBarTs = bars.length ? bars[bars.length - 1].ts : null;
+    const seg = (price, color, fromTs, toTs, style, width = 1) => {
+      if (price == null || !fromTs || !chartRef.current) return;
+      const end = toTs || lastBarTs;
+      if (!end || end < fromTs) return;
+      const s = chartRef.current.addLineSeries({
+        color, lineWidth: width, lineStyle: style,
+        crosshairMarkerVisible: false, priceLineVisible: false,
+        lastValueVisible: false, autoscaleInfoProvider: () => null,
+      });
+      s.setData([{ time: fromTs, value: price }, { time: end, value: price }]);
+      pivotSeriesRef.current.push(s);
+    };
+    (coupTrades || []).forEach(t => {
+      const isLong = t.side === "long";
+      const win = (t.r ?? 0) > 0;
+      const col = win ? COLORS.up : COLORS.down;
+      markers.push({
+        time: t.entry_ts, position: isLong ? "belowBar" : "aboveBar",
+        color: col, shape: isLong ? "arrowUp" : "arrowDown",
+        text: `C${isLong ? "↑" : "↓"} ${t.entry_mode || ""}`.trim(), size: 2,
+      });
+      if (t.exit_ts) {
+        const rTxt = t.r == null ? "" : `${t.r >= 0 ? "+" : ""}${t.r.toFixed(2)}R`;
+        markers.push({
+          time: t.exit_ts, position: isLong ? "aboveBar" : "belowBar",
+          color: col, shape: "circle", text: `${t.reason || "exit"} ${rTxt}`.trim(), size: 1,
+        });
+      }
+      seg(t.entry, col, t.entry_ts, t.exit_ts, LineStyle.Solid, 2);
+      seg(t.sl, COLORS.sl, t.entry_ts, t.exit_ts, LineStyle.Dashed);
+      seg(t.tp, COLORS.tp, t.entry_ts, t.exit_ts, LineStyle.Dashed);
+    });
+
     markers.sort((a, b) => a.time - b.time);
     if (markers.length) try { cs.setMarkers(markers); } catch {}
+    markersRef.current = markers;
 
-  }, [dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, bars, indicators]);
+  }, [dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, coupTrades, bars, indicators]);
 
   function resetView() {
     if (chartRef.current) chartRef.current.timeScale().fitContent();
@@ -865,6 +952,37 @@ export default function CandleChart({ bars, dailyVp, priorVp, detections, positi
               <span style={{ color: "#888" }}>  vol </span><span>{r(bt.volume, 2)}</span></div>
             <div><span style={{ color: "#888" }}>outcome </span><span>{bt.outcome || "—"}</span></div>
             {tIst && <div><span style={{ color: "#888" }}>at </span><span>{tIst}</span></div>}
+          </div>
+        );
+      })()}
+      {/* Marker hover tooltip */}
+      {hoverMarker && (() => {
+        const m = hoverMarker;
+        const W = 240, H = 90;
+        const wrapRect = containerRef.current?.getBoundingClientRect() || { width: 800, height: 400 };
+        let tx = m.x + 12, ty = m.y + 12;
+        if (tx + W > wrapRect.width)  tx = m.x - W - 12;
+        if (ty + H > wrapRect.height) ty = m.y - H - 12;
+        const isHi = m.position === "aboveBar";
+        const txt = m.text || "";
+        let header = txt, desc = "";
+        if (txt === "REV")          { header = `REVERSAL ${isHi ? "HIGH" : "LOW"}`; desc = "Delta-confirmed sweep with strong rejection bar — highest-confidence reversal signal"; }
+        else if (txt === "LG")      { header = `LIQUIDITY GRAB ${isHi ? "HIGH" : "LOW"}`; desc = "Institutional sweep of EQH/EQL or named level — delta confirmed, reversal likely"; }
+        else if (txt === "SR")      { header = `STOP RUN ${isHi ? "HIGH" : "LOW"}`; desc = "Sweep without delta confirmation — stops taken, direction unclear"; }
+        else if (txt === "FS")      { header = `FAILED SWEEP ${isHi ? "HIGH" : "LOW"}`; desc = "Price accepted beyond level — potential breakout, not a reversal"; }
+        else if (txt.startsWith("EQH")) { header = "EQUAL HIGH"; desc = "Retail stop cluster — two+ pivots within 0.15%. Prime institutional sweep target before reversal"; }
+        else if (txt.startsWith("EQL")) { header = "EQUAL LOW";  desc = "Retail stop cluster — two+ pivots within 0.15%. Prime institutional sweep target before reversal"; }
+        else if (txt.startsWith("ABS")) { header = `ABSORPTION ${isHi ? "SELL" : "BUY"}`; desc = "Large passive volume at extreme with minimal movement — potential reversal signal"; }
+        return (
+          <div style={{
+            position: "absolute", left: tx, top: ty,
+            background: "rgba(13,13,13,0.92)", border: "1px solid #2a2a2a",
+            borderRadius: 3, padding: "6px 8px", pointerEvents: "none",
+            zIndex: 20, minWidth: W, fontFamily: "JetBrains Mono, monospace",
+            fontSize: 11, color: "#bbb", lineHeight: 1.5,
+          }}>
+            <div style={{ color: m.color, fontWeight: 700 }}>{header}</div>
+            {desc && <div style={{ color: "#888", marginTop: 2 }}>{desc}</div>}
           </div>
         );
       })()}

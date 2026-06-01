@@ -819,6 +819,8 @@ def _build_snapshot(settings: dict, symbol: str, tf: str, minutes: int,
         from pipeline.features.sweep import read_sweep_log as _read_sweep_log
         _since = bars[0]["ts"] if bars else 0
         historical_sweeps = _read_sweep_log(symbol, since_ts=_since, tf=tf)
+        for _s in historical_sweeps:
+            _s.setdefault("source", "level")
     except Exception:
         pass
 
@@ -860,6 +862,15 @@ def _build_snapshot(settings: dict, symbol: str, tf: str, minutes: int,
                     })
     except Exception as _e:
         LOG.warning(f"[dashboard] swing_points failed: {_e}")
+
+    # Swing-derived sweeps — sweeps OF the displayed same-TF swing highs/lows.
+    # Appended alongside the level-based log sweeps (source="level").
+    try:
+        from pipeline.features.sweep import detect_swing_sweeps as _dss
+        if raw_bars and swing_points:
+            historical_sweeps = historical_sweeps + _dss(raw_bars, swing_points)
+    except Exception as _e:
+        LOG.warning(f"[dashboard] swing_sweeps failed: {_e}")
 
     return {
         "symbol": symbol,
