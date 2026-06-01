@@ -211,7 +211,7 @@ def emit_candidates(symbol: str, tf: str):
         winner = "short" if absorbs[-1].side == "sell" else "long"
         post = bars[i + 1:i + 1 + confirm_within]
         _patch_store(bars, i + 1 + len(post))
-        confirmed = bool(post) and inst._confirm(winner, post, bars[:i + 1 + len(post)])
+        confirmed = bool(post) and inst._confirm(winner, b, post, bars[:i + 1 + len(post)])
         # forward outcome label
         a = atr(bars[:i + 1]) or 0.0
         fwd = bars[i + 1:i + 1 + CONT_N]

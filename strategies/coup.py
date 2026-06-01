@@ -12,8 +12,11 @@ Thesis (per user):
                 buyers absorbed at top  → canonical Absorption.side=="sell" → winner SHORT
                 sellers absorbed at low → canonical Absorption.side=="buy"  → winner LONG
   2. CONFIRM  — wait (≤ confirm_within bars) for the winner side to aggress *with
-                result*: a new same-side stacked imbalance, or a CVD pattern in
-                the winner direction.
+                result*: a post bar where winner-direction delta dominates
+                (|delta|/vol ≥ confirm_delta_ratio) AND it produced a result —
+                a fresh winner-side stacked imbalance or price progress past the
+                trigger close. Fallback: a CVD pattern in the winner direction
+                with confidence ≥ confirm_cvd_conf.
   3. ENTRY    — single tactical entry at the current candle close (Phase 1).
                 Structural SL just beyond the trigger candle's absorbed extreme.
   4. EXIT     — the winner side in turn getting absorbed at an extreme (the mirror
@@ -135,7 +138,7 @@ class Coup(Strategy):
         post = bars[t_idx + 1:]
         if not post or len(post) > confirm_within:
             return None  # not yet, or trigger went stale
-        if not self._confirm(winner, post, bars):
+        if not self._confirm(winner, t_bar, post, bars):
             return None
 
         # ── 3. ENTRY — single tactical entry; price per entry_mode ──
@@ -206,19 +209,44 @@ class Coup(Strategy):
                 found = (base + off, winner, b)  # keep the most recent
         return found
 
-    @staticmethod
-    def _confirm(winner: str, post: list[Bar], bars: list[Bar]) -> bool:
-        """Winner side aggresses with result after the trigger."""
-        target = "buy" if winner == "long" else "sell"
+    def _confirm(self, winner: str, t_bar: Bar, post: list[Bar], bars: list[Bar]) -> bool:
+        """Winner side aggresses *with result* after the trigger.
+
+        Stronger than mere presence of a same-side stacked imbalance (which a
+        balanced bar can carry): require a post bar where the winner side is the
+        dominant aggressor (signed delta in the winner direction ≥ a fraction of
+        that bar's volume) AND that aggression produced a result — a fresh
+        winner-side stacked imbalance, or price progress past the trigger close.
+        CVD fallback is gated on real confidence, not bare pattern membership.
+        """
+        cfg = self.config
+        dr_min = float(cfg.get("confirm_delta_ratio", 0.25))
+        cvd_conf_min = float(cfg.get("confirm_cvd_conf", 0.60))
+        need_progress = bool(cfg.get("confirm_require_progress", True))
+        long = winner == "long"
+        target = "buy" if long else "sell"
+        ref = t_bar.ohlc.c  # continuation reference
+
         for b in post:
-            zones = stacked_imbalances(build_fp(b), min_stack=3)
-            if any(z.side == target for z in zones):
+            total = self._total_vol(b)
+            d = b.delta or 0.0
+            # aggression: winner-direction delta dominates this bar
+            aggressive = (d > 0 if long else d < 0) and abs(d) / max(total, 1e-9) >= dr_min
+            if not aggressive:
+                continue
+            # result: fresh winner-side stacked imbalance, or price progress
+            has_zone = any(z.side == target for z in stacked_imbalances(build_fp(b), min_stack=3))
+            progressed = (b.ohlc.c > ref) if long else (b.ohlc.c < ref)
+            if has_zone or (not need_progress) or progressed:
                 return True
+
+        # CVD fallback — require real confidence, matching side
         sig = cvd_detect(bars[-20:])
-        if winner == "long" and sig.pattern in _CVD_LONG:
-            return True
-        if winner == "short" and sig.pattern in _CVD_SHORT:
-            return True
+        if sig.confidence >= cvd_conf_min:
+            if long and sig.pattern in _CVD_LONG:
+                return True
+            if not long and sig.pattern in _CVD_SHORT:
+                return True
         return False
 
     # ── entry variants (A/B which fill is best) ──────────────────────────────────

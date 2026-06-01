@@ -44,6 +44,9 @@ strategies:
       vol_mult: 1.8         # trigger bar total vol ≥ this × 20-bar median
       delta_ratio: 0.35     # trigger |delta| / total vol floor
       confirm_within: 3     # bars after trigger to confirm winner aggression
+      confirm_delta_ratio: 0.25   # post bar |delta|/vol floor to count as winner aggression
+      confirm_cvd_conf: 0.60      # min CVD signal confidence for the fallback confirm
+      confirm_require_progress: true  # require price progress past trigger close (else stack alone ok)
       entry_mode: range     # close | imbalance | lvn | range. range best across all SL
       range_pct: 0.5        # entry_mode=range: retrace into trigger candle (0.5=mid)
       sl_mode: imbalance    # candle | swing | imbalance
