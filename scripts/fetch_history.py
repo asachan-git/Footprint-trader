@@ -175,13 +175,22 @@ def download_and_store(
     print(f"  Downloaded {len(raw)} bars from Bybit")
 
     s = store()
-    injected = 0
+    # Dedup by close_ts, not bar_id: real bars from some live feeds (e.g. Binance
+    # gold remapped XAUUSDT→XAUTUSDT) historically carried a bar_id hash keyed to
+    # the source symbol, so a synthetic bar at the same minute would NOT collide on
+    # bar_id and would duplicate the real bar. Skip any minute already present.
+    existing_ts = {bar.close_ts for bar in s.recent(symbol, "1m", 10_000_000)}
+    injected = skipped = 0
     for b in raw:
+        if b["ts"] in existing_ts:
+            skipped += 1
+            continue
         bar = _build_synthetic_bar(symbol, "1m", b, price_step)
         if s.put(bar):
             injected += 1
+            existing_ts.add(b["ts"])
 
-    print(f"  Injected {injected} new bars into state_store")
+    print(f"  Injected {injected} new bars into state_store ({skipped} minutes already present, skipped)")
     return injected
 
 
