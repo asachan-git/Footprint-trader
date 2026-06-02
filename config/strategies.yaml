@@ -43,6 +43,15 @@ strategies:
       lookback: 6           # bars back to search for an un-acted trigger
       vol_mult: 1.8         # trigger bar total vol ≥ this × 20-bar median
       delta_ratio: 0.35     # trigger |delta| / total vol floor
+      # absorption_mode: momentum | canonical. A/B'd on BTCUSDT 15m (2026-06-02):
+      #   momentum  (winner side already dominant at the extreme — a one-sided/
+      #     CONTINUATION candle): range+imbalance n=12 75% +0.69R; candidates
+      #     avgMFE 1.68 / MAE 1.25; confirmed cont 67%. THIS is coup's real edge.
+      #   canonical (textbook absorption — aggressor pushes the extreme & is
+      #     rejected): n=5-6 17-40% win, mostly negative; avgMFE 0.97 / MAE 1.85
+      #     (drifts AGAINST). True absorption is NOT tradeable here.
+      # Verdict: coup is a CONTINUATION strategy, not absorption. Keep momentum.
+      absorption_mode: momentum
       confirm_within: 3     # bars after trigger to confirm winner aggression
       confirm_delta_ratio: 0.25   # post bar |delta|/vol floor to count as winner aggression
       confirm_cvd_conf: 0.60      # min CVD signal confidence for the fallback confirm
@@ -56,4 +65,26 @@ strategies:
       #     bias fill-rate. Re-sweep as the footprint store grows.
       sl_buffer_pct: 0.10   # buffer beyond the chosen level, × trigger candle range
       swing_lookback: 3     # ±bars for swing pivots (sl_mode=swing)
+      flip_exit: true
+
+  # coup_reversal = coup engine in REVERSAL absorption mode (user's observed
+  # pattern: high-vol candle CLOSING with a wick rejection of an extreme + a
+  # bottom/top volume fight + next-candle follow-through). Rare on BTC 15m (~5
+  # confirmed/1500 bars) — runs in paper ALONGSIDE momentum coup to accumulate
+  # real samples. Own store: data/strategies/coup_reversal/.
+  - name: coup_reversal
+    enabled: true
+    config:
+      symbols: [BTCUSDT]
+      decide_tf: 15m
+      absorption_mode: reversal
+      vol_lookback: 10      # high vol vs last ~10 candles
+      lookback: 6
+      vol_mult: 1.8
+      confirm_within: 2     # next candle(s) must show winner follow-through
+      confirm_delta_ratio: 0.25
+      confirm_require_progress: true
+      entry_mode: close     # enter on the confirming candle (not a retrace)
+      sl_mode: candle       # structural beyond the rejected extreme
+      sl_buffer_pct: 0.10
       flip_exit: true

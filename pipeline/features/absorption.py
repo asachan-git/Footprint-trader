@@ -107,11 +107,27 @@ def detect_close_failure_absorption(
     return tuple(out)
 
 
-def detect_canonical_absorption(bar: Bar, fp: FootprintMatrix) -> tuple[Absorption, ...]:
-    """Canonical absorption: delta at bar extreme is OPPOSITE to bar direction.
+def detect_canonical_absorption(bar: Bar, fp: FootprintMatrix,
+                                mode: str = "momentum") -> tuple[Absorption, ...]:
+    """Absorption at a bar extreme. Convention: ask_vol = aggressive BUYs,
+    bid_vol = aggressive SELLs (see bybit/footprint_builder.py).
 
-    Bear candle (close < open): buy-vol dominant in upper 10% = bearish signal (buyers absorbed).
-    Bull candle (close > open): sell-vol dominant in lower 10% = bullish signal (sellers absorbed).
+    Two selection modes (the ratio threshold and returned side are unchanged;
+    only WHICH cells must dominate at the extreme differs):
+
+      momentum (default, legacy behaviour) — the *winning* side already dominates
+        the extreme: bear candle with bid(sell) dominant in upper 10%, or bull
+        candle with ask(buy) dominant in lower 10%. This is really a
+        one-sided/continuation candle, NOT textbook absorption, but it is what
+        coup has traded historically — kept as default until the A/B proves out.
+
+      canonical — true absorption: the *aggressor* side pushes into the extreme
+        and is absorbed (rejected). Bear candle with ask(buy) dominant in the
+        upper 10% = buyers pushed the high and failed → buyers absorbed → short.
+        Bull candle with bid(sell) dominant in the lower 10% = sellers pushed the
+        low and failed → sellers absorbed → long.
+
+    side encodes the WINNER ("sell" → short, "buy" → long) in both modes.
     """
     if not bar.bid_ladder or not bar.ask_ladder:
         return ()
@@ -121,21 +137,68 @@ def detect_canonical_absorption(bar: Bar, fp: FootprintMatrix) -> tuple[Absorpti
     if total_range <= 0:
         return ()
 
+    canonical = mode == "canonical"
     is_bear = c < o
     is_bull = c > o
     extreme_zone = total_range * 0.10
 
     results: list[Absorption] = []
 
+    # ── reversal mode (user's observed pattern) ──────────────────────────────
+    # LONG: candle CLOSES up (sellers trapped) with a lower-wick REJECTION of the
+    #   low, a real volume fight at the bottom, and buyers control there
+    #   (aggressive buying ask-dominant) OR sellers were absorbed (bid heavy but
+    #   price rejected up). SHORT = mirror at the high. The decisive next-candle
+    #   follow-through is enforced separately by coup._confirm.
+    if mode == "reversal":
+        REJ_MIN = 0.33      # wick rejecting the extreme ≥ 1/3 of range
+        BOT_FRAC = 0.10     # ≥10% of bar volume traded in the extreme zone
+        bar_total = (fp.total_bid + fp.total_ask) if fp else 0.0
+        if bar_total <= 0:
+            return ()
+        if is_bull:
+            lo_t = l + extreme_zone
+            lo_ask = sum(v.vol for v in bar.ask_ladder if v.price <= lo_t)
+            lo_bid = sum(v.vol for v in bar.bid_ladder if v.price <= lo_t)
+            lo_tot = lo_ask + lo_bid
+            lower_wick = (min(o, c) - l) / total_range
+            buyers_win = lo_ask >= lo_bid                  # aggressive buying
+            sellers_absorbed = lo_bid >= 1.5 * max(lo_ask, 1e-9)   # bid heavy, rejected
+            if (lower_wick >= REJ_MIN and lo_tot / bar_total >= BOT_FRAC
+                    and lo_tot > 0 and (buyers_win or sellers_absorbed)):
+                results.append(Absorption(
+                    price=l, side="buy", volume=int(lo_tot), bar_pct=lo_tot / bar_total,
+                    is_wick_trap=lower_wick >= 0.30,
+                ))
+        if is_bear:
+            up_t = h - extreme_zone
+            up_ask = sum(v.vol for v in bar.ask_ladder if v.price >= up_t)
+            up_bid = sum(v.vol for v in bar.bid_ladder if v.price >= up_t)
+            up_tot = up_ask + up_bid
+            upper_wick = (h - max(o, c)) / total_range
+            sellers_win = up_bid >= up_ask                 # aggressive selling
+            buyers_absorbed = up_ask >= 1.5 * max(up_bid, 1e-9)   # ask heavy, rejected
+            if (upper_wick >= REJ_MIN and up_tot / bar_total >= BOT_FRAC
+                    and up_tot > 0 and (sellers_win or buyers_absorbed)):
+                results.append(Absorption(
+                    price=h, side="sell", volume=int(up_tot), bar_pct=up_tot / bar_total,
+                    is_wick_trap=upper_wick >= 0.30,
+                ))
+        return tuple(results)
+
     if is_bear:
         upper_threshold = h - extreme_zone
         upper_bid = sum(lvl.vol for lvl in bar.bid_ladder if lvl.price >= upper_threshold)
         upper_ask = sum(lvl.vol for lvl in bar.ask_ladder if lvl.price >= upper_threshold)
         upper_total = upper_bid + upper_ask
-        if upper_total > 0 and upper_ask > 0 and upper_bid / upper_ask >= 1.5:
+        # canonical: buyers (ask) pushed the high and were absorbed → ask must dominate
+        # momentum: sellers (bid) already dominant at the high
+        num, den = (upper_ask, upper_bid) if canonical else (upper_bid, upper_ask)
+        dom = upper_ask if canonical else upper_bid
+        if upper_total > 0 and den > 0 and num / den >= 1.5:
             wick_pct = (h - max(o, c)) / total_range
             results.append(Absorption(
-                price=h, side="sell", volume=int(upper_total), bar_pct=upper_bid / upper_total,
+                price=h, side="sell", volume=int(upper_total), bar_pct=dom / upper_total,
                 is_wick_trap=wick_pct >= 0.30,
             ))
 
@@ -144,10 +207,14 @@ def detect_canonical_absorption(bar: Bar, fp: FootprintMatrix) -> tuple[Absorpti
         lower_ask = sum(lvl.vol for lvl in bar.ask_ladder if lvl.price <= lower_threshold)
         lower_bid = sum(lvl.vol for lvl in bar.bid_ladder if lvl.price <= lower_threshold)
         lower_total = lower_bid + lower_ask
-        if lower_total > 0 and lower_bid > 0 and lower_ask / lower_bid >= 1.5:
+        # canonical: sellers (bid) pushed the low and were absorbed → bid must dominate
+        # momentum: buyers (ask) already dominant at the low
+        num, den = (lower_bid, lower_ask) if canonical else (lower_ask, lower_bid)
+        dom = lower_bid if canonical else lower_ask
+        if lower_total > 0 and den > 0 and num / den >= 1.5:
             wick_pct = (min(o, c) - l) / total_range
             results.append(Absorption(
-                price=l, side="buy", volume=int(lower_total), bar_pct=lower_ask / lower_total,
+                price=l, side="buy", volume=int(lower_total), bar_pct=dom / lower_total,
                 is_wick_trap=wick_pct >= 0.30,
             ))
 

@@ -7,6 +7,14 @@ join the side that did the absorbing — the new winner — and ride it for
 continuation. Unlike democracy/republic (a weighted vote panel), coup is a
 single decisive event off the footprint, not a poll.
 
+NOTE on the mechanic (validated 2026-06-02): coup was conceived as "absorption→
+continuation", but an A/B on the absorption detector showed the edge comes from
+the `momentum` selection (the winner side already dominant at the extreme — a
+one-sided/CONTINUATION candle), NOT textbook absorption (`canonical`, where the
+aggressor pushes the extreme and is rejected — that variant backtests negative).
+So coup is really a high-volume CONTINUATION strategy. `absorption_mode` config
+selects the variant (default momentum). See config/strategies.yaml.
+
 Thesis (per user):
   1. TRIGGER  — high-vol + high-|delta| 15m candle, extreme aggressor absorbed.
                 buyers absorbed at top  → canonical Absorption.side=="sell" → winner SHORT
@@ -113,18 +121,21 @@ class Coup(Strategy):
         entry_mode = str(cfg.get("entry_mode", "close"))     # close | imbalance | lvn | range
         range_pct = float(cfg.get("range_pct", 0.5))         # entry_mode=range: pullback into candle
 
-        bars = store().recent(symbol, decide_tf, 25)
-        if len(bars) < 8:
+        vol_lookback = int(cfg.get("vol_lookback", 20))   # candles for the vol median
+        bars = store().recent(symbol, decide_tf, max(25, vol_lookback + 5))
+        if len(bars) < min(8, vol_lookback):
             return None
 
-        # rolling median of total bar volume over the last 20 bars.
-        totals = [t for t in (self._total_vol(b) for b in bars[-20:]) if t > 0]
+        # rolling median of total bar volume over the last `vol_lookback` bars.
+        totals = [t for t in (self._total_vol(b) for b in bars[-vol_lookback:]) if t > 0]
         med = median(totals) if totals else 0.0
         if med <= 0:
             return None
 
         # ── 1. TRIGGER — most recent high-vol/high-delta absorption in window ──
-        trigger = self._find_trigger(bars, lookback, vol_mult * med, delta_ratio)
+        absorption_mode = str(cfg.get("absorption_mode", "momentum"))
+        trigger = self._find_trigger(bars, lookback, vol_mult * med, delta_ratio,
+                                     absorption_mode)
         if trigger is None:
             return None
         t_idx, winner, t_bar = trigger
@@ -192,19 +203,23 @@ class Coup(Strategy):
         return fp.total_bid + fp.total_ask
 
     def _find_trigger(self, bars: list[Bar], lookback: int, vol_floor: float,
-                      delta_ratio: float):
+                      delta_ratio: float, absorption_mode: str = "momentum"):
         """Return (idx, winner_side, trigger_bar) for the most recent qualifying
         trigger in the lookback window, else None."""
         scan = bars[-lookback:]
         base = len(bars) - len(scan)
         found = None
+        # reversal candles are two-sided (wick + fight at the extreme) → low NET
+        # |delta|; the |delta| gate (a momentum/one-sided test) would exclude them.
+        # The reversal detector enforces direction itself, so skip the gate there.
+        skip_delta_gate = absorption_mode == "reversal"
         for off, b in enumerate(scan):
             total = self._total_vol(b)
             if total < vol_floor:
                 continue
-            if b.delta is None or abs(b.delta) / max(total, 1e-9) < delta_ratio:
+            if not skip_delta_gate and (b.delta is None or abs(b.delta) / max(total, 1e-9) < delta_ratio):
                 continue
-            for a in detect_canonical_absorption(b, build_fp(b)):
+            for a in detect_canonical_absorption(b, build_fp(b), mode=absorption_mode):
                 winner = "short" if a.side == "sell" else "long"
                 found = (base + off, winner, b)  # keep the most recent
         return found

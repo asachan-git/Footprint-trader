@@ -46,6 +46,11 @@ CONT_ATR = 1.0      # winner-dir move ≥ this × ATR within CONT_N = continuati
 
 COUP_DIR = ROOT / "data" / "strategies" / "coup"
 
+# Absorption selection mode for the A/B (momentum | canonical | reversal).
+# Set from CLI: `--absorption reversal`. vol_lookback via `--vollb 10`.
+ABS_MODE = "momentum"
+VOL_LB = 20
+
 
 class _Slice:
     def __init__(self, bars, upto):
@@ -95,7 +100,8 @@ def _try_fill(side, entry, future) -> int | None:
 
 def _run_combo(symbol, tf, bars, em, sm) -> tuple[int, int, list[dict]]:
     """Return (signals, filled, trades[]) for one entry_mode × sl_mode combo."""
-    inst = Coup(config={"symbols": [symbol], "entry_mode": em, "sl_mode": sm})
+    inst = Coup(config={"symbols": [symbol], "entry_mode": em, "sl_mode": sm,
+                        "absorption_mode": ABS_MODE, "vol_lookback": VOL_LB})
     signals = filled = 0
     trades: list[dict] = []
     open_until = -1
@@ -188,7 +194,7 @@ def emit_candidates(symbol: str, tf: str):
     bars = store().recent(symbol, tf, 10_000_000)
     if len(bars) < 60:
         print("not enough bars"); return
-    inst = Coup(config={"symbols": [symbol]})
+    inst = Coup(config={"symbols": [symbol], "absorption_mode": ABS_MODE})
     cfg = inst.config
     vol_mult = float(cfg.get("vol_mult", 1.8))
     delta_ratio = float(cfg.get("delta_ratio", 0.35))
@@ -205,7 +211,7 @@ def emit_candidates(symbol: str, tf: str):
             continue
         if b.delta is None or abs(b.delta) / max(total, 1e-9) < delta_ratio:
             continue
-        absorbs = detect_canonical_absorption(b, fp)
+        absorbs = detect_canonical_absorption(b, fp, mode=ABS_MODE)
         if not absorbs:
             continue
         winner = "short" if absorbs[-1].side == "sell" else "long"
@@ -249,6 +255,11 @@ def emit_candidates(symbol: str, tf: str):
 if __name__ == "__main__":
     sym = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "BTCUSDT"
     tf = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("-") else "15m"
+    if "--absorption" in sys.argv:
+        ABS_MODE = sys.argv[sys.argv.index("--absorption") + 1]
+    if "--vollb" in sys.argv:
+        VOL_LB = int(sys.argv[sys.argv.index("--vollb") + 1])
+    print(f"[absorption_mode={ABS_MODE} vol_lookback={VOL_LB}]")
     if "--emit" in sys.argv:
         j = sys.argv.index("--emit")
         emit_trades(sym, tf, sys.argv[j + 1], sys.argv[j + 2])
