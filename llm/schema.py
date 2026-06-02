@@ -18,7 +18,7 @@ class Decision(BaseModel):
     entry: float | None = Field(None, description="Entry price; required if side != flat")
     stop_loss: float | None = Field(None, description="Stop loss; required if side != flat")
     take_profit: float | None = Field(None, description="Take profit; required if side != flat")
-    confidence: float = Field(ge=0.0, le=1.0, description="0..1 model confidence")
+    confidence: float = Field(ge=0.0, le=1.0, description="0..1 confidence. NOTE: for the rules engine (democracy/republic) this is bias_strength/5 — NOT a calibrated win-probability. Validated 2026-06-02: outcome is flat across bias buckets under raw-direction, 2R-bracket AND real-grid-R labels. Use as an exposure/ordering proxy + the hedge-eval min-conf gate only; not P(win) until calibrated on cross-regime data.")
     rationale: str = Field(default="", description="Full prose summary of the trade thesis")
     # Structured reasoning breakdown (non-flat decisions)
     entry_reasoning: str = Field(default="", description="2-3 bullet points (- prefix) citing specific footprint/VP levels that confirm the entry")

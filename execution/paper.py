@@ -177,6 +177,7 @@ class PaperExecutor:
             entry=round(leg1.price, 4),
             stop_loss=plan.safety_sl if plan.safety_sl is not None else (leg1.price * 0.95 if plan.side == "long" else leg1.price * 1.05),
             take_profit=plan.take_profit,
+            # bias/5 — exposure/ordering proxy, NOT a calibrated win-probability.
             confidence=min(1.0, plan.bias_strength / 5.0),
             rationale=f"grid leg1 anchor (bias={plan.bias_strength}/5)",
             grid_leg=1,

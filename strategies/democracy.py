@@ -45,6 +45,8 @@ class Democracy(Strategy):
             entry=close,
             stop_loss=sl,
             take_profit=tp,
+            # NOT a calibrated win-probability — bias/5 is flat vs outcome
+            # (validated 2026-06-02). Exposure-scaling + hedge-gate proxy only.
             confidence=min(1.0, dd.bias_strength / 5.0),
             bias_strength=dd.bias_strength,
             rationale=(
