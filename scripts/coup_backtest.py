@@ -50,6 +50,7 @@ COUP_DIR = ROOT / "data" / "strategies" / "coup"
 # Set from CLI: `--absorption reversal`. vol_lookback via `--vollb 10`.
 ABS_MODE = "momentum"
 VOL_LB = 20
+CONF_DR = 0.25   # confirm_delta_ratio; CLI --confdr
 
 
 class _Slice:
@@ -101,7 +102,8 @@ def _try_fill(side, entry, future) -> int | None:
 def _run_combo(symbol, tf, bars, em, sm) -> tuple[int, int, list[dict]]:
     """Return (signals, filled, trades[]) for one entry_mode × sl_mode combo."""
     inst = Coup(config={"symbols": [symbol], "entry_mode": em, "sl_mode": sm,
-                        "absorption_mode": ABS_MODE, "vol_lookback": VOL_LB})
+                        "absorption_mode": ABS_MODE, "vol_lookback": VOL_LB,
+                        "confirm_delta_ratio": CONF_DR})
     signals = filled = 0
     trades: list[dict] = []
     open_until = -1
@@ -259,7 +261,9 @@ if __name__ == "__main__":
         ABS_MODE = sys.argv[sys.argv.index("--absorption") + 1]
     if "--vollb" in sys.argv:
         VOL_LB = int(sys.argv[sys.argv.index("--vollb") + 1])
-    print(f"[absorption_mode={ABS_MODE} vol_lookback={VOL_LB}]")
+    if "--confdr" in sys.argv:
+        CONF_DR = float(sys.argv[sys.argv.index("--confdr") + 1])
+    print(f"[absorption_mode={ABS_MODE} vol_lookback={VOL_LB} confirm_dr={CONF_DR}]")
     if "--emit" in sys.argv:
         j = sys.argv.index("--emit")
         emit_trades(sym, tf, sys.argv[j + 1], sys.argv[j + 2])

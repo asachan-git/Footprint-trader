@@ -81,10 +81,23 @@ strategies:
       vol_lookback: 10      # high vol vs last ~10 candles
       lookback: 6
       vol_mult: 1.8
+      # Tuned from data/reports/absorption_observations_granular.md (39 reversal
+      # candles): next-candle PROGRESSION is the edge — progressed/closeWith
+      # flips continuation 51%→78%, full follow-through (dWith+closeWith+prog)
+      # →91%. coup's 0.25 next-bar delta-magnitude gate was too strict (fired
+      # only 3×), rejecting winners that progressed with small delta. So require
+      # winner-direction delta SIGN + price progression, not magnitude.
+      # (Also observed: extWick≥0.5 and vol≥3× continue LESS — climax/exhaustion
+      # — so we do NOT chase giant wicks/vol spikes.)
       confirm_within: 2     # next candle(s) must show winner follow-through
-      confirm_delta_ratio: 0.25
-      confirm_require_progress: true
-      entry_mode: close     # enter on the confirming candle (not a retrace)
-      sl_mode: candle       # structural beyond the rejected extreme
+      confirm_delta_ratio: 0.05   # winner-direction delta SIGN (not magnitude)
+      confirm_require_progress: true   # next candle must progress past trigger close
+      # entry/SL A/B'd on the 39-candle obs at confdr=0.05 (coup_backtest
+      # --absorption reversal --vollb 10 --confdr 0.05): imbalance+imbalance best
+      # (n=9, 56% win, +3.00R, avgR+0.33). close+candle was WORST (-1.67R);
+      # range entry 0% win (retrace makes no sense for a reversal). PROVISIONAL
+      # n=9 on one down-week — paper-validate.
+      entry_mode: imbalance # limit at winner-side imbalance zone edge (fills ~100%)
+      sl_mode: imbalance    # far edge of the winner-side imbalance zone
       sl_buffer_pct: 0.10
       flip_exit: true
