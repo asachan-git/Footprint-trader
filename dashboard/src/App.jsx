@@ -1,11 +1,11 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import CandleChart from "./components/CandleChart.jsx";
 import FootprintPane from "./components/FootprintPane.jsx";
 import VoteBreakdown from "./components/VoteBreakdown.jsx";
 import DecisionCards from "./components/DecisionCards.jsx";
 import Positions from "./components/Positions.jsx";
 import ABStats from "./components/ABStats.jsx";
-import { fetchStrategyTrades } from "./api.js";
+import { fetchStrategyTrades, fetchGridTrades, fetchStrategyCycles, fetchGridCycles } from "./api.js";
 
 const SYMBOLS  = ["BTCUSDT", "XAUTUSDT"];
 const TFS      = ["1m", "5m", "15m"];
@@ -16,7 +16,8 @@ const LS_IND_KEY  = "fb_indicators_v1";
 const DEFAULT_IND = {
   sweepArrows: true,  eqLevels: true,   pivotLines: false, nakedPocs: true,  priorPoc: true,
   liveSweep:   true,  srFsSweeps: false, fvgLines:  false,  priorVa:   false, absorptions: false,
-  coupTrades:  true,
+  coupTrades:  true,  demoTrades: true, repTrades: true,
+  m1Trades:    false, m2Trades: false, cycleTrades: false,
 };
 
 const IND_ITEMS = [
@@ -30,7 +31,12 @@ const IND_ITEMS = [
   { key: "priorVa",      label: "Prior VA (H/L)",         tip: "Prior session Value Area High/Low — 70% of prior-day volume traded between these two levels" },
   { key: "fvgLines",     label: "FVGs",                   tip: "Fair Value Gaps — 3-bar imbalance zones where price moved too fast; often filled on retest" },
   { key: "absorptions",  label: "Absorptions",            tip: "Absorption — large passive volume at price extreme with minimal bar movement; potential reversal signal" },
-  { key: "coupTrades",   label: "Coup Trades",            tip: "coup strategy entries/exits (15m). Backtest + live: entry/exit arrows, SL/TP segments, win/loss colored" },
+  { key: "coupTrades",   label: "Coup Trades",            tip: "coup strategy entries/exits (15m, orange). Backtest + live: entry/exit arrows, SL/TP segments" },
+  { key: "demoTrades",   label: "Democracy Trades",       tip: "democracy strategy live paper trades (15m, blue). Entry arrow + SL/TP segments; hover for reason" },
+  { key: "repTrades",    label: "Republic Trades",        tip: "republic strategy live paper trades (15m, purple, tight-SL). Entry arrow + SL/TP segments; hover for reason" },
+  { key: "m1Trades",     label: "M1 Trades (history)",    tip: "Mode-1 Claude-direction grid trade history (15m, teal). Open/closed entries + SL/TP; hover for open time, reason, R" },
+  { key: "m2Trades",     label: "M2 Trades (history)",    tip: "Mode-2 rules grid trade history (15m, amber). Open/closed entries + SL/TP; hover for open time, reason, R" },
+  { key: "cycleTrades",  label: "Cycle Trades",           tip: "Grid recovery cycles (dashed boxes) for the enabled strategies/modes. Shows cycle # + chain; hover for realized PnL + reason" },
 ];
 
 function LayersToggle({ indicators, onChange }) {
@@ -147,18 +153,57 @@ export default function App() {
   const [data,      setData]      = useState(null);
   const [stale,     setStale]     = useState(false);
   const [lastTs,    setLastTs]    = useState(null);
-  const [coupTrades, setCoupTrades] = useState([]);
+  const [stratTrades, setStratTrades] = useState({ coup: [], democracy: [], republic: [], m1: [], m2: [] });
+  const [stratCycles, setStratCycles] = useState({ coup: [], democracy: [], republic: [], m1: [] });
   const esRef = useRef(null);
 
-  // coup trades for the chart overlay (backtest + live). Backend filters by
-  // symbol/tf; trade ts only align to 15m bars, so the overlay shows on 15m.
+  // Strategy + grid-mode trades + cycles for the chart overlay. coup =
+  // backtest+live, democracy/republic = live paper, m1/m2 = grid-mode history.
+  // Backend filters by symbol/tf; all entries are 15m. Refreshed on symbol/tf
+  // change + every 30s so new live entries appear without a reload.
   useEffect(() => {
     let cancel = false;
-    fetchStrategyTrades("coup", symbol, tf, "all")
-      .then(t => { if (!cancel) setCoupTrades(t); })
-      .catch(() => { if (!cancel) setCoupTrades([]); });
-    return () => { cancel = true; };
+    const load = () => {
+      Promise.all([
+        fetchStrategyTrades("coup", symbol, tf, "all").catch(() => []),
+        fetchStrategyTrades("democracy", symbol, tf, "live").catch(() => []),
+        fetchStrategyTrades("republic", symbol, tf, "live").catch(() => []),
+        fetchGridTrades("m1", symbol, tf).catch(() => []),
+        fetchGridTrades("m2", symbol, tf).catch(() => []),
+        fetchStrategyCycles("coup", symbol, tf).catch(() => []),
+        fetchStrategyCycles("democracy", symbol, tf).catch(() => []),
+        fetchStrategyCycles("republic", symbol, tf).catch(() => []),
+        fetchGridCycles("m1", symbol, tf).catch(() => []),
+      ]).then(([coup, democracy, republic, m1, m2, cCoup, cDemo, cRep, cM1]) => {
+        if (cancel) return;
+        setStratTrades({ coup, democracy, republic, m1, m2 });
+        setStratCycles({ coup: cCoup, democracy: cDemo, republic: cRep, m1: cM1 });
+      });
+    };
+    load();
+    const id = setInterval(load, 30000);
+    return () => { cancel = true; clearInterval(id); };
   }, [symbol, tf]);
+
+  // Merge enabled strategies/modes into one tagged array for the chart (15m).
+  const strategyTrades = useMemo(() => {
+    if (tf !== "15m") return [];
+    const tag = (arr, name) => (arr || []).map(t => ({ ...t, strategy: name }));
+    const out = [];
+    if (indicators.coupTrades !== false) out.push(...tag(stratTrades.coup, "coup"));
+    if (indicators.demoTrades !== false) out.push(...tag(stratTrades.democracy, "democracy"));
+    if (indicators.repTrades  !== false) out.push(...tag(stratTrades.republic, "republic"));
+    if (indicators.m1Trades) out.push(...tag(stratTrades.m1, "m1"));
+    if (indicators.m2Trades) out.push(...tag(stratTrades.m2, "m2"));
+    if (indicators.cycleTrades) {
+      if (indicators.coupTrades !== false) out.push(...tag(stratCycles.coup, "coup"));
+      if (indicators.demoTrades !== false) out.push(...tag(stratCycles.democracy, "democracy"));
+      if (indicators.repTrades  !== false) out.push(...tag(stratCycles.republic, "republic"));
+      if (indicators.m1Trades) out.push(...tag(stratCycles.m1, "m1"));
+    }
+    return out;
+  }, [stratTrades, stratCycles, indicators.coupTrades, indicators.demoTrades,
+      indicators.repTrades, indicators.m1Trades, indicators.m2Trades, indicators.cycleTrades, tf]);
   // Shared visible-time-range across FP ↔ Candle. Each pane writes on pan,
   // reads on becoming visible. Ref, not state, so no re-render loops.
   const rangeRef = useRef(null);  // {from: ts, to: ts} | null
@@ -290,6 +335,7 @@ export default function App() {
             nakedPocs={data?.naked_pocs ?? []}
             historicalSweeps={data?.historical_sweeps ?? []}
             swingPoints={data?.swing_points ?? []}
+            strategyTrades={strategyTrades}
             symbol={symbol}
             indicators={indicators}
           />
@@ -309,7 +355,7 @@ export default function App() {
             nakedPocs={data?.naked_pocs ?? []}
             historicalSweeps={data?.historical_sweeps ?? []}
             swingPoints={data?.swing_points ?? []}
-            coupTrades={tf === "15m" && indicators.coupTrades !== false ? coupTrades : []}
+            strategyTrades={strategyTrades}
             symbol={symbol}
             chartMode={chartMode}
             indicators={indicators}

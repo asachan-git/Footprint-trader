@@ -100,7 +100,8 @@ function inferTickSize(bars) {
 
 export default function FootprintPane({
   bars, dailyVp, priorVp, detections, positions, pendingOrders, nakedPocs,
-  closedPositions, cvd, cvdSignal, zones, latestM2, historicalSweeps, swingPoints, symbol, indicators,
+  closedPositions, cvd, cvdSignal, zones, latestM2, historicalSweeps, swingPoints,
+  strategyTrades = [], symbol, indicators,
 }) {
   const canvasRef = useRef(null);
   const wrapRef   = useRef(null);
@@ -1201,6 +1202,95 @@ export default function FootprintPane({
       }
     });
 
+    // ── Strategy / grid / cycle trade overlay (mirrors CandleChart) ──────────
+    // Gradient reward (entry→TP) / risk (entry→SL) zones + entry line + RR
+    // label. Open trades extend to the right edge. Cycles drawn dashed.
+    // Entry registered into detHitsRef → hover card (SL/target/reason/PnL).
+    if (showTrades && strategyTrades?.length) {
+      const SCOL = { coup: "#ff9800", democracy: "#42a5f5", republic: "#ab47bc", m1: "#26a69a", m2: "#ffca28" };
+      const STAG = { coup: "C", democracy: "D", republic: "R", m1: "1", m2: "2" };
+      for (const t of strategyTrades) {
+        if (t.entry == null || t.entry_ts == null) continue;
+        const xA = tsToVisibleX(t.entry_ts);
+        if (xA < -barW || xA > plotW + barW) continue;
+        let xB = t.exit_ts ? tsToVisibleX(t.exit_ts) : plotW;
+        if (xB <= xA) xB = xA + 3;
+        xB = Math.min(xB, plotW);
+        const yE = yOfPrice(t.entry);
+        if (yE < PAD_TOP - 50 || yE > PAD_TOP + plotH + 50) continue;
+        const ySL = t.sl != null ? yOfPrice(t.sl) : null;
+        const yTP = t.tp != null ? yOfPrice(t.tp) : null;
+        const col = SCOL[t.strategy] || "#fff";
+        const cyc = !!t.is_cycle;
+        const aFill = cyc ? 0.11 : 0.20;
+        const bw = Math.max(3, xB - xA);
+        if (yTP != null) {
+          const g = ctx.createLinearGradient(0, yE, 0, yTP);
+          g.addColorStop(0, "rgba(38,166,154,0.04)");
+          g.addColorStop(1, `rgba(38,166,154,${aFill})`);
+          ctx.fillStyle = g; ctx.fillRect(xA, Math.min(yE, yTP), bw, Math.abs(yTP - yE));
+        }
+        if (ySL != null) {
+          const g = ctx.createLinearGradient(0, yE, 0, ySL);
+          g.addColorStop(0, "rgba(239,83,80,0.04)");
+          g.addColorStop(1, `rgba(239,83,80,${aFill})`);
+          ctx.fillStyle = g; ctx.fillRect(xA, Math.min(yE, ySL), bw, Math.abs(ySL - yE));
+        }
+        ctx.lineWidth = 1; ctx.setLineDash(cyc ? [4, 3] : []);
+        if (yTP != null) { ctx.strokeStyle = "rgba(38,166,154,0.7)"; ctx.beginPath(); ctx.moveTo(xA, yTP); ctx.lineTo(xB, yTP); ctx.stroke(); }
+        if (ySL != null) { ctx.strokeStyle = "rgba(239,83,80,0.7)"; ctx.beginPath(); ctx.moveTo(xA, ySL); ctx.lineTo(xB, ySL); ctx.stroke(); }
+        // left (entry) + right (exit) vertical bounds — frames the position box
+        const yTop = Math.min(ySL ?? yE, yTP ?? yE), yBot = Math.max(ySL ?? yE, yTP ?? yE);
+        ctx.strokeStyle = "rgba(150,150,150,0.45)";
+        ctx.beginPath(); ctx.moveTo(xA, yTop); ctx.lineTo(xA, yBot); ctx.stroke();
+        if (!t.open) { ctx.beginPath(); ctx.moveTo(xB, yTop); ctx.lineTo(xB, yBot); ctx.stroke(); }
+        ctx.strokeStyle = col; ctx.lineWidth = cyc ? 1 : 1.5;
+        ctx.beginPath(); ctx.moveTo(xA, yE); ctx.lineTo(xB, yE); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = col; ctx.beginPath(); ctx.arc(xA, yE, 3, 0, 2 * Math.PI); ctx.fill();
+
+        // EXIT marker (where it closed) + path line entry→exit, win/loss colored
+        const yX = t.exit_price != null ? yOfPrice(t.exit_price) : null;
+        if (!t.open && yX != null) {
+          const won = (t.r ?? t.pnl ?? 0) > 0;
+          const xc = won ? COLORS.up : COLORS.down;
+          ctx.strokeStyle = xc; ctx.lineWidth = 1; ctx.setLineDash([2, 2]);
+          ctx.beginPath(); ctx.moveTo(xA, yE); ctx.lineTo(xB, yX); ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = xc;
+          ctx.beginPath();
+          ctx.moveTo(xB, yX - 3.5); ctx.lineTo(xB + 3.5, yX);
+          ctx.lineTo(xB, yX + 3.5); ctx.lineTo(xB - 3.5, yX); ctx.closePath(); ctx.fill();
+          const out = t.r != null ? `${t.r >= 0 ? "+" : ""}${t.r.toFixed(2)}R`
+                    : t.pnl != null ? `${t.pnl >= 0 ? "+" : ""}${(+t.pnl).toFixed(2)}` : "";
+          if (out) {
+            ctx.font = "10px JetBrains Mono, monospace"; ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+            const ow = ctx.measureText(out).width;
+            const ox = Math.min(xB + 6, plotW - ow - 4);
+            ctx.fillStyle = "rgba(13,13,13,0.82)"; ctx.fillRect(ox - 2, yX - 6, ow + 4, 12);
+            ctx.fillStyle = xc; ctx.fillText(out, ox, yX + 3);
+          }
+          detHitsRef.current.push({ x: xB, y: yX, r: 6, type: "strat_trade", payload: { ...t } });
+        }
+
+        let rr = null;
+        if (t.sl != null && t.tp != null && t.entry !== t.sl)
+          rr = Math.abs(t.tp - t.entry) / Math.abs(t.entry - t.sl);
+        const label = `${t.side === "long" ? "▲" : "▼"}${STAG[t.strategy] || "?"}`
+                    + `${cyc && t.cycle_num != null ? `#${t.cycle_num}` : ""}`
+                    + `${rr != null ? ` RR ${rr.toFixed(2)}` : ""}${t.open ? " ●" : ""}`;
+        ctx.font = "10px JetBrains Mono, monospace";
+        ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+        const tw = ctx.measureText(label).width;
+        const lx = Math.max(0, Math.min(xA + 4, plotW - tw - 6));
+        const ly = yE - 5;
+        ctx.fillStyle = "rgba(13,13,13,0.82)"; ctx.fillRect(lx - 3, ly - 9, tw + 6, 12);
+        ctx.fillStyle = col; ctx.fillText(label, lx, ly);
+
+        detHitsRef.current.push({ x: xA, y: yE, r: 7, type: "strat_trade", payload: { ...t, rr } });
+      }
+    }
+
     // Daily VP histogram on the right strip (aggregated from session bars).
     // Uses all loaded bars (not just visible) for accuracy.
     if (VP_WIDTH_PX > 0) {
@@ -1557,7 +1647,7 @@ export default function FootprintPane({
         lastLabelX = xC;
       }
     }
-  }, [bars, dailyVp, priorVp, detections, positions, pendingOrders, closedPositions, cvd, cvdSignal, zones, view, cellMode, selectedPosId, showTrades, showBubbles, theme, swingPoints, indicators, historicalSweeps, nakedPocs]);
+  }, [bars, dailyVp, priorVp, detections, positions, pendingOrders, closedPositions, cvd, cvdSignal, zones, view, cellMode, selectedPosId, showTrades, showBubbles, theme, swingPoints, indicators, historicalSweeps, nakedPocs, strategyTrades]);
 
   // Resize observer → trigger re-render
   useEffect(() => {
@@ -1962,7 +2052,28 @@ export default function FootprintPane({
         if (tx + W > rect.width)  tx = hoverDet.x - W - 12;
         if (ty + H > rect.height) ty = hoverDet.y - H - 12;
         let header = "", body = null;
-        if (hoverDet.type === "sweep") {
+        if (hoverDet.type === "strat_trade") {
+          const SCOL = { coup: "#ff9800", democracy: "#42a5f5", republic: "#ab47bc", m1: "#26a69a", m2: "#ffca28" };
+          const col = SCOL[p.strategy] || "#fff";
+          header = (<span style={{ color: col, fontWeight: 700 }}>
+            {(p.strategy || "").toUpperCase()} {(p.side || "").toUpperCase()}
+            {p.is_cycle ? ` · cycle${p.cycle_num != null ? ` #${p.cycle_num}` : ""}` : ""}
+            <span style={{ color: p.open ? "#ffd700" : "#888", marginLeft: 6 }}>{p.open ? "● OPEN" : "○ closed"}</span>
+          </span>);
+          body = (<>
+            {p.entry_ts_ist && <div style={{ color: "#999" }}>opened {p.entry_ts_ist}</div>}
+            <div><span style={{ color: "#888" }}>entry </span>{r(p.entry)}
+              {p.bias_strength != null && <span style={{ color: "#888" }}>  bias {p.bias_strength}/5</span>}</div>
+            <div>
+              <span style={{ color: COLORS.down }}>SL {r(p.sl)}</span>{"  "}
+              <span style={{ color: COLORS.up }}>{p.tp != null ? `TP ${r(p.tp)}` : "TP — (open)"}</span>
+              {p.rr != null && <span style={{ color: "#888" }}>  RR {p.rr.toFixed(2)}</span>}
+            </div>
+            {p.pnl != null && <div style={{ color: p.pnl >= 0 ? COLORS.up : COLORS.down }}>PnL {p.pnl >= 0 ? "+" : ""}{r(p.pnl)}</div>}
+            {!p.open && p.reason && <div style={{ color: "#999" }}>⇲ {p.reason}</div>}
+            {p.rationale && <div style={{ color: "#888" }}>↳ {p.rationale}</div>}
+          </>);
+        } else if (hoverDet.type === "sweep") {
           const isHi = p.type === "sweep_high";
           const color = isHi ? COLORS.down : COLORS.up;
           header = (<span style={{ color, fontWeight: 700 }}>

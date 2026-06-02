@@ -88,6 +88,118 @@ function drawVP(canvas, chart, candleSeries, dailyVp, bars) {
   }
 }
 
+// ── Trade position boxes (TradingView long/short tool look) ──────────────────
+// Green reward zone entry→TP, red risk zone entry→SL, entry line + RR label.
+// Open trades (no exit_ts) extend to the right edge.
+function drawTradeBoxes(canvas, chart, candleSeries, trades, bars) {
+  if (!canvas || !chart || !candleSeries) return;
+  const rect = canvas.getBoundingClientRect();
+  const W = Math.round(rect.width)  || canvas.parentElement?.clientWidth  || 800;
+  const H = Math.round(rect.height) || canvas.parentElement?.clientHeight || 400;
+  if (canvas.width !== W)  canvas.width  = W;
+  if (canvas.height !== H) canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, W, H);
+  if (!trades?.length) return;
+
+  const ts = chart.timeScale();
+  const lastTs = bars?.length ? bars[bars.length - 1].ts : null;
+
+  for (const t of trades) {
+    if (t.entry == null || t.entry_ts == null) continue;
+    const x1 = ts.timeToCoordinate(t.entry_ts);
+    if (x1 == null) continue;
+    let x2 = t.exit_ts ? ts.timeToCoordinate(t.exit_ts)
+                       : (lastTs != null ? ts.timeToCoordinate(lastTs) : null);
+    if (x2 == null) x2 = W;                 // open & beyond right edge → extend
+    if (x2 <= x1) x2 = x1 + 3;
+    const bw = Math.max(3, x2 - x1);
+
+    const yE  = candleSeries.priceToCoordinate(t.entry);
+    if (yE == null) continue;
+    const ySL = t.sl != null ? candleSeries.priceToCoordinate(t.sl) : null;
+    const yTP = t.tp != null ? candleSeries.priceToCoordinate(t.tp) : null;
+    const col = STRAT_COLORS[t.strategy] || "#fff";
+    const cyc = !!t.is_cycle;   // cycles drawn dashed + lighter
+
+    const aFill = cyc ? 0.12 : 0.24;   // cycles fainter
+    // reward zone (entry → TP) — green gradient, lighter at entry
+    if (yTP != null) {
+      const g = ctx.createLinearGradient(0, yE, 0, yTP);
+      g.addColorStop(0, "rgba(38,166,154,0.04)");
+      g.addColorStop(1, `rgba(38,166,154,${aFill})`);
+      ctx.fillStyle = g;
+      ctx.fillRect(x1, Math.min(yE, yTP), bw, Math.abs(yTP - yE));
+    }
+    // risk zone (entry → SL) — red gradient
+    if (ySL != null) {
+      const g = ctx.createLinearGradient(0, yE, 0, ySL);
+      g.addColorStop(0, "rgba(239,83,80,0.04)");
+      g.addColorStop(1, `rgba(239,83,80,${aFill})`);
+      ctx.fillStyle = g;
+      ctx.fillRect(x1, Math.min(yE, ySL), bw, Math.abs(ySL - yE));
+    }
+    // zone edges (cycles dashed)
+    ctx.lineWidth = 1;
+    ctx.setLineDash(cyc ? [4, 3] : []);
+    if (yTP != null) { ctx.strokeStyle = "rgba(38,166,154,0.65)"; ctx.beginPath(); ctx.moveTo(x1, yTP); ctx.lineTo(x2, yTP); ctx.stroke(); }
+    if (ySL != null) { ctx.strokeStyle = "rgba(239,83,80,0.65)"; ctx.beginPath(); ctx.moveTo(x1, ySL); ctx.lineTo(x2, ySL); ctx.stroke(); }
+    // left (entry) + right (exit) vertical bounds spanning SL↔TP — frames the box
+    const yTop = Math.min(ySL ?? yE, yTP ?? yE), yBot = Math.max(ySL ?? yE, yTP ?? yE);
+    ctx.strokeStyle = "rgba(150,150,150,0.45)";
+    ctx.beginPath(); ctx.moveTo(x1, yTop); ctx.lineTo(x1, yBot); ctx.stroke();           // entry edge
+    if (!t.open) { ctx.beginPath(); ctx.moveTo(x2, yTop); ctx.lineTo(x2, yBot); ctx.stroke(); } // exit edge
+    // entry line + dot
+    ctx.strokeStyle = col; ctx.lineWidth = cyc ? 1 : 1.5;
+    ctx.beginPath(); ctx.moveTo(x1, yE); ctx.lineTo(x2, yE); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x1, yE, 3, 0, 2 * Math.PI); ctx.fill();
+
+    // EXIT marker — where the trade actually closed (win=green / loss=red),
+    // plus a path line entry→exit showing the outcome.
+    const yX = t.exit_price != null ? candleSeries.priceToCoordinate(t.exit_price) : null;
+    if (!t.open && yX != null) {
+      const won = (t.r ?? t.pnl ?? 0) > 0;
+      const xc = won ? COLORS.up : COLORS.down;
+      ctx.strokeStyle = xc; ctx.lineWidth = 1; ctx.setLineDash([2, 2]);
+      ctx.beginPath(); ctx.moveTo(x1, yE); ctx.lineTo(x2, yX); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = xc;
+      ctx.beginPath();                                   // diamond at close
+      ctx.moveTo(x2, yX - 3.5); ctx.lineTo(x2 + 3.5, yX);
+      ctx.lineTo(x2, yX + 3.5); ctx.lineTo(x2 - 3.5, yX); ctx.closePath(); ctx.fill();
+      // outcome label at exit
+      const out = t.r != null ? `${t.r >= 0 ? "+" : ""}${t.r.toFixed(2)}R`
+                : t.pnl != null ? `${t.pnl >= 0 ? "+" : ""}${(+t.pnl).toFixed(2)}` : "";
+      if (out) {
+        ctx.font = "10px JetBrains Mono, monospace";
+        const ow = ctx.measureText(out).width;
+        const ox = Math.min(x2 + 6, W - ow - 4);
+        ctx.fillStyle = "rgba(13,13,13,0.82)"; ctx.fillRect(ox - 2, yX - 6, ow + 4, 12);
+        ctx.fillStyle = xc; ctx.fillText(out, ox, yX + 3);
+      }
+    }
+
+    // RR label at entry
+    let rr = null;
+    if (t.sl != null && t.tp != null && t.entry !== t.sl)
+      rr = Math.abs(t.tp - t.entry) / Math.abs(t.entry - t.sl);
+    const tag = STRAT_TAG[t.strategy] || "?";
+    const label = `${t.side === "long" ? "▲" : "▼"}${tag}`
+                + `${cyc && t.cycle_num != null ? `#${t.cycle_num}` : ""}`
+                + `${rr != null ? `  RR ${rr.toFixed(2)}` : ""}`
+                + `${t.open ? "  ●" : ""}`;
+    ctx.font = "10px JetBrains Mono, monospace";
+    const tw = ctx.measureText(label).width;
+    const lx = Math.min(x1 + 4, W - tw - 6);
+    const ly = yE - 5;
+    ctx.fillStyle = "rgba(13,13,13,0.82)";
+    ctx.fillRect(lx - 3, ly - 9, tw + 6, 12);
+    ctx.fillStyle = col;
+    ctx.fillText(label, lx, ly);
+  }
+}
+
 // ── Big-trade bubble overlay ─────────────────────────────────────────────────
 function drawBubbles(canvas, chart, candleSeries, bigTrades, show, bars, hitsOut) {
   if (!canvas) return;
@@ -460,7 +572,16 @@ function drawFootprintWithRetry(canvas, chart, candleSeries, bars, attempt = 0) 
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, coupTrades = [], symbol, chartMode, indicators }) {
+const STRAT_COLORS = {
+  coup:      "#ff9800",
+  democracy: "#42a5f5",
+  republic:  "#ab47bc",
+  m1:        "#26a69a",
+  m2:        "#ffca28",
+};
+const STRAT_TAG = { coup: "C", democracy: "D", republic: "R", m1: "1", m2: "2" };
+
+export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, strategyTrades = [], symbol, chartMode, indicators }) {
   // lightweight-charts setData asserts strictly-asc UNIQUE timestamps. Long
   // windows (5D) can emit duplicate/out-of-order ts → crash. Sort asc + dedupe
   // by ts (keep last) once, feed everywhere downstream.
@@ -477,6 +598,10 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   const vpCanvasRef  = useRef(null);
   const fpCanvasRef  = useRef(null);
   const bbCanvasRef  = useRef(null);
+  const tpCanvasRef  = useRef(null);   // trade position boxes
+  const stratTradesRef = useRef(strategyTrades);
+  stratTradesRef.current = strategyTrades;
+  const redrawRef    = useRef(null);   // exposes redrawAll to other effects
   const [showBubbles, setShowBubbles] = useState(() => {
     try { return localStorage.getItem("fb_show_bubbles") !== "0"; } catch { return true; }
   });
@@ -500,6 +625,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   const barsRef      = useRef(bars);
   const dailyVpRef   = useRef(dailyVp);
   const prevSymbol   = useRef(symbol);
+  const fitBarsRef   = useRef(null);   // bars ref at last symbol-fit (race guard)
   barsRef.current    = bars;
   dailyVpRef.current = dailyVp;
 
@@ -570,7 +696,9 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       drawVP(vpCanvasRef.current, chart, candleSeries, dailyVpRef.current, barsRef.current);
       drawFootprint(fpCanvasRef.current, chart, candleSeries, barsRef.current);
       drawBubbles(bbCanvasRef.current, chart, candleSeries, bigTradesRef.current, showBubblesRef.current, barsRef.current, bubbleHitsRef.current);
+      drawTradeBoxes(tpCanvasRef.current, chart, candleSeries, stratTradesRef.current, barsRef.current);
     };
+    redrawRef.current = redrawAll;
     chart.timeScale().subscribeVisibleLogicalRangeChange(redrawAll);
     chart.subscribeCrosshairMove(redrawAll);
     chart.subscribeCrosshairMove(param => {
@@ -612,7 +740,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       if (!containerRef.current) return;
       const { clientWidth: w, clientHeight: h } = containerRef.current;
       chart.applyOptions({ width: w, height: h });
-      for (const c of [vpCanvasRef.current, fpCanvasRef.current, bbCanvasRef.current]) {
+      for (const c of [vpCanvasRef.current, fpCanvasRef.current, bbCanvasRef.current, tpCanvasRef.current]) {
         if (c) { c.width = w; c.height = h; }
       }
       redrawAll();
@@ -650,10 +778,19 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       return { time: b.ts, value: cvdSum };
     }));
 
-    if (prevSymbol.current !== symbol) {
+    // Fit + rescale ONLY on the render where the new symbol's data actually
+    // arrives. On symbol switch the effect first runs with the *previous*
+    // symbol's bars still in place (data refetch is async); fitting/marking
+    // prevSymbol there would consume the fit on stale data and leave the view
+    // stuck on the old instrument when the new bars land. Gate on bars-ref
+    // change so we fit when XAUT/BTC data truly swaps in (not on every tick —
+    // prevSymbol===symbol then).
+    if (prevSymbol.current !== symbol && bars !== fitBarsRef.current) {
       prevSymbol.current = symbol;
       chartRef.current?.timeScale().fitContent();
+      candleRef.current?.priceScale().applyOptions({ autoScale: true });
     }
+    fitBarsRef.current = bars;
 
     drawVP(vpCanvasRef.current, chartRef.current, candleRef.current, dailyVp, bars);
     // Defer bubble draw a frame so chart's internal coordinate mapping is
@@ -856,48 +993,52 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       });
     }
 
-    // ── Coup strategy trades (backtest + live) ───────────────────────────────
-    // entry/exit arrows + entry/SL/TP segments spanning entry_ts→exit_ts only
-    // (time-bounded line series, like pivots — not full-width price lines).
-    const lastBarTs = bars.length ? bars[bars.length - 1].ts : null;
-    const seg = (price, color, fromTs, toTs, style, width = 1) => {
-      if (price == null || !fromTs || !chartRef.current) return;
-      const end = toTs || lastBarTs;
-      if (!end || end < fromTs) return;
-      const s = chartRef.current.addLineSeries({
-        color, lineWidth: width, lineStyle: style,
-        crosshairMarkerVisible: false, priceLineVisible: false,
-        lastValueVisible: false, autoscaleInfoProvider: () => null,
-      });
-      s.setData([{ time: fromTs, value: price }, { time: end, value: price }]);
-      pivotSeriesRef.current.push(s);
-    };
-    (coupTrades || []).forEach(t => {
+    // ── Strategy / grid trades ───────────────────────────────────────────────
+    // Entry/exit ARROWS here (markers, hover-enabled); the entry/SL/TP zones are
+    // drawn as gradient position boxes on the trade canvas (drawTradeBoxes).
+    // Strategy trades (coup/democracy/republic/m1/m2; backtest + live). Entry arrow
+    // colored per strategy; entry/SL/TP time-bounded segments. Open trades have
+    // no exit_ts → segments extend to the current bar (so a TP-less open trade
+    // shows entry→now + its SL). Entry reason shown on hover via marker.reason.
+    (strategyTrades || []).forEach(t => {
       const isLong = t.side === "long";
-      const win = (t.r ?? 0) > 0;
-      const col = win ? COLORS.up : COLORS.down;
+      const strat = t.strategy || "coup";
+      const col = STRAT_COLORS[strat] || COLORS.up;
+      const isOpen = t.open || !t.exit_ts;
+      const tag = STRAT_TAG[strat] || strat[0].toUpperCase();
       markers.push({
         time: t.entry_ts, position: isLong ? "belowBar" : "aboveBar",
         color: col, shape: isLong ? "arrowUp" : "arrowDown",
-        text: `C${isLong ? "↑" : "↓"} ${t.entry_mode || ""}`.trim(), size: 2,
+        text: `${tag}${isLong ? "↑" : "↓"}`, size: 2,
+        strategy: strat, side: t.side, isOpen,
+        reason: t.rationale || t.entry_mode || "",
+        entry: t.entry, sl: t.sl, tp: t.tp,
+        confidence: t.confidence, bias: t.bias_strength,
+        invalidation: t.invalidation_note,
+        openTime: t.entry_ts_ist, exitTime: t.exit_ts_ist,
+        r: t.r, exitReason: t.reason,
+        isCycle: t.is_cycle, cycleNum: t.cycle_num, pnl: t.pnl,
       });
       if (t.exit_ts) {
         const rTxt = t.r == null ? "" : `${t.r >= 0 ? "+" : ""}${t.r.toFixed(2)}R`;
+        const win = (t.r ?? 0) > 0;
         markers.push({
           time: t.exit_ts, position: isLong ? "aboveBar" : "belowBar",
-          color: col, shape: "circle", text: `${t.reason || "exit"} ${rTxt}`.trim(), size: 1,
+          color: win ? COLORS.up : COLORS.down, shape: "circle",
+          text: `${t.reason || "exit"} ${rTxt}`.trim(), size: 1,
         });
       }
-      seg(t.entry, col, t.entry_ts, t.exit_ts, LineStyle.Solid, 2);
-      seg(t.sl, COLORS.sl, t.entry_ts, t.exit_ts, LineStyle.Dashed);
-      seg(t.tp, COLORS.tp, t.entry_ts, t.exit_ts, LineStyle.Dashed);
+      // entry/SL/TP drawn as gradient position boxes on the trade canvas
+      // (drawTradeBoxes), not as line series — better UX, less clutter.
     });
 
     markers.sort((a, b) => a.time - b.time);
     if (markers.length) try { cs.setMarkers(markers); } catch {}
     markersRef.current = markers;
+    // repaint trade boxes whenever the trade set changes
+    redrawRef.current?.();
 
-  }, [dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, coupTrades, bars, indicators]);
+  }, [dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, strategyTrades, bars, indicators]);
 
   function resetView() {
     if (chartRef.current) chartRef.current.timeScale().fitContent();
@@ -912,6 +1053,8 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   return (
     <div style={{ width: "100%", height: "100%", position: "relative" }}>
       <div ref={containerRef} style={{ width: "100%", height: "100%" }} />
+      {/* Trade position boxes — under VP/bubbles so they read as background */}
+      <canvas ref={tpCanvasRef} style={{ ...canvasStyle, zIndex: 4 }} />
       {/* VP overlay — always shown */}
       <canvas ref={vpCanvasRef} style={{ ...canvasStyle, zIndex: 5 }} />
       {/* Bubble overlay — always rendered; visibility gated inside drawBubbles */}
@@ -965,6 +1108,51 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
         if (ty + H > wrapRect.height) ty = m.y - H - 12;
         const isHi = m.position === "aboveBar";
         const txt = m.text || "";
+
+        // Strategy trade entry — rich card: strategy, side, entry/SL/TP, reason.
+        if (m.strategy) {
+          const fmt = (v) => (v == null ? "—" : (+v).toFixed(2));
+          const sideTxt = (m.side || "").toUpperCase();
+          const rr = (m.entry != null && m.sl != null && m.tp != null && m.entry !== m.sl)
+            ? `  RR ${(Math.abs(m.tp - m.entry) / Math.abs(m.entry - m.sl)).toFixed(2)}` : "";
+          return (
+            <div style={{
+              position: "absolute", left: tx, top: ty,
+              background: "rgba(13,13,13,0.94)", border: `1px solid ${m.color}`,
+              borderRadius: 3, padding: "6px 8px", pointerEvents: "none",
+              zIndex: 20, minWidth: 220, fontFamily: "JetBrains Mono, monospace",
+              fontSize: 11, color: "#bbb", lineHeight: 1.5,
+            }}>
+              <div style={{ color: m.color, fontWeight: 700 }}>
+                {m.strategy.toUpperCase()} {sideTxt}
+                {m.isCycle ? ` · cycle${m.cycleNum != null ? ` #${m.cycleNum}` : ""}` : ""}
+                {m.bias ? ` · bias ${m.bias}/5` : ""}
+                <span style={{ color: m.isOpen ? "#ffd700" : "#888", marginLeft: 6 }}>
+                  {m.isOpen ? "● OPEN" : "○ closed"}
+                </span>
+              </div>
+              {m.isCycle && m.pnl != null && (
+                <div style={{ color: m.pnl >= 0 ? COLORS.up : COLORS.down }}>
+                  PnL {m.pnl >= 0 ? "+" : ""}{(+m.pnl).toFixed(2)}
+                </div>
+              )}
+              {m.openTime && <div style={{ color: "#999" }}>opened {m.openTime}</div>}
+              <div>entry {fmt(m.entry)}{m.confidence != null ? `  conf ${(+m.confidence).toFixed(2)}` : ""}</div>
+              <div><span style={{ color: COLORS.sl }}>SL {fmt(m.sl)}</span>{"   "}
+                <span style={{ color: COLORS.tp }}>{m.tp != null ? `TP ${fmt(m.tp)}` : "TP — (open)"}</span>{rr}</div>
+              {!m.isOpen && (m.exitReason || m.r != null) && (
+                <div style={{ color: "#999", marginTop: 1 }}>
+                  exit {m.r != null ? `${m.r >= 0 ? "+" : ""}${(+m.r).toFixed(2)}R` : ""}
+                  {m.exitTime ? `  ${m.exitTime}` : ""}
+                </div>
+              )}
+              {m.reason && <div style={{ color: "#888", marginTop: 2 }}>↳ {m.reason}</div>}
+              {!m.isOpen && m.exitReason && <div style={{ color: "#777" }}>⇲ {m.exitReason}</div>}
+              {m.invalidation && <div style={{ color: "#777", marginTop: 1 }}>✕ {m.invalidation}</div>}
+            </div>
+          );
+        }
+
         let header = txt, desc = "";
         if (txt === "REV")          { header = `REVERSAL ${isHi ? "HIGH" : "LOW"}`; desc = "Delta-confirmed sweep with strong rejection bar — highest-confidence reversal signal"; }
         else if (txt === "LG")      { header = `LIQUIDITY GRAB ${isHi ? "HIGH" : "LOW"}`; desc = "Institutional sweep of EQH/EQL or named level — delta confirmed, reversal likely"; }

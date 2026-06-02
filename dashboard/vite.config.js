@@ -9,6 +9,8 @@ export default defineConfig({
     proxy: {
       "/dashboard/state":  "http://localhost:5000",
       "/dashboard/stream": { target: "http://localhost:5000", changeOrigin: true, ws: false },
+      "/strategies":       "http://localhost:5000",
+      "/grid":             "http://localhost:5000",
     },
   },
   build: {

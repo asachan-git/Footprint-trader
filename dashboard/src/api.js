@@ -14,3 +14,19 @@ export async function fetchStrategyTrades(name, symbol, tf, source = "all") {
   const { data } = await axios.get(`/strategies/${name}/trades`, { params });
   return data?.trades ?? [];
 }
+
+// Grid-mode (m1 / m2) trade history.
+export async function fetchGridTrades(mode, symbol, tf) {
+  const { data } = await axios.get(`/grid/${mode}/trades`, { params: { symbol, tf } });
+  return data?.trades ?? [];
+}
+
+// Cycle history (grid recovery cycles, joined with position levels).
+export async function fetchStrategyCycles(name, symbol, tf) {
+  const { data } = await axios.get(`/strategies/${name}/cycles`, { params: { symbol, tf } });
+  return data?.cycles ?? [];
+}
+export async function fetchGridCycles(mode, symbol, tf) {
+  const { data } = await axios.get(`/grid/${mode}/cycles`, { params: { symbol, tf } });
+  return data?.cycles ?? [];
+}
