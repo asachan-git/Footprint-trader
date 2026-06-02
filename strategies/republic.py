@@ -42,34 +42,22 @@ class Republic(Democracy):
         sl_atr_mult = float(self.config.get("sl_atr_mult", 1.5))
         atr15 = self._atr15(bar.symbol)
         if atr15 <= 0:
-            LOG.warning(f"[republic] {bar.symbol} no ATR — keeping disaster SL")
+            LOG.warning(f"[{self.name}] {bar.symbol} no ATR — keeping disaster SL")
             return plan
 
         anchor = plan.anchor_price
 
-        # ── Structural SL with VP/LVN confluence ──────────────────────────────
-        # Stop just beyond the entry candle's sell/buy zone (the extreme where the
-        # aggressors stacked), used ONLY when that level is in confluence with a VP
-        # HVN/POC/VAH/VAL or sits in an LVN gap. Validated 2026-06-02
-        # (scripts/validate_sl_confluence.py, robust over buf/conf/rr): struct+
-        # confluence ≈ +0.5R vs +0.17R for plain 1.5×ATR on confirmed setups. With
-        # no confluence, fall back to the 1.5×ATR stop.
-        buf = float(self.config.get("sl_struct_buf_atr", 0.2))
-        conf_tol = float(self.config.get("sl_conf_tol_atr", 0.25))
-        extreme = bar.ohlc.h if plan.side == "short" else bar.ohlc.l
-        sl_struct = (extreme + buf * atr15) if plan.side == "short" else (extreme - buf * atr15)
-        atr_sl = (anchor + sl_atr_mult * atr15) if plan.side == "short" else (anchor - sl_atr_mult * atr15)
-        if self._sl_confluent(bar.symbol, sl_struct, atr15, conf_tol):
-            new_sl, sl_src = sl_struct, "struct_confluence"
-        else:
-            new_sl, sl_src = atr_sl, f"{sl_atr_mult}×ATR"
+        # SL anchor is the A/B variable — Republic uses the candle-extreme + VP/LVN
+        # confluence stop; subclasses (e.g. Senate) override _compute_sl to anchor
+        # the stop differently while sharing the TP-scaling + clamp logic below.
+        new_sl, sl_src = self._compute_sl(plan, bar, atr15, anchor)
 
         # Never loosen past the disaster floor (plan.safety_sl), when present.
         if plan.safety_sl is not None:
             new_sl = (max(new_sl, plan.safety_sl) if plan.side == "long"
                       else min(new_sl, plan.safety_sl))
 
-        LOG.info(f"[republic] {bar.symbol} {plan.side} SL → {new_sl:.2f} ({sl_src})")
+        LOG.info(f"[{self.name}] {bar.symbol} {plan.side} SL → {new_sl:.2f} ({sl_src})")
         new_offset = (new_sl - anchor) / anchor if anchor > 0 else plan.safety_sl_offset_pct
 
         # ── Footprint-confirmation TP scaling ─────────────────────────────────
@@ -100,13 +88,13 @@ class Republic(Democracy):
                     new_tp_source = f"conf_tp:{cand.source}"
                     new_tp_offset = (new_tp - anchor) / anchor if anchor > 0 else plan.tp_offset_pct
                     LOG.info(
-                        f"[republic] {bar.symbol} {plan.side} TP pushed "
+                        f"[{self.name}] {bar.symbol} {plan.side} TP pushed "
                         f"{plan.take_profit:.2f} → {new_tp:.2f} "
                         f"(bias={plan.bias_strength}≥{conf_bias_min}, "
                         f"{conf_atr_mult}×ATR, {new_tp_source})"
                     )
             except Exception as e:
-                LOG.warning(f"[republic] {bar.symbol} TP scale failed: {e}")
+                LOG.warning(f"[{self.name}] {bar.symbol} TP scale failed: {e}")
 
         # GridPlan is frozen — return a copy with tightened SL + (maybe) pushed TP,
         # offset_pcts kept consistent for live cross-venue translation.
@@ -115,6 +103,22 @@ class Republic(Democracy):
             safety_sl=new_sl, safety_sl_offset_pct=new_offset,
             take_profit=new_tp, tp_source=new_tp_source, tp_offset_pct=new_tp_offset,
         )
+
+    def _compute_sl(self, plan, bar: Bar, atr15: float, anchor: float) -> tuple[float, str]:
+        """Republic SL: stop just beyond the entry candle's sell/buy zone (the
+        extreme), used ONLY when in confluence with a VP HVN/POC/VAH/VAL or an LVN
+        gap; else fall back to sl_atr_mult×ATR. Validated 2026-06-02
+        (scripts/validate_sl_confluence.py): ≈ +0.5R vs +0.17R for plain ATR on
+        confirmed setups. Subclasses override this to A/B a different SL anchor."""
+        sl_atr_mult = float(self.config.get("sl_atr_mult", 1.5))
+        buf = float(self.config.get("sl_struct_buf_atr", 0.2))
+        conf_tol = float(self.config.get("sl_conf_tol_atr", 0.25))
+        extreme = bar.ohlc.h if plan.side == "short" else bar.ohlc.l
+        sl_struct = (extreme + buf * atr15) if plan.side == "short" else (extreme - buf * atr15)
+        atr_sl = (anchor + sl_atr_mult * atr15) if plan.side == "short" else (anchor - sl_atr_mult * atr15)
+        if self._sl_confluent(bar.symbol, sl_struct, atr15, conf_tol):
+            return sl_struct, "struct_confluence"
+        return atr_sl, f"{sl_atr_mult}×ATR"
 
     @staticmethod
     def _sl_confluent(symbol: str, sl: float, atr: float, tol_atr: float) -> bool:

@@ -29,6 +29,22 @@ strategies:
       symbols: [BTCUSDT, XAUTUSDT]
       vote_tf: 15m
       sl_atr_mult: 1.5      # hard SL distance from anchor, in ATR_15m units
+      sl_struct_buf_atr: 0.2  # SL = candle extreme ± this×ATR (when VP/LVN-confluent)
+      sl_conf_tol_atr: 0.25   # VP/LVN confluence tolerance, ×ATR
+
+  # senate = republic's engine, SL anchored to footprint WALLS instead of the
+  # candle extreme. SL just beyond the favourable stacked-imbalance / big-trade
+  # levels on the stop side ("selling zone in our favour"); VP-confluent walls
+  # tagged wall_vp; ATR fallback. SL-anchor A/B vs republic on the same signal.
+  # Validated scripts/validate_sl_levels.py: wall ≈ +0.31R vs +0.17R ATR (confirmed).
+  - name: senate
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      vote_tf: 15m
+      sl_atr_mult: 1.5        # ATR fallback distance when no wall present
+      sl_wall_buf_atr: 0.25   # SL = beyond the farthest favourable wall ± this×ATR
+      sl_conf_tol_atr: 0.25   # wall∧VP confluence tolerance (tags wall_vp), ×ATR
 
   # coup = pure-footprint absorption→continuation. A high-vol/high-delta candle
   # absorbs its extreme aggressor (buyers@top / sellers@low); we join the winner

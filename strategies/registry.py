@@ -15,6 +15,7 @@ import yaml
 from .base import Strategy
 from .democracy import Democracy
 from .republic import Republic
+from .senate import Senate
 from .coup import Coup
 from .coup_reversal import CoupReversal
 
@@ -26,6 +27,7 @@ STRATEGIES_YAML = ROOT / "config" / "strategies.yaml"
 REGISTRY: dict[str, type[Strategy]] = {
     "democracy": Democracy,
     "republic": Republic,
+    "senate": Senate,
     "coup": Coup,
     "coup_reversal": CoupReversal,
 }
