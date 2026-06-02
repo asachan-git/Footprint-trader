@@ -51,6 +51,8 @@ COUP_DIR = ROOT / "data" / "strategies" / "coup"
 ABS_MODE = "momentum"
 VOL_LB = 20
 CONF_DR = 0.25   # confirm_delta_ratio; CLI --confdr
+VOL_MAX = 1e9    # climax cap: skip vol ≥ VOL_MAX×median; CLI --volmax
+REJ_MAX = 1.0    # exhaustion cap: skip rejection wick > REJ_MAX; CLI --rejmax
 
 
 class _Slice:
@@ -103,7 +105,8 @@ def _run_combo(symbol, tf, bars, em, sm) -> tuple[int, int, list[dict]]:
     """Return (signals, filled, trades[]) for one entry_mode × sl_mode combo."""
     inst = Coup(config={"symbols": [symbol], "entry_mode": em, "sl_mode": sm,
                         "absorption_mode": ABS_MODE, "vol_lookback": VOL_LB,
-                        "confirm_delta_ratio": CONF_DR})
+                        "confirm_delta_ratio": CONF_DR,
+                        "vol_mult_max": VOL_MAX, "rej_max": REJ_MAX})
     signals = filled = 0
     trades: list[dict] = []
     open_until = -1
@@ -263,7 +266,12 @@ if __name__ == "__main__":
         VOL_LB = int(sys.argv[sys.argv.index("--vollb") + 1])
     if "--confdr" in sys.argv:
         CONF_DR = float(sys.argv[sys.argv.index("--confdr") + 1])
-    print(f"[absorption_mode={ABS_MODE} vol_lookback={VOL_LB} confirm_dr={CONF_DR}]")
+    if "--volmax" in sys.argv:
+        VOL_MAX = float(sys.argv[sys.argv.index("--volmax") + 1])
+    if "--rejmax" in sys.argv:
+        REJ_MAX = float(sys.argv[sys.argv.index("--rejmax") + 1])
+    print(f"[absorption_mode={ABS_MODE} vol_lookback={VOL_LB} confirm_dr={CONF_DR} "
+          f"vol_max={VOL_MAX} rej_max={REJ_MAX}]")
     if "--emit" in sys.argv:
         j = sys.argv.index("--emit")
         emit_trades(sym, tf, sys.argv[j + 1], sys.argv[j + 2])

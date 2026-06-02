@@ -134,8 +134,13 @@ class Coup(Strategy):
 
         # ── 1. TRIGGER — most recent high-vol/high-delta absorption in window ──
         absorption_mode = str(cfg.get("absorption_mode", "momentum"))
+        # Climax guards (default no-op): skip vol spikes ≥ vol_mult_max×median and
+        # rejection wicks > rej_max (reversal obs: vol≥3× and extWick≥0.5 continue
+        # LESS — exhaustion). Only coup_reversal sets these.
+        vol_ceiling = float(cfg.get("vol_mult_max", 1e9)) * med
+        rej_max = float(cfg.get("rej_max", 1.0))
         trigger = self._find_trigger(bars, lookback, vol_mult * med, delta_ratio,
-                                     absorption_mode)
+                                     absorption_mode, vol_ceiling, rej_max)
         if trigger is None:
             return None
         t_idx, winner, t_bar = trigger
@@ -203,7 +208,8 @@ class Coup(Strategy):
         return fp.total_bid + fp.total_ask
 
     def _find_trigger(self, bars: list[Bar], lookback: int, vol_floor: float,
-                      delta_ratio: float, absorption_mode: str = "momentum"):
+                      delta_ratio: float, absorption_mode: str = "momentum",
+                      vol_ceiling: float = float("inf"), rej_max: float = 1.0):
         """Return (idx, winner_side, trigger_bar) for the most recent qualifying
         trigger in the lookback window, else None."""
         scan = bars[-lookback:]
@@ -215,12 +221,19 @@ class Coup(Strategy):
         skip_delta_gate = absorption_mode == "reversal"
         for off, b in enumerate(scan):
             total = self._total_vol(b)
-            if total < vol_floor:
+            if total < vol_floor or total > vol_ceiling:   # too quiet OR climax
                 continue
             if not skip_delta_gate and (b.delta is None or abs(b.delta) / max(total, 1e-9) < delta_ratio):
                 continue
             for a in detect_canonical_absorption(b, build_fp(b), mode=absorption_mode):
                 winner = "short" if a.side == "sell" else "long"
+                if rej_max < 1.0:   # skip exhaustion: rejection wick too large
+                    rng = b.ohlc.h - b.ohlc.l
+                    if rng > 0:
+                        wick = ((min(b.ohlc.o, b.ohlc.c) - b.ohlc.l) if winner == "long"
+                                else (b.ohlc.h - max(b.ohlc.o, b.ohlc.c))) / rng
+                        if wick > rej_max:
+                            continue
                 found = (base + off, winner, b)  # keep the most recent
         return found
 

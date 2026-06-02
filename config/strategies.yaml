@@ -81,6 +81,11 @@ strategies:
       vol_lookback: 10      # high vol vs last ~10 candles
       lookback: 6
       vol_mult: 1.8
+      # Climax cap (swept on the 39-candle obs): skip vol ≥ 3×median. Drops the
+      # 2 exhaustion spikes → avgR 0.33→0.55, sumR 3.00→3.89 (n 9→7). A wick cap
+      # (rej_max) was ALSO tested but HURT trade-R (cut winners) despite worse
+      # CONT-rate — so not applied. PROVISIONAL n=7, paper-validate.
+      vol_mult_max: 3.0
       # Tuned from data/reports/absorption_observations_granular.md (39 reversal
       # candles): next-candle PROGRESSION is the edge — progressed/closeWith
       # flips continuation 51%→78%, full follow-through (dWith+closeWith+prog)
