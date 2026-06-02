@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { createChart, CrosshairMode, LineStyle } from "lightweight-charts";
+import { createChart, CrosshairMode, LineStyle, PriceScaleMode } from "lightweight-charts";
 
 const COLORS = {
   bg:        "#0d0d0d",
@@ -26,7 +26,13 @@ function istFormatter(ts) {
 
 // ── volume profile overlay ────────────────────────────────────────────────────
 
-function drawVP(canvas, chart, candleSeries, dailyVp, bars) {
+// True volume-at-price profile from bid/ask ladders.
+//   vpMode "visible" → only bars in the visible logical range (zoom-scoped,
+//   bounded cost); "full" → entire loaded window.
+// Computes POC, 70% value area, and HVN/LVN by volume percentile — all from the
+// actual per-price ladders (not a close-price approximation). Falls back to
+// close-bucketing only when bars carry no ladders (synthetic history).
+function drawVP(canvas, chart, candleSeries, dailyVp, bars, vpMode = "visible") {
   if (!canvas || !chart || !candleSeries || !bars.length) return;
 
   const rect = canvas.getBoundingClientRect();
@@ -37,55 +43,123 @@ function drawVP(canvas, chart, candleSeries, dailyVp, bars) {
 
   const ctx = canvas.getContext("2d");
   ctx.clearRect(0, 0, W, H);
-
   const VP_MAX_W = Math.round(W * 0.16);
-  const poc = dailyVp?.poc || (bars[0]?.c || 1);
-  const step = Math.max(poc * 0.0003, 0.01);
 
-  // Bucket bar volumes by close price
-  const buckets = {};
-  for (const b of bars) {
-    const key = Math.round(b.c / step);
-    const k = key.toFixed(0);
-    if (!buckets[k]) buckets[k] = { price: key * step, bid: 0, ask: 0 };
-    buckets[k].bid += b.bid_vol || 0;
-    buckets[k].ask += b.ask_vol || 0;
+  // Scope bars: visible-range slice (cost bounded by zoom) or full window.
+  let slice = bars;
+  if (vpMode !== "full") {
+    const lr = chart.timeScale().getVisibleLogicalRange();
+    if (lr) {
+      const from = Math.max(0, Math.floor(lr.from));
+      const to   = Math.min(bars.length - 1, Math.ceil(lr.to));
+      if (to >= from) slice = bars.slice(from, to + 1);
+    }
   }
 
-  const rows = Object.values(buckets);
-  const maxVol = rows.reduce((m, r) => Math.max(m, r.bid + r.ask), 0) || 1;
+  // Aggregate real volume-at-price from ladders.
+  const prof = new Map();   // price -> {price, bid, ask}
+  let haveLadder = false;
+  const add = (p, bid, ask) => {
+    const e = prof.get(p) || { price: p, bid: 0, ask: 0 };
+    e.bid += bid; e.ask += ask; prof.set(p, e);
+  };
+  for (const b of slice) {
+    const nb = (b.bid_ladder?.length || 0) + (b.ask_ladder?.length || 0);
+    if (nb > 0) haveLadder = true;
+    (b.bid_ladder || []).forEach(l => add(l.p, l.v, 0));
+    (b.ask_ladder || []).forEach(l => add(l.p, 0, l.v));
+  }
+  if (!haveLadder) {
+    // Synthetic bars: no ladders — bucket by close price.
+    const poc0 = dailyVp?.poc || slice[0]?.c || 1;
+    const step0 = Math.max(poc0 * 0.0003, 0.01);
+    for (const b of slice) {
+      add(Math.round(b.c / step0) * step0, b.bid_vol || 0, b.ask_vol || 0);
+    }
+  }
 
-  const hvnZones = dailyVp?.hvn_zones || [];
-  const lvnZones = dailyVp?.lvn_zones || [];
+  const rows = [...prof.values()].sort((a, b) => a.price - b.price);
+  if (!rows.length) return;
+  const totals = rows.map(r => r.bid + r.ask);
+  const maxVol = Math.max(...totals, 1);
+  const grand  = totals.reduce((s, v) => s + v, 0) || 1;
 
-  for (const r of rows) {
+  // POC + 70% value area (expand around POC toward the larger neighbour).
+  let pocIdx = 0;
+  for (let i = 1; i < rows.length; i++) if (totals[i] > totals[pocIdx]) pocIdx = i;
+  let lo = pocIdx, hi = pocIdx, vaVol = totals[pocIdx];
+  const target = grand * 0.7;
+  while (vaVol < target && (lo > 0 || hi < rows.length - 1)) {
+    const below = lo > 0 ? totals[lo - 1] : -1;
+    const above = hi < rows.length - 1 ? totals[hi + 1] : -1;
+    if (above >= below) { hi++; vaVol += Math.max(0, above); }
+    else                { lo--; vaVol += Math.max(0, below); }
+  }
+  const pocPrice = rows[pocIdx].price;
+
+  // HVN/LVN thresholds by volume percentile of the profile.
+  const sortedTot = [...totals].sort((a, b) => a - b);
+  const pctl = (q) => sortedTot[Math.min(sortedTot.length - 1, Math.floor(q * sortedTot.length))];
+  const hvnT = pctl(0.80), lvnT = pctl(0.20);
+
+  // Row height from the smallest positive price step.
+  let step = Infinity;
+  for (let i = 1; i < rows.length; i++) {
+    const d = rows[i].price - rows[i - 1].price;
+    if (d > 0 && d < step) step = d;
+  }
+  if (!isFinite(step)) step = Math.max(pocPrice * 0.0001, 0.01);
+  const yA = candleSeries.priceToCoordinate(pocPrice);
+  const yB = candleSeries.priceToCoordinate(pocPrice + step);
+  const cellH = (yA != null && yB != null) ? Math.max(1, Math.abs(yA - yB)) : 2;
+
+  // Value-area band background.
+  const yVaTop = candleSeries.priceToCoordinate(rows[hi].price);
+  const yVaBot = candleSeries.priceToCoordinate(rows[lo].price);
+  if (yVaTop != null && yVaBot != null) {
+    ctx.fillStyle = "rgba(120,140,180,0.05)";
+    ctx.fillRect(0, Math.min(yVaTop, yVaBot) - cellH / 2, VP_MAX_W, Math.abs(yVaBot - yVaTop) + cellH);
+  }
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i], total = totals[i];
+    if (total <= 0) continue;
     const y = candleSeries.priceToCoordinate(r.price);
-    if (y === null || y < 0 || y > H) continue;
+    if (y === null || y < -cellH || y > H + cellH) continue;
+    // HVN/LVN tint
+    if (total >= hvnT)      { ctx.fillStyle = "rgba(66,165,245,0.05)"; ctx.fillRect(0, y - cellH / 2, VP_MAX_W, cellH); }
+    else if (total <= lvnT) { ctx.fillStyle = "rgba(255,152,0,0.05)"; ctx.fillRect(0, y - cellH / 2, VP_MAX_W, cellH); }
 
-    const total  = r.bid + r.ask || 1;
     const totalW = (total / maxVol) * VP_MAX_W;
     const bidW   = (r.bid / total) * totalW;
     const askW   = totalW - bidW;
-    const cellH  = Math.max(2, (step / (poc * 0.01)) * 0.5);
-
-    // HVN/LVN background tint
-    const isHvn = hvnZones.some(z => r.price >= z.low && r.price <= z.high);
-    const isLvn = lvnZones.some(z => r.price >= z.low && r.price <= z.high);
-    if (isHvn) {
-      ctx.fillStyle = "rgba(66,165,245,0.06)";
-      ctx.fillRect(0, y - cellH, VP_MAX_W, cellH * 2);
-    }
-    if (isLvn) {
-      ctx.fillStyle = "rgba(255,152,0,0.06)";
-      ctx.fillRect(0, y - cellH, VP_MAX_W, cellH * 2);
-    }
-
-    const isPoc = dailyVp?.poc && Math.abs(r.price - dailyVp.poc) < step * 0.7;
-    ctx.fillStyle = isPoc ? "rgba(255,215,0,0.55)" : "rgba(38,166,154,0.30)";
-    ctx.fillRect(0, y - 1, bidW, 2);
-    ctx.fillStyle = isPoc ? "rgba(255,215,0,0.55)" : "rgba(239,83,80,0.30)";
-    ctx.fillRect(bidW, y - 1, askW, 2);
+    const isPoc  = i === pocIdx;
+    const inVA   = i >= lo && i <= hi;
+    const rh     = Math.max(1, cellH * 0.9);
+    const aBid   = isPoc ? 0.7 : inVA ? 0.5 : 0.28;
+    const aAsk   = isPoc ? 0.7 : inVA ? 0.55 : 0.30;
+    ctx.fillStyle = `rgba(239,83,80,${aBid})`;
+    ctx.fillRect(0, y - rh / 2, bidW, rh);
+    ctx.fillStyle = `rgba(38,166,154,${aAsk})`;
+    ctx.fillRect(bidW, y - rh / 2, askW, rh);
   }
+
+  // POC line + value-area edge ticks across the VP strip.
+  const yPoc = candleSeries.priceToCoordinate(pocPrice);
+  if (yPoc != null) {
+    ctx.strokeStyle = "rgba(255,215,0,0.85)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, yPoc); ctx.lineTo(VP_MAX_W, yPoc); ctx.stroke();
+  }
+  for (const yy of [yVaTop, yVaBot]) {
+    if (yy == null) continue;
+    ctx.strokeStyle = "rgba(120,140,180,0.4)"; ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(0, yy); ctx.lineTo(VP_MAX_W, yy); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.fillStyle = "rgba(255,215,0,0.6)"; ctx.font = "9px JetBrains Mono, monospace";
+  ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+  ctx.fillText(`VP·${vpMode === "full" ? "full" : "vis"} POC ${pocPrice.toFixed(2)}`, 3, H - 3);
 }
 
 // ── Trade position boxes (TradingView long/short tool look) ──────────────────
@@ -581,7 +655,184 @@ const STRAT_COLORS = {
 };
 const STRAT_TAG = { coup: "C", democracy: "D", republic: "R", m1: "1", m2: "2" };
 
-export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, strategyTrades = [], symbol, chartMode, indicators }) {
+// ── Indicator math (chart-only; no server coupling) ──────────────────────────
+
+const IST_SEC = 19800;
+// UTC-midnight session bucket (system uses SESSION_START_UTC=0 for both symbols).
+const _sessionDay = (ts) => Math.floor(ts / 86400);
+
+// Session-anchored VWAP + volume-weighted σ bands. Resets each UTC day.
+// Returns parallel arrays keyed to bars: {vwap, u1, l1, u2, l2}.
+function computeVWAP(bars) {
+  const out = { vwap: [], u1: [], l1: [], u2: [], l2: [] };
+  let day = null, cumPV = 0, cumV = 0, cumP2V = 0;
+  for (const b of bars) {
+    const d = _sessionDay(b.ts);
+    if (d !== day) { day = d; cumPV = cumV = cumP2V = 0; }
+    const tp = (b.h + b.l + b.c) / 3;
+    const v = (b.bid_vol || 0) + (b.ask_vol || 0);
+    cumPV += tp * v; cumV += v; cumP2V += tp * tp * v;
+    const vwap = cumV > 0 ? cumPV / cumV : tp;
+    const variance = cumV > 0 ? Math.max(0, cumP2V / cumV - vwap * vwap) : 0;
+    const sd = Math.sqrt(variance);
+    out.vwap.push({ time: b.ts, value: vwap });
+    out.u1.push({ time: b.ts, value: vwap + sd });
+    out.l1.push({ time: b.ts, value: vwap - sd });
+    out.u2.push({ time: b.ts, value: vwap + 2 * sd });
+    out.l2.push({ time: b.ts, value: vwap - 2 * sd });
+  }
+  return out;
+}
+
+// SuperTrend — ATR-based trailing stop that flips with trend. The single most
+// useful "visual TSL": line sits below price in uptrend (green), above in
+// downtrend (red). period=ATR length, mult=band width.
+function computeSuperTrend(bars, period = 10, mult = 3) {
+  const n = bars.length;
+  if (n < period + 1) return [];
+  // Wilder ATR
+  const tr = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    const b = bars[i];
+    if (i === 0) { tr[i] = b.h - b.l; continue; }
+    const pc = bars[i - 1].c;
+    tr[i] = Math.max(b.h - b.l, Math.abs(b.h - pc), Math.abs(b.l - pc));
+  }
+  const atr = new Array(n).fill(0);
+  let seed = 0;
+  for (let i = 1; i <= period; i++) seed += tr[i];
+  atr[period] = seed / period;
+  for (let i = period + 1; i < n; i++) atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period;
+
+  const out = [];
+  let prevUpper = 0, prevLower = 0, prevST = 0, prevDir = 1; // 1=up, -1=down
+  for (let i = period; i < n; i++) {
+    const b = bars[i];
+    const mid = (b.h + b.l) / 2;
+    let upper = mid + mult * atr[i];
+    let lower = mid - mult * atr[i];
+    if (i > period) {
+      upper = (upper < prevUpper || bars[i - 1].c > prevUpper) ? upper : prevUpper;
+      lower = (lower > prevLower || bars[i - 1].c < prevLower) ? lower : prevLower;
+    }
+    let dir = prevDir;
+    if (i > period) {
+      if (prevST === prevUpper) dir = b.c > upper ? 1 : -1;
+      else                      dir = b.c < lower ? -1 : 1;
+    } else {
+      dir = b.c >= mid ? 1 : -1;
+    }
+    const st = dir === 1 ? lower : upper;
+    out.push({ time: b.ts, value: st, dir });
+    prevUpper = upper; prevLower = lower; prevST = st; prevDir = dir;
+  }
+  return out;
+}
+
+// Heikin-Ashi transform. HA close = avg(o,h,l,c); HA open = avg(prev HA o,c).
+function toHeikin(bars) {
+  const out = [];
+  let prevO = null, prevC = null;
+  for (const b of bars) {
+    const haC = (b.o + b.h + b.l + b.c) / 4;
+    const haO = prevO == null ? (b.o + b.c) / 2 : (prevO + prevC) / 2;
+    const haH = Math.max(b.h, haO, haC);
+    const haL = Math.min(b.l, haO, haC);
+    out.push({ time: b.ts, open: haO, high: haH, low: haL, close: haC });
+    prevO = haO; prevC = haC;
+  }
+  return out;
+}
+
+// ── Drawing layer: horizontal lines (S/R, manual SL/TP), alerts, measure ─────
+
+const DRAW_LS = (symbol) => `fb_draw_${symbol}`;
+const loadLines = (symbol) => {
+  try { return JSON.parse(localStorage.getItem(DRAW_LS(symbol))) || []; }
+  catch { return []; }
+};
+const saveLines = (symbol, lines) => {
+  try { localStorage.setItem(DRAW_LS(symbol), JSON.stringify(lines)); } catch {}
+};
+
+const LINE_COLORS = {
+  ray:   "#5c9eff",   // manual S/R line
+  alert: "#ffb300",   // price alert
+};
+
+// Render horizontal lines + alerts + in-progress measure onto the draw canvas.
+function drawOverlay(canvas, chart, candleSeries, lines, measure, hoverId) {
+  if (!canvas || !chart || !candleSeries) return;
+  const rect = canvas.getBoundingClientRect();
+  const W = Math.round(rect.width)  || canvas.parentElement?.clientWidth  || 800;
+  const H = Math.round(rect.height) || canvas.parentElement?.clientHeight || 400;
+  if (canvas.width !== W)  canvas.width  = W;
+  if (canvas.height !== H) canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, W, H);
+
+  ctx.font = "10px JetBrains Mono, monospace";
+  for (const ln of lines || []) {
+    const y = candleSeries.priceToCoordinate(ln.price);
+    if (y === null) continue;
+    const col = ln.triggered ? "#ef5350" : (LINE_COLORS[ln.kind] || "#888");
+    const isAlert = ln.kind === "alert";
+    ctx.strokeStyle = col;
+    ctx.lineWidth = ln.id === hoverId ? 2 : 1;
+    ctx.setLineDash(isAlert ? [6, 4] : []);
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    ctx.setLineDash([]);
+    // label chip (left)
+    const px = ln.price >= 100 ? ln.price.toFixed(1) : ln.price.toFixed(2);
+    const glyph = isAlert ? (ln.triggered ? "🔔!" : "🔔") : "—";
+    const label = `${glyph} ${px}${ln.note ? " " + ln.note : ""}`;
+    const tw = ctx.measureText(label).width;
+    ctx.fillStyle = "rgba(13,13,13,0.85)";
+    ctx.fillRect(2, y - 7, tw + 8, 13);
+    ctx.fillStyle = col;
+    ctx.textBaseline = "middle"; ctx.textAlign = "left";
+    ctx.fillText(label, 6, y);
+    // delete hint dot (right) when hovered
+    if (ln.id === hoverId) {
+      ctx.fillStyle = col;
+      ctx.beginPath(); ctx.arc(W - 8, y, 3, 0, 2 * Math.PI); ctx.fill();
+    }
+  }
+
+  if (measure && measure.p1 != null && measure.p2 != null) {
+    const y1 = candleSeries.priceToCoordinate(measure.p1);
+    const y2 = candleSeries.priceToCoordinate(measure.p2);
+    const x1 = measure.x1, x2 = measure.x2;
+    if (y1 != null && y2 != null) {
+      const up = measure.p2 >= measure.p1;
+      const col = up ? "rgba(38,166,154,1)" : "rgba(239,83,80,1)";
+      const fill = up ? "rgba(38,166,154,0.12)" : "rgba(239,83,80,0.12)";
+      ctx.fillStyle = fill;
+      ctx.fillRect(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1));
+      ctx.strokeStyle = col; ctx.lineWidth = 1; ctx.setLineDash([4, 3]);
+      ctx.strokeRect(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1));
+      ctx.setLineDash([]);
+      // readout box
+      const dPrice = measure.p2 - measure.p1;
+      const pct = measure.p1 ? (dPrice / measure.p1) * 100 : 0;
+      const nbars = measure.bars != null ? measure.bars : "";
+      const lines2 = [
+        `${dPrice >= 0 ? "+" : ""}${dPrice >= 100 || dPrice <= -100 ? dPrice.toFixed(1) : dPrice.toFixed(2)}  (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)`,
+        nbars !== "" ? `${nbars} bars` : "",
+      ].filter(Boolean);
+      const bw = Math.max(...lines2.map(s => ctx.measureText(s).width)) + 12;
+      const bx = Math.min(x1, x2) + Math.abs(x2 - x1) / 2 - bw / 2;
+      const by = Math.min(y1, y2) - (lines2.length * 14) - 6;
+      ctx.fillStyle = "rgba(13,13,13,0.9)";
+      ctx.fillRect(bx, by, bw, lines2.length * 14 + 4);
+      ctx.strokeStyle = col; ctx.strokeRect(bx, by, bw, lines2.length * 14 + 4);
+      ctx.fillStyle = "#ddd"; ctx.textAlign = "left"; ctx.textBaseline = "top";
+      lines2.forEach((s, i) => ctx.fillText(s, bx + 6, by + 4 + i * 14));
+    }
+  }
+}
+
+export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, strategyTrades = [], symbol, chartMode, indicators, chartType = "candles", logScale = false }) {
   // lightweight-charts setData asserts strictly-asc UNIQUE timestamps. Long
   // windows (5D) can emit duplicate/out-of-order ts → crash. Sort asc + dedupe
   // by ts (keep last) once, feed everywhere downstream.
@@ -618,6 +869,24 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   const candleRef    = useRef(null);
   const deltaRef     = useRef(null);
   const cvdRef       = useRef(null);
+  const lineRef      = useRef(null);   // close-line series (line chartType)
+  const vwapRef      = useRef(null);
+  const vwapBandRef  = useRef([]);     // [u1,l1,u2,l2] line series
+  const stRef        = useRef(null);   // SuperTrend trail series
+  const [countdown, setCountdown] = useState("");
+  const [legend, setLegend]       = useState(null);  // {o,h,l,c,delta,vol,up}
+  // Drawing layer (measure / horizontal ray / alert)
+  const drawCanvasRef = useRef(null);
+  const [drawTool, setDrawTool] = useState(null);    // null|'measure'|'ray'|'alert'
+  const [lines, setLines]       = useState(() => loadLines(symbol));
+  const [hoverLineId, setHoverLineId] = useState(null);
+  const drawLinesRef = useRef(lines);   drawLinesRef.current = lines;
+  const drawToolRef = useRef(drawTool); drawToolRef.current = drawTool;
+  const hoverLineRef = useRef(null);
+  const measureRef  = useRef(null);
+  const dragRef     = useRef(null);
+  const alertPrevClose = useRef(null);
+  let _lineSeq = useRef(1);
   const linesRef       = useRef([]);
   const pivotSeriesRef = useRef([]);
   const markersRef   = useRef([]);
@@ -628,6 +897,8 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   const fitBarsRef   = useRef(null);   // bars ref at last symbol-fit (race guard)
   barsRef.current    = bars;
   dailyVpRef.current = dailyVp;
+  const vpModeRef    = useRef("visible");
+  vpModeRef.current  = indicators?.vpFull ? "full" : "visible";
 
   // Init chart once
   useEffect(() => {
@@ -687,16 +958,52 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       visible:      false,
     });
 
+    // Close-line series for the "line" chart type (hidden unless selected).
+    const lineSeries = chart.addLineSeries({
+      color: "#d0d0d0", lineWidth: 2, priceLineVisible: false,
+      lastValueVisible: false, visible: false,
+    });
+
+    // VWAP + volume-weighted σ bands (price-scale series → autoscale w/ candles).
+    const vwapSeries = chart.addLineSeries({
+      color: "#ff9800", lineWidth: 2, priceLineVisible: false,
+      lastValueVisible: true, title: "VWAP", visible: false,
+    });
+    const mkBand = (color) => chart.addLineSeries({
+      color, lineWidth: 1, lineStyle: LineStyle.Dotted,
+      priceLineVisible: false, lastValueVisible: false,
+      crosshairMarkerVisible: false, visible: false,
+    });
+    const bandSeries = [
+      mkBand("rgba(255,152,0,0.45)"),  // u1
+      mkBand("rgba(255,152,0,0.45)"),  // l1
+      mkBand("rgba(255,152,0,0.22)"),  // u2
+      mkBand("rgba(255,152,0,0.22)"),  // l2
+    ];
+
+    // SuperTrend trail — ATR-based visual TSL (color set per-point via markers
+    // not supported on a single line; we recolor by recreating segments in the
+    // data effect). Single series, neutral base color.
+    const stSeries = chart.addLineSeries({
+      color: "#26a69a", lineWidth: 2, lineStyle: LineStyle.Solid,
+      priceLineVisible: false, lastValueVisible: false, visible: false,
+    });
+
     chartRef.current  = chart;
     candleRef.current = candleSeries;
     deltaRef.current  = deltaSeries;
     cvdRef.current    = cvdSeries;
+    lineRef.current   = lineSeries;
+    vwapRef.current   = vwapSeries;
+    vwapBandRef.current = bandSeries;
+    stRef.current     = stSeries;
 
     const redrawAll = () => {
-      drawVP(vpCanvasRef.current, chart, candleSeries, dailyVpRef.current, barsRef.current);
+      drawVP(vpCanvasRef.current, chart, candleSeries, dailyVpRef.current, barsRef.current, vpModeRef.current);
       drawFootprint(fpCanvasRef.current, chart, candleSeries, barsRef.current);
       drawBubbles(bbCanvasRef.current, chart, candleSeries, bigTradesRef.current, showBubblesRef.current, barsRef.current, bubbleHitsRef.current);
       drawTradeBoxes(tpCanvasRef.current, chart, candleSeries, stratTradesRef.current, barsRef.current);
+      drawOverlay(drawCanvasRef.current, chart, candleSeries, drawLinesRef.current, measureRef.current, hoverLineRef.current);
     };
     redrawRef.current = redrawAll;
     chart.timeScale().subscribeVisibleLogicalRangeChange(redrawAll);
@@ -740,7 +1047,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       if (!containerRef.current) return;
       const { clientWidth: w, clientHeight: h } = containerRef.current;
       chart.applyOptions({ width: w, height: h });
-      for (const c of [vpCanvasRef.current, fpCanvasRef.current, bbCanvasRef.current, tpCanvasRef.current]) {
+      for (const c of [vpCanvasRef.current, fpCanvasRef.current, bbCanvasRef.current, tpCanvasRef.current, drawCanvasRef.current]) {
         if (c) { c.width = w; c.height = h; }
       }
       redrawAll();
@@ -763,8 +1070,30 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   useEffect(() => {
     if (!candleRef.current || !bars.length) return;
 
-    candleRef.current.setData(bars.map(b => ({
-      time: b.ts, open: b.o, high: b.h, low: b.l, close: b.c,
+    // Candle body: raw OHLC or Heikin-Ashi transform. "line" type feeds a
+    // separate close-line series (candle hidden); visibility handled in the
+    // chartType effect below.
+    const candleData = chartType === "heikin"
+      ? toHeikin(bars)
+      : bars.map(b => ({ time: b.ts, open: b.o, high: b.h, low: b.l, close: b.c }));
+    candleRef.current.setData(candleData);
+    lineRef.current?.setData(bars.map(b => ({ time: b.ts, value: b.c })));
+
+    // VWAP + σ bands
+    const vw = computeVWAP(bars);
+    vwapRef.current?.setData(vw.vwap);
+    const bandSeries = vwapBandRef.current;
+    if (bandSeries?.length === 4) {
+      bandSeries[0].setData(vw.u1); bandSeries[1].setData(vw.l1);
+      bandSeries[2].setData(vw.u2); bandSeries[3].setData(vw.l2);
+    }
+
+    // SuperTrend trail — recolor by mapping each point's dir to a per-point
+    // color (lightweight-charts line series supports per-point `color`).
+    const st = computeSuperTrend(bars);
+    stRef.current?.setData(st.map(p => ({
+      time: p.time, value: p.value,
+      color: p.dir === 1 ? COLORS.up : COLORS.down,
     })));
 
     deltaRef.current.setData(bars.map(b => ({
@@ -792,7 +1121,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
     }
     fitBarsRef.current = bars;
 
-    drawVP(vpCanvasRef.current, chartRef.current, candleRef.current, dailyVp, bars);
+    drawVP(vpCanvasRef.current, chartRef.current, candleRef.current, dailyVp, bars, vpModeRef.current);
     // Defer bubble draw a frame so chart's internal coordinate mapping is
     // up-to-date with the just-applied setData call.
     requestAnimationFrame(() => {
@@ -803,7 +1132,195 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
     if (chartMode === "footprint") {
       drawFootprintWithRetry(fpCanvasRef.current, chartRef.current, candleRef.current, bars);
     }
-  }, [bars, symbol, detections, showBubbles]);
+  }, [bars, symbol, detections, showBubbles, chartType]);
+
+  // Chart-type visibility: candle body vs close-line.
+  useEffect(() => {
+    if (!candleRef.current) return;
+    const isLine = chartType === "line";
+    try {
+      candleRef.current.applyOptions({ visible: !isLine });
+      lineRef.current?.applyOptions({ visible: isLine });
+    } catch {}
+  }, [chartType]);
+
+  // Log / linear price scale.
+  useEffect(() => {
+    try {
+      candleRef.current?.priceScale().applyOptions({
+        mode: logScale ? PriceScaleMode.Logarithmic : PriceScaleMode.Normal,
+      });
+    } catch {}
+  }, [logScale]);
+
+  // VWAP / SuperTrend visibility from the layers toggle.
+  useEffect(() => {
+    const showVwap = indicators?.vwap === true;
+    const showSt   = indicators?.atrTrail === true;
+    try {
+      vwapRef.current?.applyOptions({ visible: showVwap });
+      vwapBandRef.current?.forEach(s => s.applyOptions({ visible: showVwap }));
+      stRef.current?.applyOptions({ visible: showSt });
+    } catch {}
+    redrawRef.current?.();   // vpFull mode change → repaint VP
+  }, [indicators]);
+
+  // Bar-close countdown — last bar's ts IS its close timestamp; tick every 1s.
+  useEffect(() => {
+    if (!bars.length) { setCountdown(""); return; }
+    const closeTs = bars[bars.length - 1].ts;
+    const tick = () => {
+      const left = Math.round(closeTs - Date.now() / 1000);
+      if (left < 0 || left > 86400) { setCountdown(""); return; }
+      const m = Math.floor(left / 60), s = left % 60;
+      setCountdown(`${m}:${String(s).padStart(2, "0")}`);
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [bars]);
+
+  // Crosshair OHLC/Δ legend readout (TV-style top-left live values).
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const handler = (param) => {
+      if (!param.time) { setLegend(null); return; }
+      const b = barsRef.current.find(x => x.ts === param.time);
+      if (!b) { setLegend(null); return; }
+      setLegend({
+        o: b.o, h: b.h, l: b.l, c: b.c, delta: b.delta,
+        vol: (b.bid_vol || 0) + (b.ask_vol || 0), up: b.c >= b.o,
+      });
+    };
+    chart.subscribeCrosshairMove(handler);
+    return () => { try { chart.unsubscribeCrosshairMove(handler); } catch {} };
+  }, []);
+
+  // Reload drawn lines when symbol changes (lines are price-level, symbol-scoped).
+  useEffect(() => { setLines(loadLines(symbol)); measureRef.current = null; }, [symbol]);
+
+  // Persist lines when the set changes.
+  useEffect(() => { saveLines(symbol, lines); }, [lines, symbol]);
+  // Repaint on line-set or hover change (cheap, no storage write).
+  useEffect(() => { redrawRef.current?.(); }, [lines, hoverLineId]);
+
+  // Clear measure + hover when leaving a tool.
+  useEffect(() => {
+    if (!drawTool) { measureRef.current = null; dragRef.current = null; redrawRef.current?.(); }
+  }, [drawTool]);
+
+  // Alert firing — detect close crossing an armed alert line, notify once.
+  useEffect(() => {
+    if (!bars.length) return;
+    const close = bars[bars.length - 1].c;
+    const prev = alertPrevClose.current;
+    alertPrevClose.current = close;
+    if (prev == null) return;
+    let changed = false;
+    const next = lines.map(ln => {
+      if (ln.kind !== "alert" || ln.triggered) return ln;
+      if ((prev - ln.price) * (close - ln.price) <= 0) {
+        changed = true;
+        try {
+          if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+            new Notification(`${symbol} alert`, { body: `price crossed ${ln.price}` });
+          }
+        } catch {}
+        return { ...ln, triggered: true };
+      }
+      return ln;
+    });
+    if (changed) setLines(next);
+  }, [bars, symbol]);
+
+  // Interaction handlers on the draw canvas (active only when a tool is on).
+  useEffect(() => {
+    const cv = drawCanvasRef.current;
+    if (!cv) return;
+    const priceAt = (y) => { try { return candleRef.current?.coordinateToPrice(y); } catch { return null; } };
+    const timeAt  = (x) => { try { return chartRef.current?.timeScale().coordinateToTime(x); } catch { return null; } };
+    const nearestLine = (y) => {
+      const cs = candleRef.current; if (!cs) return null;
+      for (const ln of drawLinesRef.current) {
+        const ly = cs.priceToCoordinate(ln.price);
+        if (ly != null && Math.abs(ly - y) <= 6) return ln;
+      }
+      return null;
+    };
+    const barsBetween = (t1, t2) => {
+      if (t1 == null || t2 == null) return 0;
+      const lo = Math.min(t1, t2), hi = Math.max(t1, t2);
+      return barsRef.current.filter(b => b.ts >= lo && b.ts <= hi).length;
+    };
+    const xy = (e) => { const r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+
+    const onDown = (e) => {
+      const tool = drawToolRef.current; if (!tool) return;
+      const [mx, my] = xy(e);
+      const p = priceAt(my); if (p == null) return;
+      if (tool === "measure") {
+        dragRef.current = { mode: "measure" };
+        measureRef.current = { x1: mx, y1: my, p1: p, t1: timeAt(mx), x2: mx, y2: my, p2: p, bars: 0 };
+      } else {
+        const hit = nearestLine(my);
+        if (hit) { dragRef.current = { mode: "line", id: hit.id }; }
+        else {
+          const id = `l${Date.now()}_${_lineSeq.current++}`;
+          if (tool === "alert" && typeof Notification !== "undefined" && Notification.permission === "default") {
+            try { Notification.requestPermission(); } catch {}
+          }
+          setLines(prev => [...prev, { id, price: p, kind: tool, note: "", triggered: false }]);
+        }
+      }
+      redrawRef.current?.();
+    };
+    const onMove = (e) => {
+      const [mx, my] = xy(e);
+      const drag = dragRef.current;
+      if (drag?.mode === "measure" && measureRef.current) {
+        const p = priceAt(my);
+        measureRef.current = { ...measureRef.current, x2: mx, y2: my, p2: p ?? measureRef.current.p2, bars: barsBetween(measureRef.current.t1, timeAt(mx)) };
+        redrawRef.current?.();
+        return;
+      }
+      if (drag?.mode === "line") {
+        const p = priceAt(my); if (p == null) return;
+        const arr = drawLinesRef.current.map(l => l.id === drag.id ? { ...l, price: p, triggered: false } : l);
+        drawLinesRef.current = arr;        // live drag without state churn
+        redrawRef.current?.();
+        return;
+      }
+      // hover highlight
+      if (drawToolRef.current) {
+        const hit = nearestLine(my);
+        hoverLineRef.current = hit?.id ?? null;
+        setHoverLineId(prev => prev === (hit?.id ?? null) ? prev : (hit?.id ?? null));
+      }
+    };
+    const onUp = () => {
+      const drag = dragRef.current;
+      if (drag?.mode === "line") setLines([...drawLinesRef.current]);  // commit + persist
+      dragRef.current = null;
+    };
+    const onDbl = (e) => {
+      if (!drawToolRef.current) return;
+      const [, my] = xy(e);
+      const hit = nearestLine(my);
+      if (hit) setLines(prev => prev.filter(l => l.id !== hit.id));
+    };
+
+    cv.addEventListener("mousedown", onDown);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    cv.addEventListener("dblclick", onDbl);
+    return () => {
+      cv.removeEventListener("mousedown", onDown);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      cv.removeEventListener("dblclick", onDbl);
+    };
+  }, []);
 
   // On mode flip into OHLC, force a bubble redraw — chart may have stale
   // coordinate mapping while hidden (visibility:hidden); a frame after
@@ -829,7 +1346,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
 
   // Redraw VP when dailyVp changes
   useEffect(() => {
-    drawVP(vpCanvasRef.current, chartRef.current, candleRef.current, dailyVp, bars);
+    drawVP(vpCanvasRef.current, chartRef.current, candleRef.current, dailyVp, bars, vpModeRef.current);
   }, [dailyVp]);
 
   // VP price lines + detection markers + position lines
@@ -1064,6 +1581,15 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
         ref={fpCanvasRef}
         style={{ ...canvasStyle, display: chartMode === "footprint" ? "block" : "none" }}
       />
+      {/* Drawing layer — captures mouse only when a tool is active */}
+      <canvas
+        ref={drawCanvasRef}
+        style={{
+          ...canvasStyle, zIndex: 8,
+          pointerEvents: drawTool ? "auto" : "none",
+          cursor: drawTool === "measure" ? "crosshair" : drawTool ? "ns-resize" : "default",
+        }}
+      />
       {/* Bubble hover tooltip */}
       {hoverBubble && (() => {
         const bt = hoverBubble.bt;
@@ -1193,7 +1719,71 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
         >
           {showBubbles ? "● BUBBLES" : "○ bubbles"}
         </button>
+        {/* Drawing tools — measure / horizontal ray / price alert */}
+        <div style={{ display: "flex", gap: 4 }}>
+          {[
+            { k: "measure", lbl: "📏", tip: "Measure: drag to read Δprice / % / bars" },
+            { k: "ray",     lbl: "─",  tip: "Horizontal line (manual S/R, SL/TP). Click to place, drag to move, dbl-click to delete" },
+            { k: "alert",   lbl: "🔔", tip: "Price alert: click to place; notifies when price crosses. Drag to move, dbl-click to delete" },
+          ].map(t => {
+            const on = drawTool === t.k;
+            return (
+              <button
+                key={t.k}
+                onClick={() => setDrawTool(cur => cur === t.k ? null : t.k)}
+                title={t.tip}
+                style={{
+                  background: "rgba(26,26,26,0.85)",
+                  border: `1px solid ${on ? "#5c9eff" : "#2a2a2a"}`,
+                  color: on ? "#5c9eff" : "#888",
+                  padding: "2px 6px", cursor: "pointer", borderRadius: 3, lineHeight: 1.4,
+                }}
+              >
+                {t.lbl}
+              </button>
+            );
+          })}
+          {lines.length > 0 && (
+            <button
+              onClick={() => setLines([])}
+              title="Clear all drawn lines & alerts for this symbol"
+              style={{
+                background: "rgba(26,26,26,0.85)", border: "1px solid #2a2a2a",
+                color: "#888", padding: "2px 6px", cursor: "pointer", borderRadius: 3, lineHeight: 1.4,
+              }}
+            >
+              ✕{lines.length}
+            </button>
+          )}
+        </div>
+        {/* OHLC / Δ legend — follows crosshair (TV top-left readout) */}
+        {legend && (
+          <div style={{
+            background: "rgba(13,13,13,0.85)", border: "1px solid #2a2a2a",
+            borderRadius: 3, padding: "2px 7px", color: "#999", lineHeight: 1.5,
+            whiteSpace: "nowrap",
+          }}>
+            <span style={{ color: legend.up ? COLORS.up : COLORS.down }}>
+              O{legend.o} H{legend.h} L{legend.l} C{legend.c}
+            </span>
+            <span style={{ color: legend.delta >= 0 ? COLORS.up : COLORS.down, marginLeft: 6 }}>
+              Δ{legend.delta >= 0 ? "+" : ""}{Math.abs(legend.delta) >= 100 ? legend.delta.toFixed(0) : legend.delta.toFixed(1)}
+            </span>
+            <span style={{ color: "#666", marginLeft: 6 }}>V{legend.vol >= 1000 ? (legend.vol / 1000).toFixed(1) + "k" : legend.vol.toFixed(0)}</span>
+          </div>
+        )}
       </div>
+      {/* Bar-close countdown — top-center badge */}
+      {countdown && (
+        <div style={{
+          position: "absolute", top: 6, left: "50%", transform: "translateX(-50%)",
+          zIndex: 10, background: "rgba(26,26,26,0.85)", border: "1px solid #2a2a2a",
+          borderRadius: 3, padding: "2px 8px", fontFamily: "JetBrains Mono, monospace",
+          fontSize: 11, color: "#888", lineHeight: 1.4,
+        }}>
+          ⏱ {countdown}
+        </div>
+      )}
       <button
         onClick={resetView}
         title="Reset view"

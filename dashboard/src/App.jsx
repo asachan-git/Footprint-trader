@@ -18,6 +18,7 @@ const DEFAULT_IND = {
   liveSweep:   true,  srFsSweeps: false, fvgLines:  false,  priorVa:   false, absorptions: false,
   coupTrades:  true,  demoTrades: true, repTrades: true,
   m1Trades:    false, m2Trades: false, cycleTrades: false,
+  vwap:        false, atrTrail: false, vpFull: false,
 };
 
 const IND_ITEMS = [
@@ -37,6 +38,9 @@ const IND_ITEMS = [
   { key: "m1Trades",     label: "M1 Trades (history)",    tip: "Mode-1 Claude-direction grid trade history (15m, teal). Open/closed entries + SL/TP; hover for open time, reason, R" },
   { key: "m2Trades",     label: "M2 Trades (history)",    tip: "Mode-2 rules grid trade history (15m, amber). Open/closed entries + SL/TP; hover for open time, reason, R" },
   { key: "cycleTrades",  label: "Cycle Trades",           tip: "Grid recovery cycles (dashed boxes) for the enabled strategies/modes. Shows cycle # + chain; hover for realized PnL + reason" },
+  { key: "vwap",         label: "VWAP + σ bands",         tip: "Session-anchored VWAP (UTC day) with volume-weighted ±1σ/±2σ bands. Dynamic SL/TP anchor; mean-revert target = VWAP, stretch target = ±2σ" },
+  { key: "atrTrail",     label: "ATR Trail (SuperTrend)", tip: "ATR-based SuperTrend trailing stop. Sits below price in uptrend (green), above in downtrend (red). Visual TSL / trend filter" },
+  { key: "vpFull",       label: "VP: full window",        tip: "Volume profile (left edge) scope: ON = whole loaded window, OFF = visible range only. Real bid/ask volume-at-price with POC + 70% value area + HVN/LVN" },
 ];
 
 function LayersToggle({ indicators, onChange }) {
@@ -134,13 +138,15 @@ export default function App() {
   const [tf,        setTf]        = useState(_prefs.tf        || "1m");
   const [minutes,   setMinutes]   = useState(_prefs.minutes   || 120);
   const [chartMode, setChartMode] = useState(_prefs.chartMode || "ohlc");
+  const [chartType, setChartType] = useState(_prefs.chartType || "candles"); // candles|heikin|line
+  const [logScale,  setLogScale]  = useState(_prefs.logScale  || false);
 
   // Persist toolbar selections across reloads
   useEffect(() => {
     try {
-      localStorage.setItem(LS_KEY, JSON.stringify({ symbol, tf, minutes, chartMode }));
+      localStorage.setItem(LS_KEY, JSON.stringify({ symbol, tf, minutes, chartMode, chartType, logScale }));
     } catch {}
-  }, [symbol, tf, minutes, chartMode]);
+  }, [symbol, tf, minutes, chartMode, chartType, logScale]);
   const [indicators, setIndicators] = useState(() => {
     try { return { ...DEFAULT_IND, ...JSON.parse(localStorage.getItem(LS_IND_KEY)) }; }
     catch { return DEFAULT_IND; }
@@ -307,6 +313,24 @@ export default function App() {
         >
           {chartMode === "ohlc" ? "OHLC" : "FP"}
         </button>
+        {chartMode === "ohlc" && (
+          <>
+            <button
+              onClick={() => setChartType(t => t === "candles" ? "heikin" : t === "heikin" ? "line" : "candles")}
+              title="Cycle chart type: candles → Heikin-Ashi → line"
+            >
+              {chartType === "candles" ? "▦ CANDLE" : chartType === "heikin" ? "▨ HA" : "╱ LINE"}
+            </button>
+            <button
+              onClick={() => setLogScale(v => !v)}
+              title="Toggle log / linear price scale"
+              style={{ borderColor: logScale ? "var(--yellow)" : undefined,
+                       color:       logScale ? "var(--yellow)" : undefined }}
+            >
+              {logScale ? "LOG" : "LIN"}
+            </button>
+          </>
+        )}
         <div className={`live-dot${stale ? " stale" : ""}`} />
         <span className="last-update">{lastTs ? `updated ${lastTs}` : "loading…"}</span>
       </div>
@@ -359,6 +383,8 @@ export default function App() {
             symbol={symbol}
             chartMode={chartMode}
             indicators={indicators}
+            chartType={chartType}
+            logScale={logScale}
           />
         </div>
       </div>
