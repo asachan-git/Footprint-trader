@@ -274,6 +274,51 @@ function drawTradeBoxes(canvas, chart, candleSeries, trades, bars) {
   }
 }
 
+// ── CVD divergence overlay ───────────────────────────────────────────────────
+// Marks price/CVD regular divergences at swing pivots (from backend
+// scan_divergences). bear ▽ red above the swing high, bull △ green below the
+// swing low. hitsOut collects {x,y,r,d} for hover tooltips.
+function drawCVDDivergence(canvas, chart, candleSeries, divs, bars, show, hitsOut) {
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const W = Math.round(rect.width)  || canvas.parentElement?.clientWidth  || 800;
+  const H = Math.round(rect.height) || canvas.parentElement?.clientHeight || 400;
+  if (canvas.width !== W)  canvas.width  = W;
+  if (canvas.height !== H) canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, W, H);
+  if (hitsOut) hitsOut.length = 0;
+  if (!show || !divs?.length) return;
+
+  const ts = chart.timeScale();
+  for (const d of divs) {
+    const x = ts.timeToCoordinate(d.ts);
+    if (x == null) continue;
+    const y = candleSeries.priceToCoordinate(d.price);
+    if (y == null) continue;
+    const bear = d.type === "bear";
+    const col = bear ? COLORS.down : COLORS.up;
+    const dir = bear ? -1 : 1;             // bear above (−), bull below (+)
+    const ty = bear ? y - 16 : y + 16;     // triangle tip offset from price
+    const s = 6;                            // half-width
+    ctx.beginPath();
+    if (bear) { ctx.moveTo(x, ty + s); ctx.lineTo(x - s, ty - s); ctx.lineTo(x + s, ty - s); }
+    else      { ctx.moveTo(x, ty - s); ctx.lineTo(x - s, ty + s); ctx.lineTo(x + s, ty + s); }
+    ctx.closePath();
+    ctx.fillStyle = col;
+    ctx.globalAlpha = 0.9;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    // connector to the price extreme
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath(); ctx.moveTo(x, ty + dir * s); ctx.lineTo(x, y); ctx.stroke();
+    ctx.setLineDash([]);
+    if (hitsOut) hitsOut.push({ x, y: ty, r: 9, d });
+  }
+}
+
 // ── Big-trade bubble overlay ─────────────────────────────────────────────────
 function drawBubbles(canvas, chart, candleSeries, bigTrades, show, bars, hitsOut) {
   if (!canvas) return;
@@ -652,8 +697,9 @@ const STRAT_COLORS = {
   republic:  "#ab47bc",
   m1:        "#26a69a",
   m2:        "#ffca28",
+  reversal:  "#26c6da",
 };
-const STRAT_TAG = { coup: "C", democracy: "D", republic: "R", m1: "1", m2: "2" };
+const STRAT_TAG = { coup: "C", democracy: "D", republic: "R", m1: "1", m2: "2", reversal: "⚑" };
 
 // ── Indicator math (chart-only; no server coupling) ──────────────────────────
 
@@ -862,7 +908,7 @@ function resolveTradeOutcome(t, bars) {
   return t;  // still running — no touch yet
 }
 
-export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, strategyTrades = [], symbol, chartMode, indicators, chartType = "candles", logScale = false }) {
+export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, strategyTrades = [], cvd = [], cvdDivergences = [], symbol, chartMode, indicators, chartType = "candles", logScale = false }) {
   // lightweight-charts setData asserts strictly-asc UNIQUE timestamps. Long
   // windows (5D) can emit duplicate/out-of-order ts → crash. Sort asc + dedupe
   // by ts (keep last) once, feed everywhere downstream.
@@ -897,6 +943,13 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   }, [showBubbles]);
   const bubbleHitsRef = useRef([]);
   const [hoverBubble, setHoverBubble] = useState(null);  // {bt, x, y}
+  const cdCanvasRef  = useRef(null);   // CVD divergence overlay
+  const cvdDivRef    = useRef(cvdDivergences);
+  cvdDivRef.current  = cvdDivergences;
+  const divHitsRef   = useRef([]);
+  const [hoverDiv, setHoverDiv] = useState(null);  // {d, x, y}
+  const showCvdDivRef = useRef(!!indicators?.cvdDiv);
+  useEffect(() => { showCvdDivRef.current = !!indicators?.cvdDiv; }, [indicators]);
   const bigTradesRef = useRef([]);
   const showBubblesRef = useRef(showBubbles);
   useEffect(() => { bigTradesRef.current = detections?.big_trades || []; }, [detections]);
@@ -1039,6 +1092,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       drawFootprint(fpCanvasRef.current, chart, candleSeries, barsRef.current);
       drawBubbles(bbCanvasRef.current, chart, candleSeries, bigTradesRef.current, showBubblesRef.current, barsRef.current, bubbleHitsRef.current);
       drawTradeBoxes(tpCanvasRef.current, chart, candleSeries, stratTradesRef.current, barsRef.current);
+      drawCVDDivergence(cdCanvasRef.current, chart, candleSeries, cvdDivRef.current, barsRef.current, showCvdDivRef.current, divHitsRef.current);
       drawOverlay(drawCanvasRef.current, chart, candleSeries, drawLinesRef.current, measureRef.current, hoverLineRef.current);
     };
     redrawRef.current = redrawAll;
@@ -1070,8 +1124,18 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
         if (hit && prev && prev.bt === hit.bt) return { ...prev, x: mx, y: my };
         return hit ? { bt: hit.bt, x: mx, y: my } : null;
       });
+      // Hit-test CVD divergence markers.
+      let dHit = null;
+      for (const h of divHitsRef.current) {
+        if (Math.hypot(mx - h.x, my - h.y) <= h.r + 2) { dHit = h; break; }
+      }
+      setHoverDiv(prev => {
+        if (!dHit && !prev) return prev;
+        if (dHit && prev && prev.d === dHit.d) return { ...prev, x: mx, y: my };
+        return dHit ? { d: dHit.d, x: mx, y: my } : null;
+      });
     };
-    const onMouseLeave = () => setHoverBubble(null);
+    const onMouseLeave = () => { setHoverBubble(null); setHoverDiv(null); };
     const onMouseWheel = () => redrawAll();
     if (containerRef.current) {
       containerRef.current.addEventListener("mousemove", onMouseMoveAny);
@@ -1083,7 +1147,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       if (!containerRef.current) return;
       const { clientWidth: w, clientHeight: h } = containerRef.current;
       chart.applyOptions({ width: w, height: h });
-      for (const c of [vpCanvasRef.current, fpCanvasRef.current, bbCanvasRef.current, tpCanvasRef.current, drawCanvasRef.current]) {
+      for (const c of [vpCanvasRef.current, fpCanvasRef.current, bbCanvasRef.current, tpCanvasRef.current, cdCanvasRef.current, drawCanvasRef.current]) {
         if (c) { c.width = w; c.height = h; }
       }
       redrawAll();
@@ -1137,11 +1201,28 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       color: b.delta >= 0 ? COLORS.up : COLORS.down,
     })));
 
-    let cvdSum = 0;
-    cvdRef.current.setData(bars.map(b => {
-      cvdSum += b.delta || 0;
-      return { time: b.ts, value: cvdSum };
-    }));
+    // CVD line: prefer backend session-reset CVD candles (consistent with the
+    // divergence markers); fall back to local cumulative delta.
+    if (cvd?.length) {
+      const seen = new Set();
+      const cvdData = [];
+      for (const c of cvd) {
+        if (seen.has(c.ts)) continue;
+        seen.add(c.ts);
+        cvdData.push({ time: c.ts, value: c.c });
+      }
+      cvdData.sort((a, b) => a.time - b.time);
+      cvdRef.current.setData(cvdData);
+    } else {
+      let cvdSum = 0;
+      cvdRef.current.setData(bars.map(b => {
+        cvdSum += b.delta || 0;
+        return { time: b.ts, value: cvdSum };
+      }));
+    }
+    const showCvd = !!indicators?.cvdDiv;
+    cvdRef.current.applyOptions({ visible: showCvd });
+    chartRef.current?.priceScale("cvd").applyOptions({ visible: showCvd });
 
     // Fit + rescale ONLY on the render where the new symbol's data actually
     // arrives. On symbol switch the effect first runs with the *previous*
@@ -1163,12 +1244,14 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
     requestAnimationFrame(() => {
       drawBubbles(bbCanvasRef.current, chartRef.current, candleRef.current,
                   detections?.big_trades || [], showBubbles, bars, bubbleHitsRef.current);
+      drawCVDDivergence(cdCanvasRef.current, chartRef.current, candleRef.current,
+                        cvdDivergences, bars, !!indicators?.cvdDiv, divHitsRef.current);
     });
 
     if (chartMode === "footprint") {
       drawFootprintWithRetry(fpCanvasRef.current, chartRef.current, candleRef.current, bars);
     }
-  }, [bars, symbol, detections, showBubbles, chartType]);
+  }, [bars, symbol, detections, showBubbles, chartType, cvd, cvdDivergences, indicators]);
 
   // Chart-type visibility: candle body vs close-line.
   useEffect(() => {
@@ -1497,6 +1580,59 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       });
     }
 
+    // Coup absorption trigger candles (momentum mode) — full window
+    if (indicators?.coupAbs !== false) {
+      (detections?.coup_absorptions || []).forEach(a => {
+        const isLong = a.winner === "long";
+        markers.push({
+          time: a.ts,
+          position: isLong ? "belowBar" : "aboveBar",
+          color: isLong ? COLORS.up : COLORS.down,
+          shape: isLong ? "arrowUp" : "arrowDown",
+          text: `cABS`,
+          size: 1,
+          absObs: { ...a, strat: "coup", modeLabel: "momentum" },
+        });
+      });
+    }
+
+    // Coup-reversal absorption trigger candles (reversal mode) — full window
+    if (indicators?.coupRevAbs !== false) {
+      (detections?.coup_reversal_absorptions || []).forEach(a => {
+        const isLong = a.winner === "long";
+        markers.push({
+          time: a.ts,
+          position: isLong ? "belowBar" : "aboveBar",
+          color: isLong ? "#26c6da" : "#ab47bc",
+          shape: isLong ? "arrowUp" : "arrowDown",
+          text: `crABS`,
+          size: 1,
+          absObs: { ...a, strat: "coup_reversal", modeLabel: "reversal" },
+        });
+      });
+    }
+
+    // Confirmed absorptions ★ — only candles whose next bar confirmed the reversal
+    // (the high-continuation subset). Gold squares, both modes.
+    if (indicators?.coupAbsConf) {
+      const conf = [
+        ...(detections?.coup_absorptions || []).map(a => ({ ...a, strat: "coup", modeLabel: "momentum" })),
+        ...(detections?.coup_reversal_absorptions || []).map(a => ({ ...a, strat: "coup_reversal", modeLabel: "reversal" })),
+      ].filter(a => a.next_confirms === true);
+      conf.forEach(a => {
+        const isLong = a.winner === "long";
+        markers.push({
+          time: a.ts,
+          position: isLong ? "belowBar" : "aboveBar",
+          color: "#ffd700",
+          shape: "square",
+          text: `★ ${a.continuation ? "CONT" : ""}`.trim(),
+          size: 2,
+          absObs: a,
+        });
+      });
+    }
+
     // Bounded pivot lines — extend only until level is taken out
     const findTakeout = (sp) => {
       const isHi = sp.side === "high";
@@ -1612,6 +1748,8 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       <canvas ref={vpCanvasRef} style={{ ...canvasStyle, zIndex: 5 }} />
       {/* Bubble overlay — always rendered; visibility gated inside drawBubbles */}
       <canvas ref={bbCanvasRef} style={{ ...canvasStyle, zIndex: 6 }} />
+      {/* CVD divergence overlay — visibility gated inside drawCVDDivergence */}
+      <canvas ref={cdCanvasRef} style={{ ...canvasStyle, zIndex: 7 }} />
       {/* Footprint overlay — FP mode only */}
       <canvas
         ref={fpCanvasRef}
@@ -1660,6 +1798,40 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
           </div>
         );
       })()}
+      {/* CVD divergence hover tooltip */}
+      {hoverDiv && (() => {
+        const d = hoverDiv.d;
+        const bear = d.type === "bear";
+        const color = bear ? COLORS.down : COLORS.up;
+        const W = 220, H = 86;
+        const wrapRect = containerRef.current?.getBoundingClientRect() || { width: 800, height: 400 };
+        let tx = hoverDiv.x + 12, ty = hoverDiv.y + 12;
+        if (tx + W > wrapRect.width)  tx = hoverDiv.x - W - 12;
+        if (ty + H > wrapRect.height) ty = hoverDiv.y - H - 12;
+        const tIst = d.ts ? (() => {
+          const dt = new Date((d.ts + 19800) * 1000);
+          return `${String(dt.getUTCHours()).padStart(2,"0")}:${String(dt.getUTCMinutes()).padStart(2,"0")} IST`;
+        })() : "";
+        return (
+          <div style={{
+            position: "absolute", left: tx, top: ty,
+            background: "rgba(13,13,13,0.92)", border: `1px solid ${color}`,
+            borderRadius: 3, padding: "6px 8px", pointerEvents: "none",
+            zIndex: 20, minWidth: W, fontFamily: "JetBrains Mono, monospace",
+            fontSize: 11, color: "#bbb", lineHeight: 1.5,
+          }}>
+            <div style={{ color, fontWeight: 700 }}>
+              CVD DIVERGENCE · {bear ? "BEARISH" : "BULLISH"}
+            </div>
+            <div>{bear ? "price higher-high, CVD lower-high" : "price lower-low, CVD higher-low"}</div>
+            <div><span style={{ color: "#888" }}>price </span><span>{d.price}</span>
+              <span style={{ color: "#888" }}>  str </span><span>{d.strength}</span></div>
+            <div><span style={{ color: "#888" }}>cvd </span><span>{d.cvd}</span>
+              <span style={{ color: "#888" }}> vs </span><span>{d.prev_cvd}</span></div>
+            {tIst && <div><span style={{ color: "#888" }}>at </span><span>{tIst}</span></div>}
+          </div>
+        );
+      })()}
       {/* Marker hover tooltip */}
       {hoverMarker && (() => {
         const m = hoverMarker;
@@ -1670,6 +1842,45 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
         if (ty + H > wrapRect.height) ty = m.y - H - 12;
         const isHi = m.position === "aboveBar";
         const txt = m.text || "";
+
+        // Absorption candle — rich card: who trapped, aggressor, next-candle confirm.
+        if (m.absObs) {
+          const a = m.absObs;
+          const isLong = a.winner === "long";
+          const nc = a.next_confirms;
+          return (
+            <div style={{
+              position: "absolute", left: tx, top: ty,
+              background: "rgba(13,13,13,0.94)", border: `1px solid ${m.color}`,
+              borderRadius: 3, padding: "6px 8px", pointerEvents: "none",
+              zIndex: 20, minWidth: 230, fontFamily: "JetBrains Mono, monospace",
+              fontSize: 11, color: "#bbb", lineHeight: 1.5,
+            }}>
+              <div style={{ color: m.color, fontWeight: 700 }}>
+                {a.strat.toUpperCase()} · {a.winner.toUpperCase()} ({a.modeLabel})
+              </div>
+              <div>{a.bar_dir} candle · vol×{a.vol_ratio} · Δ{a.delta}</div>
+              <div><span style={{ color: isLong ? COLORS.up : COLORS.down }}>
+                {a.trapped} trapped → {a.winner}</span></div>
+              <div>extreme aggressor <b>{a.zone_aggressor}</b>
+                {a.zone_buy_frac != null ? ` (buy ${(a.zone_buy_frac * 100).toFixed(0)}%)` : ""}
+                {"  "}ask {a.zone_ask} / bid {a.zone_bid}</div>
+              <div>absPct {a.bar_pct}{a.is_wick_trap ? " · wick-trap" : ""}</div>
+              {nc != null && (
+                <div style={{ color: nc ? COLORS.up : "#888", marginTop: 1 }}>
+                  next candle {nc ? "✔ CONFIRMS" : "✗ no confirm"}
+                  {a.next_delta != null ? ` (Δ${a.next_delta})` : ""}
+                </div>
+              )}
+              {a.fwd_mfe_atr != null && (
+                <div style={{ color: a.continuation ? COLORS.up : COLORS.down, marginTop: 1 }}>
+                  fwd 6-bar: MFE {a.fwd_mfe_atr}atr / MAE {a.fwd_mae_atr}atr
+                  {"  "}[{a.continuation ? "CONT" : "fail"}]
+                </div>
+              )}
+            </div>
+          );
+        }
 
         // Strategy trade entry — rich card: strategy, side, entry/SL/TP, reason.
         if (m.strategy) {

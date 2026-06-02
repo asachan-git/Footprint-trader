@@ -16,9 +16,10 @@ const LS_IND_KEY  = "fb_indicators_v1";
 const DEFAULT_IND = {
   sweepArrows: true,  eqLevels: true,   pivotLines: false, nakedPocs: true,  priorPoc: true,
   liveSweep:   true,  srFsSweeps: false, fvgLines:  false,  priorVa:   false, absorptions: false,
+  coupAbs:     false, coupRevAbs: false, coupAbsConf: false,
   coupTrades:  true,  demoTrades: true, repTrades: true,
   m1Trades:    false, m2Trades: false, cycleTrades: false,
-  vwap:        false, atrTrail: false, vpFull: false,
+  vwap:        false, atrTrail: false, vpFull: false, cvdDiv: false, revPattern: false,
 };
 
 const IND_ITEMS = [
@@ -32,6 +33,9 @@ const IND_ITEMS = [
   { key: "priorVa",      label: "Prior VA (H/L)",         tip: "Prior session Value Area High/Low — 70% of prior-day volume traded between these two levels" },
   { key: "fvgLines",     label: "FVGs",                   tip: "Fair Value Gaps — 3-bar imbalance zones where price moved too fast; often filled on retest" },
   { key: "absorptions",  label: "Absorptions",            tip: "Absorption — large passive volume at price extreme with minimal bar movement; potential reversal signal" },
+  { key: "coupAbs",      label: "Coup Absorptions",       tip: "coup trigger candles (momentum mode): high-vol/high-delta 15m bar with the winner side dominant at the extreme. ▲ below = long, ▼ above = short" },
+  { key: "coupRevAbs",   label: "Coup-Reversal Absorptions", tip: "coup_reversal trigger candles (reversal mode): high-vol candle closing with a wick rejection + volume fight at the extreme. ◆ marker, color = winner side" },
+  { key: "coupAbsConf",  label: "Confirmed Absorptions ★", tip: "ONLY absorption candles whose NEXT candle confirmed the reversal (winner-dir delta dominant + closed past trigger). Gold squares — the high-continuation subset. Both coup + coup_reversal" },
   { key: "coupTrades",   label: "Coup Trades",            tip: "coup strategy entries/exits (15m, orange). Backtest + live: entry/exit arrows, SL/TP segments" },
   { key: "demoTrades",   label: "Democracy Trades",       tip: "democracy strategy live paper trades (15m, blue). Entry arrow + SL/TP segments; hover for reason" },
   { key: "repTrades",    label: "Republic Trades",        tip: "republic strategy live paper trades (15m, purple, tight-SL). Entry arrow + SL/TP segments; hover for reason" },
@@ -41,6 +45,8 @@ const IND_ITEMS = [
   { key: "vwap",         label: "VWAP + σ bands",         tip: "Session-anchored VWAP (UTC day) with volume-weighted ±1σ/±2σ bands. Dynamic SL/TP anchor; mean-revert target = VWAP, stretch target = ±2σ" },
   { key: "atrTrail",     label: "ATR Trail (SuperTrend)", tip: "ATR-based SuperTrend trailing stop. Sits below price in uptrend (green), above in downtrend (red). Visual TSL / trend filter" },
   { key: "vpFull",       label: "VP: full window",        tip: "Volume profile (left edge) scope: ON = whole loaded window, OFF = visible range only. Real bid/ask volume-at-price with POC + 70% value area + HVN/LVN" },
+  { key: "cvdDiv",       label: "CVD Divergence",         tip: "Cumulative Volume Delta line (secondary scale) + regular divergence markers: price makes a new swing extreme but CVD does not. Bear ▽ (red) at higher-high w/ lower CVD; bull △ (green) at lower-low w/ higher CVD. Hover for CVD values" },
+  { key: "revPattern",   label: "Reversal Pattern ⚑",     tip: "DIAGNOSTIC (not a trade signal — backtests ~breakeven). Climax pivot (vol≥2×med) + next-bar delta flip (closes reversal way + rev-delta swing ≥50). Rendered as TRADES (⚑, cyan): entry→exit box w/ structural SL (swing high/low + buffer) + 2R TP, win/loss colored, outcome resolved from bars; hover for reason/RR. Any TF" },
 ];
 
 function LayersToggle({ indicators, onChange }) {
@@ -191,11 +197,20 @@ export default function App() {
     return () => { cancel = true; clearInterval(id); };
   }, [symbol, tf]);
 
-  // Merge enabled strategies/modes into one tagged array for the chart (15m).
+  // Merge enabled strategies/modes into one tagged array for the chart.
+  const reversalPatterns = data?.reversal_patterns ?? [];
   const strategyTrades = useMemo(() => {
-    if (tf !== "15m") return [];
     const tag = (arr, name) => (arr || []).map(t => ({ ...t, strategy: name }));
     const out = [];
+    // Reversal-pattern "trades" (diagnostic) — any TF; outcome resolved from bars.
+    if (indicators.revPattern) {
+      out.push(...(reversalPatterns || []).map(p => ({
+        strategy: "reversal", side: p.side,
+        entry: p.entry, entry_ts: p.ts, sl: p.sl, tp: p.tp, open: true,
+        rationale: `reversal: climax vol×${p.vol_ratio} + flip Δswing${p.delta_swing} · SL=${p.sl_basis}`,
+      })));
+    }
+    if (tf !== "15m") return out;
     if (indicators.coupTrades !== false) out.push(...tag(stratTrades.coup, "coup"));
     if (indicators.demoTrades !== false) out.push(...tag(stratTrades.democracy, "democracy"));
     if (indicators.repTrades  !== false) out.push(...tag(stratTrades.republic, "republic"));
@@ -209,7 +224,8 @@ export default function App() {
     }
     return out;
   }, [stratTrades, stratCycles, indicators.coupTrades, indicators.demoTrades,
-      indicators.repTrades, indicators.m1Trades, indicators.m2Trades, indicators.cycleTrades, tf]);
+      indicators.repTrades, indicators.m1Trades, indicators.m2Trades, indicators.cycleTrades,
+      indicators.revPattern, reversalPatterns, tf]);
   // Shared visible-time-range across FP ↔ Candle. Each pane writes on pan,
   // reads on becoming visible. Ref, not state, so no re-render loops.
   const rangeRef = useRef(null);  // {from: ts, to: ts} | null
@@ -354,6 +370,7 @@ export default function App() {
             closedPositions={data?.positions?.closed ?? []}
             cvd={data?.cvd ?? []}
             cvdSignal={data?.cvd_signal ?? null}
+            cvdDivergences={data?.cvd_divergences ?? []}
             zones={data?.zones ?? {}}
             latestM2={data?.latest_m2 ?? null}
             nakedPocs={data?.naked_pocs ?? []}
@@ -380,6 +397,8 @@ export default function App() {
             historicalSweeps={data?.historical_sweeps ?? []}
             swingPoints={data?.swing_points ?? []}
             strategyTrades={strategyTrades}
+            cvd={data?.cvd ?? []}
+            cvdDivergences={data?.cvd_divergences ?? []}
             symbol={symbol}
             chartMode={chartMode}
             indicators={indicators}

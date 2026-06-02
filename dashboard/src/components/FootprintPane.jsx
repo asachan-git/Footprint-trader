@@ -126,7 +126,7 @@ function resolveTradeOutcome(t, bars) {
 
 export default function FootprintPane({
   bars, dailyVp, priorVp, detections, positions, pendingOrders, nakedPocs,
-  closedPositions, cvd, cvdSignal, zones, latestM2, historicalSweeps, swingPoints,
+  closedPositions, cvd, cvdSignal, cvdDivergences = [], zones, latestM2, historicalSweeps, swingPoints,
   strategyTrades = [], symbol, indicators,
 }) {
   const canvasRef = useRef(null);
@@ -917,6 +917,39 @@ export default function FootprintPane({
       }
     });
 
+    // CVD divergence markers — price/CVD regular divergence at swing pivots.
+    if (indicators?.cvdDiv && cvdDivergences?.length) {
+      cvdDivergences.forEach(d => {
+        const xC = tsToVisibleX(d.ts);
+        if (xC < -barW || xC > plotW + barW) return;
+        const y = yOfPrice(d.price);
+        if (y < PAD_TOP || y > PAD_TOP + plotH) return;
+        const bear = d.type === "bear";
+        const color = bear ? COLORS.down : COLORS.up;
+        const triH = 7, triW = 6;
+        const ty = bear ? y - 16 : y + 16;
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.9;
+        ctx.beginPath();
+        if (bear) { ctx.moveTo(xC, ty + triH); ctx.lineTo(xC - triW, ty - triH); ctx.lineTo(xC + triW, ty - triH); }
+        else      { ctx.moveTo(xC, ty - triH); ctx.lineTo(xC - triW, ty + triH); ctx.lineTo(xC + triW, ty + triH); }
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalAlpha = 1.0;
+        // dashed connector to the price extreme
+        ctx.save();
+        ctx.setLineDash([2, 2]);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(xC, bear ? ty - triH : ty + triH);
+        ctx.lineTo(xC, y);
+        ctx.stroke();
+        ctx.restore();
+        detHitsRef.current.push({ x: xC, y: ty, r: 10, type: "cvd_div", payload: { ...d } });
+      });
+    }
+
     // SR/FS sweeps — small dim arrows with hover detail
     if (indicators?.srFsSweeps !== false) {
       (historicalSweeps || []).forEach(sw => {
@@ -1233,8 +1266,8 @@ export default function FootprintPane({
     // label. Open trades extend to the right edge. Cycles drawn dashed.
     // Entry registered into detHitsRef → hover card (SL/target/reason/PnL).
     if (showTrades && strategyTrades?.length) {
-      const SCOL = { coup: "#ff9800", democracy: "#42a5f5", republic: "#ab47bc", m1: "#26a69a", m2: "#ffca28" };
-      const STAG = { coup: "C", democracy: "D", republic: "R", m1: "1", m2: "2" };
+      const SCOL = { coup: "#ff9800", democracy: "#42a5f5", republic: "#ab47bc", m1: "#26a69a", m2: "#ffca28", reversal: "#26c6da" };
+      const STAG = { coup: "C", democracy: "D", republic: "R", m1: "1", m2: "2", reversal: "⚑" };
       // Resolve open/unresolved trades against future candles (real TP/SL touch).
       const resolved = strategyTrades.map(t => resolveTradeOutcome(t, bars));
       for (const t of resolved) {
@@ -1675,7 +1708,7 @@ export default function FootprintPane({
         lastLabelX = xC;
       }
     }
-  }, [bars, dailyVp, priorVp, detections, positions, pendingOrders, closedPositions, cvd, cvdSignal, zones, view, cellMode, selectedPosId, showTrades, showBubbles, theme, swingPoints, indicators, historicalSweeps, nakedPocs, strategyTrades]);
+  }, [bars, dailyVp, priorVp, detections, positions, pendingOrders, closedPositions, cvd, cvdSignal, cvdDivergences, zones, view, cellMode, selectedPosId, showTrades, showBubbles, theme, swingPoints, indicators, historicalSweeps, nakedPocs, strategyTrades]);
 
   // Resize observer → trigger re-render
   useEffect(() => {
@@ -2162,6 +2195,17 @@ export default function FootprintPane({
               ? <div style={{ color: "#aaa", marginTop: 2 }}>Retail stop cluster — two+ pivots within 0.15%. Prime institutional sweep target before reversal.</div>
               : <div style={{ color: "#aaa", marginTop: 2 }}>Structural swing {isHi ? "high" : "low"} — local price extreme. Line ends when level is taken out.</div>
             }
+          </>);
+        } else if (hoverDet.type === "cvd_div") {
+          const bear = p.type === "bear";
+          const color = bear ? COLORS.down : COLORS.up;
+          header = (<span style={{ color, fontWeight: 700 }}>CVD DIVERGENCE · {bear ? "BEARISH" : "BULLISH"}</span>);
+          body = (<>
+            <div style={{ color: "#aaa" }}>{bear ? "price higher-high, CVD lower-high" : "price lower-low, CVD higher-low"}</div>
+            <div><span style={{ color: "#888" }}>price </span><span>{r(p.price)}</span>
+              <span style={{ color: "#888" }}>  str </span><span>{p.strength}</span></div>
+            <div><span style={{ color: "#888" }}>cvd </span><span>{p.cvd}</span>
+              <span style={{ color: "#888" }}> vs </span><span>{p.prev_cvd}</span></div>
           </>);
         } else if (hoverDet.type === "big_trade") {
           const isBuy = p.aggressor === "buy";

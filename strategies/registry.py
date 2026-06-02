@@ -18,6 +18,7 @@ from .republic import Republic
 from .senate import Senate
 from .coup import Coup
 from .coup_reversal import CoupReversal
+from .reversal import Reversal
 
 LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
@@ -30,6 +31,7 @@ REGISTRY: dict[str, type[Strategy]] = {
     "senate": Senate,
     "coup": Coup,
     "coup_reversal": CoupReversal,
+    "reversal": Reversal,
 }
 
 

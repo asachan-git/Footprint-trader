@@ -125,3 +125,24 @@ strategies:
       sl_mode: imbalance    # far edge of the winner-side imbalance zone
       sl_buffer_pct: 0.10
       flip_exit: true
+
+  # reversal = the VP-gated climax-pivot → next-bar-delta-flip setup
+  # (scripts/reversal_study.py + reversal_pattern_backtest.py). Distinct mechanic
+  # from coup_reversal: a CAUSAL swing pivot with climax volume, then a next candle
+  # that flips reversal-aligned delta and closes the reversal way, ENTERED only when
+  # it FADES a value-area extreme (long ≤ VAL / short ≥ VAH) and is NOT nearest a HVN
+  # magnet. Raw pattern ~breakeven; the VP gate + structural SL was the only filter
+  # that turned it PF-positive in backtest (VA-extreme + imbalance SL → PF ~1.50 vs
+  # 0.95, n=57). PROVISIONAL — edge skewed short over one down-week, so it runs in
+  # PAPER to accumulate cross-regime out-of-sample samples. Own store:
+  # data/strategies/reversal/. Market entry at the flip-bar close; structural SL =
+  # trapped-side stacked-imbalance edge (swing high/low fallback); forced 2R TP;
+  # flip + hard-SL exit (inherited from coup).
+  - name: reversal
+    enabled: true
+    config:
+      symbols: [BTCUSDT]
+      decide_tf: 15m
+      vol_mult: 2.0        # climax: pivot vol ≥ 2× median(prior 20)
+      delta_swing: 50.0    # next-bar reversal-aligned delta swing vs the pivot
+      vp_filter: true      # ONLY fade value-area extremes, skip HVN magnets
