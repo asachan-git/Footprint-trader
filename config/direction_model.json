@@ -1,0 +1,24 @@
+{
+  "horizon_bars": 6,
+  "modules": [
+    "confirmation",
+    "cvd",
+    "delta_div",
+    "fvg",
+    "stacked_imb",
+    "unfinished_auction",
+    "vp_position"
+  ],
+  "weights": {
+    "intercept": 0.10183558018595565,
+    "confirmation": 0.019523400548274335,
+    "cvd": -0.21103559795931054,
+    "delta_div": 0.27811997816396417,
+    "fvg": -0.08213583557002514,
+    "stacked_imb": -0.11827500408584346,
+    "unfinished_auction": -0.37518347839647515,
+    "vp_position": -0.5466049116176044
+  },
+  "base_rate_up": 0.4851120776179324,
+  "brier_test": 0.2467908259005292
+}
