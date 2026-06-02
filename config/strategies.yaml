@@ -146,3 +146,140 @@ strategies:
       vol_mult: 2.0        # climax: pivot vol ≥ 2× median(prior 20)
       delta_swing: 50.0    # next-bar reversal-aligned delta swing vs the pivot
       vp_filter: true      # ONLY fade value-area extremes, skip HVN magnets
+      # Entry A/B (BTC+XAU, VP-gated, imbalance SL, 2R): lvn LIMIT best per-trade
+      # (PF 2.0, +0.50R, but 38% fill); market most fills (PF 1.33, +0.17R, 96%);
+      # imbalance near-edge worst (PF 1.23). lvn = limit at the low-volume bin
+      # between the pivot extreme and POC; decide() waits ≤entry_expiry_bars for a
+      # retrace touch (else voids). Switch to "market" for more fills / fewer misses.
+      entry_mode: lvn       # market | lvn | imbalance
+      entry_expiry_bars: 3  # bars a LIMIT waits for the touch before voiding
+      # SL = trapped-side stacked-imbalance far edge (swing high/low fallback) — set
+      # by the detector. Dynamic exits: absorption-flip + hard-SL (from coup) +
+      # CVD-divergence-against (cut when order-flow exhausts against us) + POC-trail
+      # (cycle_manager, unconditional). 2R TP kept.
+      cvd_divergence_exit: true
+      cvd_exit_conf: 0.65   # min CVD-signal confidence to trigger the exit
+
+  # reversal_si = reversal pattern, stacked-imbalance IGNITION entry + footprint-
+  # managed exit. Separate store; runs alongside `reversal` (lvn entry / 2R) for a
+  # live A/B. Entry: the VP-gated flip must ALSO print a fresh trade-direction
+  # stacked imbalance on the flip bar (orderflow ignition); market entry at the flip
+  # close; SL just beyond that stack's far low/high. Target: opposite-side LVN
+  # (value vacuum) in the profit direction → else next unfilled FVG → else 2R, set as
+  # the TP cap. Exits: absorption-flip + CVD-divergence (early reversal) + SI-trail
+  # (tighten SL under each bar's stacked imbalance) + hard-SL. PROVISIONAL — paper.
+  - name: reversal_si
+    enabled: true
+    config:
+      symbols: [BTCUSDT]
+      decide_tf: 15m
+      vol_mult: 2.0
+      delta_swing: 50.0
+      vp_filter: true       # fade value-area extremes, skip HVN magnets
+      entry_mode: si_flip   # fresh trade-direction stacked imbalance on the flip bar
+      target_mode: vp_lvn   # opposite LVN → FVG → 2R fallback
+      si_trail: true        # trail SL under each bar's trade-direction stacked imbalance
+      cvd_divergence_exit: true
+      cvd_exit_conf: 0.65
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # 5m PARALLEL INSTANCES — every strategy also runs on 5m alongside its 15m twin
+  # for a TF A/B (finer entries/exits). `class` reuses the registered class under a
+  # new instance name → separate store (data/strategies/<name>_5m/). The manager
+  # gates entry to each instance's decide_tf/vote_tf, so 5m and 15m never cross-fire.
+  # The 5m feed is noisier; vote-panel TFs (democracy/republic/senate) are calibrated
+  # on 15m, so treat their 5m results as exploratory. Disable any that underperform.
+  # ──────────────────────────────────────────────────────────────────────────────
+  - name: democracy_5m
+    class: democracy
+    enabled: true
+    config: { symbols: [BTCUSDT, XAUTUSDT], vote_tf: 5m }
+
+  - name: republic_5m
+    class: republic
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      vote_tf: 5m
+      sl_atr_mult: 1.5
+      sl_struct_buf_atr: 0.2
+      sl_conf_tol_atr: 0.25
+
+  - name: senate_5m
+    class: senate
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      vote_tf: 5m
+      sl_atr_mult: 1.5
+      sl_wall_buf_atr: 0.25
+      sl_conf_tol_atr: 0.25
+
+  - name: coup_5m
+    class: coup
+    enabled: true
+    config:
+      symbols: [BTCUSDT]
+      decide_tf: 5m
+      lookback: 6
+      vol_mult: 1.8
+      delta_ratio: 0.35
+      absorption_mode: momentum
+      confirm_within: 3
+      confirm_delta_ratio: 0.25
+      confirm_cvd_conf: 0.60
+      confirm_require_progress: true
+      entry_mode: range
+      range_pct: 0.5
+      sl_mode: imbalance
+      sl_buffer_pct: 0.10
+      swing_lookback: 3
+      flip_exit: true
+
+  - name: coup_reversal_5m
+    class: coup_reversal
+    enabled: true
+    config:
+      symbols: [BTCUSDT]
+      decide_tf: 5m
+      absorption_mode: reversal
+      vol_lookback: 10
+      lookback: 6
+      vol_mult: 1.8
+      vol_mult_max: 2.5
+      confirm_within: 2
+      confirm_delta_ratio: 0.15
+      confirm_require_progress: true
+      entry_mode: imbalance
+      sl_mode: imbalance
+      sl_buffer_pct: 0.10
+      flip_exit: true
+
+  - name: reversal_5m
+    class: reversal
+    enabled: true
+    config:
+      symbols: [BTCUSDT]
+      decide_tf: 5m
+      vol_mult: 2.0
+      delta_swing: 50.0   # NOTE: 5m delta is smaller — may need lowering after data
+      vp_filter: true
+      entry_mode: lvn
+      entry_expiry_bars: 3
+      cvd_divergence_exit: true
+      cvd_exit_conf: 0.65
+
+  - name: reversal_si_5m
+    class: reversal_si
+    enabled: true
+    config:
+      symbols: [BTCUSDT]
+      decide_tf: 5m
+      vol_mult: 2.0
+      delta_swing: 50.0
+      vp_filter: true
+      entry_mode: si_flip
+      target_mode: vp_lvn
+      si_trail: true
+      cvd_divergence_exit: true
+      cvd_exit_conf: 0.65

@@ -37,6 +37,44 @@ def _vol(bar) -> float:
     return fp.total_bid + fp.total_ask
 
 
+def _entry_level(piv, side, mode):
+    """Footprint LIMIT entry level on the pivot bar (None → not placeable).
+      imbalance — near edge of the trapped-side stacked-imbalance zone (long pulls
+                  back DOWN into the SELL cluster's high; short UP into the BUY low).
+      lvn       — low-volume bin between the pivot extreme and POC (retrace vacuum).
+      market/other → None (caller uses the flip close).
+    Backtest (BTC+XAU, VP-gated, 2R): lvn best per-trade (PF 2.0, +0.5R, 38% fill);
+    imbalance near-edge worst; market robust (PF 1.33, 96% fill)."""
+    fp = build_fp(piv)
+    if mode == "imbalance":
+        trapped = "sell" if side == "long" else "buy"
+        zones = [z for z in stacked_imbalances(fp, min_stack=3) if z.side == trapped]
+        if not zones:
+            return None
+        z = max(zones, key=lambda z: z.count)
+        return z.price_high if side == "long" else z.price_low
+    if mode == "lvn":
+        if not fp.cells or fp.poc_price is None:
+            return None
+        poc = fp.poc_price
+        region = [c for c in fp.cells
+                  if c.total > 0 and (c.price <= poc if side == "long" else c.price >= poc)]
+        if len(region) < 2:
+            return None
+        return min(region, key=lambda c: c.total).price
+    return None
+
+
+def _flip_si(nxt, side):
+    """Strongest TRADE-DIRECTION stacked imbalance on the flip bar (orderflow
+    ignition): long → a BUY stack, short → a SELL stack. None if absent."""
+    want = "buy" if side == "long" else "sell"
+    zones = [z for z in stacked_imbalances(build_fp(nxt), min_stack=3) if z.side == want]
+    if not zones:
+        return None
+    return max(zones, key=lambda z: z.count)
+
+
 def _imbalance_sl(piv, side, buf):
     """SL beyond the trapped-side stacked-imbalance zone on the pivot bar.
     long → sellers trapped at the low → SL below the strongest SELL zone;
@@ -75,12 +113,17 @@ def _vp_gate(bars, i, symbol, tf, price, side):
 
 
 def detect(bars: list, vol_mult: float = 2.0, delta_swing: float = 50.0,
-           symbol: str = "BTCUSDT", tf: str = "15m", vp_filter: bool = True) -> list[dict]:
+           symbol: str = "BTCUSDT", tf: str = "15m", vp_filter: bool = True,
+           entry_mode: str = "market") -> list[dict]:
     """Return reversal-pattern markers across the history.
 
-    Each: {ts (flip bar), pivot_ts, side ("long"|"short"), pivot_price, entry,
-    sl, tp, vol_ratio, delta_swing, sl_basis, near_level, vp_pos}. ts is the flip
-    (i+1) bar — when the pattern is knowable and where entry would print.
+    Each: {ts (flip bar), pivot_ts, side, pivot_price, entry, entry_kind,
+    is_limit, sl, tp, vol_ratio, delta_swing, sl_basis, near_level, vp_pos}.
+    ts is the flip (i+1) bar — when the pattern is knowable.
+
+    entry_mode: market (flip close, fills immediately) | lvn | imbalance (a LIMIT at
+    that footprint level — the caller waits for a retrace touch; is_limit=True). TP is
+    2R from the chosen entry. Backtest: lvn best per-trade (PF 2.0), market most fills.
 
     vp_filter (default on): keep only reversals fading a value-area extreme and not
     at a HVN magnet (backtest: that subset + imbalance SL = PF 1.50 vs 0.95 baseline).
@@ -119,19 +162,39 @@ def detect(bars: list, vol_mult: float = 2.0, delta_swing: float = 50.0,
 
         a = atr(bars[max(0, i - 50):i + 1], ATR_PERIOD)
         buf = SL_BUF_ATR * a
-        entry = float(nxt.ohlc.c)
         side = "short" if is_top else "long"
         pivot_price = piv.ohlc.h if is_top else piv.ohlc.l
         # ── VP gate: fade value-area extremes, skip HVN magnets ──
         vp_ok, near_level, vp_pos = _vp_gate(bars, i, symbol, tf, pivot_price, side)
         if vp_filter and not vp_ok:
             continue
-        # SL: prefer the trapped-side stacked-imbalance (big-trade) zone edge; fall
-        # back to the structural swing high/low + ATR buffer when no zone qualifies.
+        # ── entry: market (flip close) | LIMIT at a footprint level | si_flip ──
+        flip_close = float(nxt.ohlc.c)
+        entry, entry_kind, is_limit = flip_close, "market", False
         candle_sl = (max(piv.ohlc.h, nxt.ohlc.h) + buf) if is_top else (min(piv.ohlc.l, nxt.ohlc.l) - buf)
-        sl = _imbalance_sl(piv, side, buf)
-        sl_basis = "imbalance"
-        # imbalance zone can sit inside the candle → must stay beyond entry
+        sl, sl_basis = None, ""
+
+        if entry_mode == "si_flip":
+            # IGNITION: require a fresh trade-direction stacked imbalance on the flip
+            # bar; market entry at its close; SL just beyond that stack's far edge.
+            z = _flip_si(nxt, side)
+            if z is None:
+                continue
+            entry, entry_kind, is_limit = flip_close, "si_flip", False
+            sl = (z.price_low - buf) if side == "long" else (z.price_high + buf)
+            sl_basis = "si_flip"
+        elif entry_mode in ("lvn", "imbalance"):
+            lvl = _entry_level(piv, side, entry_mode)
+            # only a level that improves on the close (long below / short above) is a
+            # real pullback limit; otherwise fall back to market.
+            if lvl is not None and ((side == "long" and lvl < flip_close) or
+                                    (side == "short" and lvl > flip_close)):
+                entry, entry_kind, is_limit = float(lvl), entry_mode, True
+
+        # SL (non-si_flip): trapped-side stacked-imbalance far edge; swing fallback.
+        if sl is None:
+            sl = _imbalance_sl(piv, side, buf)
+            sl_basis = "imbalance"
         if sl is None or (side == "long" and sl >= entry) or (side == "short" and sl <= entry):
             sl = candle_sl
             sl_basis = "swing_high" if is_top else "swing_low"
@@ -143,6 +206,8 @@ def detect(bars: list, vol_mult: float = 2.0, delta_swing: float = 50.0,
             "side": side,
             "pivot_price": round(pivot_price, 4),
             "entry": round(entry, 4),
+            "entry_kind": entry_kind,
+            "is_limit": is_limit,
             "sl": round(sl, 4),
             "tp": round(tp, 4),
             "vol_ratio": round(vr, 2),

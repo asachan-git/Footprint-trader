@@ -113,6 +113,36 @@ def _imbalance_sl(piv, trade_side, buf):
     return (z.price_low - buf) if trade_side == "long" else (z.price_high + buf)
 
 
+def _entry_level(piv, trade_side, mode):
+    """Footprint LIMIT entry level on the pivot bar (None → can't place).
+      imbalance — near edge of the trapped-side stacked-imbalance zone: long pulls
+                  back DOWN into the SELL cluster (its high); short up into the BUY
+                  cluster (its low).
+      lvn       — low-volume bin between the pivot extreme and POC (retrace vacuum)."""
+    from pipeline.features.stacked_imbalance import stacked_imbalances
+    fp = build_fp(piv)
+    if mode == "imbalance":
+        trapped = "sell" if trade_side == "long" else "buy"
+        zones = [z for z in stacked_imbalances(fp, min_stack=3) if z.side == trapped]
+        if not zones:
+            return None
+        z = max(zones, key=lambda z: z.count)
+        return z.price_high if trade_side == "long" else z.price_low
+    if mode == "lvn":
+        if not fp.cells or fp.poc_price is None:
+            return None
+        poc = fp.poc_price
+        region = [c for c in fp.cells
+                  if c.total > 0 and (c.price <= poc if trade_side == "long" else c.price >= poc)]
+        if len(region) < 2:
+            return None
+        return min(region, key=lambda c: c.total).price
+    return None
+
+
+FILL_WITHIN = 3   # bars after the flip a limit entry has to be touched, else void
+
+
 def _sim(side, entry, sl, tp, future):
     """First-touch SL/TP then time-stop. Return (R, reason) or None."""
     risk = abs(entry - sl) or 1e-9
@@ -209,6 +239,78 @@ def summarize(trades):
             f"avgR={statistics.mean(rs):+.3f}  PF={pf:4.2f}  L/S={longs}/{len(rs)-longs}")
 
 
+def entry_ab(bars, vol_mult, delta_swing, symbol, tf, entry_mode, vp_only=True):
+    """Re-run the pattern with a chosen ENTRY mode; SL = trapped-side imbalance far
+    edge, TP = 2R from the ACTUAL fill. Returns (trades, attempts) so the caller can
+    report fill-rate. market = enter at flip close (always fills); imbalance/lvn =
+    LIMIT, filled only if touched within FILL_WITHIN bars (else voided)."""
+    trades, attempts = [], 0
+    n = len(bars)
+    open_until = -1
+    for i in range(LEFT_L + VOL_LB, n - 2):
+        if i <= open_until:
+            continue
+        piv, nxt = bars[i], bars[i + 1]
+        left_h = [b.ohlc.h for b in bars[i - LEFT_L:i]]
+        left_l = [b.ohlc.l for b in bars[i - LEFT_L:i]]
+        is_top = piv.ohlc.h >= max(left_h) and piv.ohlc.h > nxt.ohlc.h
+        is_bot = piv.ohlc.l <= min(left_l) and piv.ohlc.l < nxt.ohlc.l
+        if not (is_top or is_bot):
+            continue
+        prior = [_vol(b) for b in bars[i - VOL_LB:i] if _vol(b) > 0]
+        if not prior:
+            continue
+        vr = _vol(piv) / statistics.median(prior)
+        if vr < vol_mult:
+            continue
+        pd, nd = build_fp(piv).delta, build_fp(nxt).delta
+        rev_piv = -pd if is_top else pd
+        rev_nxt = -nd if is_top else nd
+        closed_rev = (nxt.ohlc.c < nxt.ohlc.o) if is_top else (nxt.ohlc.c > nxt.ohlc.o)
+        if not (closed_rev and rev_nxt > 0 and (rev_nxt - rev_piv) >= delta_swing):
+            continue
+        side = "short" if is_top else "long"
+        a = atr(bars[max(0, i - 50):i + 1], ATR_PERIOD)
+        ctx = _vp_ctx(bars, i, symbol, tf, (piv.ohlc.h if is_top else piv.ohlc.l), side, a)
+        if vp_only and not (ctx["va_aligned"] and ctx["near_level"] != "HVN"):
+            continue
+
+        attempts += 1
+        buf = SL_BUF_ATR * a
+        # find entry + the bar index where the position is actually live
+        if entry_mode == "market":
+            entry = float(nxt.ohlc.c)
+            fut = bars[i + 2:]
+        else:
+            lvl = _entry_level(piv, side, entry_mode)
+            if lvl is None:
+                continue
+            fk = None
+            for k, b in enumerate(bars[i + 2:i + 2 + FILL_WITHIN]):
+                if b.ohlc.l <= lvl <= b.ohlc.h:
+                    fk = k
+                    break
+            if fk is None:
+                continue                      # limit never touched → voided
+            entry = float(lvl)
+            fut = bars[i + 2 + fk + 1:]        # walk from the bar after the fill
+        # SL = trapped-side imbalance far edge (structural), fallback candle extreme
+        sl = _imbalance_sl(piv, side, buf)
+        candle_sl = (max(piv.ohlc.h, nxt.ohlc.h) + buf) if is_top else (min(piv.ohlc.l, nxt.ohlc.l) - buf)
+        if sl is None or (side == "long" and sl >= entry) or (side == "short" and sl <= entry):
+            sl = candle_sl
+        risk = abs(entry - sl)
+        if risk <= 0 or not fut:
+            continue
+        tp = entry + RR * risk if side == "long" else entry - RR * risk
+        r = _sim(side, entry, sl, tp, fut)
+        if r is None:
+            continue
+        trades.append({"i": i, "side": side, "r": r[0], "reason": r[1], **ctx})
+        open_until = i + 1 + MAX_HOLD
+    return trades, attempts
+
+
 def _with_trend(t):
     """A reversal aligned WITH the larger trend = buy-the-dip in a bull, sell-the-
     rip in a bear. Counter-trend = long in a bear / short in a bull (the knife-catch)."""
@@ -279,6 +381,17 @@ def main():
     imb = run("imbalance")
     show("VA-aligned only", [t for t in imb if t['va_aligned']])
     show("VA-aligned + ¬counter-trend", [t for t in imb if t['va_aligned'] and not _counter_trend(t)])
+
+    # ── 6. ENTRY-MODE A/B (live setup: VP-gated, imbalance SL, 2R) ──
+    print("\n=== 6. Entry-mode A/B (VP-gated, imbalance SL, 2R) — fill-rate matters ===")
+    for em in ("market", "imbalance", "lvn"):
+        allt, att = [], 0
+        for (s, tf), bars in data.items():
+            t, a = entry_ab(bars, VM, DS, s, tf, em, vp_only=True)
+            allt += t
+            att += a
+        fr = f"{100*len(allt)/att:.0f}%" if att else "—"
+        print(f"  entry={em:10s} fills={len(allt)}/{att} ({fr})  {summarize(allt)}")
 
 
 if __name__ == "__main__":

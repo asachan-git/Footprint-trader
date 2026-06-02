@@ -19,6 +19,7 @@ from .senate import Senate
 from .coup import Coup
 from .coup_reversal import CoupReversal
 from .reversal import Reversal
+from .reversal_si import ReversalSI
 
 LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
@@ -32,6 +33,7 @@ REGISTRY: dict[str, type[Strategy]] = {
     "coup": Coup,
     "coup_reversal": CoupReversal,
     "reversal": Reversal,
+    "reversal_si": ReversalSI,
 }
 
 
@@ -49,10 +51,15 @@ def build_enabled() -> list[Strategy]:
         name = entry.get("name")
         if not entry.get("enabled", True):
             continue
-        cls = REGISTRY.get(name)
+        # `class` lets a config entry instantiate a registered class under a
+        # different instance name (e.g. name=coup_5m, class=coup) so a 5m and a 15m
+        # instance get separate stores (data/strategies/<name>/). Falls back to name.
+        cls = REGISTRY.get(entry.get("class") or name)
         if cls is None:
             LOG.warning(f"[registry] unknown strategy {name!r} — skipping (not in REGISTRY)")
             continue
-        out.append(cls(config=entry.get("config") or {}))
+        inst = cls(config=entry.get("config") or {})
+        inst.name = name          # per-instance store/log key (overrides class attr)
+        out.append(inst)
         LOG.info(f"[registry] loaded strategy: {name}")
     return out

@@ -103,21 +103,25 @@ def _aggregate_mtf(bar, settings) -> None:
         return
     s = store()
     primary_bars = s.recent(bar.symbol, primary_tf, 1_000)
-    decide_tf = str((settings.get("decide_on_bar_close") or {}).get("tf", "15m"))
-    enabled = bool((settings.get("decide_on_bar_close") or {}).get("enabled", True))
+    _dobc = settings.get("decide_on_bar_close") or {}
+    decide_tf = str(_dobc.get("tf", "15m"))
+    # Strategy ENTRY ticks fire on each of these synthetic closes; the manager gates
+    # each strategy to enter only on its own decide_tf/vote_tf (so a 5m and a 15m
+    # instance can run in parallel). Default to the legacy single decide_tf.
+    decide_tfs = set(_dobc.get("tfs") or [decide_tf])
+    enabled = bool(_dobc.get("enabled", True))
     for tf in settings["instrument"]["timeframes"]:
         if tf == primary_tf:
             continue
         synth = maybe_emit(primary_bars, primary_tf, tf)
         if synth is not None:
             s.put(synth)
-            if enabled and tf == decide_tf:
-                _trigger_decide_on_bar_close(bar.symbol, tf, synth.bar_id)
-                # Strategy-manager ENTRY tick on the synthetic decide-TF close.
-                # The /ingest body only ever sees the 1m bar, so its manager
-                # tick runs with allow_entry=False (exits only). Entries must
-                # fire here, when the 15m bar actually closes — otherwise the
-                # managed strategies (democracy/republic/coup) never decide().
+            if enabled and tf in decide_tfs:
+                # Claude per-bar decide only on the canonical decide_tf (15m).
+                if tf == decide_tf:
+                    _trigger_decide_on_bar_close(bar.symbol, tf, synth.bar_id)
+                # Strategy-manager ENTRY tick on this synthetic close. The /ingest
+                # body only sees the 1m bar (manage-only), so entries must fire here.
                 try:
                     from strategies.manager import get_manager
                     get_manager(settings).tick(
