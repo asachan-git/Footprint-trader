@@ -42,8 +42,9 @@ function Card({ title, dec, accentColor }) {
           style={{ width: `${confPct}%` }}
         />
       </div>
-      <div style={{ color: "#555", fontSize: 9, marginBottom: 4 }}>
-        conf {confPct}%
+      <div style={{ color: "#555", fontSize: 9, marginBottom: 4 }}
+           title={isM2 ? "rules-engine 'confidence' = bias_strength/5 — exposure proxy, NOT a calibrated win-probability" : "model confidence"}>
+        {isM2 ? `bias ${confPct}% (uncalibrated)` : `conf ${confPct}%`}
       </div>
 
       {/* entry / SL / TP */}

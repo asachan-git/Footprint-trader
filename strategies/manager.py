@@ -96,7 +96,12 @@ class StrategyManager:
             return StrategyResult(strat.name, symbol, "skipped",
                                   {"reason": "cycle already open",
                                    "position_id": open_pos[0].position_id})
-        if not allow_entry:
+        # Gate entry to this strategy's own decision TF so a 5m and a 15m instance
+        # run in parallel without cross-firing: enter only when the closing `tf`
+        # matches the strategy's decide_tf (footprint) / vote_tf (vote panel).
+        default_tf = str((settings.get("decide_on_bar_close") or {}).get("tf", "15m"))
+        eff_tf = str(strat.config.get("decide_tf") or strat.config.get("vote_tf") or default_tf)
+        if not allow_entry or tf != eff_tf:
             return StrategyResult(strat.name, symbol, "managed", {})
 
         decision = strat.decide(symbol, tf, bar, eff_settings)

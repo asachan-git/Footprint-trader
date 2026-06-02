@@ -115,12 +115,19 @@ def _feature_stacked_imbalance(bar: Bar, history: list[Bar], params: dict) -> di
     )
     atr_floor = None
     meaningful = bool(stacked)
-    if stacked and params.get("atr_pct"):
+    if stacked and (params.get("atr_pct") or params.get("proximity_atr")):
         from pipeline.features.atr import atr as compute_atr
         atr_val = compute_atr(history[-15:] if len(history) >= 15 else history) or 1.0
-        min_range = atr_val * float(params["atr_pct"])
-        meaningful = any((z.price_high - z.price_low) >= min_range for z in stacked)
-        atr_floor = round(min_range, 4)
+        current_price = bar.ohlc.c
+        proximity_mult = float(params.get("proximity_atr", 0))
+        min_span_pct = float(params.get("atr_pct", 0))
+        min_range = atr_val * min_span_pct if min_span_pct else 0
+        atr_floor = round(min_range, 4) if min_range else None
+        meaningful = any(
+            (min_range == 0 or (z.price_high - z.price_low) >= min_range)
+            and (proximity_mult == 0 or abs((z.price_low + z.price_high) / 2 - current_price) <= atr_val * proximity_mult)
+            for z in stacked
+        )
     return {
         "signal": meaningful,
         "n_zones": len(stacked),
@@ -154,19 +161,35 @@ def _feature_sweep(bar: Bar, history: list[Bar], params: dict) -> dict:
 
 
 def _feature_delta_divergence(bar: Bar, history: list[Bar], params: dict) -> dict:
-    """Detect delta divergence: price makes HH/LL but delta does not confirm."""
-    if len(history) < 3:
-        return {"signal": False, "reason": "insufficient history"}
-    window = (history + [bar])[-int(params.get("window", 5)):]
-    closes = [b.ohlc.c for b in window]
-    deltas = [b.delta or 0.0 for b in window]
-    bullish_div = (closes[-1] < closes[-2]) and (deltas[-1] > deltas[-2])   # price LL, delta HL
-    bearish_div = (closes[-1] > closes[-2]) and (deltas[-1] < deltas[-2])   # price HH, delta LH
+    """Delta divergence: price makes new high/low vs prior window but delta fails to confirm.
+
+    Compares current bar to the prior N-bar window (excludes current bar):
+      bearish: current close > window max close, but current delta < window max delta
+      bullish: current close < window min close, but current delta > window min delta
+    More robust than bar-to-bar comparison — requires actual price extremes to be broken.
+    """
+    _empty = {"signal": False, "direction": "none", "price_vs_window": 0.0, "delta_vs_window": 0.0}
+    window_size = int(params.get("window", 5))
+    if len(history) < window_size:
+        return _empty
+    prior = history[-window_size:]
+    prior_closes = [b.ohlc.c for b in prior]
+    prior_deltas = [b.delta or 0.0 for b in prior]
+    cur_close = bar.ohlc.c
+    cur_delta = bar.delta or 0.0
+    max_close = max(prior_closes)
+    min_close = min(prior_closes)
+    max_delta = max(prior_deltas)
+    min_delta = min(prior_deltas)
+    # Bearish: price breaks above prior window high, but delta lower than prior window max
+    bearish_div = (cur_close > max_close) and (cur_delta < max_delta)
+    # Bullish: price breaks below prior window low, but delta higher than prior window min
+    bullish_div = (cur_close < min_close) and (cur_delta > min_delta)
     return {
         "signal": bullish_div or bearish_div,
         "direction": "bullish" if bullish_div else ("bearish" if bearish_div else "none"),
-        "price_change": round(closes[-1] - closes[-2], 4),
-        "delta_change": round(deltas[-1] - deltas[-2], 4),
+        "price_vs_window": round(cur_close - max_close if bearish_div else min_close - cur_close, 4),
+        "delta_vs_window": round(max_delta - cur_delta if bearish_div else cur_delta - min_delta, 4),
     }
 
 
@@ -234,10 +257,118 @@ def _feature_fvg(bar: Bar, history: list[Bar], params: dict) -> dict:
         return {"signal": False, "error": str(e)}
 
 
+def _feature_unfinished_auction(bar: Bar, history: list[Bar], params: dict) -> dict:
+    from pipeline.features.unfinished_auction import detect as ua_detect
+    from pipeline.footprint import build as build_fp
+    fp = build_fp(bar)
+    ua = ua_detect(
+        fp,
+        n_cells=int(params.get("n_cells", 2)),
+        min_vol=float(params.get("min_vol", 0.5)),
+        min_ratio=float(params.get("min_ratio", 4.0)),
+    )
+    return {
+        "signal": ua.fired,
+        "side": ua.side,
+        "extreme_price": ua.extreme_price,
+        "ratio": ua.ratio,
+    }
+
+
+def _feature_combined_gates(bar: Bar, history: list[Bar], params: dict) -> dict:
+    """Run all three direction gates and report combined veto for long/short.
+
+    Output columns:
+      stacked_side    : "sell"/"buy"/"none"  — conflicting stacked zone side
+      delta_dir       : "bearish"/"bullish"/"none"
+      ua_side         : "up"/"down"/"none"
+      veto_long       : 1 if any gate would block a long entry
+      veto_short      : 1 if any gate would block a short entry
+      n_gates_long    : number of gates vetoing long
+      n_gates_short   : number of gates vetoing short
+    """
+    from pipeline.footprint import build as build_fp
+    fp = build_fp(bar)
+    atr_val = 1.0
+
+    # ── Stacked imbalance ──────────────────────────────────────────────────
+    stacked_side = "none"
+    try:
+        from pipeline.features.stacked_imbalance import stacked_imbalances
+        from pipeline.features.atr import atr as compute_atr
+        stacks = stacked_imbalances(fp, min_stack=int(params.get("si_min_stack", 10)),
+                                    ratio=float(params.get("si_ratio", 2.5)))
+        if stacks and len(history) >= 5:
+            atr_val = compute_atr(history[-15:]) or 1.0
+            price = bar.ohlc.c
+            prox_mult = float(params.get("si_proximity_atr", 1.0))
+            span_pct  = float(params.get("si_span_atr", 0.15))
+            for z in stacks:
+                mid = (z.price_low + z.price_high) / 2
+                if (abs(mid - price) <= atr_val * prox_mult
+                        and (z.price_high - z.price_low) >= atr_val * span_pct):
+                    stacked_side = z.side   # "sell" or "buy"
+                    break
+    except Exception:
+        pass
+
+    # ── Delta divergence ──────────────────────────────────────────────────
+    delta_dir = "none"
+    try:
+        from pipeline.features.delta_divergence import detect as dd_detect
+        window = int(params.get("dd_window", 15))
+        if len(history) >= window:
+            dd = dd_detect(bar, history, window=window)
+            if dd.fired:
+                delta_dir = dd.direction
+    except Exception:
+        pass
+
+    # ── Unfinished auction ────────────────────────────────────────────────
+    ua_side = "none"
+    try:
+        from pipeline.features.unfinished_auction import detect as ua_detect
+        ua = ua_detect(fp,
+                       n_cells=int(params.get("ua_n_cells", 2)),
+                       min_vol=float(params.get("ua_min_vol", 0.5)),
+                       min_ratio=float(params.get("ua_min_ratio", 8.0)))
+        if ua.fired:
+            ua_side = ua.side
+    except Exception:
+        pass
+
+    # ── Combine: count gates that veto each direction ─────────────────────
+    gates_long  = (
+        int(stacked_side == "sell") +   # sell stack blocks long
+        int(delta_dir == "bearish") +   # bearish div blocks long
+        int(ua_side == "down")          # unfinished_down blocks long
+    )
+    gates_short = (
+        int(stacked_side == "buy") +    # buy stack blocks short
+        int(delta_dir == "bullish") +   # bullish div blocks short
+        int(ua_side == "up")            # unfinished_up blocks short
+    )
+    veto_long  = int(gates_long > 0)
+    veto_short = int(gates_short > 0)
+
+    return {
+        "signal":       int(veto_long or veto_short),
+        "stacked_side": stacked_side,
+        "delta_dir":    delta_dir,
+        "ua_side":      ua_side,
+        "veto_long":    veto_long,
+        "veto_short":   veto_short,
+        "n_gates_long": gates_long,
+        "n_gates_short": gates_short,
+    }
+
+
 BUILTIN_FEATURES: dict[str, Callable] = {
     "stacked_imbalance": _feature_stacked_imbalance,
     "sweep": _feature_sweep,
     "delta_divergence": _feature_delta_divergence,
+    "unfinished_auction": _feature_unfinished_auction,
+    "combined_gates": _feature_combined_gates,
     "pre_filter": _feature_pre_filter,
     "va_touch": _feature_va_touch,
     "fvg": _feature_fvg,

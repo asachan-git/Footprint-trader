@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from bybit.footprint_builder import FootprintBuilder  # same builder, reuse
+from bybit.footprint_builder import FootprintBuilder, _bar_id  # same builder, reuse
 from .ws_client import stream_trades
 from .rest_poller import stream_trades as rest_stream_trades
 
@@ -38,9 +38,13 @@ LOG = logging.getLogger("binance.main")
 def _post(flask_url: str, payload: dict, symbol_as: str | None = None) -> None:
     payload["format"] = "binance_v1"
     if symbol_as:
-        # Remap bar_id and symbol so downstream state_store key matches target symbol
-        payload["bar_id"] = payload["bar_id"].replace(payload["symbol"], symbol_as, 1)
+        # Remap symbol so downstream state_store key matches target symbol.
+        # Recompute bar_id from the target symbol — a string-replace would leave
+        # the hash keyed to the source symbol, breaking bar_id idempotency
+        # against other producers (fetch_history, rebuild_footprint_history)
+        # that hash the target symbol.
         payload["symbol"] = symbol_as
+        payload["bar_id"] = _bar_id(symbol_as, payload["tf"], payload["close_ts"])
     data = json.dumps(payload).encode()
     req = urlreq.Request(
         flask_url.rstrip("/") + "/ingest",

@@ -1,10 +1,11 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import CandleChart from "./components/CandleChart.jsx";
 import FootprintPane from "./components/FootprintPane.jsx";
 import VoteBreakdown from "./components/VoteBreakdown.jsx";
 import DecisionCards from "./components/DecisionCards.jsx";
 import Positions from "./components/Positions.jsx";
 import ABStats from "./components/ABStats.jsx";
+import { fetchStrategyTrades, fetchGridTrades, fetchStrategyCycles, fetchGridCycles } from "./api.js";
 
 const SYMBOLS  = ["BTCUSDT", "XAUTUSDT"];
 const TFS      = ["1m", "5m", "15m"];
@@ -15,19 +16,37 @@ const LS_IND_KEY  = "fb_indicators_v1";
 const DEFAULT_IND = {
   sweepArrows: true,  eqLevels: true,   pivotLines: false, nakedPocs: true,  priorPoc: true,
   liveSweep:   true,  srFsSweeps: false, fvgLines:  false,  priorVa:   false, absorptions: false,
+  coupAbs:     false, coupRevAbs: false, coupAbsConf: false,
+  coupTrades:  true,  demoTrades: true, repTrades: true,
+  m1Trades:    false, m2Trades: false, cycleTrades: false,
+  vwap:        false, atrTrail: false, vpFull: false, cvdDiv: false, revPattern: false,
 };
 
 const IND_ITEMS = [
-  { key: "sweepArrows",  label: "Sweep Arrows (REV/LG)" },
-  { key: "srFsSweeps",   label: "SR / FS Sweeps" },
-  { key: "liveSweep",    label: "Live Sweep Level" },
-  { key: "eqLevels",     label: "EQH / EQL" },
-  { key: "pivotLines",   label: "Pivot Lines" },
-  { key: "nakedPocs",    label: "Naked POCs" },
-  { key: "priorPoc",     label: "Prior POC" },
-  { key: "priorVa",      label: "Prior VA (H/L)" },
-  { key: "fvgLines",     label: "FVGs" },
-  { key: "absorptions",  label: "Absorptions" },
+  { key: "sweepArrows",  label: "Sweep Arrows (REV/LG)", tip: "Reversal & Liquidity Grab — delta-confirmed sweeps of key levels; high institutional signal" },
+  { key: "srFsSweeps",   label: "SR / FS Sweeps",        tip: "Stop Run & Failed Sweep — lower-confidence sweeps without clear delta confirmation" },
+  { key: "liveSweep",    label: "Live Sweep Level",       tip: "Current bar wick extreme — live price level being swept right now" },
+  { key: "eqLevels",     label: "EQH / EQL",             tip: "Equal Highs/Lows — two+ pivots within 0.15% form a retail stop cluster; prime institutional sweep target" },
+  { key: "pivotLines",   label: "Pivot Lines",            tip: "Structural swing highs/lows — local price extremes (TF-aware lookback). Line ends when level is taken out" },
+  { key: "nakedPocs",    label: "Naked POCs",             tip: "Naked Point of Control — prior-session POCs price has never returned to test; strong magnet levels" },
+  { key: "priorPoc",     label: "Prior POC",              tip: "Prior session Point of Control — high-volume node from yesterday's session" },
+  { key: "priorVa",      label: "Prior VA (H/L)",         tip: "Prior session Value Area High/Low — 70% of prior-day volume traded between these two levels" },
+  { key: "fvgLines",     label: "FVGs",                   tip: "Fair Value Gaps — 3-bar imbalance zones where price moved too fast; often filled on retest" },
+  { key: "absorptions",  label: "Absorptions",            tip: "Absorption — large passive volume at price extreme with minimal bar movement; potential reversal signal" },
+  { key: "coupAbs",      label: "Coup Absorptions",       tip: "coup trigger candles (momentum mode): high-vol/high-delta 15m bar with the winner side dominant at the extreme. ▲ below = long, ▼ above = short" },
+  { key: "coupRevAbs",   label: "Coup-Reversal Absorptions", tip: "coup_reversal trigger candles (reversal mode): high-vol candle closing with a wick rejection + volume fight at the extreme. ◆ marker, color = winner side" },
+  { key: "coupAbsConf",  label: "Confirmed Absorptions ★", tip: "ONLY absorption candles whose NEXT candle confirmed the reversal (winner-dir delta dominant + closed past trigger). Gold squares — the high-continuation subset. Both coup + coup_reversal" },
+  { key: "coupTrades",   label: "Coup Trades",            tip: "coup strategy entries/exits (15m, orange). Backtest + live: entry/exit arrows, SL/TP segments" },
+  { key: "demoTrades",   label: "Democracy Trades",       tip: "democracy strategy live paper trades (15m, blue). Entry arrow + SL/TP segments; hover for reason" },
+  { key: "repTrades",    label: "Republic Trades",        tip: "republic strategy live paper trades (15m, purple, tight-SL). Entry arrow + SL/TP segments; hover for reason" },
+  { key: "m1Trades",     label: "M1 Trades (history)",    tip: "Mode-1 Claude-direction grid trade history (15m, teal). Open/closed entries + SL/TP; hover for open time, reason, R" },
+  { key: "m2Trades",     label: "M2 Trades (history)",    tip: "Mode-2 rules grid trade history (15m, amber). Open/closed entries + SL/TP; hover for open time, reason, R" },
+  { key: "cycleTrades",  label: "Cycle Trades",           tip: "Grid recovery cycles (dashed boxes) for the enabled strategies/modes. Shows cycle # + chain; hover for realized PnL + reason" },
+  { key: "vwap",         label: "VWAP + σ bands",         tip: "Session-anchored VWAP (UTC day) with volume-weighted ±1σ/±2σ bands. Dynamic SL/TP anchor; mean-revert target = VWAP, stretch target = ±2σ" },
+  { key: "atrTrail",     label: "ATR Trail (SuperTrend)", tip: "ATR-based SuperTrend trailing stop. Sits below price in uptrend (green), above in downtrend (red). Visual TSL / trend filter" },
+  { key: "vpFull",       label: "VP: full window",        tip: "Volume profile (left edge) scope: ON = whole loaded window, OFF = visible range only. Real bid/ask volume-at-price with POC + 70% value area + HVN/LVN" },
+  { key: "cvdDiv",       label: "CVD Divergence",         tip: "Cumulative Volume Delta line (secondary scale) + regular divergence markers: price makes a new swing extreme but CVD does not. Bear ▽ (red) at higher-high w/ lower CVD; bull △ (green) at lower-low w/ higher CVD. Hover for CVD values" },
+  { key: "revPattern",   label: "Reversal Pattern ⚑",     tip: "DIAGNOSTIC (not a trade signal — backtests ~breakeven). Climax pivot (vol≥2×med) + next-bar delta flip (closes reversal way + rev-delta swing ≥50). Rendered as TRADES (⚑, cyan): entry→exit box w/ structural SL (swing high/low + buffer) + 2R TP, win/loss colored, outcome resolved from bars; hover for reason/RR. Any TF" },
 ];
 
 function LayersToggle({ indicators, onChange }) {
@@ -61,6 +80,7 @@ function LayersToggle({ indicators, onChange }) {
               <div
                 key={item.key}
                 onClick={() => onChange(item.key, !on)}
+                title={item.tip}
                 style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 12px",
                   cursor: "pointer", color: on ? "#ccc" : "#444", userSelect: "none" }}
                 onMouseEnter={e => e.currentTarget.style.background = "#1a1a1a"}
@@ -124,13 +144,15 @@ export default function App() {
   const [tf,        setTf]        = useState(_prefs.tf        || "1m");
   const [minutes,   setMinutes]   = useState(_prefs.minutes   || 120);
   const [chartMode, setChartMode] = useState(_prefs.chartMode || "ohlc");
+  const [chartType, setChartType] = useState(_prefs.chartType || "candles"); // candles|heikin|line
+  const [logScale,  setLogScale]  = useState(_prefs.logScale  || false);
 
   // Persist toolbar selections across reloads
   useEffect(() => {
     try {
-      localStorage.setItem(LS_KEY, JSON.stringify({ symbol, tf, minutes, chartMode }));
+      localStorage.setItem(LS_KEY, JSON.stringify({ symbol, tf, minutes, chartMode, chartType, logScale }));
     } catch {}
-  }, [symbol, tf, minutes, chartMode]);
+  }, [symbol, tf, minutes, chartMode, chartType, logScale]);
   const [indicators, setIndicators] = useState(() => {
     try { return { ...DEFAULT_IND, ...JSON.parse(localStorage.getItem(LS_IND_KEY)) }; }
     catch { return DEFAULT_IND; }
@@ -143,7 +165,67 @@ export default function App() {
   const [data,      setData]      = useState(null);
   const [stale,     setStale]     = useState(false);
   const [lastTs,    setLastTs]    = useState(null);
+  const [stratTrades, setStratTrades] = useState({ coup: [], democracy: [], republic: [], m1: [], m2: [] });
+  const [stratCycles, setStratCycles] = useState({ coup: [], democracy: [], republic: [], m1: [] });
   const esRef = useRef(null);
+
+  // Strategy + grid-mode trades + cycles for the chart overlay. coup =
+  // backtest+live, democracy/republic = live paper, m1/m2 = grid-mode history.
+  // Backend filters by symbol/tf; all entries are 15m. Refreshed on symbol/tf
+  // change + every 30s so new live entries appear without a reload.
+  useEffect(() => {
+    let cancel = false;
+    const load = () => {
+      Promise.all([
+        fetchStrategyTrades("coup", symbol, tf, "all").catch(() => []),
+        fetchStrategyTrades("democracy", symbol, tf, "live").catch(() => []),
+        fetchStrategyTrades("republic", symbol, tf, "live").catch(() => []),
+        fetchGridTrades("m1", symbol, tf).catch(() => []),
+        fetchGridTrades("m2", symbol, tf).catch(() => []),
+        fetchStrategyCycles("coup", symbol, tf).catch(() => []),
+        fetchStrategyCycles("democracy", symbol, tf).catch(() => []),
+        fetchStrategyCycles("republic", symbol, tf).catch(() => []),
+        fetchGridCycles("m1", symbol, tf).catch(() => []),
+      ]).then(([coup, democracy, republic, m1, m2, cCoup, cDemo, cRep, cM1]) => {
+        if (cancel) return;
+        setStratTrades({ coup, democracy, republic, m1, m2 });
+        setStratCycles({ coup: cCoup, democracy: cDemo, republic: cRep, m1: cM1 });
+      });
+    };
+    load();
+    const id = setInterval(load, 30000);
+    return () => { cancel = true; clearInterval(id); };
+  }, [symbol, tf]);
+
+  // Merge enabled strategies/modes into one tagged array for the chart.
+  const reversalPatterns = data?.reversal_patterns ?? [];
+  const strategyTrades = useMemo(() => {
+    const tag = (arr, name) => (arr || []).map(t => ({ ...t, strategy: name }));
+    const out = [];
+    // Reversal-pattern "trades" (diagnostic) — any TF; outcome resolved from bars.
+    if (indicators.revPattern) {
+      out.push(...(reversalPatterns || []).map(p => ({
+        strategy: "reversal", side: p.side,
+        entry: p.entry, entry_ts: p.ts, sl: p.sl, tp: p.tp, open: true,
+        rationale: `reversal: climax vol×${p.vol_ratio} + flip Δswing${p.delta_swing} · SL=${p.sl_basis}`,
+      })));
+    }
+    if (tf !== "15m") return out;
+    if (indicators.coupTrades !== false) out.push(...tag(stratTrades.coup, "coup"));
+    if (indicators.demoTrades !== false) out.push(...tag(stratTrades.democracy, "democracy"));
+    if (indicators.repTrades  !== false) out.push(...tag(stratTrades.republic, "republic"));
+    if (indicators.m1Trades) out.push(...tag(stratTrades.m1, "m1"));
+    if (indicators.m2Trades) out.push(...tag(stratTrades.m2, "m2"));
+    if (indicators.cycleTrades) {
+      if (indicators.coupTrades !== false) out.push(...tag(stratCycles.coup, "coup"));
+      if (indicators.demoTrades !== false) out.push(...tag(stratCycles.democracy, "democracy"));
+      if (indicators.repTrades  !== false) out.push(...tag(stratCycles.republic, "republic"));
+      if (indicators.m1Trades) out.push(...tag(stratCycles.m1, "m1"));
+    }
+    return out;
+  }, [stratTrades, stratCycles, indicators.coupTrades, indicators.demoTrades,
+      indicators.repTrades, indicators.m1Trades, indicators.m2Trades, indicators.cycleTrades,
+      indicators.revPattern, reversalPatterns, tf]);
   // Shared visible-time-range across FP ↔ Candle. Each pane writes on pan,
   // reads on becoming visible. Ref, not state, so no re-render loops.
   const rangeRef = useRef(null);  // {from: ts, to: ts} | null
@@ -247,6 +329,24 @@ export default function App() {
         >
           {chartMode === "ohlc" ? "OHLC" : "FP"}
         </button>
+        {chartMode === "ohlc" && (
+          <>
+            <button
+              onClick={() => setChartType(t => t === "candles" ? "heikin" : t === "heikin" ? "line" : "candles")}
+              title="Cycle chart type: candles → Heikin-Ashi → line"
+            >
+              {chartType === "candles" ? "▦ CANDLE" : chartType === "heikin" ? "▨ HA" : "╱ LINE"}
+            </button>
+            <button
+              onClick={() => setLogScale(v => !v)}
+              title="Toggle log / linear price scale"
+              style={{ borderColor: logScale ? "var(--yellow)" : undefined,
+                       color:       logScale ? "var(--yellow)" : undefined }}
+            >
+              {logScale ? "LOG" : "LIN"}
+            </button>
+          </>
+        )}
         <div className={`live-dot${stale ? " stale" : ""}`} />
         <span className="last-update">{lastTs ? `updated ${lastTs}` : "loading…"}</span>
       </div>
@@ -270,11 +370,13 @@ export default function App() {
             closedPositions={data?.positions?.closed ?? []}
             cvd={data?.cvd ?? []}
             cvdSignal={data?.cvd_signal ?? null}
+            cvdDivergences={data?.cvd_divergences ?? []}
             zones={data?.zones ?? {}}
             latestM2={data?.latest_m2 ?? null}
             nakedPocs={data?.naked_pocs ?? []}
             historicalSweeps={data?.historical_sweeps ?? []}
             swingPoints={data?.swing_points ?? []}
+            strategyTrades={strategyTrades}
             symbol={symbol}
             indicators={indicators}
           />
@@ -294,9 +396,14 @@ export default function App() {
             nakedPocs={data?.naked_pocs ?? []}
             historicalSweeps={data?.historical_sweeps ?? []}
             swingPoints={data?.swing_points ?? []}
+            strategyTrades={strategyTrades}
+            cvd={data?.cvd ?? []}
+            cvdDivergences={data?.cvd_divergences ?? []}
             symbol={symbol}
             chartMode={chartMode}
             indicators={indicators}
+            chartType={chartType}
+            logScale={logScale}
           />
         </div>
       </div>

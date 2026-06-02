@@ -29,3 +29,257 @@ strategies:
       symbols: [BTCUSDT, XAUTUSDT]
       vote_tf: 15m
       sl_atr_mult: 1.5      # hard SL distance from anchor, in ATR_15m units
+      sl_struct_buf_atr: 0.2  # SL = candle extreme ± this×ATR (when VP/LVN-confluent)
+      sl_conf_tol_atr: 0.25   # VP/LVN confluence tolerance, ×ATR
+
+  # senate = republic's engine, SL anchored to footprint WALLS instead of the
+  # candle extreme. SL just beyond the favourable stacked-imbalance / big-trade
+  # levels on the stop side ("selling zone in our favour"); VP-confluent walls
+  # tagged wall_vp; ATR fallback. SL-anchor A/B vs republic on the same signal.
+  # Validated scripts/validate_sl_levels.py: wall ≈ +0.31R vs +0.17R ATR (confirmed).
+  - name: senate
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      vote_tf: 15m
+      sl_atr_mult: 1.5        # ATR fallback distance when no wall present
+      sl_wall_buf_atr: 0.25   # SL = beyond the farthest favourable wall ± this×ATR
+      sl_conf_tol_atr: 0.25   # wall∧VP confluence tolerance (tags wall_vp), ×ATR
+
+  # coup = pure-footprint absorption→continuation. A high-vol/high-delta candle
+  # absorbs its extreme aggressor (buyers@top / sellers@low); we join the winner
+  # once it aggresses with result. Single tactical entry, structural SL beyond the
+  # trigger extreme, exit when the winner side is in turn absorbed (flip). Phase 1:
+  # entry at candle close. BTC only — Binance gold flow too thin. See STRATEGIES.md.
+  - name: coup
+    enabled: true
+    config:
+      symbols: [BTCUSDT]
+      decide_tf: 15m
+      lookback: 6           # bars back to search for an un-acted trigger
+      vol_mult: 1.8         # trigger bar total vol ≥ this × 20-bar median
+      delta_ratio: 0.35     # trigger |delta| / total vol floor
+      # absorption_mode: momentum | canonical. A/B'd on BTCUSDT 15m (2026-06-02):
+      #   momentum  (winner side already dominant at the extreme — a one-sided/
+      #     CONTINUATION candle): range+imbalance n=12 75% +0.69R; candidates
+      #     avgMFE 1.68 / MAE 1.25; confirmed cont 67%. THIS is coup's real edge.
+      #   canonical (textbook absorption — aggressor pushes the extreme & is
+      #     rejected): n=5-6 17-40% win, mostly negative; avgMFE 0.97 / MAE 1.85
+      #     (drifts AGAINST). True absorption is NOT tradeable here.
+      # Verdict: coup is a CONTINUATION strategy, not absorption. Keep momentum.
+      absorption_mode: momentum
+      confirm_within: 3     # bars after trigger to confirm winner aggression
+      confirm_delta_ratio: 0.25   # post bar |delta|/vol floor to count as winner aggression
+      confirm_cvd_conf: 0.60      # min CVD signal confidence for the fallback confirm
+      confirm_require_progress: true  # require price progress past trigger close (else stack alone ok)
+      entry_mode: range     # close | imbalance | lvn | range. range best across all SL
+      range_pct: 0.5        # entry_mode=range: retrace into trigger candle (0.5=mid)
+      sl_mode: imbalance    # candle | swing | imbalance
+      #   ^ tuned via scripts/coup_backtest.py (BTCUSDT 15m) after the entry/SL guard +
+      #     same-bar-wait + 2R-TP fixes. range+imbalance: 65% fill, 77% win, +0.79R avg.
+      #     PROVISIONAL — n≈13, rankings unstable at this sample; unfilled limits may
+      #     bias fill-rate. Re-sweep as the footprint store grows.
+      sl_buffer_pct: 0.10   # buffer beyond the chosen level, × trigger candle range
+      swing_lookback: 3     # ±bars for swing pivots (sl_mode=swing)
+      flip_exit: true
+
+  # coup_reversal = coup engine in REVERSAL absorption mode (user's observed
+  # pattern: high-vol candle CLOSING with a wick rejection of an extreme + a
+  # bottom/top volume fight + next-candle follow-through). Rare on BTC 15m (~5
+  # confirmed/1500 bars) — runs in paper ALONGSIDE momentum coup to accumulate
+  # real samples. Own store: data/strategies/coup_reversal/.
+  - name: coup_reversal
+    enabled: true
+    config:
+      symbols: [BTCUSDT]
+      decide_tf: 15m
+      absorption_mode: reversal
+      vol_lookback: 10      # high vol vs last ~10 candles
+      lookback: 6
+      vol_mult: 1.8
+      # Climax cap, swept on the TWO-ZONE detector (confdr0.15): vol_max 2.5 best
+      # — n=28 57% win +0.21R +5.84R, vs no-cap n=39 51% +0.17R +6.55R (2.5 trades
+      # quality over volume). Wick cap (rej_max) tested earlier, HURT trade-R, not used.
+      vol_mult_max: 2.5
+      # Tuned from data/reports/absorption_observations_granular.md (39 reversal
+      # candles): next-candle PROGRESSION is the edge — progressed/closeWith
+      # flips continuation 51%→78%, full follow-through (dWith+closeWith+prog)
+      # →91%. coup's 0.25 next-bar delta-magnitude gate was too strict (fired
+      # only 3×), rejecting winners that progressed with small delta. So require
+      # winner-direction delta SIGN + price progression, not magnitude.
+      # (Also observed: extWick≥0.5 and vol≥3× continue LESS — climax/exhaustion
+      # — so we do NOT chase giant wicks/vol spikes.)
+      confirm_within: 2     # next candle(s) must show winner follow-through
+      # Two-zone trigger is intentionally WEAK (sellers trapped at low + buyers
+      # leading just below close, dominance only) → the NEXT-candle confirm does
+      # the filtering. confdr swept on two-zone: 0.15 best (n=31 +0.18R +5.54R)
+      # vs 0.05 (n=37 +0.11R) and 0.35 (collapses to +0.00R).
+      confirm_delta_ratio: 0.15   # next-bar winner delta dominance ≥ 15%
+      confirm_require_progress: true   # next candle must progress past trigger close
+      # entry/SL A/B'd on the 39-candle obs at confdr=0.05 (coup_backtest
+      # --absorption reversal --vollb 10 --confdr 0.05): imbalance+imbalance best
+      # (n=9, 56% win, +3.00R, avgR+0.33). close+candle was WORST (-1.67R);
+      # range entry 0% win (retrace makes no sense for a reversal). PROVISIONAL
+      # n=9 on one down-week — paper-validate.
+      entry_mode: imbalance # limit at winner-side imbalance zone edge (fills ~100%)
+      sl_mode: imbalance    # far edge of the winner-side imbalance zone
+      sl_buffer_pct: 0.10
+      flip_exit: true
+
+  # reversal = the VP-gated climax-pivot → next-bar-delta-flip setup
+  # (scripts/reversal_study.py + reversal_pattern_backtest.py). Distinct mechanic
+  # from coup_reversal: a CAUSAL swing pivot with climax volume, then a next candle
+  # that flips reversal-aligned delta and closes the reversal way, ENTERED only when
+  # it FADES a value-area extreme (long ≤ VAL / short ≥ VAH) and is NOT nearest a HVN
+  # magnet. Raw pattern ~breakeven; the VP gate + structural SL was the only filter
+  # that turned it PF-positive in backtest (VA-extreme + imbalance SL → PF ~1.50 vs
+  # 0.95, n=57). PROVISIONAL — edge skewed short over one down-week, so it runs in
+  # PAPER to accumulate cross-regime out-of-sample samples. Own store:
+  # data/strategies/reversal/. Market entry at the flip-bar close; structural SL =
+  # trapped-side stacked-imbalance edge (swing high/low fallback); forced 2R TP;
+  # flip + hard-SL exit (inherited from coup).
+  - name: reversal
+    enabled: true
+    config:
+      symbols: [BTCUSDT]
+      decide_tf: 15m
+      vol_mult: 2.0        # climax: pivot vol ≥ 2× median(prior 20)
+      delta_swing: 50.0    # next-bar reversal-aligned delta swing vs the pivot
+      vp_filter: true      # ONLY fade value-area extremes, skip HVN magnets
+      # Entry A/B (BTC+XAU, VP-gated, imbalance SL, 2R): lvn LIMIT best per-trade
+      # (PF 2.0, +0.50R, but 38% fill); market most fills (PF 1.33, +0.17R, 96%);
+      # imbalance near-edge worst (PF 1.23). lvn = limit at the low-volume bin
+      # between the pivot extreme and POC; decide() waits ≤entry_expiry_bars for a
+      # retrace touch (else voids). Switch to "market" for more fills / fewer misses.
+      entry_mode: lvn       # market | lvn | imbalance
+      entry_expiry_bars: 3  # bars a LIMIT waits for the touch before voiding
+      # SL = trapped-side stacked-imbalance far edge (swing high/low fallback) — set
+      # by the detector. Dynamic exits: absorption-flip + hard-SL (from coup) +
+      # CVD-divergence-against (cut when order-flow exhausts against us) + POC-trail
+      # (cycle_manager, unconditional). 2R TP kept.
+      cvd_divergence_exit: true
+      cvd_exit_conf: 0.65   # min CVD-signal confidence to trigger the exit
+
+  # reversal_si = reversal pattern, stacked-imbalance IGNITION entry + footprint-
+  # managed exit. Separate store; runs alongside `reversal` (lvn entry / 2R) for a
+  # live A/B. Entry: the VP-gated flip must ALSO print a fresh trade-direction
+  # stacked imbalance on the flip bar (orderflow ignition); market entry at the flip
+  # close; SL just beyond that stack's far low/high. Target: opposite-side LVN
+  # (value vacuum) in the profit direction → else next unfilled FVG → else 2R, set as
+  # the TP cap. Exits: absorption-flip + CVD-divergence (early reversal) + SI-trail
+  # (tighten SL under each bar's stacked imbalance) + hard-SL. PROVISIONAL — paper.
+  - name: reversal_si
+    enabled: true
+    config:
+      symbols: [BTCUSDT]
+      decide_tf: 15m
+      vol_mult: 2.0
+      delta_swing: 50.0
+      vp_filter: true       # fade value-area extremes, skip HVN magnets
+      entry_mode: si_flip   # fresh trade-direction stacked imbalance on the flip bar
+      target_mode: vp_lvn   # opposite LVN → FVG → 2R fallback
+      si_trail: true        # trail SL under each bar's trade-direction stacked imbalance
+      cvd_divergence_exit: true
+      cvd_exit_conf: 0.65
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # 5m PARALLEL INSTANCES — every strategy also runs on 5m alongside its 15m twin
+  # for a TF A/B (finer entries/exits). `class` reuses the registered class under a
+  # new instance name → separate store (data/strategies/<name>_5m/). The manager
+  # gates entry to each instance's decide_tf/vote_tf, so 5m and 15m never cross-fire.
+  # The 5m feed is noisier; vote-panel TFs (democracy/republic/senate) are calibrated
+  # on 15m, so treat their 5m results as exploratory. Disable any that underperform.
+  # ──────────────────────────────────────────────────────────────────────────────
+  - name: democracy_5m
+    class: democracy
+    enabled: true
+    config: { symbols: [BTCUSDT, XAUTUSDT], vote_tf: 5m }
+
+  - name: republic_5m
+    class: republic
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      vote_tf: 5m
+      sl_atr_mult: 1.5
+      sl_struct_buf_atr: 0.2
+      sl_conf_tol_atr: 0.25
+
+  - name: senate_5m
+    class: senate
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      vote_tf: 5m
+      sl_atr_mult: 1.5
+      sl_wall_buf_atr: 0.25
+      sl_conf_tol_atr: 0.25
+
+  - name: coup_5m
+    class: coup
+    enabled: true
+    config:
+      symbols: [BTCUSDT]
+      decide_tf: 5m
+      lookback: 6
+      vol_mult: 1.8
+      delta_ratio: 0.35
+      absorption_mode: momentum
+      confirm_within: 3
+      confirm_delta_ratio: 0.25
+      confirm_cvd_conf: 0.60
+      confirm_require_progress: true
+      entry_mode: range
+      range_pct: 0.5
+      sl_mode: imbalance
+      sl_buffer_pct: 0.10
+      swing_lookback: 3
+      flip_exit: true
+
+  - name: coup_reversal_5m
+    class: coup_reversal
+    enabled: true
+    config:
+      symbols: [BTCUSDT]
+      decide_tf: 5m
+      absorption_mode: reversal
+      vol_lookback: 10
+      lookback: 6
+      vol_mult: 1.8
+      vol_mult_max: 2.5
+      confirm_within: 2
+      confirm_delta_ratio: 0.15
+      confirm_require_progress: true
+      entry_mode: imbalance
+      sl_mode: imbalance
+      sl_buffer_pct: 0.10
+      flip_exit: true
+
+  - name: reversal_5m
+    class: reversal
+    enabled: true
+    config:
+      symbols: [BTCUSDT]
+      decide_tf: 5m
+      vol_mult: 2.0
+      delta_swing: 50.0   # NOTE: 5m delta is smaller — may need lowering after data
+      vp_filter: true
+      entry_mode: lvn
+      entry_expiry_bars: 3
+      cvd_divergence_exit: true
+      cvd_exit_conf: 0.65
+
+  - name: reversal_si_5m
+    class: reversal_si
+    enabled: true
+    config:
+      symbols: [BTCUSDT]
+      decide_tf: 5m
+      vol_mult: 2.0
+      delta_swing: 50.0
+      vp_filter: true
+      entry_mode: si_flip
+      target_mode: vp_lvn
+      si_trail: true
+      cvd_divergence_exit: true
+      cvd_exit_conf: 0.65

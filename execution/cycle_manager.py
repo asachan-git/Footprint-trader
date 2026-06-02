@@ -206,6 +206,129 @@ def _check_hard_sl(symbol: str, latest: Bar) -> list[dict]:
     return closed
 
 
+def _check_absorption_flip(symbol: str, latest: Bar) -> list[dict]:
+    """Close any open cycle whose winner side gets absorbed at an extreme — the
+    mirror of the entry trigger, now against us (the `coup` strategy's exit).
+
+    Long position → canonical absorption side=="sell" (buyers absorbed at top).
+    Short position → canonical absorption side=="buy" (sellers absorbed at low).
+    Opt-in (caller gates on settings.cycle.coup_flip_exit). Realized R is marked to
+    the bar close against the cycle's own risk denominator (avg_entry − stop_loss).
+    """
+    from execution.pending_orders import pending_store
+    from execution.position_store import position_store
+    from pipeline.footprint import build as _build_fp
+    from pipeline.features.absorption import detect_canonical_absorption
+
+    closed: list[dict] = []
+    absorbs = detect_canonical_absorption(latest, _build_fp(latest))
+    if not absorbs:
+        return closed
+    sides = {a.side for a in absorbs}
+
+    pos_store = position_store()
+    c = latest.ohlc.c
+    for pos in pos_store.open_positions(symbol):
+        flip = (pos.side == "long" and "sell" in sides) or \
+               (pos.side == "short" and "buy" in sides)
+        if not flip:
+            continue
+        risk = abs(pos.avg_entry - (pos.stop_loss or 0)) or 1e-9
+        pnl = (c - pos.avg_entry) if pos.side == "long" else (pos.avg_entry - c)
+        realized_r = pnl / risk
+        if pos_store.close_position(pos.position_id, reason="absorption_flip", realized_r=realized_r):
+            pending_store().cancel_for_position(pos.position_id)
+            _va_state.pop(pos.position_id, None)
+            _trend_escape_state.pop(pos.position_id, None)
+            closed.append({"position_id": pos.position_id, "realized_r": round(realized_r, 3)})
+            LOG.info(f"[cycle] ABSORPTION-FLIP {pos.position_id} {pos.side} @ {c:.2f} R={realized_r:.2f}")
+    return closed
+
+
+def _check_cvd_divergence_exit(symbol: str, latest: Bar, settings: dict | None = None) -> list[dict]:
+    """Close any open cycle when CVD shows ORDER-FLOW EXHAUSTING against it — a
+    divergence / hidden-flow / wick-trap signal on the OPPOSITE side, ≥ conf gate.
+
+    Opt-in (caller gates on settings.cycle.cvd_divergence_exit). Long exits on a
+    short-side exhaustion signal (divergence_bear / hidden_selling / wick_trap),
+    short on the bull mirror. Realized R marked to the bar close like the other
+    footprint exits. Used by the `reversal` strategy."""
+    from execution.pending_orders import pending_store
+    from execution.position_store import position_store
+    from pipeline.state_store import store as _store
+    from pipeline.features.cvd_candlestick import detect as _cvd_detect
+
+    closed: list[dict] = []
+    pos_store = position_store()
+    opens = pos_store.open_positions(symbol)
+    if not opens:
+        return closed
+    conf_gate = float((settings or {}).get("cycle", {}).get("cvd_exit_conf", 0.65))
+    exhaustion = {"divergence_bear", "divergence_bull", "hidden_buying",
+                  "hidden_selling", "wick_trap"}
+    bars = _store().recent(symbol, latest.tf, 30)
+    sig = _cvd_detect(bars) if len(bars) >= 6 else None
+    if not sig or sig.pattern not in exhaustion or sig.confidence < conf_gate:
+        return closed
+
+    c = latest.ohlc.c
+    for pos in opens:
+        against = (pos.side == "long" and sig.side == "short") or \
+                  (pos.side == "short" and sig.side == "long")
+        if not against:
+            continue
+        risk = abs(pos.avg_entry - (pos.stop_loss or 0)) or 1e-9
+        pnl = (c - pos.avg_entry) if pos.side == "long" else (pos.avg_entry - c)
+        realized_r = pnl / risk
+        if pos_store.close_position(pos.position_id, reason="cvd_divergence", realized_r=realized_r):
+            pending_store().cancel_for_position(pos.position_id)
+            _va_state.pop(pos.position_id, None)
+            _trend_escape_state.pop(pos.position_id, None)
+            closed.append({"position_id": pos.position_id, "realized_r": round(realized_r, 3),
+                           "pattern": sig.pattern})
+            LOG.info(f"[cycle] CVD-DIVERGENCE-EXIT {pos.position_id} {pos.side} @ {c:.2f} "
+                     f"R={realized_r:.2f} ({sig.pattern} conf={sig.confidence:.2f})")
+    return closed
+
+
+def _check_si_trail(symbol: str, latest: Bar, settings: dict | None = None) -> list[dict]:
+    """Trail the stop under each new bar's TRADE-DIRECTION stacked imbalance — a
+    footprint chandelier. Long: SL → strongest BUY-stack low − buf; short: SELL-stack
+    high + buf. Tighten ONLY (never loosen), and never cross price. Opt-in
+    (settings.cycle.si_trail_exit). Used by `reversal_si`."""
+    from execution.position_store import position_store
+    from pipeline.footprint import build as _build_fp
+    from pipeline.features.stacked_imbalance import stacked_imbalances
+    from pipeline.features.atr import atr as _atr
+    from pipeline.state_store import store as _store
+
+    moved: list[dict] = []
+    pstore = position_store()
+    opens = pstore.open_positions(symbol)
+    if not opens:
+        return moved
+    recent = _store().recent(symbol, latest.tf, 20)
+    a = _atr(recent) if recent else 0.0
+    buf = 0.05 * a
+    zones = stacked_imbalances(_build_fp(latest), min_stack=3)
+    c = latest.ohlc.c
+    for pos in opens:
+        want = "buy" if pos.side == "long" else "sell"
+        zs = [z for z in zones if z.side == want]
+        if not zs:
+            continue
+        z = max(zs, key=lambda z: z.count)
+        new_sl = (z.price_low - buf) if pos.side == "long" else (z.price_high + buf)
+        cur = pos.stop_loss
+        tighter = (new_sl > cur) if pos.side == "long" else (new_sl < cur)
+        safe = (new_sl < c) if pos.side == "long" else (new_sl > c)
+        if tighter and safe:
+            pstore.adjust_sl(pos.position_id, round(new_sl, 4), reason="si_trail")
+            moved.append({"position_id": pos.position_id, "new_sl": round(new_sl, 4)})
+            LOG.info(f"[cycle] SI-TRAIL {pos.position_id} {pos.side} SL {cur:.2f}→{new_sl:.2f}")
+    return moved
+
+
 def _sweep_continuation_active(symbol: str, side: Literal["long", "short"]) -> bool:
     """True if there is a fresh sweep_reclaim event that aligns with cycle direction.
 
@@ -639,6 +762,36 @@ def on_bar_close(symbol: str, primary_tf: str, latest: Bar, settings: dict | Non
         except Exception as e:
             LOG.exception(f"[cycle] hard_sl check failed: {e}")
             actions["hard_sl_error"] = str(e)
+
+    # Absorption-flip exit — OPT-IN (settings.cycle.coup_flip_exit). The `coup`
+    # strategy exits when its winner side gets absorbed at an extreme (the entry
+    # trigger mirrored against the open position). Default OFF; other strategies
+    # untouched.
+    if (settings or {}).get("cycle", {}).get("coup_flip_exit"):
+        try:
+            actions["closed_flip"] = _check_absorption_flip(symbol, latest)
+        except Exception as e:
+            LOG.exception(f"[cycle] absorption_flip check failed: {e}")
+            actions["flip_error"] = str(e)
+
+    # CVD-divergence exit — OPT-IN (settings.cycle.cvd_divergence_exit). Cut a cycle
+    # when CVD exhaustion prints against it. Used by the `reversal` strategy.
+    if (settings or {}).get("cycle", {}).get("cvd_divergence_exit"):
+        try:
+            actions["closed_cvd"] = _check_cvd_divergence_exit(symbol, latest, settings)
+        except Exception as e:
+            LOG.exception(f"[cycle] cvd_divergence check failed: {e}")
+            actions["cvd_exit_error"] = str(e)
+
+    # SI-trail — OPT-IN (settings.cycle.si_trail_exit). Footprint chandelier stop for
+    # the `reversal_si` strategy: tighten SL under each bar's stacked imbalance; the
+    # tightened stop triggers on a later bar's hard-SL check.
+    if (settings or {}).get("cycle", {}).get("si_trail_exit"):
+        try:
+            actions["si_trailed"] = _check_si_trail(symbol, latest, settings)
+        except Exception as e:
+            LOG.exception(f"[cycle] si_trail failed: {e}")
+            actions["si_trail_error"] = str(e)
 
     # TP participation adjustment — extend/shrink TP based on live order-flow score
     try:

@@ -42,31 +42,110 @@ class Republic(Democracy):
         sl_atr_mult = float(self.config.get("sl_atr_mult", 1.5))
         atr15 = self._atr15(bar.symbol)
         if atr15 <= 0:
-            LOG.warning(f"[republic] {bar.symbol} no ATR — keeping disaster SL")
+            LOG.warning(f"[{self.name}] {bar.symbol} no ATR — keeping disaster SL")
             return plan
 
         anchor = plan.anchor_price
-        dist = sl_atr_mult * atr15
-        new_sl = anchor - dist if plan.side == "long" else anchor + dist
 
-        # Only tighten — never loosen past the disaster floor. If the plan has no
-        # safety_sl (None), the tightened SL is unconditionally the stop.
-        if plan.safety_sl is None:
-            pass
-        elif plan.side == "long":
-            new_sl = max(new_sl, plan.safety_sl)
-        else:
-            new_sl = min(new_sl, plan.safety_sl)
+        # SL anchor is the A/B variable — Republic uses the candle-extreme + VP/LVN
+        # confluence stop; subclasses (e.g. Senate) override _compute_sl to anchor
+        # the stop differently while sharing the TP-scaling + clamp logic below.
+        new_sl, sl_src = self._compute_sl(plan, bar, atr15, anchor)
 
-        _prev = f"{plan.safety_sl:.2f}" if plan.safety_sl is not None else "none"
-        LOG.info(
-            f"[republic] {bar.symbol} {plan.side} SL tightened "
-            f"{_prev} → {new_sl:.2f} ({sl_atr_mult}×ATR={dist:.2f})"
-        )
-        # GridPlan is frozen — return a copy with the tightened SL (+ its offset_pct
-        # kept consistent for live venue translation).
+        # Never loosen past the disaster floor (plan.safety_sl), when present.
+        if plan.safety_sl is not None:
+            new_sl = (max(new_sl, plan.safety_sl) if plan.side == "long"
+                      else min(new_sl, plan.safety_sl))
+
+        LOG.info(f"[{self.name}] {bar.symbol} {plan.side} SL → {new_sl:.2f} ({sl_src})")
         new_offset = (new_sl - anchor) / anchor if anchor > 0 else plan.safety_sl_offset_pct
-        return replace(plan, safety_sl=new_sl, safety_sl_offset_pct=new_offset)
+
+        # ── Footprint-confirmation TP scaling ─────────────────────────────────
+        # obs(n=108, data/observations/absorption_obs.jsonl): strat_confirm setups
+        # are +EV at *every* TP and improve as TP runs out (+0.073R@1.5×ATR →
+        # +0.145R@3.5×ATR), while unconfirmed setups never pay (−0.2..−0.3R) so a
+        # farther TP can't rescue them. bias_strength is the aggregate footprint
+        # vote (incl. the absorption-confirmation vote) — used here as the confirm
+        # proxy. On a strong vote, re-target TP to a real footprint zone ≥ N×ATR
+        # out (capture the MFE); leave weak-vote TPs exactly as plan_grid set them.
+        new_tp = plan.take_profit
+        new_tp_source = plan.tp_source
+        new_tp_offset = plan.tp_offset_pct
+        conf_bias_min = int(self.config.get("tp_conf_bias_min", 4))
+        conf_atr_mult = float(self.config.get("tp_conf_atr_mult", 3.0))
+        if plan.bias_strength >= conf_bias_min and plan.legs:
+            try:
+                from execution.tp_resolver import resolve_tp
+                leg1 = plan.legs[0].price
+                cand = resolve_tp(bar.symbol, plan.side, anchor=leg1,
+                                  min_distance=conf_atr_mult * atr15)
+                # Only push TP farther — never pull it closer than plan_grid's.
+                if cand is not None and (
+                    (plan.side == "long" and cand.price > plan.take_profit)
+                    or (plan.side == "short" and cand.price < plan.take_profit)
+                ):
+                    new_tp = cand.price
+                    new_tp_source = f"conf_tp:{cand.source}"
+                    new_tp_offset = (new_tp - anchor) / anchor if anchor > 0 else plan.tp_offset_pct
+                    LOG.info(
+                        f"[{self.name}] {bar.symbol} {plan.side} TP pushed "
+                        f"{plan.take_profit:.2f} → {new_tp:.2f} "
+                        f"(bias={plan.bias_strength}≥{conf_bias_min}, "
+                        f"{conf_atr_mult}×ATR, {new_tp_source})"
+                    )
+            except Exception as e:
+                LOG.warning(f"[{self.name}] {bar.symbol} TP scale failed: {e}")
+
+        # GridPlan is frozen — return a copy with tightened SL + (maybe) pushed TP,
+        # offset_pcts kept consistent for live cross-venue translation.
+        return replace(
+            plan,
+            safety_sl=new_sl, safety_sl_offset_pct=new_offset,
+            take_profit=new_tp, tp_source=new_tp_source, tp_offset_pct=new_tp_offset,
+        )
+
+    def _compute_sl(self, plan, bar: Bar, atr15: float, anchor: float) -> tuple[float, str]:
+        """Republic SL: stop just beyond the entry candle's sell/buy zone (the
+        extreme), used ONLY when in confluence with a VP HVN/POC/VAH/VAL or an LVN
+        gap; else fall back to sl_atr_mult×ATR. Validated 2026-06-02
+        (scripts/validate_sl_confluence.py): ≈ +0.5R vs +0.17R for plain ATR on
+        confirmed setups. Subclasses override this to A/B a different SL anchor."""
+        sl_atr_mult = float(self.config.get("sl_atr_mult", 1.5))
+        buf = float(self.config.get("sl_struct_buf_atr", 0.2))
+        conf_tol = float(self.config.get("sl_conf_tol_atr", 0.25))
+        extreme = bar.ohlc.h if plan.side == "short" else bar.ohlc.l
+        sl_struct = (extreme + buf * atr15) if plan.side == "short" else (extreme - buf * atr15)
+        atr_sl = (anchor + sl_atr_mult * atr15) if plan.side == "short" else (anchor - sl_atr_mult * atr15)
+        if self._sl_confluent(bar.symbol, sl_struct, atr15, conf_tol):
+            return sl_struct, "struct_confluence"
+        return atr_sl, f"{sl_atr_mult}×ATR"
+
+    @staticmethod
+    def _sl_confluent(symbol: str, sl: float, atr: float, tol_atr: float) -> bool:
+        """True if the stop level lines up with a VP HVN/POC/VAH/VAL (within
+        tol_atr×ATR) or sits inside an LVN gap. Uses live daily/weekly VP cache."""
+        if atr <= 0:
+            return False
+        tol = tol_atr * atr
+        try:
+            from pipeline.features.vp_cache import get as vp_get
+        except Exception:
+            return False
+        for period in ("daily", "weekly"):
+            vp = vp_get(symbol, period)
+            if not vp:
+                continue
+            for hvn in vp.get("hvn_zones") or []:
+                if abs(sl - (hvn["low"] + hvn["high"]) / 2) <= tol:
+                    return True
+            for key in ("poc", "vah", "val", "naked_poc"):
+                v = vp.get(key)
+                if isinstance(v, (int, float)) and v > 0 and abs(sl - v) <= tol:
+                    return True
+            for lvn in vp.get("lvn_zones") or []:
+                if lvn["low"] <= sl <= lvn["high"]:
+                    return True
+        return False
 
     @staticmethod
     def _atr15(symbol: str) -> float:

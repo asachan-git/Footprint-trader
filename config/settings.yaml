@@ -15,12 +15,23 @@ cycle:
     bars: 3              # K consecutive bars against
     atr_mult: 1.5        # N x ATR adverse from avg_entry
   poc_trail_min_atr_mult: 0.5   # TP must stay ≥ 0.5×ATR from avg_entry when trailing to POC
+  # Aggressive scale-out (grid_sim.py "aggressive keep2"): on first bounce
+  # PROFIT_BUF×ATR beyond avg, close the deep large-lot legs (bought cheap → in
+  # profit), keep `keep_near` nearest legs, move them to break-even. Converts
+  # bounce-then-die cycles into scratches. Trades ~⅓ total return for ~halved
+  # adverse-market deaths + exposure. DEFAULT OFF — A/B on paper before enabling.
+  scale_out:
+    enabled: false
+    keep_near: 2          # nearest legs to keep riding to TP
+    profit_buf_atr: 0.5   # bounce trigger: price this many ATR beyond avg_entry
 
 # Event-driven decide trigger — fires Mode 1 + Mode 2 instantly when a new TF
 # bar is emitted by mtf_aggregator (replaces wall-clock cron loops in start.sh).
 decide_on_bar_close:
   enabled: true
-  tf: 15m
+  tf: 15m            # legacy default decide TF (Claude per-bar + fallback gate)
+  tfs: [5m, 15m]     # strategy-manager ENTRY ticks fire on each of these synthetic closes;
+                     # each strategy enters only on its own decide_tf/vote_tf (manager-gated)
 
 instrument:
   symbol: XAUTUSDT

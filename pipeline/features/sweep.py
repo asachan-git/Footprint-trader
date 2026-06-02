@@ -465,16 +465,100 @@ def _sweep_log_path(symbol: str, tf: str = "1m") -> Path:
     return SWEEP_LOG_DIR / f"sweeps_{symbol}_{tf}.jsonl"
 
 
+_LIQUIDITY_LABELS = (
+    "prior_day_high", "prior_day_low", "session_high", "session_low",
+    "equal_high", "equal_low",
+)
+
+
 def _classify_signal(sig: SweepSignal) -> str:
-    """Derive sweep classification from signal fields (same logic as registry age_bars==1)."""
+    """Derive sweep classification from signal fields.
+
+    Priority order (was rejection-first, which mislabeled stop-cluster grabs as
+    reversals and flooded the chart with REV):
+      1. no delta confirm           → stop_run
+      2. liquidity level (EQ/PDH/PDL/session) → liquidity_grab, even on strong
+         rejection — sweeping a known stop cluster IS a grab, not a reversal.
+      3. strong rejection (≥0.55) at a structural level → reversal
+      4. weak rejection elsewhere   → failed_sweep (dimmed; was REV noise)
+    """
     if not sig.delta_confirms:
         return "stop_run"
+    if sig.level_label in _LIQUIDITY_LABELS:
+        return "liquidity_grab"
     if sig.rejection_pct >= 0.55:
         return "reversal"
-    if sig.level_label in ("prior_day_high", "prior_day_low", "session_high", "session_low",
-                           "equal_high", "equal_low"):
-        return "liquidity_grab"
-    return "reversal"
+    return "failed_sweep"
+
+
+def detect_swing_sweeps(raw_bars, swing_points) -> list[dict]:
+    """Sweeps of the *same-TF displayed swing highs/lows*.
+
+    For each swing pivot the chart draws, find the first later bar that wicks
+    beyond the swing price and closes back inside (rejection ≥ MIN_REJECTION_PCT).
+    Classified with the same logic as live sweeps so the dashboard renders them
+    as REV/LG/SR/FS arrows. Returns log-schema dicts tagged ``source="swing"``.
+
+    Unlike read_sweep_log (VP/session/prior-day levels from the live engine),
+    these always sit on a swing the chart shows on this timeframe.
+    """
+    if not raw_bars or not swing_points:
+        return []
+    ts_to_idx = {b.close_ts: i for i, b in enumerate(raw_bars)}
+    out: list[dict] = []
+    for sp in swing_points:
+        side  = sp.get("side")
+        price = sp.get("price")
+        sp_ts = sp.get("ts")
+        if price is None or sp_ts is None or side not in ("high", "low"):
+            continue
+        start = ts_to_idx.get(sp_ts)
+        if start is None:
+            continue
+        direction  = "high" if side == "high" else "low"
+        sweep_type = "sweep_high" if side == "high" else "sweep_low"
+        label      = "swing_high" if side == "high" else "swing_low"
+        for b in raw_bars[start + 1:]:
+            rng = b.ohlc.h - b.ohlc.l
+            if rng <= 0 or rng / max(b.ohlc.c, 0.01) < MIN_BAR_RANGE_PCT:
+                continue
+            swept = (b.ohlc.h > price and b.ohlc.c < price) if side == "high" \
+                    else (b.ohlc.l < price and b.ohlc.c > price)
+            if not swept:
+                continue
+            rej = _close_rejection_pct(b, direction)
+            if rej < MIN_REJECTION_PCT:
+                continue
+            vol_ext, avg_vol = _extreme_volume(b, direction)
+            vol_ratio = vol_ext / avg_vol if avg_vol > 0 else 0.0
+            delta_ok  = _delta_confirms_sweep(b, sweep_type)
+            conf = _sweep_confidence(rej, vol_ratio, label)
+            if not delta_ok:
+                conf = round(conf * 0.5, 2)
+            extreme = b.ohlc.h if side == "high" else b.ohlc.l
+            sig = SweepSignal(
+                type=sweep_type, swept_level=price, level_label=label,
+                wick_extreme=extreme, bar_close=b.ohlc.c, confidence=conf,
+                volume_at_extreme=vol_ext, avg_level_volume=avg_vol,
+                vol_ratio=round(vol_ratio, 3), reason="swing-derived",
+                delta_confirms=delta_ok, rejection_pct=rej, granularity="candle",
+            )
+            out.append({
+                "ts": b.close_ts,
+                "type": sweep_type,
+                "swept_level": round(price, 4),
+                "level_label": label,
+                "wick_extreme": round(extreme, 4),
+                "bar_close": round(b.ohlc.c, 4),
+                "confidence": round(conf, 3),
+                "delta_confirms": delta_ok,
+                "rejection_pct": round(rej, 3),
+                "granularity": "candle",
+                "classification": _classify_signal(sig),
+                "source": "swing",
+            })
+            break  # first sweep of this pivot only
+    return out
 
 
 def log_sweep(symbol: str, sig: SweepSignal, bar_ts: int, tf: str = "1m") -> None:
@@ -512,6 +596,21 @@ def read_sweep_log(symbol: str, since_ts: int = 0, tf: str = "1m") -> list[dict]
                 try:
                     e = json.loads(line)
                     if e.get("ts", 0) >= since_ts:
+                        # Re-derive classification from stored fields so historical
+                        # sweeps reflect current _classify_signal logic (old log
+                        # entries were tagged with the prior rejection-first rule).
+                        e["classification"] = _classify_signal(SweepSignal(
+                            type=e.get("type", "none"),
+                            swept_level=e.get("swept_level", 0.0),
+                            level_label=e.get("level_label", ""),
+                            wick_extreme=e.get("wick_extreme", 0.0),
+                            bar_close=e.get("bar_close", 0.0),
+                            confidence=e.get("confidence", 0.0),
+                            volume_at_extreme=0.0, avg_level_volume=0.0, vol_ratio=0.0,
+                            reason="", delta_confirms=e.get("delta_confirms", True),
+                            rejection_pct=e.get("rejection_pct", 0.0),
+                            granularity=e.get("granularity", "candle"),
+                        ))
                         out.append(e)
                 except Exception:
                     pass

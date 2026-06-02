@@ -260,6 +260,84 @@ def _confirmation_vote(symbol: str, primary_tf: str) -> Vote | None:
     return None
 
 
+def _stacked_imbalance_vote(symbol: str, primary_tf: str) -> Vote | None:
+    """Stacked imbalance vote — near-price sell/buy column biases direction.
+
+    min_stack=10 + proximity ≤1×ATR + span ≥0.15×ATR keeps fire rate ~10-20%.
+    sell stack → bearish vote; buy stack → bullish vote.
+    Weight 0.60 — significant but not dominant.
+    """
+    try:
+        from pipeline.state_store import store
+        from pipeline.footprint import build as build_fp
+        from pipeline.features.stacked_imbalance import stacked_imbalances
+        from pipeline.features.atr import atr as compute_atr
+        bars = store().recent(symbol, primary_tf, 15)
+        if not bars:
+            return None
+        fp = build_fp(bars[-1])
+        stacks = stacked_imbalances(fp, min_stack=10, ratio=2.5)
+        if not stacks:
+            return None
+        atr_val = compute_atr(bars) or 1.0
+        price = bars[-1].ohlc.c
+        for z in stacks:
+            mid = (z.price_low + z.price_high) / 2
+            if (abs(mid - price) <= atr_val
+                    and (z.price_high - z.price_low) >= atr_val * 0.15):
+                direction = -1.0 if z.side == "sell" else 1.0
+                conf = min(1.0, z.count / 15)
+                return Vote("stacked_imb", direction, conf * 0.60,
+                            f"{z.side}_stack n={z.count} @ {z.price_low:.2f}-{z.price_high:.2f}")
+    except Exception:
+        pass
+    return None
+
+
+def _delta_divergence_vote(symbol: str, primary_tf: str) -> Vote | None:
+    """Delta divergence vote — price breaks window extreme but delta fails to confirm.
+
+    window=15 bars. bearish div → short bias; bullish div → long bias.
+    Weight 0.50 — moderate signal from recent data.
+    """
+    try:
+        from pipeline.features.delta_divergence import from_store as dd_store
+        dd = dd_store(symbol, primary_tf, window=15)
+        if not dd.fired:
+            return None
+        direction = -1.0 if dd.direction == "bearish" else 1.0
+        return Vote("delta_div", direction, 0.50,
+                    f"{dd.direction} div price_break={dd.price_vs_window:.2f} delta_lag={dd.delta_vs_window:.2f}")
+    except Exception:
+        pass
+    return None
+
+
+def _unfinished_auction_vote(symbol: str, primary_tf: str) -> Vote | None:
+    """Unfinished auction vote — single-print at bar extreme → price drawn back.
+
+    min_ratio=8. up = price drawn up (bullish); down = price drawn down (bearish).
+    Weight 0.40 — softest of the three footprint votes.
+    """
+    try:
+        from pipeline.state_store import store
+        from pipeline.footprint import build as build_fp
+        from pipeline.features.unfinished_auction import detect as ua_detect
+        bars = store().recent(symbol, primary_tf, 1)
+        if not bars:
+            return None
+        ua = ua_detect(build_fp(bars[-1]), n_cells=2, min_vol=0.5, min_ratio=8.0)
+        if not ua.fired:
+            return None
+        direction = 1.0 if ua.side == "up" else -1.0
+        conf = min(1.0, ua.ratio / 20)
+        return Vote("unfinished_auction", direction, conf * 0.40,
+                    f"unfinished_{ua.side} @ {ua.extreme_price:.2f} ratio={ua.ratio:.1f}")
+    except Exception:
+        pass
+    return None
+
+
 def _shape_regime_agreement(vp_shape: str, regime_type: str) -> float:
     """Multiplier [0.7, 1.2] based on VP shape × day_type agreement."""
     agree = {
@@ -300,6 +378,10 @@ def collect_votes(symbol: str, primary_tf: str = "15m") -> list[Vote]:
         # _wave_vote dropped 2026-05-29 (Tier 5.2): Elliott Wave subjective, no WR evidence.
         _sweep_vote(symbol, primary_tf),
         _confirmation_vote(symbol, primary_tf),
+        # Footprint structural votes (demoted from hard gates 2026-05-30)
+        _stacked_imbalance_vote(symbol, primary_tf),
+        _delta_divergence_vote(symbol, primary_tf),
+        _unfinished_auction_vote(symbol, primary_tf),
     ]
     return [v for v in raw if v is not None]
 
@@ -314,6 +396,40 @@ class DirectionDecision:
 
 
 FLAT_THRESHOLD = 0.35   # raised from 0.30 — reduce noise after weight rebalance
+
+# ── Adverse-regime gate ───────────────────────────────────────────────────────
+# DISABLED 2026-05-30 — REFUTED on real signals (scripts/gate_test.py).
+# Synthetic all-bars scan (stacked_edge_scan.py) said counter-trend loses, so this
+# gate was built to veto it. But tested on ACTUAL M2 signals (mode_compare.jsonl,
+# 263 trades), counter-trend signals are the BEST: WR82% avgR+0.123 vs kept +0.038.
+# The gate removed 13% of trades and made avgR WORSE (+0.049 → +0.038). M2 already
+# handles regime via its votes; its counter-trend signals are deliberate reversals.
+# Kept behind a flag (off) — do NOT enable without re-validating on real signals.
+ADVERSE_GATE_ENABLED = False
+REGIME_N = 20
+TREND_T  = 2.0
+
+
+def _trend_regime(symbol: str, primary_tf: str) -> tuple[str, float]:
+    """Causal trend regime from trailing REGIME_N 15m bars: ('trend_up'|'trend_down'|
+    'range', slope_in_atr). 'range' on insufficient bars or flat ATR."""
+    try:
+        from pipeline.state_store import store
+        from pipeline.features.atr import atr as _atr
+        bars = store().recent(symbol, primary_tf, REGIME_N + 5)
+        if len(bars) < REGIME_N + 1:
+            return "range", 0.0
+        atr_val = _atr(bars[-REGIME_N:]) or 0.0
+        if atr_val <= 0:
+            return "range", 0.0
+        slope = (bars[-1].ohlc.c - bars[-(REGIME_N + 1)].ohlc.c) / atr_val
+        if slope >= TREND_T:
+            return "trend_up", round(slope, 2)
+        if slope <= -TREND_T:
+            return "trend_down", round(slope, 2)
+        return "range", round(slope, 2)
+    except Exception:
+        return "range", 0.0
 
 
 def decide_direction(symbol: str, primary_tf: str = "15m") -> DirectionDecision:
@@ -347,10 +463,24 @@ def decide_direction(symbol: str, primary_tf: str = "15m") -> DirectionDecision:
                                  votes=votes,
                                  note=f"|score|={abs(score):.2f} < {FLAT_THRESHOLD} (mult={multiplier:.2f})")
     side = "long" if score > 0 else "short"
+
+    # Adverse-regime gate: veto counter-trend entries in a confirmed trend.
+    # Counter-trend lost on both symbols in validation; with-trend won.
+    if ADVERSE_GATE_ENABLED:
+        regime, slope = _trend_regime(symbol, primary_tf)
+        counter = (regime == "trend_up" and side == "short") or \
+                  (regime == "trend_down" and side == "long")
+        if counter:
+            return DirectionDecision(
+                side="flat", bias_strength=1, score=round(score, 3), votes=votes,
+                note=f"adverse-regime gate: {side} vs {regime} (slope={slope:+.1f}ATR)",
+            )
+
     # bias_strength: map |score| from FLAT_THRESHOLD..1.0 to 1..5
     span = 1.0 - FLAT_THRESHOLD
     norm = (abs(score) - FLAT_THRESHOLD) / span
     bs = max(1, min(5, round(norm * 4) + 1))
+
     return DirectionDecision(
         side=side, bias_strength=bs, score=round(score, 3),
         votes=votes,

@@ -243,6 +243,116 @@ def _build_detections(symbol: str, tf: str) -> dict:
         except Exception:
             pass
 
+        # Coup / coup_reversal absorption candles — scan the whole window with the
+        # strategies' own trigger detector (detect_canonical_absorption) so the chart
+        # marks every candle coup/coup_reversal would treat as an absorption trigger,
+        # not just the latest bar. Mirrors coup._find_trigger gating: vol ≥ vol_mult×
+        # rolling-median total, momentum also gated on |delta|/vol; reversal isn't.
+        try:
+            from pipeline.features.absorption import detect_canonical_absorption
+            from pipeline.footprint import build as _fp_build
+            from pipeline.features.atr import atr as _atr
+            from statistics import median as _median
+            _CONT_N, _CONT_ATR = 6, 1.0   # winner-dir move >= 1xATR within 6 bars = continuation
+
+            def _extreme_split(b, winner):
+                """Aggressive buy(ask)/sell(bid) vol in the absorbed extreme 10% zone."""
+                h, l = b.ohlc.h, b.ohlc.l
+                rng = max(h - l, 1e-9)
+                zone = rng * 0.10
+                if winner == "short":
+                    thr = h - zone
+                    ask = sum(v.vol for v in b.ask_ladder if v.price >= thr)
+                    bid = sum(v.vol for v in b.bid_ladder if v.price >= thr)
+                else:
+                    thr = l + zone
+                    ask = sum(v.vol for v in b.ask_ladder if v.price <= thr)
+                    bid = sum(v.vol for v in b.bid_ladder if v.price <= thr)
+                tot = ask + bid
+                return (round(ask, 2), round(bid, 2),
+                        ("buy" if ask >= bid else "sell"),
+                        (round(ask / tot, 3) if tot > 0 else None))
+
+            # Wider, deduped window so markers span the full loaded chart history
+            # (the shared 100-bar `bars` only covers ~25h of 15m). store() globs
+            # main + *_agg files (dup close_ts) → dedupe keeping the richer ladder.
+            _raw = _st().recent(symbol, tf, 3000)
+            _byts: dict[int, object] = {}
+            for _b in _raw:
+                ex = _byts.get(_b.close_ts)
+                if ex is None or (len(_b.bid_ladder) + len(_b.ask_ladder)) > (len(ex.bid_ladder) + len(ex.ask_ladder)):
+                    _byts[_b.close_ts] = _b
+            cbars = [_byts[k] for k in sorted(_byts)]
+
+            def _scan(mode: str, vol_mult: float, delta_ratio: float, vol_lb: int):
+                fps = [_fp_build(b) for b in cbars]
+                tots = [(fp.total_bid + fp.total_ask) for fp in fps]
+                gate_delta = mode != "reversal"
+                out = []
+                for i, b in enumerate(cbars):
+                    prior = [t for t in tots[max(0, i - vol_lb):i] if t > 0]
+                    if not prior:
+                        continue
+                    med = _median(prior)
+                    if med <= 0 or tots[i] < vol_mult * med:
+                        continue
+                    if gate_delta and (b.delta is None
+                                       or abs(b.delta) / max(tots[i], 1e-9) < delta_ratio):
+                        continue
+                    for a in detect_canonical_absorption(b, fps[i], mode=mode):
+                        winner = "long" if a.side == "buy" else "short"
+                        zask, zbid, zagg, zbf = _extreme_split(b, winner)
+                        # next-candle reversal confirmation (if a next bar exists)
+                        nxt = cbars[i + 1] if i + 1 < len(cbars) else None
+                        nconf = None
+                        ndelta = nxt.delta if nxt else None
+                        if nxt is not None:
+                            ntot = tots[i + 1]
+                            nd = nxt.delta or 0.0
+                            ndr = abs(nd) / max(ntot, 1e-9)
+                            dwith = (nd > 0) if winner == "long" else (nd < 0)
+                            prog = (nxt.ohlc.c > b.ohlc.c) if winner == "long" else (nxt.ohlc.c < b.ohlc.c)
+                            nconf = bool(dwith and ndr >= 0.25 and prog)
+                        # forward outcome: MFE/MAE in ATR over next _CONT_N bars
+                        atr_v = _atr(cbars[:i + 1]) or 0.0
+                        fwd = cbars[i + 1:i + 1 + _CONT_N]
+                        c0 = b.ohlc.c
+                        mfe_atr = mae_atr = None
+                        cont = None
+                        if fwd and atr_v > 0:
+                            if winner == "long":
+                                mfe = max(x.ohlc.h for x in fwd) - c0
+                                mae = c0 - min(x.ohlc.l for x in fwd)
+                            else:
+                                mfe = c0 - min(x.ohlc.l for x in fwd)
+                                mae = max(x.ohlc.h for x in fwd) - c0
+                            mfe_atr = round(mfe / atr_v, 2)
+                            mae_atr = round(mae / atr_v, 2)
+                            cont = bool(mfe >= _CONT_ATR * atr_v)
+                        out.append({
+                            "ts": b.close_ts,
+                            "winner": winner,
+                            "trapped": "buyers@top" if winner == "short" else "sellers@low",
+                            "price": a.price,
+                            "bar_dir": "bull" if b.ohlc.c > b.ohlc.o else ("bear" if b.ohlc.c < b.ohlc.o else "doji"),
+                            "vol_ratio": round(tots[i] / med, 2),
+                            "delta": round(b.delta or 0, 2),
+                            "bar_pct": round(a.bar_pct, 2),
+                            "is_wick_trap": a.is_wick_trap,
+                            "zone_ask": zask, "zone_bid": zbid,
+                            "zone_aggressor": zagg, "zone_buy_frac": zbf,
+                            "next_confirms": nconf,
+                            "next_delta": round(ndelta, 2) if ndelta is not None else None,
+                            "fwd_mfe_atr": mfe_atr, "fwd_mae_atr": mae_atr,
+                            "continuation": cont,
+                        })
+                return out
+
+            detections["coup_absorptions"] = _scan("momentum", 1.8, 0.35, 20)
+            detections["coup_reversal_absorptions"] = _scan("reversal", 1.8, 0.35, 10)
+        except Exception as e:
+            LOG.debug(f"[dashboard] coup absorptions failed: {e}")
+
         # Wave
         try:
             from pipeline.features.wave import classify as wave_classify
@@ -772,8 +882,11 @@ def _build_snapshot(settings: dict, symbol: str, tf: str, minutes: int,
     # CVD candle series + dominant CVD signal
     cvd_candles: list[dict] = []
     cvd_signal: dict | None = None
+    cvd_divergences: list[dict] = []
     try:
-        from pipeline.features.cvd_candlestick import build_cvd_candles, detect as detect_cvd
+        from pipeline.features.cvd_candlestick import (
+            build_cvd_candles, detect as detect_cvd, scan_divergences,
+        )
         cvd_objs = build_cvd_candles(raw_bars)
         cvd_candles = [
             {"ts": c.ts, "o": round(c.cvd_open, 4), "h": round(c.cvd_high, 4),
@@ -790,8 +903,18 @@ def _build_snapshot(settings: dict, symbol: str, tf: str, minutes: int,
                 "reference_level": round(sig.reference_level, 4),
                 "reason":    sig.reason,
             }
+        cvd_divergences = scan_divergences(raw_bars, lookback=3)
     except Exception as e:
         LOG.debug(f"[dashboard] cvd_candles failed: {e}")
+
+    # Reversal-pattern markers (climax pivot → next-bar delta flip; diagnostic)
+    reversal_patterns: list[dict] = []
+    try:
+        from pipeline.features.reversal_pattern import detect as detect_rev
+        reversal_patterns = detect_rev(raw_bars, vol_mult=2.0, delta_swing=50.0,
+                                       symbol=symbol, tf=tf, vp_filter=True)
+    except Exception as e:
+        LOG.debug(f"[dashboard] reversal_patterns failed: {e}")
 
     # Strong zones (TP/SL targets) — long + short ladders around current price
     zones_out: dict = {"long": [], "short": []}
@@ -819,6 +942,8 @@ def _build_snapshot(settings: dict, symbol: str, tf: str, minutes: int,
         from pipeline.features.sweep import read_sweep_log as _read_sweep_log
         _since = bars[0]["ts"] if bars else 0
         historical_sweeps = _read_sweep_log(symbol, since_ts=_since, tf=tf)
+        for _s in historical_sweeps:
+            _s.setdefault("source", "level")
     except Exception:
         pass
 
@@ -861,6 +986,15 @@ def _build_snapshot(settings: dict, symbol: str, tf: str, minutes: int,
     except Exception as _e:
         LOG.warning(f"[dashboard] swing_points failed: {_e}")
 
+    # Swing-derived sweeps — sweeps OF the displayed same-TF swing highs/lows.
+    # Appended alongside the level-based log sweeps (source="level").
+    try:
+        from pipeline.features.sweep import detect_swing_sweeps as _dss
+        if raw_bars and swing_points:
+            historical_sweeps = historical_sweeps + _dss(raw_bars, swing_points)
+    except Exception as _e:
+        LOG.warning(f"[dashboard] swing_sweeps failed: {_e}")
+
     return {
         "symbol": symbol,
         "tf": tf,
@@ -874,6 +1008,8 @@ def _build_snapshot(settings: dict, symbol: str, tf: str, minutes: int,
         "positions": {"open": positions_out, "pending": pending_out, "closed": closed_out},
         "cvd": cvd_candles,
         "cvd_signal": cvd_signal,
+        "cvd_divergences": cvd_divergences,
+        "reversal_patterns": reversal_patterns,
         "zones": zones_out,
         "ab_stats": ab_stats,
         "historical_sweeps": historical_sweeps,

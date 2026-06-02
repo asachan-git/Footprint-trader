@@ -159,24 +159,32 @@ class PaperExecutor:
                 return {"mode": "paper", "skipped": "same-direction cycle open",
                         "position_id": existing.position_id}
 
-        # Leg 1 fills immediately as the entry anchor
+        # Leg 1 fills immediately as the entry anchor — but NEVER at a better price
+        # than the market actually offered this bar. A sell-limit above market
+        # (short) or a buy-limit below market (long) is not marketable, so it can't
+        # fill at the limit; cap the anchor fill at bar close. Without this cap the
+        # anchor booked a phantom favorable entry at the zone price the market never
+        # reached after the signal (validated 2026-06-02).
         leg1 = plan.legs[0]
-        # Guard: TP must be on profit side of leg1 entry. Otherwise anchor opens
+        entry_price = (min(leg1.price, bar.ohlc.c) if plan.side == "short"
+                       else max(leg1.price, bar.ohlc.c))
+        # Guard: TP must be on profit side of the actual fill. Otherwise anchor opens
         # with TP <= entry (long) or TP >= entry (short) → instant degenerate fill.
-        if plan.side == "long" and plan.take_profit <= leg1.price:
-            LOG.warning(f"[paper-grid] reject {bar.symbol} long: TP {plan.take_profit:.2f} <= leg1 {leg1.price:.2f}")
+        if plan.side == "long" and plan.take_profit <= entry_price:
+            LOG.warning(f"[paper-grid] reject {bar.symbol} long: TP {plan.take_profit:.2f} <= entry {entry_price:.2f}")
             return {"mode": "paper", "skipped": "degenerate_tp_long",
-                    "tp": plan.take_profit, "leg1": leg1.price}
-        if plan.side == "short" and plan.take_profit >= leg1.price:
-            LOG.warning(f"[paper-grid] reject {bar.symbol} short: TP {plan.take_profit:.2f} >= leg1 {leg1.price:.2f}")
+                    "tp": plan.take_profit, "entry": entry_price}
+        if plan.side == "short" and plan.take_profit >= entry_price:
+            LOG.warning(f"[paper-grid] reject {bar.symbol} short: TP {plan.take_profit:.2f} >= entry {entry_price:.2f}")
             return {"mode": "paper", "skipped": "degenerate_tp_short",
-                    "tp": plan.take_profit, "leg1": leg1.price}
+                    "tp": plan.take_profit, "entry": entry_price}
         from llm.schema import Decision as _D
         filled = _D(
             side=plan.side,
-            entry=round(leg1.price, 4),
-            stop_loss=plan.safety_sl if plan.safety_sl is not None else (leg1.price * 0.95 if plan.side == "long" else leg1.price * 1.05),
+            entry=round(entry_price, 4),
+            stop_loss=plan.safety_sl if plan.safety_sl is not None else (entry_price * 0.95 if plan.side == "long" else entry_price * 1.05),
             take_profit=plan.take_profit,
+            # bias/5 — exposure/ordering proxy, NOT a calibrated win-probability.
             confidence=min(1.0, plan.bias_strength / 5.0),
             rationale=f"grid leg1 anchor (bias={plan.bias_strength}/5)",
             grid_leg=1,
@@ -212,15 +220,16 @@ class PaperExecutor:
             pass
 
         LOG.info(
-            f"[paper-grid] OPEN {plan.side} {bar.symbol} leg1@{leg1.price:.2f} lots={leg1.lots} "
-            f"+ 4 pending legs, TP={plan.take_profit:.2f} ({plan.tp_source})"
+            f"[paper-grid] OPEN {plan.side} {bar.symbol} leg1@{entry_price:.2f} "
+            f"(zone {leg1.price:.2f}, close {bar.ohlc.c:.2f}) lots={leg1.lots} "
+            f"+ {len(plan.legs)-1} pending legs, TP={plan.take_profit:.2f} ({plan.tp_source})"
         )
 
         return {
             "mode": "paper", "grid": True,
             "position_id": pos.position_id,
             "side": plan.side,
-            "leg1_filled": {"price": leg1.price, "lots": leg1.lots},
+            "leg1_filled": {"price": entry_price, "zone_price": leg1.price, "lots": leg1.lots},
             "pending_legs": [{"id": pid, "price": leg.price, "lots": leg.lots, "leg": leg.leg_idx}
                               for pid, leg in zip(pending_ids, plan.legs[1:])],
             "take_profit": plan.take_profit,

@@ -98,9 +98,36 @@ function inferTickSize(bars) {
   return tick || 0.01;
 }
 
+// Resolve an unresolved/open trade's outcome from future candles: first TP-or-SL
+// touch after entry wins. Trades already closed with a managed exit keep theirs.
+function resolveTradeOutcome(t, bars) {
+  const hasClosedResult = !t.open && (t.r != null || t.exit_price != null);
+  if (hasClosedResult) return t;
+  if (t.entry == null || t.entry_ts == null || t.sl == null || t.tp == null) return t;
+  const isLong = t.side === "long";
+  for (const b of bars) {
+    if (b.ts <= t.entry_ts) continue;
+    const hitTP = isLong ? b.h >= t.tp : b.l <= t.tp;
+    const hitSL = isLong ? b.l <= t.sl : b.h >= t.sl;
+    if (!hitTP && !hitSL) continue;
+    const tpFirst = hitTP && !hitSL;
+    const both = hitTP && hitSL;
+    const risk = Math.abs(t.entry - t.sl) || 1e-9;
+    return {
+      ...t, open: false, _resolved: true,
+      exit_ts: b.ts,
+      exit_price: tpFirst ? t.tp : t.sl,
+      r: tpFirst ? Math.abs(t.tp - t.entry) / risk : -1,
+      reason: tpFirst ? "TP hit (candle)" : both ? "SL/TP same bar→SL" : "SL hit (candle)",
+    };
+  }
+  return t;
+}
+
 export default function FootprintPane({
   bars, dailyVp, priorVp, detections, positions, pendingOrders, nakedPocs,
-  closedPositions, cvd, cvdSignal, zones, latestM2, historicalSweeps, swingPoints, symbol, indicators,
+  closedPositions, cvd, cvdSignal, cvdDivergences = [], zones, latestM2, historicalSweeps, swingPoints,
+  strategyTrades = [], symbol, indicators,
 }) {
   const canvasRef = useRef(null);
   const wrapRef   = useRef(null);
@@ -655,6 +682,51 @@ export default function FootprintPane({
     });
 
     detHitsRef.current = [];
+
+    // VP level hit regions (drawn earlier, registered here after the clear)
+    const pushLevelHit = (price, label, desc) => {
+      if (price == null) return;
+      const y = yOfPrice(price);
+      if (y < PAD_TOP || y > PAD_TOP + plotH) return;
+      detHitsRef.current.push({ x: 25, y: y - 7, r: 14, type: "vp_level", payload: { label, price, desc } });
+    };
+    if (dailyVp) {
+      pushLevelHit(dailyVp.poc, "POC", "Point of Control — price with highest traded volume in current session");
+      pushLevelHit(dailyVp.vah, "VAH", "Value Area High — upper bound where 70% of session volume was traded");
+      pushLevelHit(dailyVp.val, "VAL", "Value Area Low — lower bound where 70% of session volume was traded");
+      if (dailyVp.naked_poc) pushLevelHit(dailyVp.naked_poc, "nPOC", "Naked POC — current-session untested prior POC; strong magnet level");
+      (nakedPocs || []).forEach(n => {
+        const lbl = `nPOC-${n.session[0]}${n.age_sessions}`;
+        pushLevelHit(n.price, lbl, `Naked POC from ${n.session} session, ${n.age_sessions} session(s) untested — magnet for mean reversion`);
+      });
+    }
+    if (priorVp?.poc) pushLevelHit(priorVp.poc, "pPOC", "Prior session Point of Control — highest-volume node from the previous session");
+
+    // Zone tick hit regions
+    const zoneDescMap = {
+      H: "HVN — High Volume Node: price stalls, strong support/resistance",
+      P: "VP Level — Volume Profile anchor (POC / VA boundary)",
+      S: "Swing/Session level — structural pivot or key session extreme",
+      F: "FVG — Fair Value Gap: imbalance zone, often filled on retest",
+      W: "Sweep level — liquidity wick extreme from a prior sweep",
+      C: "CVD level — cumulative delta structural pivot",
+      L: "LVN — Low Volume Node: price typically accelerates through",
+    };
+    (zones?.long  || []).forEach(z => {
+      const y = yOfPrice(z.price);
+      if (y < PAD_TOP || y > PAD_TOP + plotH) return;
+      const ch = zoneTypeChar(z.source);
+      detHitsRef.current.push({ x: plotW - 6, y, r: 9, type: "zone_tick",
+        payload: { price: z.price, source: z.source, side: "long",  char: ch, desc: zoneDescMap[ch] || z.source } });
+    });
+    (zones?.short || []).forEach(z => {
+      const y = yOfPrice(z.price);
+      if (y < PAD_TOP || y > PAD_TOP + plotH) return;
+      const ch = zoneTypeChar(z.source);
+      detHitsRef.current.push({ x: plotW - 6, y, r: 9, type: "zone_tick",
+        payload: { price: z.price, source: z.source, side: "short", char: ch, desc: zoneDescMap[ch] || z.source } });
+    });
+
     // Sweep markers — compact arrow + tiny "SW" pill; hover for full info.
     const drawSweepMarker = (ev, primary) => {
       if (!ev || !ev.type) return;
@@ -765,6 +837,7 @@ export default function FootprintPane({
     }
 
     // Swing point levels — dashed line + triangle; EQH/EQL and normal pivot lines are separate toggles
+    // Line extends from pivot bar → first bar that takes out the level (or right edge if still active)
     (swingPoints || []).forEach(sp => {
       const isEq = sp.is_equal;
       if (isEq  && indicators?.eqLevels   === false) return;
@@ -776,14 +849,24 @@ export default function FootprintPane({
       const isHi = sp.side === "high";
       const baseRgb = isEq ? "255,152,0" : (isHi ? "239,83,80" : "38,166,154");
 
-      // Dashed horizontal line: pivot bar → right edge of plot
+      // Find first bar after pivot that takes out the level
+      let takeoutTs = null;
+      for (const b of bars) {
+        if (b.ts <= sp.ts) continue;
+        if (isHi ? b.high > sp.price : b.low < sp.price) { takeoutTs = b.ts; break; }
+      }
+      const xEnd = takeoutTs != null
+        ? Math.min(tsToVisibleX(takeoutTs), plotW)
+        : plotW;
+
+      // Dashed horizontal line: pivot bar → takeout bar (or right edge if active)
       ctx.save();
       ctx.setLineDash([3, 4]);
       ctx.strokeStyle = `rgba(${baseRgb},${isEq ? 0.55 : 0.28})`;
       ctx.lineWidth = isEq ? 1.5 : 0.8;
       ctx.beginPath();
       ctx.moveTo(xC, y);
-      ctx.lineTo(plotW, y);
+      ctx.lineTo(xEnd, y);
       ctx.stroke();
       ctx.setLineDash([]);
       ctx.restore();
@@ -816,8 +899,16 @@ export default function FootprintPane({
       const pivotLabel = isEq ? `${isHi ? "EQH" : "EQL"} ${sp.price.toFixed(2)}` : sp.price.toFixed(2);
       ctx.fillText(pivotLabel, xC + triW + 3, y - (isHi ? 3 : -3));
 
-      // Right-edge label for EQH/EQL (reinforces the level across wide chart)
-      if (isEq) {
+      // Hover hit region for all pivot labels
+      detHitsRef.current.push({
+        x: xC, y,
+        r: isEq ? 12 : 8,
+        type: "pivot_label",
+        payload: { side: sp.side, price: sp.price, is_equal: isEq, active: takeoutTs === null },
+      });
+
+      // Right-edge label for EQH/EQL only when level is still active (not taken out)
+      if (isEq && takeoutTs === null) {
         ctx.font = "bold 9px JetBrains Mono, monospace";
         ctx.fillStyle = `rgba(${baseRgb},0.7)`;
         ctx.textAlign = "right";
@@ -825,6 +916,39 @@ export default function FootprintPane({
         ctx.fillText(`${isHi ? "EQH" : "EQL"}`, plotW - 2, y);
       }
     });
+
+    // CVD divergence markers — price/CVD regular divergence at swing pivots.
+    if (indicators?.cvdDiv && cvdDivergences?.length) {
+      cvdDivergences.forEach(d => {
+        const xC = tsToVisibleX(d.ts);
+        if (xC < -barW || xC > plotW + barW) return;
+        const y = yOfPrice(d.price);
+        if (y < PAD_TOP || y > PAD_TOP + plotH) return;
+        const bear = d.type === "bear";
+        const color = bear ? COLORS.down : COLORS.up;
+        const triH = 7, triW = 6;
+        const ty = bear ? y - 16 : y + 16;
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.9;
+        ctx.beginPath();
+        if (bear) { ctx.moveTo(xC, ty + triH); ctx.lineTo(xC - triW, ty - triH); ctx.lineTo(xC + triW, ty - triH); }
+        else      { ctx.moveTo(xC, ty - triH); ctx.lineTo(xC - triW, ty + triH); ctx.lineTo(xC + triW, ty + triH); }
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalAlpha = 1.0;
+        // dashed connector to the price extreme
+        ctx.save();
+        ctx.setLineDash([2, 2]);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(xC, bear ? ty - triH : ty + triH);
+        ctx.lineTo(xC, y);
+        ctx.stroke();
+        ctx.restore();
+        detHitsRef.current.push({ x: xC, y: ty, r: 10, type: "cvd_div", payload: { ...d } });
+      });
+    }
 
     // SR/FS sweeps — small dim arrows with hover detail
     if (indicators?.srFsSweeps !== false) {
@@ -1136,6 +1260,97 @@ export default function FootprintPane({
         markerHitsRef.current.push({ x: xStart, y: yEntry, r: sz + 2, posId: pos.position_id });
       }
     });
+
+    // ── Strategy / grid / cycle trade overlay (mirrors CandleChart) ──────────
+    // Gradient reward (entry→TP) / risk (entry→SL) zones + entry line + RR
+    // label. Open trades extend to the right edge. Cycles drawn dashed.
+    // Entry registered into detHitsRef → hover card (SL/target/reason/PnL).
+    if (showTrades && strategyTrades?.length) {
+      const SCOL = { coup: "#ff9800", democracy: "#42a5f5", republic: "#ab47bc", m1: "#26a69a", m2: "#ffca28", reversal: "#26c6da" };
+      const STAG = { coup: "C", democracy: "D", republic: "R", m1: "1", m2: "2", reversal: "⚑" };
+      // Resolve open/unresolved trades against future candles (real TP/SL touch).
+      const resolved = strategyTrades.map(t => resolveTradeOutcome(t, bars));
+      for (const t of resolved) {
+        if (t.entry == null || t.entry_ts == null) continue;
+        const xA = tsToVisibleX(t.entry_ts);
+        if (xA < -barW || xA > plotW + barW) continue;
+        let xB = t.exit_ts ? tsToVisibleX(t.exit_ts) : plotW;
+        if (xB <= xA) xB = xA + 3;
+        xB = Math.min(xB, plotW);
+        const yE = yOfPrice(t.entry);
+        if (yE < PAD_TOP - 50 || yE > PAD_TOP + plotH + 50) continue;
+        const ySL = t.sl != null ? yOfPrice(t.sl) : null;
+        const yTP = t.tp != null ? yOfPrice(t.tp) : null;
+        const col = SCOL[t.strategy] || "#fff";
+        const cyc = !!t.is_cycle;
+        const aFill = cyc ? 0.11 : 0.20;
+        const bw = Math.max(3, xB - xA);
+        if (yTP != null) {
+          const g = ctx.createLinearGradient(0, yE, 0, yTP);
+          g.addColorStop(0, "rgba(38,166,154,0.04)");
+          g.addColorStop(1, `rgba(38,166,154,${aFill})`);
+          ctx.fillStyle = g; ctx.fillRect(xA, Math.min(yE, yTP), bw, Math.abs(yTP - yE));
+        }
+        if (ySL != null) {
+          const g = ctx.createLinearGradient(0, yE, 0, ySL);
+          g.addColorStop(0, "rgba(239,83,80,0.04)");
+          g.addColorStop(1, `rgba(239,83,80,${aFill})`);
+          ctx.fillStyle = g; ctx.fillRect(xA, Math.min(yE, ySL), bw, Math.abs(ySL - yE));
+        }
+        ctx.lineWidth = 1; ctx.setLineDash(cyc ? [4, 3] : []);
+        if (yTP != null) { ctx.strokeStyle = "rgba(38,166,154,0.7)"; ctx.beginPath(); ctx.moveTo(xA, yTP); ctx.lineTo(xB, yTP); ctx.stroke(); }
+        if (ySL != null) { ctx.strokeStyle = "rgba(239,83,80,0.7)"; ctx.beginPath(); ctx.moveTo(xA, ySL); ctx.lineTo(xB, ySL); ctx.stroke(); }
+        // left (entry) + right (exit) vertical bounds — frames the position box
+        const yTop = Math.min(ySL ?? yE, yTP ?? yE), yBot = Math.max(ySL ?? yE, yTP ?? yE);
+        ctx.strokeStyle = "rgba(150,150,150,0.45)";
+        ctx.beginPath(); ctx.moveTo(xA, yTop); ctx.lineTo(xA, yBot); ctx.stroke();
+        if (!t.open) { ctx.beginPath(); ctx.moveTo(xB, yTop); ctx.lineTo(xB, yBot); ctx.stroke(); }
+        ctx.strokeStyle = col; ctx.lineWidth = cyc ? 1 : 1.5;
+        ctx.beginPath(); ctx.moveTo(xA, yE); ctx.lineTo(xB, yE); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = col; ctx.beginPath(); ctx.arc(xA, yE, 3, 0, 2 * Math.PI); ctx.fill();
+
+        // EXIT marker (where it closed) + path line entry→exit, win/loss colored
+        const yX = t.exit_price != null ? yOfPrice(t.exit_price) : null;
+        if (!t.open && yX != null) {
+          const won = (t.r ?? t.pnl ?? 0) > 0;
+          const xc = won ? COLORS.up : COLORS.down;
+          ctx.strokeStyle = xc; ctx.lineWidth = 1; ctx.setLineDash([2, 2]);
+          ctx.beginPath(); ctx.moveTo(xA, yE); ctx.lineTo(xB, yX); ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = xc;
+          ctx.beginPath();
+          ctx.moveTo(xB, yX - 3.5); ctx.lineTo(xB + 3.5, yX);
+          ctx.lineTo(xB, yX + 3.5); ctx.lineTo(xB - 3.5, yX); ctx.closePath(); ctx.fill();
+          const out = t.r != null ? `${t.r >= 0 ? "+" : ""}${t.r.toFixed(2)}R`
+                    : t.pnl != null ? `${t.pnl >= 0 ? "+" : ""}${(+t.pnl).toFixed(2)}` : "";
+          if (out) {
+            ctx.font = "10px JetBrains Mono, monospace"; ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+            const ow = ctx.measureText(out).width;
+            const ox = Math.min(xB + 6, plotW - ow - 4);
+            ctx.fillStyle = "rgba(13,13,13,0.82)"; ctx.fillRect(ox - 2, yX - 6, ow + 4, 12);
+            ctx.fillStyle = xc; ctx.fillText(out, ox, yX + 3);
+          }
+          detHitsRef.current.push({ x: xB, y: yX, r: 6, type: "strat_trade", payload: { ...t } });
+        }
+
+        let rr = null;
+        if (t.sl != null && t.tp != null && t.entry !== t.sl)
+          rr = Math.abs(t.tp - t.entry) / Math.abs(t.entry - t.sl);
+        const label = `${t.side === "long" ? "▲" : "▼"}${STAG[t.strategy] || "?"}`
+                    + `${cyc && t.cycle_num != null ? `#${t.cycle_num}` : ""}`
+                    + `${rr != null ? ` RR ${rr.toFixed(2)}` : ""}${t.open ? " ●" : ""}`;
+        ctx.font = "10px JetBrains Mono, monospace";
+        ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+        const tw = ctx.measureText(label).width;
+        const lx = Math.max(0, Math.min(xA + 4, plotW - tw - 6));
+        const ly = yE - 5;
+        ctx.fillStyle = "rgba(13,13,13,0.82)"; ctx.fillRect(lx - 3, ly - 9, tw + 6, 12);
+        ctx.fillStyle = col; ctx.fillText(label, lx, ly);
+
+        detHitsRef.current.push({ x: xA, y: yE, r: 7, type: "strat_trade", payload: { ...t, rr } });
+      }
+    }
 
     // Daily VP histogram on the right strip (aggregated from session bars).
     // Uses all loaded bars (not just visible) for accuracy.
@@ -1493,7 +1708,7 @@ export default function FootprintPane({
         lastLabelX = xC;
       }
     }
-  }, [bars, dailyVp, priorVp, detections, positions, pendingOrders, closedPositions, cvd, cvdSignal, zones, view, cellMode, selectedPosId, showTrades, showBubbles, theme]);
+  }, [bars, dailyVp, priorVp, detections, positions, pendingOrders, closedPositions, cvd, cvdSignal, cvdDivergences, zones, view, cellMode, selectedPosId, showTrades, showBubbles, theme, swingPoints, indicators, historicalSweeps, nakedPocs, strategyTrades]);
 
   // Resize observer → trigger re-render
   useEffect(() => {
@@ -1898,7 +2113,28 @@ export default function FootprintPane({
         if (tx + W > rect.width)  tx = hoverDet.x - W - 12;
         if (ty + H > rect.height) ty = hoverDet.y - H - 12;
         let header = "", body = null;
-        if (hoverDet.type === "sweep") {
+        if (hoverDet.type === "strat_trade") {
+          const SCOL = { coup: "#ff9800", democracy: "#42a5f5", republic: "#ab47bc", m1: "#26a69a", m2: "#ffca28" };
+          const col = SCOL[p.strategy] || "#fff";
+          header = (<span style={{ color: col, fontWeight: 700 }}>
+            {(p.strategy || "").toUpperCase()} {(p.side || "").toUpperCase()}
+            {p.is_cycle ? ` · cycle${p.cycle_num != null ? ` #${p.cycle_num}` : ""}` : ""}
+            <span style={{ color: p.open ? "#ffd700" : "#888", marginLeft: 6 }}>{p.open ? "● OPEN" : "○ closed"}</span>
+          </span>);
+          body = (<>
+            {p.entry_ts_ist && <div style={{ color: "#999" }}>opened {p.entry_ts_ist}</div>}
+            <div><span style={{ color: "#888" }}>entry </span>{r(p.entry)}
+              {p.bias_strength != null && <span style={{ color: "#888" }}>  bias {p.bias_strength}/5</span>}</div>
+            <div>
+              <span style={{ color: COLORS.down }}>SL {r(p.sl)}</span>{"  "}
+              <span style={{ color: COLORS.up }}>{p.tp != null ? `TP ${r(p.tp)}` : "TP — (open)"}</span>
+              {p.rr != null && <span style={{ color: "#888" }}>  RR {p.rr.toFixed(2)}</span>}
+            </div>
+            {p.pnl != null && <div style={{ color: p.pnl >= 0 ? COLORS.up : COLORS.down }}>PnL {p.pnl >= 0 ? "+" : ""}{r(p.pnl)}</div>}
+            {!p.open && p.reason && <div style={{ color: "#999" }}>⇲ {p.reason}</div>}
+            {p.rationale && <div style={{ color: "#888" }}>↳ {p.rationale}</div>}
+          </>);
+        } else if (hoverDet.type === "sweep") {
           const isHi = p.type === "sweep_high";
           const color = isHi ? COLORS.down : COLORS.up;
           header = (<span style={{ color, fontWeight: 700 }}>
@@ -1915,6 +2151,23 @@ export default function FootprintPane({
             </div>
             <div><span style={{ color: "#888" }}>age </span><span>{p.age_bars ?? 0} bar(s)</span></div>
           </>);
+        } else if (hoverDet.type === "vp_level") {
+          const colorMap = { POC: COLORS.pocBorder, VAH: COLORS.vah, VAL: COLORS.val };
+          const color = colorMap[p.label] || "rgba(255,215,0,0.8)";
+          header = (<span style={{ color, fontWeight: 700 }}>{p.label}</span>);
+          body = (<>
+            <div><span style={{ color: "#888" }}>price </span><span>{r(p.price)}</span></div>
+            {p.desc && <div style={{ color: "#aaa", marginTop: 2 }}>{p.desc}</div>}
+          </>);
+        } else if (hoverDet.type === "zone_tick") {
+          const color = p.side === "long" ? COLORS.up : COLORS.down;
+          header = (<span style={{ color, fontWeight: 700 }}>{p.char} ZONE — {p.side.toUpperCase()}</span>);
+          body = (<>
+            <div><span style={{ color: "#888" }}>price </span><span>{r(p.price)}</span>
+              <span style={{ color: "#888" }}>  src </span><span style={{ color: "#aaa" }}>{p.source}</span>
+            </div>
+            {p.desc && <div style={{ color: "#aaa", marginTop: 2 }}>{p.desc}</div>}
+          </>);
         } else if (hoverDet.type === "absorption") {
           const color = p.side === "buy" ? COLORS.up : COLORS.down;
           header = (<span style={{ color, fontWeight: 700 }}>ABSORPTION {String(p.side || "").toUpperCase()}</span>);
@@ -1927,6 +2180,32 @@ export default function FootprintPane({
               </>}
             </div>
             {p.reason && <div style={{ color: "#aaa", marginTop: 2 }}>{p.reason}</div>}
+          </>);
+        } else if (hoverDet.type === "pivot_label") {
+          const isHi = p.side === "high";
+          const color = p.is_equal ? "#ff9800" : (isHi ? COLORS.down : COLORS.up);
+          const tag = p.is_equal ? (isHi ? "EQH" : "EQL") : (isHi ? "SWING HIGH" : "SWING LOW");
+          header = (<span style={{ color, fontWeight: 700 }}>{tag}</span>);
+          body = (<>
+            <div><span style={{ color: "#888" }}>price </span><span>{r(p.price)}</span>
+              <span style={{ color: "#888" }}>  status </span>
+              <span style={{ color: p.active ? COLORS.up : "#888" }}>{p.active ? "active" : "swept"}</span>
+            </div>
+            {p.is_equal
+              ? <div style={{ color: "#aaa", marginTop: 2 }}>Retail stop cluster — two+ pivots within 0.15%. Prime institutional sweep target before reversal.</div>
+              : <div style={{ color: "#aaa", marginTop: 2 }}>Structural swing {isHi ? "high" : "low"} — local price extreme. Line ends when level is taken out.</div>
+            }
+          </>);
+        } else if (hoverDet.type === "cvd_div") {
+          const bear = p.type === "bear";
+          const color = bear ? COLORS.down : COLORS.up;
+          header = (<span style={{ color, fontWeight: 700 }}>CVD DIVERGENCE · {bear ? "BEARISH" : "BULLISH"}</span>);
+          body = (<>
+            <div style={{ color: "#aaa" }}>{bear ? "price higher-high, CVD lower-high" : "price lower-low, CVD higher-low"}</div>
+            <div><span style={{ color: "#888" }}>price </span><span>{r(p.price)}</span>
+              <span style={{ color: "#888" }}>  str </span><span>{p.strength}</span></div>
+            <div><span style={{ color: "#888" }}>cvd </span><span>{p.cvd}</span>
+              <span style={{ color: "#888" }}> vs </span><span>{p.prev_cvd}</span></div>
           </>);
         } else if (hoverDet.type === "big_trade") {
           const isBuy = p.aggressor === "buy";

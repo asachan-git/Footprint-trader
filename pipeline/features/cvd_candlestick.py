@@ -271,6 +271,63 @@ def detect(bars: list, lookback: int = SWING_LOOKBACK) -> CVDSignal:
     return max(candidates, key=lambda s: s.confidence)
 
 
+def scan_divergences(bars: list, lookback: int = 3) -> list[dict]:
+    """Scan the whole bar history for price/CVD regular divergences at swing pivots.
+
+    Unlike detect() (latest-signal-only), this returns one marker per confirmed
+    divergence across the series, for chart plotting.
+
+      - bearish: price swing high makes a HIGHER high than the prior price swing
+        high, but CVD at that pivot is a LOWER high  → buyers exhausting.
+      - bullish: price swing low makes a LOWER low than the prior price swing low,
+        but CVD at that pivot is a HIGHER low  → sellers exhausting.
+
+    Pivots come from wave.detect_swing_points (price h/l, ±lookback window); CVD is
+    read at the same bar index from build_cvd_candles. Returns a list of
+    {ts, type:"bear"|"bull", price, cvd, prev_cvd, strength}.
+    """
+    if len(bars) < (2 * lookback + 3):
+        return []
+    from pipeline.features.wave import detect_swing_points
+
+    candles = build_cvd_candles(bars)
+    if len(candles) != len(bars):
+        return []
+    cvd_at = [c.cvd_close for c in candles]
+
+    highs, lows = detect_swing_points(bars, lookback=lookback)
+    out: list[dict] = []
+
+    # Bearish: consecutive price swing highs, price up but CVD down.
+    for (i_prev, p_prev), (i_cur, p_cur) in zip(highs, highs[1:]):
+        if p_cur > p_prev and cvd_at[i_cur] < cvd_at[i_prev]:
+            denom = abs(cvd_at[i_prev]) + 1.0
+            out.append({
+                "ts": bars[i_cur].close_ts,
+                "type": "bear",
+                "price": round(p_cur, 4),
+                "cvd": round(cvd_at[i_cur], 1),
+                "prev_cvd": round(cvd_at[i_prev], 1),
+                "strength": round(min(1.0, (cvd_at[i_prev] - cvd_at[i_cur]) / denom), 3),
+            })
+
+    # Bullish: consecutive price swing lows, price down but CVD up.
+    for (i_prev, p_prev), (i_cur, p_cur) in zip(lows, lows[1:]):
+        if p_cur < p_prev and cvd_at[i_cur] > cvd_at[i_prev]:
+            denom = abs(cvd_at[i_prev]) + 1.0
+            out.append({
+                "ts": bars[i_cur].close_ts,
+                "type": "bull",
+                "price": round(p_cur, 4),
+                "cvd": round(cvd_at[i_cur], 1),
+                "prev_cvd": round(cvd_at[i_prev], 1),
+                "strength": round(min(1.0, (cvd_at[i_cur] - cvd_at[i_prev]) / denom), 3),
+            })
+
+    out.sort(key=lambda d: d["ts"])
+    return out
+
+
 def from_store(symbol: str, primary_tf: str = "15m", lookback: int = SWING_LOOKBACK) -> CVDSignal:
     """Convenience: detect CVD pattern from state_store bars."""
     try:
