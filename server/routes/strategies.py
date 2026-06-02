@@ -44,14 +44,16 @@ def _backtest_trades(name: str, symbol: str | None, tf: str | None) -> list[dict
     return out
 
 
-def _live_trades(name: str, symbol: str | None, tf: str | None) -> list[dict]:
-    """Pair open/close rows in the per-strategy positions.jsonl into trade shape."""
-    f = _STRAT_DIR / name / "positions.jsonl"
-    if not f.exists():
+def _pair_trades(path: Path, symbol: str | None, tf: str | None,
+                 source: str = "live") -> list[dict]:
+    """Pair open/close rows in a positions.jsonl into trade shape (entry/exit,
+    SL/TP, reason, R, open-time). Used for per-strategy stores and the global
+    m1/m2 grid logs alike."""
+    if not path.exists():
         return []
     opens: dict[str, dict] = {}
     closes: dict[str, dict] = {}
-    for line in f.open():
+    for line in path.open():
         if not line.strip():
             continue
         r = json.loads(line)
@@ -72,14 +74,97 @@ def _live_trades(name: str, symbol: str | None, tf: str | None) -> list[dict]:
         out.append({
             "symbol": o.get("symbol"), "tf": o.get("tf"), "side": o.get("side"),
             "entry_ts": o.get("ts"), "entry": o.get("entry"),
+            "entry_ts_ist": o.get("ts_ist"),
             "sl": o.get("stop_loss"), "tp": o.get("take_profit"),
             "exit_ts": c.get("ts") or c.get("closed_ts"),
+            "exit_ts_ist": c.get("ts_ist"),
             "exit_price": c.get("exit_price"),
             "reason": c.get("reason"), "r": c.get("realized_r"),
+            "rationale": o.get("rationale"),
+            "invalidation_note": o.get("invalidation_note"),
+            "confidence": o.get("confidence"), "bias_strength": o.get("bias_strength"),
+            "lots": o.get("lots"), "fill_type": o.get("fill_type"),
             "entry_mode": o.get("entry_mode"), "sl_mode": o.get("sl_mode"),
-            "source": "live",
+            "open": pid not in closes,
+            "source": o.get("source") or source,
         })
     return out
+
+
+def _live_trades(name: str, symbol: str | None, tf: str | None) -> list[dict]:
+    """Pair open/close rows in the per-strategy positions.jsonl into trade shape."""
+    return _pair_trades(_STRAT_DIR / name / "positions.jsonl", symbol, tf, source="live")
+
+
+def _position_map(path: Path) -> dict[str, dict]:
+    """position_id -> latest open row (for entry/SL/TP join from cycles)."""
+    out: dict[str, dict] = {}
+    if not path.exists():
+        return out
+    for line in path.open():
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        if r.get("type") == "open" and r.get("position_id"):
+            out[r["position_id"]] = r
+    return out
+
+
+def _pair_cycles(cycles_path: Path, positions_path: Path,
+                 symbol: str | None, tf: str | None, source: str) -> list[dict]:
+    """Pair cycle open/close rows by cycle_id; join the linked position's
+    entry/SL/TP (cycles log carries only position_id + realized_pnl/reason).
+    A cycle = one grid recovery cycle (cycle_num, parent_cycle_id chain)."""
+    if not cycles_path.exists():
+        return []
+    pos = _position_map(positions_path)
+    opens: dict[str, dict] = {}
+    closes: dict[str, dict] = {}
+    for line in cycles_path.open():
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        cid = r.get("cycle_id")
+        if not cid:
+            continue
+        if r.get("type") == "open":
+            opens[cid] = r
+        elif r.get("type") == "close":
+            closes[cid] = r
+    out = []
+    for cid, o in opens.items():
+        if symbol and o.get("symbol") != symbol:
+            continue
+        if tf and o.get("tf") != tf:
+            continue
+        p = pos.get(o.get("position_id"), {})
+        c = closes.get(cid, {})
+        out.append({
+            "symbol": o.get("symbol"), "tf": o.get("tf"),
+            "side": o.get("direction") or p.get("side"),
+            "entry_ts": o.get("ts"), "entry_ts_ist": o.get("ts_ist"),
+            "entry": p.get("entry"), "sl": p.get("stop_loss"), "tp": p.get("take_profit"),
+            "exit_ts": c.get("ts"), "exit_ts_ist": c.get("ts_ist"),
+            "reason": c.get("reason"), "pnl": c.get("realized_pnl"),
+            "rationale": p.get("rationale"),
+            "cycle_num": o.get("cycle_num"), "parent_cycle_id": o.get("parent_cycle_id"),
+            "open": cid not in closes,
+            "is_cycle": True, "source": source,
+        })
+    return out
+
+
+# Global grid cycle log (m1). m2 has no separate cycle log.
+_CYCLE_LOGS = {
+    "m1": (_ROOT / "data" / "cycles.jsonl", _ROOT / "data" / "positions.jsonl"),
+}
+
+
+# Global grid-mode logs (not per-strategy stores).
+_GRID_LOGS = {
+    "m1": _ROOT / "data" / "positions.jsonl",      # m1_claude
+    "m2": _ROOT / "data" / "positions_m2.jsonl",   # m2_rules
+}
 
 
 def manager() -> StrategyManager:
@@ -122,6 +207,48 @@ def strategy_trades(name: str):
         trades += _live_trades(name, symbol, tf)
     trades.sort(key=lambda t: t.get("entry_ts") or 0)
     return jsonify({"ok": True, "name": name, "source": source, "trades": trades})
+
+
+@bp.get("/grid/<mode>/trades")
+def grid_trades(mode: str):
+    """Grid-mode trade history for the chart overlay. mode = m1 | m2.
+    Pairs open/close rows from the global positions log; includes open time,
+    entry/SL/TP, rationale, exit + realized R. Open positions have open=true."""
+    mode = mode.lower()
+    path = _GRID_LOGS.get(mode)
+    if path is None:
+        return jsonify({"ok": False, "error": f"unknown grid mode {mode!r}"}), 404
+    symbol = request.args.get("symbol")
+    tf = request.args.get("tf")
+    trades = _pair_trades(path, symbol, tf, source=mode)
+    trades.sort(key=lambda t: t.get("entry_ts") or 0)
+    return jsonify({"ok": True, "mode": mode, "trades": trades})
+
+
+@bp.get("/strategies/<name>/cycles")
+def strategy_cycles(name: str):
+    """Per-strategy cycle history (grid recovery cycles), joined with position
+    entry/SL/TP. cycle_num/parent_cycle_id expose the recovery chain."""
+    symbol = request.args.get("symbol")
+    tf = request.args.get("tf")
+    d = _STRAT_DIR / name
+    cycles = _pair_cycles(d / "cycles.jsonl", d / "positions.jsonl", symbol, tf, source="live")
+    cycles.sort(key=lambda t: t.get("entry_ts") or 0)
+    return jsonify({"ok": True, "name": name, "cycles": cycles})
+
+
+@bp.get("/grid/<mode>/cycles")
+def grid_cycles(mode: str):
+    """Grid-mode cycle history (m1). Pairs the global cycle log with positions."""
+    mode = mode.lower()
+    pair = _CYCLE_LOGS.get(mode)
+    if pair is None:
+        return jsonify({"ok": True, "mode": mode, "cycles": []})
+    symbol = request.args.get("symbol")
+    tf = request.args.get("tf")
+    cycles = _pair_cycles(pair[0], pair[1], symbol, tf, source=mode)
+    cycles.sort(key=lambda t: t.get("entry_ts") or 0)
+    return jsonify({"ok": True, "mode": mode, "cycles": cycles})
 
 
 @bp.post("/strategies/tick")

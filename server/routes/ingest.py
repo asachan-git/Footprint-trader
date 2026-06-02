@@ -113,6 +113,18 @@ def _aggregate_mtf(bar, settings) -> None:
             s.put(synth)
             if enabled and tf == decide_tf:
                 _trigger_decide_on_bar_close(bar.symbol, tf, synth.bar_id)
+                # Strategy-manager ENTRY tick on the synthetic decide-TF close.
+                # The /ingest body only ever sees the 1m bar, so its manager
+                # tick runs with allow_entry=False (exits only). Entries must
+                # fire here, when the 15m bar actually closes — otherwise the
+                # managed strategies (democracy/republic/coup) never decide().
+                try:
+                    from strategies.manager import get_manager
+                    get_manager(settings).tick(
+                        synth.symbol, tf, synth, settings, allow_entry=True,
+                    )
+                except Exception as e:
+                    LOG.warning(f"[ingest][strategies] synth entry tick failed: {e}")
             # Sweep detection for synthetic bars (e.g. 15m)
             try:
                 from pipeline.features.sweep import detect as _sw_det2, tick_registry as _sw_tick2, log_sweep as _sw_log2
