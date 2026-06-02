@@ -123,6 +123,22 @@ def try_full_grid(signal: dict, bar: dict, bars_15m: list[dict],
         return None
 
 
+def trend_regime(bars15: list[dict], atr15: float, k_atr: float = 2.0) -> str:
+    """Lightweight regime at a signal bar: 20-bar close change normalized by ATR.
+    ≥ +k_atr → trend_up, ≤ −k_atr → trend_down, else range. Used to test whether
+    the short/long edge survives WITHIN a trend direction or is just the window's
+    net drift (regime-confounding)."""
+    if len(bars15) < 21 or atr15 <= 0:
+        return "range"
+    ret = bars15[-1]["ohlc"]["c"] - bars15[-21]["ohlc"]["c"]
+    n = ret / atr15
+    if n >= k_atr:
+        return "trend_up"
+    if n <= -k_atr:
+        return "trend_down"
+    return "range"
+
+
 def main() -> None:
     signals = load_jsonl(MC_FILE)
     fired   = [s for s in signals if s.get("side") not in ("flat", None)
@@ -218,6 +234,7 @@ def main() -> None:
             "atr15":      atr15,
             "vote_keys":  vote_keys,
             "grid_method": grid_method,
+            "regime":     trend_regime(prior_15m, atr15),
         })
 
     # ── Report ───────────────────────────────────────────────────────────────
@@ -291,6 +308,41 @@ def main() -> None:
         if not rs: continue
         wr = sum(1 for r in rs if r > 0) / len(rs)
         print(f"  {k}: n={len(rs):3d}  WR={wr*100:.0f}%  totalR={sum(rs):+.3f}  avgR={sum(rs)/len(rs):+.4f}")
+    print()
+
+    # ── Regime × side — does the directional edge survive within a regime, or
+    # is it just the window's net drift? (the key confound check) ──────────────
+    print("Regime × side (does short/long edge survive within a trend?):")
+    print(f"  {'regime':12s} {'side':6s} {'n':>4s} {'WR':>5s} {'avgR':>8s}")
+    reg_side = defaultdict(list)
+    for r in rows:
+        reg_side[(r["regime"], r["side"])].append(r["realized_r"])
+    for reg in ("trend_up", "range", "trend_down"):
+        for sd in ("long", "short"):
+            rs = reg_side.get((reg, sd), [])
+            if not rs:
+                continue
+            wr = sum(1 for x in rs if x > 0) / len(rs)
+            print(f"  {reg:12s} {sd:6s} {len(rs):>4d} {wr*100:>4.0f}% {sum(rs)/len(rs):>+8.4f}")
+    # regime mix (is the sample dominated by one regime?)
+    reg_mix = defaultdict(int)
+    for r in rows:
+        reg_mix[r["regime"]] += 1
+    print("  regime mix:", {k: reg_mix[k] for k in ("trend_up", "range", "trend_down")})
+    print()
+
+    # ── Vote × side avgR — is the long-side weakness a specific broken vote? ──
+    print("Vote × side (avgR of signals where the vote is present):")
+    print(f"  {'module':20s} {'long n/avgR':>16s}   {'short n/avgR':>16s}")
+    vs = defaultdict(lambda: {"long": [], "short": []})
+    for r in rows:
+        for v in r["vote_keys"]:
+            vs[v][r["side"]].append(r["realized_r"])
+    for v in sorted(vs, key=lambda k: -(len(vs[k]['long']) + len(vs[k]['short']))):
+        lo, sh = vs[v]["long"], vs[v]["short"]
+        lo_s = f"{len(lo):>3d}/{sum(lo)/len(lo):+.3f}" if lo else "   —"
+        sh_s = f"{len(sh):>3d}/{sum(sh)/len(sh):+.3f}" if sh else "   —"
+        print(f"  {v:20s} {lo_s:>16s}   {sh_s:>16s}")
     print()
 
     # Vote composition — which votes appear most in winning vs losing signals
