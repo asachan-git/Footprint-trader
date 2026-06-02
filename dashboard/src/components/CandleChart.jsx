@@ -832,6 +832,36 @@ function drawOverlay(canvas, chart, candleSeries, lines, measure, hoverId) {
   }
 }
 
+// Resolve a trade's real outcome from future candles. Used for trades that
+// carry no concrete closed result (open trades, or records missing r/exit) —
+// walk bars after entry and report whichever of TP / SL price touches first.
+// Trades that already closed with a managed exit (trail / flip / invalidation)
+// keep their stored result, since that exit isn't a plain TP/SL touch.
+function resolveTradeOutcome(t, bars) {
+  const hasClosedResult = !t.open && (t.r != null || t.exit_price != null);
+  if (hasClosedResult) return t;
+  if (t.entry == null || t.entry_ts == null || t.sl == null || t.tp == null) return t;
+  const isLong = t.side === "long";
+  for (const b of bars) {
+    if (b.ts <= t.entry_ts) continue;
+    const hitTP = isLong ? b.h >= t.tp : b.l <= t.tp;
+    const hitSL = isLong ? b.l <= t.sl : b.h >= t.sl;
+    if (!hitTP && !hitSL) continue;
+    // Both touched in the same bar → can't tell order; assume SL first (honest).
+    const tpFirst = hitTP && !hitSL;
+    const both = hitTP && hitSL;
+    const risk = Math.abs(t.entry - t.sl) || 1e-9;
+    return {
+      ...t, open: false, _resolved: true,
+      exit_ts: b.ts,
+      exit_price: tpFirst ? t.tp : t.sl,
+      r: tpFirst ? Math.abs(t.tp - t.entry) / risk : -1,
+      reason: tpFirst ? "TP hit (candle)" : both ? "SL/TP same bar→SL" : "SL hit (candle)",
+    };
+  }
+  return t;  // still running — no touch yet
+}
+
 export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, strategyTrades = [], symbol, chartMode, indicators, chartType = "candles", logScale = false }) {
   // lightweight-charts setData asserts strictly-asc UNIQUE timestamps. Long
   // windows (5D) can emit duplicate/out-of-order ts → crash. Sort asc + dedupe
@@ -850,8 +880,14 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   const fpCanvasRef  = useRef(null);
   const bbCanvasRef  = useRef(null);
   const tpCanvasRef  = useRef(null);   // trade position boxes
-  const stratTradesRef = useRef(strategyTrades);
-  stratTradesRef.current = strategyTrades;
+  // Enrich trades with candle-derived outcomes (open / unresolved trades get
+  // their real TP-or-SL-first result from future bars).
+  const resolvedTrades = useMemo(
+    () => (strategyTrades || []).map(t => resolveTradeOutcome(t, bars)),
+    [strategyTrades, bars],
+  );
+  const stratTradesRef = useRef(resolvedTrades);
+  stratTradesRef.current = resolvedTrades;
   const redrawRef    = useRef(null);   // exposes redrawAll to other effects
   const [showBubbles, setShowBubbles] = useState(() => {
     try { return localStorage.getItem("fb_show_bubbles") !== "0"; } catch { return true; }
@@ -1517,7 +1553,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
     // colored per strategy; entry/SL/TP time-bounded segments. Open trades have
     // no exit_ts → segments extend to the current bar (so a TP-less open trade
     // shows entry→now + its SL). Entry reason shown on hover via marker.reason.
-    (strategyTrades || []).forEach(t => {
+    resolvedTrades.forEach(t => {
       const isLong = t.side === "long";
       const strat = t.strategy || "coup";
       const col = STRAT_COLORS[strat] || COLORS.up;
@@ -1555,7 +1591,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
     // repaint trade boxes whenever the trade set changes
     redrawRef.current?.();
 
-  }, [dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, strategyTrades, bars, indicators]);
+  }, [dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, resolvedTrades, bars, indicators]);
 
   function resetView() {
     if (chartRef.current) chartRef.current.timeScale().fitContent();

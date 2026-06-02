@@ -98,6 +98,32 @@ function inferTickSize(bars) {
   return tick || 0.01;
 }
 
+// Resolve an unresolved/open trade's outcome from future candles: first TP-or-SL
+// touch after entry wins. Trades already closed with a managed exit keep theirs.
+function resolveTradeOutcome(t, bars) {
+  const hasClosedResult = !t.open && (t.r != null || t.exit_price != null);
+  if (hasClosedResult) return t;
+  if (t.entry == null || t.entry_ts == null || t.sl == null || t.tp == null) return t;
+  const isLong = t.side === "long";
+  for (const b of bars) {
+    if (b.ts <= t.entry_ts) continue;
+    const hitTP = isLong ? b.h >= t.tp : b.l <= t.tp;
+    const hitSL = isLong ? b.l <= t.sl : b.h >= t.sl;
+    if (!hitTP && !hitSL) continue;
+    const tpFirst = hitTP && !hitSL;
+    const both = hitTP && hitSL;
+    const risk = Math.abs(t.entry - t.sl) || 1e-9;
+    return {
+      ...t, open: false, _resolved: true,
+      exit_ts: b.ts,
+      exit_price: tpFirst ? t.tp : t.sl,
+      r: tpFirst ? Math.abs(t.tp - t.entry) / risk : -1,
+      reason: tpFirst ? "TP hit (candle)" : both ? "SL/TP same bar→SL" : "SL hit (candle)",
+    };
+  }
+  return t;
+}
+
 export default function FootprintPane({
   bars, dailyVp, priorVp, detections, positions, pendingOrders, nakedPocs,
   closedPositions, cvd, cvdSignal, zones, latestM2, historicalSweeps, swingPoints,
@@ -1209,7 +1235,9 @@ export default function FootprintPane({
     if (showTrades && strategyTrades?.length) {
       const SCOL = { coup: "#ff9800", democracy: "#42a5f5", republic: "#ab47bc", m1: "#26a69a", m2: "#ffca28" };
       const STAG = { coup: "C", democracy: "D", republic: "R", m1: "1", m2: "2" };
-      for (const t of strategyTrades) {
+      // Resolve open/unresolved trades against future candles (real TP/SL touch).
+      const resolved = strategyTrades.map(t => resolveTradeOutcome(t, bars));
+      for (const t of resolved) {
         if (t.entry == null || t.entry_ts == null) continue;
         const xA = tsToVisibleX(t.entry_ts);
         if (xA < -barW || xA > plotW + barW) continue;
