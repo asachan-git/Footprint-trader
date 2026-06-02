@@ -81,11 +81,10 @@ strategies:
       vol_lookback: 10      # high vol vs last ~10 candles
       lookback: 6
       vol_mult: 1.8
-      # Climax cap (swept on the 39-candle obs): skip vol ≥ 3×median. Drops the
-      # 2 exhaustion spikes → avgR 0.33→0.55, sumR 3.00→3.89 (n 9→7). A wick cap
-      # (rej_max) was ALSO tested but HURT trade-R (cut winners) despite worse
-      # CONT-rate — so not applied. PROVISIONAL n=7, paper-validate.
-      vol_mult_max: 3.0
+      # Climax cap, swept on the TWO-ZONE detector (confdr0.15): vol_max 2.5 best
+      # — n=28 57% win +0.21R +5.84R, vs no-cap n=39 51% +0.17R +6.55R (2.5 trades
+      # quality over volume). Wick cap (rej_max) tested earlier, HURT trade-R, not used.
+      vol_mult_max: 2.5
       # Tuned from data/reports/absorption_observations_granular.md (39 reversal
       # candles): next-candle PROGRESSION is the edge — progressed/closeWith
       # flips continuation 51%→78%, full follow-through (dWith+closeWith+prog)
@@ -95,7 +94,11 @@ strategies:
       # (Also observed: extWick≥0.5 and vol≥3× continue LESS — climax/exhaustion
       # — so we do NOT chase giant wicks/vol spikes.)
       confirm_within: 2     # next candle(s) must show winner follow-through
-      confirm_delta_ratio: 0.05   # winner-direction delta SIGN (not magnitude)
+      # Two-zone trigger is intentionally WEAK (sellers trapped at low + buyers
+      # leading just below close, dominance only) → the NEXT-candle confirm does
+      # the filtering. confdr swept on two-zone: 0.15 best (n=31 +0.18R +5.54R)
+      # vs 0.05 (n=37 +0.11R) and 0.35 (collapses to +0.00R).
+      confirm_delta_ratio: 0.15   # next-bar winner delta dominance ≥ 15%
       confirm_require_progress: true   # next candle must progress past trigger close
       # entry/SL A/B'd on the 39-candle obs at confdr=0.05 (coup_backtest
       # --absorption reversal --vollb 10 --confdr 0.05): imbalance+imbalance best

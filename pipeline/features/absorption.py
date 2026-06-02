@@ -144,45 +144,50 @@ def detect_canonical_absorption(bar: Bar, fp: FootprintMatrix,
 
     results: list[Absorption] = []
 
-    # ── reversal mode (user's observed pattern) ──────────────────────────────
-    # LONG: candle CLOSES up (sellers trapped) with a lower-wick REJECTION of the
-    #   low, a real volume fight at the bottom, and buyers control there
-    #   (aggressive buying ask-dominant) OR sellers were absorbed (bid heavy but
-    #   price rejected up). SHORT = mirror at the high. The decisive next-candle
-    #   follow-through is enforced separately by coup._confirm.
+    # ── reversal mode (user's observed pattern: absorption→aggression→cont) ──
+    # TWO ZONES per the user's spec. LONG (close up = sellers trapped):
+    #   ZONE A (extreme low, bottom 10%): aggressive SELLERS (bid) dominant —
+    #     the side that got TRAPPED (heavy selling at the low that price left).
+    #   ZONE B (small band JUST BELOW the close): aggressive BUYERS (ask)
+    #     dominant — the side that LED the recovery into the close.
+    # "Trigger can be weak" → only dominance (≥) is required, not heavy ratios;
+    # the decisive aggression-with-result is the NEXT candle (coup._confirm).
+    # SHORT = mirror at the high (buyers trapped at top, sellers lead below close
+    # = above the close band). is_wick_trap kept for info only.
     if mode == "reversal":
-        REJ_MIN = 0.33      # wick rejecting the extreme ≥ 1/3 of range
-        BOT_FRAC = 0.10     # ≥10% of bar volume traded in the extreme zone
+        BAND = total_range * 0.12       # near-close band (the LEADING side)
         bar_total = (fp.total_bid + fp.total_ask) if fp else 0.0
         if bar_total <= 0:
             return ()
         if is_bull:
             lo_t = l + extreme_zone
+            lo_bid = sum(v.vol for v in bar.bid_ladder if v.price <= lo_t)   # trapped sellers
             lo_ask = sum(v.vol for v in bar.ask_ladder if v.price <= lo_t)
-            lo_bid = sum(v.vol for v in bar.bid_ladder if v.price <= lo_t)
-            lo_tot = lo_ask + lo_bid
-            lower_wick = (min(o, c) - l) / total_range
-            buyers_win = lo_ask >= lo_bid                  # aggressive buying
-            sellers_absorbed = lo_bid >= 1.5 * max(lo_ask, 1e-9)   # bid heavy, rejected
-            if (lower_wick >= REJ_MIN and lo_tot / bar_total >= BOT_FRAC
-                    and lo_tot > 0 and (buyers_win or sellers_absorbed)):
+            nc_lo = c - BAND
+            nc_ask = sum(v.vol for v in bar.ask_ladder if nc_lo <= v.price <= c)  # leading buyers
+            nc_bid = sum(v.vol for v in bar.bid_ladder if nc_lo <= v.price <= c)
+            trapped_sellers = lo_bid > 0 and lo_bid >= lo_ask
+            leading_buyers  = nc_ask > 0 and nc_ask >= nc_bid
+            if trapped_sellers and leading_buyers:
                 results.append(Absorption(
-                    price=l, side="buy", volume=int(lo_tot), bar_pct=lo_tot / bar_total,
-                    is_wick_trap=lower_wick >= 0.30,
+                    price=l, side="buy", volume=int(lo_bid + lo_ask),
+                    bar_pct=nc_ask / bar_total,
+                    is_wick_trap=((min(o, c) - l) / total_range) >= 0.30,
                 ))
         if is_bear:
             up_t = h - extreme_zone
-            up_ask = sum(v.vol for v in bar.ask_ladder if v.price >= up_t)
+            up_ask = sum(v.vol for v in bar.ask_ladder if v.price >= up_t)   # trapped buyers
             up_bid = sum(v.vol for v in bar.bid_ladder if v.price >= up_t)
-            up_tot = up_ask + up_bid
-            upper_wick = (h - max(o, c)) / total_range
-            sellers_win = up_bid >= up_ask                 # aggressive selling
-            buyers_absorbed = up_ask >= 1.5 * max(up_bid, 1e-9)   # ask heavy, rejected
-            if (upper_wick >= REJ_MIN and up_tot / bar_total >= BOT_FRAC
-                    and up_tot > 0 and (sellers_win or buyers_absorbed)):
+            nc_hi = c + BAND
+            na_bid = sum(v.vol for v in bar.bid_ladder if c <= v.price <= nc_hi)  # leading sellers
+            na_ask = sum(v.vol for v in bar.ask_ladder if c <= v.price <= nc_hi)
+            trapped_buyers  = up_ask > 0 and up_ask >= up_bid
+            leading_sellers = na_bid > 0 and na_bid >= na_ask
+            if trapped_buyers and leading_sellers:
                 results.append(Absorption(
-                    price=h, side="sell", volume=int(up_tot), bar_pct=up_tot / bar_total,
-                    is_wick_trap=upper_wick >= 0.30,
+                    price=h, side="sell", volume=int(up_ask + up_bid),
+                    bar_pct=na_bid / bar_total,
+                    is_wick_trap=((h - max(o, c)) / total_range) >= 0.30,
                 ))
         return tuple(results)
 
