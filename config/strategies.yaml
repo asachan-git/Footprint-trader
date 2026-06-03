@@ -54,7 +54,7 @@ strategies:
   - name: coup
     enabled: true
     config:
-      symbols: [BTCUSDT]
+      symbols: [BTCUSDT, XAUTUSDT]   # XAU added for data (paper) — gold flow thinner
       decide_tf: 15m
       lookback: 6           # bars back to search for an un-acted trigger
       vol_mult: 1.8         # trigger bar total vol ≥ this × 20-bar median
@@ -91,7 +91,7 @@ strategies:
   - name: coup_reversal
     enabled: true
     config:
-      symbols: [BTCUSDT]
+      symbols: [BTCUSDT, XAUTUSDT]   # XAU added for data (paper)
       decide_tf: 15m
       absorption_mode: reversal
       vol_lookback: 10      # high vol vs last ~10 candles
@@ -219,7 +219,7 @@ strategies:
     class: coup
     enabled: true
     config:
-      symbols: [BTCUSDT]
+      symbols: [BTCUSDT, XAUTUSDT]   # XAU added for data (paper)
       decide_tf: 5m
       lookback: 6
       vol_mult: 1.8
@@ -240,7 +240,7 @@ strategies:
     class: coup_reversal
     enabled: true
     config:
-      symbols: [BTCUSDT]
+      symbols: [BTCUSDT, XAUTUSDT]   # XAU added for data (paper)
       decide_tf: 5m
       absorption_mode: reversal
       vol_lookback: 10

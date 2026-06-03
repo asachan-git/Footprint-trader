@@ -49,6 +49,7 @@ from pipeline.state_store import store
 from pipeline.footprint import build as build_fp
 from pipeline.features.absorption import detect_canonical_absorption
 from pipeline.features.stacked_imbalance import stacked_imbalances
+from pipeline.features.atr import atr
 from pipeline.features.cvd_candlestick import detect as cvd_detect
 
 from .base import Strategy
@@ -163,15 +164,18 @@ class Coup(Strategy):
         entry = self._entry_price(winner, t_bar, entry_mode, range_pct, bar.ohlc.c)
         buf = max(t_bar.ohlc.h - t_bar.ohlc.l, 1e-9) * sl_buffer_pct
         sl = self._compute_sl(winner, t_bar, bars, entry, sl_mode, buf, swing_lookback)
-        # Guard: a cross-mode SL (e.g. range entry + imbalance SL) can land on the
-        # wrong side of entry → ~0 risk, instant stop-out, blown R math. Clamp the
-        # stop strictly beyond entry by at least `buf`.
+        # Guard: an SL on/near the wrong side of entry → ~0 risk → instant stop-out,
+        # blown R math (seen live: entry 67790 / SL 67788 = 2-tick stop → −1R). The
+        # old clamp only enforced `buf`, which on a small trigger candle is tiny. Floor
+        # the risk to a real distance = max(buf, min_sl_atr_mult × ATR) beyond entry.
+        atr_val = atr(bars) or 0.0
+        min_dist = max(buf, float(cfg.get("min_sl_atr_mult", 0.5)) * atr_val)
         if winner == "long":
-            sl = min(sl, entry - buf)
+            sl = min(sl, entry - min_dist)
             risk = entry - sl
             tp = entry + 2.0 * risk
         else:
-            sl = max(sl, entry + buf)
+            sl = max(sl, entry + min_dist)
             risk = sl - entry
             tp = entry - 2.0 * risk
 
