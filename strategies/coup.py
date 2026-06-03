@@ -108,8 +108,68 @@ class Coup(Strategy):
             LOG.info(f"[coup] {bar.symbol} {plan.side} TP → {tp:.2f} (2R)")
         return new
 
+    # ── climax + next-bar delta-flip + VP-extreme trigger (ignition-bar entry) ──
+    def _decide_climax_flip(self, symbol: str, tf: str, bar: Bar, settings: dict) -> Decision | None:
+        """Replaces the absorption gate with the validated reversal thesis: a climax
+        pivot (vol≥vol_mult×median) whose NEXT bar flips reversal-aligned delta and
+        closes the reversal way, gated to value-area extremes (skip HVN). Entry is the
+        IGNITION (flip) bar close — market, no 2-bar lag. SL = trapped-side imbalance
+        far edge (swing fallback) + ATR floor; TP = 2R. See reversal_pattern.detect."""
+        from pipeline.features.reversal_pattern import detect as _rdetect, VP_WIN
+        cfg = self.config
+        decide_tf = str(cfg.get("decide_tf") or "15m")
+        vol_mult = float(cfg.get("vol_mult", 2.0))
+        delta_swing = float(cfg.get("delta_swing", 50.0))
+        vp_filter = bool(cfg.get("vp_filter", True))
+
+        need = (VP_WIN.get(decide_tf, 96) if vp_filter else 30) + 30
+        bars = store().recent(symbol, decide_tf, need)
+        if len(bars) < 30:
+            return None
+        markers = _rdetect(bars, vol_mult=vol_mult, delta_swing=delta_swing,
+                           symbol=symbol, tf=decide_tf, vp_filter=vp_filter,
+                           entry_mode="market")   # coup enters at the ignition bar
+        if not markers:
+            return None
+        m = markers[-1]
+        if m["ts"] != bars[-1].close_ts or self._acted.get(symbol) == m["ts"]:
+            return None
+
+        side = m["side"]
+        entry = float(bars[-1].ohlc.c)
+        sl = float(m["sl"])
+        atr_val = atr(bars) or 0.0
+        min_dist = max(float(cfg.get("min_sl_atr_mult", 0.5)) * atr_val, 1e-9)
+        if side == "long":
+            sl = min(sl, entry - min_dist); risk = entry - sl; tp = entry + 2.0 * risk
+        else:
+            sl = max(sl, entry + min_dist); risk = sl - entry; tp = entry - 2.0 * risk
+        if risk <= 0:
+            return None
+
+        self._acted[symbol] = m["ts"]
+        self._pending_sl[symbol] = sl
+        self._pending_tp[symbol] = tp
+        LOG.info(f"[{self.name}] {symbol} {side.upper()} climax-flip @{entry:.2f} "
+                 f"near={m['near_level']} pos={m['vp_pos']} vol×{m['vol_ratio']} "
+                 f"Δsw{m['delta_swing']} SL={sl:.2f}({m['sl_basis']}) TP={tp:.2f}")
+        return Decision(
+            side=side, entry=entry, stop_loss=sl, take_profit=tp,
+            confidence=_clamp(0.45 + (m["vol_ratio"] - vol_mult) * 0.05, 0.0, 0.9),
+            bias_strength=3,
+            rationale=(
+                f"{self.name}: {side} climax-flip — pivot vol×{m['vol_ratio']} at "
+                f"{m['near_level']} ({m['vp_pos']}), next bar flipped delta "
+                f"(Δswing {m['delta_swing']}) + closed the reversal way; ignition-bar "
+                f"entry. SL[{m['sl_basis']}] {sl:.2f}, 2R TP {tp:.2f}."
+            ),
+            invalidation_note="structural SL (imbalance/swing) hit, or winner-side flip",
+        )
+
     # ── signal ─────────────────────────────────────────────────────────────────
     def decide(self, symbol: str, tf: str, bar: Bar, settings: dict) -> Decision | None:
+        if str(self.config.get("trigger_mode", "absorption")) == "climax_flip":
+            return self._decide_climax_flip(symbol, tf, bar, settings)
         cfg = self.config
         decide_tf = str(cfg.get("decide_tf") or "15m")
         lookback = int(cfg.get("lookback", 6))

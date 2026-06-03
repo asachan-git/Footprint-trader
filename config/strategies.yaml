@@ -46,84 +46,41 @@ strategies:
       sl_wall_buf_atr: 0.25   # SL = beyond the farthest favourable wall ± this×ATR
       sl_conf_tol_atr: 0.25   # wall∧VP confluence tolerance (tags wall_vp), ×ATR
 
-  # coup = pure-footprint absorption→continuation. A high-vol/high-delta candle
-  # absorbs its extreme aggressor (buyers@top / sellers@low); we join the winner
-  # once it aggresses with result. Single tactical entry, structural SL beyond the
-  # trigger extreme, exit when the winner side is in turn absorbed (flip). Phase 1:
-  # entry at candle close. BTC only — Binance gold flow too thin. See STRATEGIES.md.
+  # coup = climax + next-bar delta-flip + VP-extreme (the validated reversal thesis),
+  # ignition-bar entry. The old absorption→continuation trigger was RETIRED 2026-06-03
+  # (live: coup family −4.3R, 9% WR; the extreme-zone aggressor read is a coin flip —
+  # see project-reversal-study). trigger_mode=climax_flip routes Coup.decide at
+  # reversal_pattern.detect (vol≥vol_mult×median pivot, next bar flips reversal-aligned
+  # delta + closes the reversal way, gated to value-area extremes, skip HVN), entering
+  # MARKET at the ignition (flip) bar — no 2-bar lag. SL = trapped-side imbalance far
+  # edge (swing fallback) + ATR floor; 2R TP; flip + hard-SL exit. coup = STRICT
+  # thresholds; coup_reversal below = LOOSER (threshold A/B, both VP-gated).
   - name: coup
     enabled: true
     config:
-      symbols: [BTCUSDT, XAUTUSDT]   # XAU added for data (paper) — gold flow thinner
+      symbols: [BTCUSDT, XAUTUSDT]   # XAU for data (paper)
+      trigger_mode: climax_flip
       decide_tf: 15m
-      lookback: 6           # bars back to search for an un-acted trigger
-      vol_mult: 1.8         # trigger bar total vol ≥ this × 20-bar median
-      delta_ratio: 0.35     # trigger |delta| / total vol floor
-      # absorption_mode: momentum | canonical. A/B'd on BTCUSDT 15m (2026-06-02):
-      #   momentum  (winner side already dominant at the extreme — a one-sided/
-      #     CONTINUATION candle): range+imbalance n=12 75% +0.69R; candidates
-      #     avgMFE 1.68 / MAE 1.25; confirmed cont 67%. THIS is coup's real edge.
-      #   canonical (textbook absorption — aggressor pushes the extreme & is
-      #     rejected): n=5-6 17-40% win, mostly negative; avgMFE 0.97 / MAE 1.85
-      #     (drifts AGAINST). True absorption is NOT tradeable here.
-      # Verdict: coup is a CONTINUATION strategy, not absorption. Keep momentum.
-      absorption_mode: momentum
-      confirm_within: 3     # bars after trigger to confirm winner aggression
-      confirm_delta_ratio: 0.25   # post bar |delta|/vol floor to count as winner aggression
-      confirm_cvd_conf: 0.60      # min CVD signal confidence for the fallback confirm
-      confirm_require_progress: true  # require price progress past trigger close (else stack alone ok)
-      entry_mode: range     # close | imbalance | lvn | range. range best across all SL
-      range_pct: 0.5        # entry_mode=range: retrace into trigger candle (0.5=mid)
-      sl_mode: imbalance    # candle | swing | imbalance
-      #   ^ tuned via scripts/coup_backtest.py (BTCUSDT 15m) after the entry/SL guard +
-      #     same-bar-wait + 2R-TP fixes. range+imbalance: 65% fill, 77% win, +0.79R avg.
-      #     PROVISIONAL — n≈13, rankings unstable at this sample; unfilled limits may
-      #     bias fill-rate. Re-sweep as the footprint store grows.
-      sl_buffer_pct: 0.10   # buffer beyond the chosen level, × trigger candle range
-      swing_lookback: 3     # ±bars for swing pivots (sl_mode=swing)
+      vol_mult: 2.0          # climax: pivot vol ≥ 2× median(prior 20)
+      delta_swing: 50.0      # next-bar reversal-aligned delta swing vs the pivot
+      vp_filter: true        # fade value-area extremes, skip HVN magnets
+      min_sl_atr_mult: 0.5   # floor SL distance at 0.5×ATR (no degenerate stops)
       flip_exit: true
 
-  # coup_reversal = coup engine in REVERSAL absorption mode (user's observed
-  # pattern: high-vol candle CLOSING with a wick rejection of an extreme + a
-  # bottom/top volume fight + next-candle follow-through). Rare on BTC 15m (~5
-  # confirmed/1500 bars) — runs in paper ALONGSIDE momentum coup to accumulate
-  # real samples. Own store: data/strategies/coup_reversal/.
+  # coup_reversal = same climax_flip trigger, LOOSER thresholds (vol_mult 1.8,
+  # delta_swing 0) → more signals; the threshold A/B vs strict `coup`. Both VP-gated,
+  # ignition-bar market entry. (Distinct from `reversal`/`reversal_si`, which use
+  # lvn-limit / SI-ignition entries on the same trigger.)
   - name: coup_reversal
     enabled: true
     config:
-      symbols: [BTCUSDT, XAUTUSDT]   # XAU added for data (paper)
+      symbols: [BTCUSDT, XAUTUSDT]   # XAU for data (paper)
+      trigger_mode: climax_flip
       decide_tf: 15m
-      absorption_mode: reversal
-      vol_lookback: 10      # high vol vs last ~10 candles
-      lookback: 6
       vol_mult: 1.8
-      # Climax cap, swept on the TWO-ZONE detector (confdr0.15): vol_max 2.5 best
-      # — n=28 57% win +0.21R +5.84R, vs no-cap n=39 51% +0.17R +6.55R (2.5 trades
-      # quality over volume). Wick cap (rej_max) tested earlier, HURT trade-R, not used.
-      vol_mult_max: 2.5
-      # Tuned from data/reports/absorption_observations_granular.md (39 reversal
-      # candles): next-candle PROGRESSION is the edge — progressed/closeWith
-      # flips continuation 51%→78%, full follow-through (dWith+closeWith+prog)
-      # →91%. coup's 0.25 next-bar delta-magnitude gate was too strict (fired
-      # only 3×), rejecting winners that progressed with small delta. So require
-      # winner-direction delta SIGN + price progression, not magnitude.
-      # (Also observed: extWick≥0.5 and vol≥3× continue LESS — climax/exhaustion
-      # — so we do NOT chase giant wicks/vol spikes.)
-      confirm_within: 2     # next candle(s) must show winner follow-through
-      # Two-zone trigger is intentionally WEAK (sellers trapped at low + buyers
-      # leading just below close, dominance only) → the NEXT-candle confirm does
-      # the filtering. confdr swept on two-zone: 0.15 best (n=31 +0.18R +5.54R)
-      # vs 0.05 (n=37 +0.11R) and 0.35 (collapses to +0.00R).
-      confirm_delta_ratio: 0.15   # next-bar winner delta dominance ≥ 15%
-      confirm_require_progress: true   # next candle must progress past trigger close
-      # entry/SL A/B'd on the 39-candle obs at confdr=0.05 (coup_backtest
-      # --absorption reversal --vollb 10 --confdr 0.05): imbalance+imbalance best
-      # (n=9, 56% win, +3.00R, avgR+0.33). close+candle was WORST (-1.67R);
-      # range entry 0% win (retrace makes no sense for a reversal). PROVISIONAL
-      # n=9 on one down-week — paper-validate.
-      entry_mode: imbalance # limit at winner-side imbalance zone edge (fills ~100%)
-      sl_mode: imbalance    # far edge of the winner-side imbalance zone
-      sl_buffer_pct: 0.10
+      delta_swing: 0.0
+      vp_filter: true
+      min_sl_atr_mult: 0.5
       flip_exit: true
 
   # reversal = the VP-gated climax-pivot → next-bar-delta-flip setup
@@ -219,40 +176,26 @@ strategies:
     class: coup
     enabled: true
     config:
-      symbols: [BTCUSDT, XAUTUSDT]   # XAU added for data (paper)
+      symbols: [BTCUSDT, XAUTUSDT]   # XAU for data (paper)
+      trigger_mode: climax_flip
       decide_tf: 5m
-      lookback: 6
-      vol_mult: 1.8
-      delta_ratio: 0.35
-      absorption_mode: momentum
-      confirm_within: 3
-      confirm_delta_ratio: 0.25
-      confirm_cvd_conf: 0.60
-      confirm_require_progress: true
-      entry_mode: range
-      range_pct: 0.5
-      sl_mode: imbalance
-      sl_buffer_pct: 0.10
-      swing_lookback: 3
+      vol_mult: 2.0
+      delta_swing: 50.0   # NOTE: 5m delta smaller — may need lowering after data
+      vp_filter: true
+      min_sl_atr_mult: 0.5
       flip_exit: true
 
   - name: coup_reversal_5m
     class: coup_reversal
     enabled: true
     config:
-      symbols: [BTCUSDT, XAUTUSDT]   # XAU added for data (paper)
+      symbols: [BTCUSDT, XAUTUSDT]   # XAU for data (paper)
+      trigger_mode: climax_flip
       decide_tf: 5m
-      absorption_mode: reversal
-      vol_lookback: 10
-      lookback: 6
       vol_mult: 1.8
-      vol_mult_max: 2.5
-      confirm_within: 2
-      confirm_delta_ratio: 0.15
-      confirm_require_progress: true
-      entry_mode: imbalance
-      sl_mode: imbalance
-      sl_buffer_pct: 0.10
+      delta_swing: 0.0
+      vp_filter: true
+      min_sl_atr_mult: 0.5
       flip_exit: true
 
   - name: reversal_5m
