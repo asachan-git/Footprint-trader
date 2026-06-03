@@ -65,7 +65,9 @@ strategies:
       delta_swing: 50.0      # next-bar reversal-aligned delta swing vs the pivot
       vp_filter: true        # fade value-area extremes, skip HVN magnets
       min_sl_atr_mult: 0.5   # floor SL distance at 0.5×ATR (no degenerate stops)
-      flip_exit: true
+      flip_exit: false          # retire absorption-flip exit (weak detector cut trades early)
+      cvd_divergence_exit: true # cut when CVD exhausts against the cycle
+      cvd_exit_conf: 0.65
 
   # coup_reversal = same climax_flip trigger, LOOSER thresholds (vol_mult 1.8,
   # delta_swing 0) → more signals; the threshold A/B vs strict `coup`. Both VP-gated,
@@ -81,7 +83,9 @@ strategies:
       delta_swing: 0.0
       vp_filter: true
       min_sl_atr_mult: 0.5
-      flip_exit: true
+      flip_exit: false          # retire absorption-flip exit (weak detector cut trades early)
+      cvd_divergence_exit: true # cut when CVD exhausts against the cycle
+      cvd_exit_conf: 0.65
 
   # reversal = the VP-gated climax-pivot → next-bar-delta-flip setup
   # (scripts/reversal_study.py + reversal_pattern_backtest.py). Distinct mechanic
@@ -185,7 +189,9 @@ strategies:
       delta_swing: 50.0   # NOTE: 5m delta smaller — may need lowering after data
       vp_filter: true
       min_sl_atr_mult: 0.5
-      flip_exit: true
+      flip_exit: false          # retire absorption-flip exit (weak detector cut trades early)
+      cvd_divergence_exit: true # cut when CVD exhausts against the cycle
+      cvd_exit_conf: 0.65
 
   - name: coup_reversal_5m
     class: coup_reversal
@@ -198,7 +204,9 @@ strategies:
       delta_swing: 0.0
       vp_filter: true
       min_sl_atr_mult: 0.5
-      flip_exit: true
+      flip_exit: false          # retire absorption-flip exit (weak detector cut trades early)
+      cvd_divergence_exit: true # cut when CVD exhausts against the cycle
+      cvd_exit_conf: 0.65
 
   - name: reversal_5m
     class: reversal

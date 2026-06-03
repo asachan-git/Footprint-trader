@@ -73,12 +73,18 @@ class Coup(Strategy):
 
     # ── execution policy ─────────────────────────────────────────────────────
     def settings_override(self, settings: dict) -> dict:
-        """Hard-SL exit on (structural stop must close the cycle), absorption-flip
-        exit on, Claude hedge-eval off (deterministic + free paper A/B)."""
+        """Hard-SL on (structural stop must close), Claude hedge-eval off. Exit
+        signals are config-driven: `flip_exit` (absorption-flip — uses the weak
+        momentum-absorption detector, default on for legacy coup) and
+        `cvd_divergence_exit` (cut when CVD exhausts against us). The climax_flip
+        coup family sets flip_exit:false + cvd_divergence_exit:true."""
+        cfg = self.config
         cyc = {**(settings.get("cycle") or {}),
                "hard_sl_exit": True,
                "hedge_eval_enabled": False,
-               "coup_flip_exit": True}
+               "coup_flip_exit": bool(cfg.get("flip_exit", True)),
+               "cvd_divergence_exit": bool(cfg.get("cvd_divergence_exit", False)),
+               "cvd_exit_conf": float(cfg.get("cvd_exit_conf", 0.65))}
         return {**settings, "cycle": cyc}
 
     def adjust_plan(self, plan, bar: Bar, settings: dict):
