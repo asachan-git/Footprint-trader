@@ -1266,8 +1266,8 @@ export default function FootprintPane({
     // label. Open trades extend to the right edge. Cycles drawn dashed.
     // Entry registered into detHitsRef → hover card (SL/target/reason/PnL).
     if (showTrades && strategyTrades?.length) {
-      const SCOL = { coup: "#ff9800", democracy: "#42a5f5", republic: "#ab47bc", m1: "#26a69a", m2: "#ffca28", reversal: "#26c6da" };
-      const STAG = { coup: "C", democracy: "D", republic: "R", m1: "1", m2: "2", reversal: "⚑" };
+      const SCOL = { coup: "#ff9800", democracy: "#42a5f5", republic: "#ab47bc", senate: "#ec407a", congress_start: "#66bb6a", congress_lvn: "#9ccc65", m1: "#26a69a", m2: "#ffca28", reversal: "#26c6da" };
+      const STAG = { coup: "C", democracy: "D", republic: "R", senate: "S", congress_start: "Gs", congress_lvn: "Gl", m1: "1", m2: "2", reversal: "⚑" };
       // Resolve open/unresolved trades against future candles (real TP/SL touch).
       const resolved = strategyTrades.map(t => resolveTradeOutcome(t, bars));
       for (const t of resolved) {
@@ -2114,7 +2114,7 @@ export default function FootprintPane({
         if (ty + H > rect.height) ty = hoverDet.y - H - 12;
         let header = "", body = null;
         if (hoverDet.type === "strat_trade") {
-          const SCOL = { coup: "#ff9800", democracy: "#42a5f5", republic: "#ab47bc", m1: "#26a69a", m2: "#ffca28" };
+          const SCOL = { coup: "#ff9800", democracy: "#42a5f5", republic: "#ab47bc", senate: "#ec407a", congress_start: "#66bb6a", congress_lvn: "#9ccc65", m1: "#26a69a", m2: "#ffca28" };
           const col = SCOL[p.strategy] || "#fff";
           header = (<span style={{ color: col, fontWeight: 700 }}>
             {(p.strategy || "").toUpperCase()} {(p.side || "").toUpperCase()}

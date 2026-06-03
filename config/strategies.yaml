@@ -46,6 +46,34 @@ strategies:
       sl_wall_buf_atr: 0.25   # SL = beyond the farthest favourable wall ± this×ATR
       sl_conf_tol_atr: 0.25   # wall∧VP confluence tolerance (tags wall_vp), ×ATR
 
+  # congress = democracy/republic vote, but ENTERED at the AGGRESSION-side stacked
+  # imbalance with the stop just below its low (long → buy-stack base; short → sell-
+  # stack high). LIMIT entry waits ≤entry_expiry_bars for a retrace touch into the
+  # imbalance (else voids), so the fill is at the ignition base, not chased. Tight
+  # stop → high R:R; republic VP TP supplies the target. Distinct from senate (stops
+  # beyond the DEFENSIVE wall). Two instances A/B the entry level. PROVISIONAL — paper.
+  - name: congress_start
+    class: congress
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      vote_tf: 15m
+      entry_mode: imb_start   # base where the aggression imbalance starts
+      entry_expiry_bars: 3
+      min_sl_atr_mult: 0.5
+      sl_atr_mult: 1.5        # republic fallback when no aggression imbalance
+
+  - name: congress_lvn
+    class: congress
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      vote_tf: 15m
+      entry_mode: imb_lvn     # low-vol gap inside the aggression imbalance
+      entry_expiry_bars: 3
+      min_sl_atr_mult: 0.5
+      sl_atr_mult: 1.5
+
   # coup = climax + next-bar delta-flip + VP-extreme (the validated reversal thesis),
   # ignition-bar entry. The old absorption→continuation trigger was RETIRED 2026-06-03
   # (live: coup family −4.3R, 9% WR; the extreme-zone aggressor read is a coin flip —

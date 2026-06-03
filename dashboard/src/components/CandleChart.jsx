@@ -695,11 +695,14 @@ const STRAT_COLORS = {
   coup:      "#ff9800",
   democracy: "#42a5f5",
   republic:  "#ab47bc",
+  senate:    "#ec407a",
+  congress_start: "#66bb6a",
+  congress_lvn:   "#9ccc65",
   m1:        "#26a69a",
   m2:        "#ffca28",
   reversal:  "#26c6da",
 };
-const STRAT_TAG = { coup: "C", democracy: "D", republic: "R", m1: "1", m2: "2", reversal: "⚑" };
+const STRAT_TAG = { coup: "C", democracy: "D", republic: "R", senate: "S", congress_start: "Gs", congress_lvn: "Gl", m1: "1", m2: "2", reversal: "⚑" };
 
 // ── Indicator math (chart-only; no server coupling) ──────────────────────────
 

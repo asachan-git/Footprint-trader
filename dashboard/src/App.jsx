@@ -17,7 +17,7 @@ const DEFAULT_IND = {
   sweepArrows: true,  eqLevels: true,   pivotLines: false, nakedPocs: true,  priorPoc: true,
   liveSweep:   true,  srFsSweeps: false, fvgLines:  false,  priorVa:   false, absorptions: false,
   coupAbs:     false, coupRevAbs: false, coupAbsConf: false,
-  coupTrades:  true,  demoTrades: true, repTrades: true,
+  coupTrades:  true,  demoTrades: true, repTrades: true, senateTrades: true, congressTrades: true,
   m1Trades:    false, m2Trades: false, cycleTrades: false,
   vwap:        false, atrTrail: false, vpFull: false, cvdDiv: false, revPattern: false,
 };
@@ -39,6 +39,8 @@ const IND_ITEMS = [
   { key: "coupTrades",   label: "Coup Trades",            tip: "coup strategy entries/exits (15m, orange). Backtest + live: entry/exit arrows, SL/TP segments" },
   { key: "demoTrades",   label: "Democracy Trades",       tip: "democracy strategy live paper trades (15m, blue). Entry arrow + SL/TP segments; hover for reason" },
   { key: "repTrades",    label: "Republic Trades",        tip: "republic strategy live paper trades (15m, purple, tight-SL). Entry arrow + SL/TP segments; hover for reason" },
+  { key: "senateTrades", label: "Senate Trades",          tip: "senate strategy live paper trades (15m, pink — republic vote + footprint-WALL SL). Entry arrow + SL/TP segments; hover for reason" },
+  { key: "congressTrades", label: "Congress Trades",      tip: "congress live paper trades (15m, green — republic vote + AGGRESSION-imbalance entry, SL below the imbalance low). Gs=imbalance-start, Gl=low-vol-gap entry. Hover for reason" },
   { key: "m1Trades",     label: "M1 Trades (history)",    tip: "Mode-1 Claude-direction grid trade history (15m, teal). Open/closed entries + SL/TP; hover for open time, reason, R" },
   { key: "m2Trades",     label: "M2 Trades (history)",    tip: "Mode-2 rules grid trade history (15m, amber). Open/closed entries + SL/TP; hover for open time, reason, R" },
   { key: "cycleTrades",  label: "Cycle Trades",           tip: "Grid recovery cycles (dashed boxes) for the enabled strategies/modes. Shows cycle # + chain; hover for realized PnL + reason" },
@@ -165,7 +167,7 @@ export default function App() {
   const [data,      setData]      = useState(null);
   const [stale,     setStale]     = useState(false);
   const [lastTs,    setLastTs]    = useState(null);
-  const [stratTrades, setStratTrades] = useState({ coup: [], democracy: [], republic: [], m1: [], m2: [] });
+  const [stratTrades, setStratTrades] = useState({ coup: [], democracy: [], republic: [], senate: [], congress_start: [], congress_lvn: [], m1: [], m2: [] });
   const [stratCycles, setStratCycles] = useState({ coup: [], democracy: [], republic: [], m1: [] });
   const esRef = useRef(null);
 
@@ -180,16 +182,20 @@ export default function App() {
         fetchStrategyTrades("coup", symbol, tf, "all").catch(() => []),
         fetchStrategyTrades("democracy", symbol, tf, "live").catch(() => []),
         fetchStrategyTrades("republic", symbol, tf, "live").catch(() => []),
+        fetchStrategyTrades("senate", symbol, tf, "live").catch(() => []),
+        fetchStrategyTrades("congress_start", symbol, tf, "live").catch(() => []),
+        fetchStrategyTrades("congress_lvn", symbol, tf, "live").catch(() => []),
         fetchGridTrades("m1", symbol, tf).catch(() => []),
         fetchGridTrades("m2", symbol, tf).catch(() => []),
         fetchStrategyCycles("coup", symbol, tf).catch(() => []),
         fetchStrategyCycles("democracy", symbol, tf).catch(() => []),
         fetchStrategyCycles("republic", symbol, tf).catch(() => []),
+        fetchStrategyCycles("senate", symbol, tf).catch(() => []),
         fetchGridCycles("m1", symbol, tf).catch(() => []),
-      ]).then(([coup, democracy, republic, m1, m2, cCoup, cDemo, cRep, cM1]) => {
+      ]).then(([coup, democracy, republic, senate, congress_start, congress_lvn, m1, m2, cCoup, cDemo, cRep, cSen, cM1]) => {
         if (cancel) return;
-        setStratTrades({ coup, democracy, republic, m1, m2 });
-        setStratCycles({ coup: cCoup, democracy: cDemo, republic: cRep, m1: cM1 });
+        setStratTrades({ coup, democracy, republic, senate, congress_start, congress_lvn, m1, m2 });
+        setStratCycles({ coup: cCoup, democracy: cDemo, republic: cRep, senate: cSen, m1: cM1 });
       });
     };
     load();
@@ -214,17 +220,23 @@ export default function App() {
     if (indicators.coupTrades !== false) out.push(...tag(stratTrades.coup, "coup"));
     if (indicators.demoTrades !== false) out.push(...tag(stratTrades.democracy, "democracy"));
     if (indicators.repTrades  !== false) out.push(...tag(stratTrades.republic, "republic"));
+    if (indicators.senateTrades !== false) out.push(...tag(stratTrades.senate, "senate"));
+    if (indicators.congressTrades !== false) {
+      out.push(...tag(stratTrades.congress_start, "congress_start"));
+      out.push(...tag(stratTrades.congress_lvn, "congress_lvn"));
+    }
     if (indicators.m1Trades) out.push(...tag(stratTrades.m1, "m1"));
     if (indicators.m2Trades) out.push(...tag(stratTrades.m2, "m2"));
     if (indicators.cycleTrades) {
       if (indicators.coupTrades !== false) out.push(...tag(stratCycles.coup, "coup"));
       if (indicators.demoTrades !== false) out.push(...tag(stratCycles.democracy, "democracy"));
       if (indicators.repTrades  !== false) out.push(...tag(stratCycles.republic, "republic"));
+      if (indicators.senateTrades !== false) out.push(...tag(stratCycles.senate, "senate"));
       if (indicators.m1Trades) out.push(...tag(stratCycles.m1, "m1"));
     }
     return out;
   }, [stratTrades, stratCycles, indicators.coupTrades, indicators.demoTrades,
-      indicators.repTrades, indicators.m1Trades, indicators.m2Trades, indicators.cycleTrades,
+      indicators.repTrades, indicators.senateTrades, indicators.congressTrades, indicators.m1Trades, indicators.m2Trades, indicators.cycleTrades,
       indicators.revPattern, reversalPatterns, tf]);
   // Shared visible-time-range across FP ↔ Candle. Each pane writes on pan,
   // reads on becoming visible. Ref, not state, so no re-render loops.
