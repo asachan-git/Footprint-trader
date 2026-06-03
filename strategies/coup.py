@@ -49,6 +49,7 @@ from pipeline.state_store import store
 from pipeline.footprint import build as build_fp
 from pipeline.features.absorption import detect_canonical_absorption
 from pipeline.features.stacked_imbalance import stacked_imbalances
+from pipeline.features.atr import atr
 from pipeline.features.cvd_candlestick import detect as cvd_detect
 
 from .base import Strategy
@@ -72,12 +73,18 @@ class Coup(Strategy):
 
     # ── execution policy ─────────────────────────────────────────────────────
     def settings_override(self, settings: dict) -> dict:
-        """Hard-SL exit on (structural stop must close the cycle), absorption-flip
-        exit on, Claude hedge-eval off (deterministic + free paper A/B)."""
+        """Hard-SL on (structural stop must close), Claude hedge-eval off. Exit
+        signals are config-driven: `flip_exit` (absorption-flip — uses the weak
+        momentum-absorption detector, default on for legacy coup) and
+        `cvd_divergence_exit` (cut when CVD exhausts against us). The climax_flip
+        coup family sets flip_exit:false + cvd_divergence_exit:true."""
+        cfg = self.config
         cyc = {**(settings.get("cycle") or {}),
                "hard_sl_exit": True,
                "hedge_eval_enabled": False,
-               "coup_flip_exit": True}
+               "coup_flip_exit": bool(cfg.get("flip_exit", True)),
+               "cvd_divergence_exit": bool(cfg.get("cvd_divergence_exit", False)),
+               "cvd_exit_conf": float(cfg.get("cvd_exit_conf", 0.65))}
         return {**settings, "cycle": cyc}
 
     def adjust_plan(self, plan, bar: Bar, settings: dict):
@@ -107,8 +114,68 @@ class Coup(Strategy):
             LOG.info(f"[coup] {bar.symbol} {plan.side} TP → {tp:.2f} (2R)")
         return new
 
+    # ── climax + next-bar delta-flip + VP-extreme trigger (ignition-bar entry) ──
+    def _decide_climax_flip(self, symbol: str, tf: str, bar: Bar, settings: dict) -> Decision | None:
+        """Replaces the absorption gate with the validated reversal thesis: a climax
+        pivot (vol≥vol_mult×median) whose NEXT bar flips reversal-aligned delta and
+        closes the reversal way, gated to value-area extremes (skip HVN). Entry is the
+        IGNITION (flip) bar close — market, no 2-bar lag. SL = trapped-side imbalance
+        far edge (swing fallback) + ATR floor; TP = 2R. See reversal_pattern.detect."""
+        from pipeline.features.reversal_pattern import detect as _rdetect, VP_WIN
+        cfg = self.config
+        decide_tf = str(cfg.get("decide_tf") or "15m")
+        vol_mult = float(cfg.get("vol_mult", 2.0))
+        delta_swing = float(cfg.get("delta_swing", 50.0))
+        vp_filter = bool(cfg.get("vp_filter", True))
+
+        need = (VP_WIN.get(decide_tf, 96) if vp_filter else 30) + 30
+        bars = store().recent(symbol, decide_tf, need)
+        if len(bars) < 30:
+            return None
+        markers = _rdetect(bars, vol_mult=vol_mult, delta_swing=delta_swing,
+                           symbol=symbol, tf=decide_tf, vp_filter=vp_filter,
+                           entry_mode="market")   # coup enters at the ignition bar
+        if not markers:
+            return None
+        m = markers[-1]
+        if m["ts"] != bars[-1].close_ts or self._acted.get(symbol) == m["ts"]:
+            return None
+
+        side = m["side"]
+        entry = float(bars[-1].ohlc.c)
+        sl = float(m["sl"])
+        atr_val = atr(bars) or 0.0
+        min_dist = max(float(cfg.get("min_sl_atr_mult", 0.5)) * atr_val, 1e-9)
+        if side == "long":
+            sl = min(sl, entry - min_dist); risk = entry - sl; tp = entry + 2.0 * risk
+        else:
+            sl = max(sl, entry + min_dist); risk = sl - entry; tp = entry - 2.0 * risk
+        if risk <= 0:
+            return None
+
+        self._acted[symbol] = m["ts"]
+        self._pending_sl[symbol] = sl
+        self._pending_tp[symbol] = tp
+        LOG.info(f"[{self.name}] {symbol} {side.upper()} climax-flip @{entry:.2f} "
+                 f"near={m['near_level']} pos={m['vp_pos']} vol×{m['vol_ratio']} "
+                 f"Δsw{m['delta_swing']} SL={sl:.2f}({m['sl_basis']}) TP={tp:.2f}")
+        return Decision(
+            side=side, entry=entry, stop_loss=sl, take_profit=tp,
+            confidence=_clamp(0.45 + (m["vol_ratio"] - vol_mult) * 0.05, 0.0, 0.9),
+            bias_strength=3,
+            rationale=(
+                f"{self.name}: {side} climax-flip — pivot vol×{m['vol_ratio']} at "
+                f"{m['near_level']} ({m['vp_pos']}), next bar flipped delta "
+                f"(Δswing {m['delta_swing']}) + closed the reversal way; ignition-bar "
+                f"entry. SL[{m['sl_basis']}] {sl:.2f}, 2R TP {tp:.2f}."
+            ),
+            invalidation_note="structural SL (imbalance/swing) hit, or winner-side flip",
+        )
+
     # ── signal ─────────────────────────────────────────────────────────────────
     def decide(self, symbol: str, tf: str, bar: Bar, settings: dict) -> Decision | None:
+        if str(self.config.get("trigger_mode", "absorption")) == "climax_flip":
+            return self._decide_climax_flip(symbol, tf, bar, settings)
         cfg = self.config
         decide_tf = str(cfg.get("decide_tf") or "15m")
         lookback = int(cfg.get("lookback", 6))
@@ -163,15 +230,18 @@ class Coup(Strategy):
         entry = self._entry_price(winner, t_bar, entry_mode, range_pct, bar.ohlc.c)
         buf = max(t_bar.ohlc.h - t_bar.ohlc.l, 1e-9) * sl_buffer_pct
         sl = self._compute_sl(winner, t_bar, bars, entry, sl_mode, buf, swing_lookback)
-        # Guard: a cross-mode SL (e.g. range entry + imbalance SL) can land on the
-        # wrong side of entry → ~0 risk, instant stop-out, blown R math. Clamp the
-        # stop strictly beyond entry by at least `buf`.
+        # Guard: an SL on/near the wrong side of entry → ~0 risk → instant stop-out,
+        # blown R math (seen live: entry 67790 / SL 67788 = 2-tick stop → −1R). The
+        # old clamp only enforced `buf`, which on a small trigger candle is tiny. Floor
+        # the risk to a real distance = max(buf, min_sl_atr_mult × ATR) beyond entry.
+        atr_val = atr(bars) or 0.0
+        min_dist = max(buf, float(cfg.get("min_sl_atr_mult", 0.5)) * atr_val)
         if winner == "long":
-            sl = min(sl, entry - buf)
+            sl = min(sl, entry - min_dist)
             risk = entry - sl
             tp = entry + 2.0 * risk
         else:
-            sl = max(sl, entry + buf)
+            sl = max(sl, entry + min_dist)
             risk = sl - entry
             tp = entry - 2.0 * risk
 
