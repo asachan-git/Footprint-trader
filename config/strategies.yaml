@@ -152,9 +152,11 @@ strategies:
     enabled: true
     config: { symbols: [BTCUSDT, XAUTUSDT], vote_tf: 5m }
 
+  # DISABLED 2026-06-03 — 5m vote panel bled (republic_5m −1.8R/37%, senate_5m
+  # −11.0R/39%) vs 15m twins +16.4R/+10.7R. Vote logic is 15m-calibrated; 5m = noise.
   - name: republic_5m
     class: republic
-    enabled: true
+    enabled: false
     config:
       symbols: [BTCUSDT, XAUTUSDT]
       vote_tf: 5m
@@ -164,7 +166,7 @@ strategies:
 
   - name: senate_5m
     class: senate
-    enabled: true
+    enabled: false
     config:
       symbols: [BTCUSDT, XAUTUSDT]
       vote_tf: 5m
