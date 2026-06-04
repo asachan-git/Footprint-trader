@@ -165,6 +165,111 @@ function drawVP(canvas, chart, candleSeries, dailyVp, bars, vpMode = "visible") 
 // ── Trade position boxes (TradingView long/short tool look) ──────────────────
 // Green reward zone entry→TP, red risk zone entry→SL, entry line + RR label.
 // Open trades (no exit_ts) extend to the right edge.
+// ── fixed-range volume profile (VPFR) ────────────────────────────────────────
+// VP computed over a user-picked candle range [fromTs, toTs], anchored at the range
+// on the time axis, with POC/VAH/VAL lines (optionally extended to the right edge).
+// Pure client-side from the bid/ask ladders (same source as drawVP).
+function drawVPFR(canvas, chart, candleSeries, bars, vpfr) {
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const W = Math.round(rect.width)  || canvas.parentElement?.clientWidth  || 800;
+  const H = Math.round(rect.height) || canvas.parentElement?.clientHeight || 400;
+  if (canvas.width !== W)  canvas.width  = W;
+  if (canvas.height !== H) canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, W, H);
+  if (!chart || !candleSeries || !vpfr || vpfr.fromTs == null || !bars.length) return;
+
+  const ts = chart.timeScale();
+  const a = vpfr.fromTs, b = vpfr.toTs;
+  const lo = b != null ? Math.min(a, b) : a;
+  const hi = b != null ? Math.max(a, b) : a;
+  const x0r = ts.timeToCoordinate(lo);
+  const x1r = b != null ? ts.timeToCoordinate(hi) : x0r;
+  const slice = bars.filter(bb => bb.ts >= lo && bb.ts <= hi);
+
+  // pick-in-progress (only the start clicked) → guide line + hint
+  if (b == null || slice.length === 0) {
+    if (x0r != null) {
+      ctx.strokeStyle = "rgba(255,215,0,0.5)"; ctx.setLineDash([4, 3]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x0r, 0); ctx.lineTo(x0r, H); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = "rgba(255,215,0,0.85)"; ctx.font = "10px JetBrains Mono, monospace";
+      ctx.textAlign = "left"; ctx.textBaseline = "top";
+      ctx.fillText("VPFR: click end candle", x0r + 4, 4);
+    }
+    return;
+  }
+
+  // aggregate ladder volume-at-price over the range
+  const prof = new Map();
+  let haveLadder = false;
+  const add = (p, bid, ask) => { const e = prof.get(p) || { price: p, bid: 0, ask: 0 }; e.bid += bid; e.ask += ask; prof.set(p, e); };
+  for (const bb of slice) {
+    if ((bb.bid_ladder?.length || 0) + (bb.ask_ladder?.length || 0) > 0) haveLadder = true;
+    (bb.bid_ladder || []).forEach(l => add(l.p, l.v, 0));
+    (bb.ask_ladder || []).forEach(l => add(l.p, 0, l.v));
+  }
+  if (!haveLadder) {
+    const poc0 = slice[0]?.c || 1, step0 = Math.max(poc0 * 0.0003, 0.01);
+    for (const bb of slice) add(Math.round(bb.c / step0) * step0, bb.bid_vol || 0, bb.ask_vol || 0);
+  }
+  const rows = [...prof.values()].sort((x, y) => x.price - y.price);
+  if (!rows.length) return;
+  const totals = rows.map(r => r.bid + r.ask);
+  const maxVol = Math.max(...totals, 1);
+  const grand = totals.reduce((s, v) => s + v, 0) || 1;
+  let pocIdx = 0; for (let i = 1; i < rows.length; i++) if (totals[i] > totals[pocIdx]) pocIdx = i;
+  let loI = pocIdx, hiI = pocIdx, va = totals[pocIdx]; const target = grand * 0.7;
+  while (va < target && (loI > 0 || hiI < rows.length - 1)) {
+    const bel = loI > 0 ? totals[loI - 1] : -1, abv = hiI < rows.length - 1 ? totals[hiI + 1] : -1;
+    if (abv >= bel) { hiI++; va += Math.max(0, abv); } else { loI--; va += Math.max(0, bel); }
+  }
+  const pocPrice = rows[pocIdx].price, vahPrice = rows[hiI].price, valPrice = rows[loI].price;
+
+  let step = Infinity;
+  for (let i = 1; i < rows.length; i++) { const d = rows[i].price - rows[i - 1].price; if (d > 0 && d < step) step = d; }
+  if (!isFinite(step)) step = Math.max(pocPrice * 0.0001, 0.01);
+  const yA = candleSeries.priceToCoordinate(pocPrice), yB = candleSeries.priceToCoordinate(pocPrice + step);
+  const cellH = (yA != null && yB != null) ? Math.max(1, Math.abs(yA - yB)) : 2;
+
+  const xLeft = Math.max(0, Math.min(x0r ?? 0, x1r ?? 0));
+  const xRight = Math.max(x0r ?? 0, x1r ?? W);
+  const barMaxW = Math.max(30, Math.min((xRight - xLeft) * 0.9, 200));
+
+  // range box
+  ctx.strokeStyle = "rgba(120,140,180,0.35)"; ctx.lineWidth = 1; ctx.setLineDash([2, 2]);
+  ctx.strokeRect(xLeft, 0, Math.max(1, xRight - xLeft), H); ctx.setLineDash([]);
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i], total = totals[i]; if (total <= 0) continue;
+    const y = candleSeries.priceToCoordinate(r.price); if (y == null || y < -cellH || y > H + cellH) continue;
+    const totalW = (total / maxVol) * barMaxW;
+    const bidW = (r.bid / total) * totalW, askW = totalW - bidW;
+    const isPoc = i === pocIdx, inVA = i >= loI && i <= hiI;
+    const rh = Math.max(1, cellH * 0.9);
+    const aB = isPoc ? 0.75 : inVA ? 0.5 : 0.28, aA = isPoc ? 0.75 : inVA ? 0.55 : 0.3;
+    ctx.fillStyle = `rgba(239,83,80,${aB})`; ctx.fillRect(xLeft, y - rh / 2, bidW, rh);
+    ctx.fillStyle = `rgba(38,166,154,${aA})`; ctx.fillRect(xLeft + bidW, y - rh / 2, askW, rh);
+  }
+
+  const xEnd = vpfr.extend ? W : xRight;
+  const lvl = (price, color, label) => {
+    const y = candleSeries.priceToCoordinate(price); if (y == null) return;
+    ctx.strokeStyle = color; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(xLeft, y); ctx.lineTo(xEnd, y); ctx.stroke();
+    ctx.fillStyle = color; ctx.font = "9px JetBrains Mono, monospace"; ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+    ctx.fillText(`${label} ${price.toFixed(2)}`, Math.min(xEnd + 3, W - 70), y - 1);
+  };
+  lvl(vahPrice, "rgba(0,188,212,0.9)", "VAH");
+  lvl(pocPrice, "rgba(255,215,0,0.95)", "POC");
+  lvl(valPrice, "rgba(224,64,251,0.9)", "VAL");
+
+  ctx.fillStyle = "rgba(255,215,0,0.7)"; ctx.font = "9px JetBrains Mono, monospace";
+  ctx.textAlign = "left"; ctx.textBaseline = "top";
+  ctx.fillText(`VPFR ${slice.length}b${vpfr.extend ? " ↦" : ""}`, xLeft + 3, 3);
+}
+
+
 function drawTradeBoxes(canvas, chart, candleSeries, trades, bars) {
   if (!canvas || !chart || !candleSeries) return;
   const rect = canvas.getBoundingClientRect();
@@ -278,7 +383,7 @@ function drawTradeBoxes(canvas, chart, candleSeries, trades, bars) {
 // Marks price/CVD regular divergences at swing pivots (from backend
 // scan_divergences). bear ▽ red above the swing high, bull △ green below the
 // swing low. hitsOut collects {x,y,r,d} for hover tooltips.
-function drawCVDDivergence(canvas, chart, candleSeries, divs, bars, show, hitsOut) {
+function drawCVDDivergence(canvas, chart, candleSeries, divs, bars, showStrict, showEq, hitsOut) {
   if (!canvas) return;
   const rect = canvas.getBoundingClientRect();
   const W = Math.round(rect.width)  || canvas.parentElement?.clientWidth  || 800;
@@ -288,10 +393,12 @@ function drawCVDDivergence(canvas, chart, candleSeries, divs, bars, show, hitsOu
   const ctx = canvas.getContext("2d");
   ctx.clearRect(0, 0, W, H);
   if (hitsOut) hitsOut.length = 0;
-  if (!show || !divs?.length) return;
+  if ((!showStrict && !showEq) || !divs?.length) return;
 
   const ts = chart.timeScale();
   for (const d of divs) {
+    // strict HH/LL on cvdDiv toggle; EqH/EqL on cvdEqDiv toggle (independent)
+    if (d.eq ? !showEq : !showStrict) continue;
     const x = ts.timeToCoordinate(d.ts);
     if (x == null) continue;
     const y = candleSeries.priceToCoordinate(d.price);
@@ -305,16 +412,27 @@ function drawCVDDivergence(canvas, chart, candleSeries, divs, bars, show, hitsOu
     if (bear) { ctx.moveTo(x, ty + s); ctx.lineTo(x - s, ty - s); ctx.lineTo(x + s, ty - s); }
     else      { ctx.moveTo(x, ty - s); ctx.lineTo(x - s, ty + s); ctx.lineTo(x + s, ty + s); }
     ctx.closePath();
-    ctx.fillStyle = col;
-    ctx.globalAlpha = 0.9;
-    ctx.fill();
-    ctx.globalAlpha = 1;
+    if (d.live) {
+      // current/forming bar — provisional: hollow outline, not a filled marker
+      ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+      ctx.globalAlpha = 0.9; ctx.stroke(); ctx.globalAlpha = 1;
+    } else {
+      ctx.fillStyle = col;
+      ctx.globalAlpha = 0.9; ctx.fill(); ctx.globalAlpha = 1;
+    }
     // connector to the price extreme
     ctx.strokeStyle = col;
     ctx.lineWidth = 1;
     ctx.setLineDash([2, 2]);
     ctx.beginPath(); ctx.moveTo(x, ty + dir * s); ctx.lineTo(x, y); ctx.stroke();
     ctx.setLineDash([]);
+    // EqH/EqL divergence → small "=" tick beside the marker (price equal, CVD diverged)
+    if (d.eq) {
+      const ey = bear ? ty - s - 5 : ty + s + 5;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(x - 4, ey - 1.5); ctx.lineTo(x + 4, ey - 1.5);
+      ctx.moveTo(x - 4, ey + 1.5); ctx.lineTo(x + 4, ey + 1.5); ctx.stroke();
+    }
     if (hitsOut) hitsOut.push({ x, y: ty, r: 9, d });
   }
 }
@@ -698,8 +816,11 @@ const STRAT_COLORS = {
   m1:        "#26a69a",
   m2:        "#ffca28",
   reversal:  "#26c6da",
+  reversal_choch: "#ef5350",
+  wave_fib:  "#66bb6a",
 };
-const STRAT_TAG = { coup: "C", democracy: "D", republic: "R", m1: "1", m2: "2", reversal: "⚑" };
+const STRAT_TAG = { coup: "C", democracy: "D", republic: "R", m1: "1", m2: "2", reversal: "⚑",
+                    reversal_choch: "⤰", wave_fib: "⤴" };
 
 // ── Indicator math (chart-only; no server coupling) ──────────────────────────
 
@@ -949,7 +1070,11 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   const divHitsRef   = useRef([]);
   const [hoverDiv, setHoverDiv] = useState(null);  // {d, x, y}
   const showCvdDivRef = useRef(!!indicators?.cvdDiv);
-  useEffect(() => { showCvdDivRef.current = !!indicators?.cvdDiv; }, [indicators]);
+  const showCvdEqRef  = useRef(!!indicators?.cvdEqDiv);
+  useEffect(() => {
+    showCvdDivRef.current = !!indicators?.cvdDiv;
+    showCvdEqRef.current  = !!indicators?.cvdEqDiv;
+  }, [indicators]);
   const bigTradesRef = useRef([]);
   const showBubblesRef = useRef(showBubbles);
   useEffect(() => { bigTradesRef.current = detections?.big_trades || []; }, [detections]);
@@ -966,7 +1091,12 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   const [legend, setLegend]       = useState(null);  // {o,h,l,c,delta,vol,up}
   // Drawing layer (measure / horizontal ray / alert)
   const drawCanvasRef = useRef(null);
-  const [drawTool, setDrawTool] = useState(null);    // null|'measure'|'ray'|'alert'
+  const vpfrCanvasRef = useRef(null);                // fixed-range volume profile overlay
+  const [drawTool, setDrawTool] = useState(null);    // null|'measure'|'ray'|'alert'|'vpfr'
+  const [vpfr, setVpfr] = useState(null);            // {fromTs, toTs|null} picked range
+  const [vpfrExtend, setVpfrExtend] = useState(false);
+  const vpfrRef = useRef(null);       vpfrRef.current = vpfr;
+  const vpfrExtendRef = useRef(false); vpfrExtendRef.current = vpfrExtend;
   const [lines, setLines]       = useState(() => loadLines(symbol));
   const [hoverLineId, setHoverLineId] = useState(null);
   const drawLinesRef = useRef(lines);   drawLinesRef.current = lines;
@@ -1092,7 +1222,9 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       drawFootprint(fpCanvasRef.current, chart, candleSeries, barsRef.current);
       drawBubbles(bbCanvasRef.current, chart, candleSeries, bigTradesRef.current, showBubblesRef.current, barsRef.current, bubbleHitsRef.current);
       drawTradeBoxes(tpCanvasRef.current, chart, candleSeries, stratTradesRef.current, barsRef.current);
-      drawCVDDivergence(cdCanvasRef.current, chart, candleSeries, cvdDivRef.current, barsRef.current, showCvdDivRef.current, divHitsRef.current);
+      drawCVDDivergence(cdCanvasRef.current, chart, candleSeries, cvdDivRef.current, barsRef.current, showCvdDivRef.current, showCvdEqRef.current, divHitsRef.current);
+      drawVPFR(vpfrCanvasRef.current, chart, candleSeries, barsRef.current,
+               vpfrRef.current ? { ...vpfrRef.current, extend: vpfrExtendRef.current } : null);
       drawOverlay(drawCanvasRef.current, chart, candleSeries, drawLinesRef.current, measureRef.current, hoverLineRef.current);
     };
     redrawRef.current = redrawAll;
@@ -1147,7 +1279,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       if (!containerRef.current) return;
       const { clientWidth: w, clientHeight: h } = containerRef.current;
       chart.applyOptions({ width: w, height: h });
-      for (const c of [vpCanvasRef.current, fpCanvasRef.current, bbCanvasRef.current, tpCanvasRef.current, cdCanvasRef.current, drawCanvasRef.current]) {
+      for (const c of [vpCanvasRef.current, vpfrCanvasRef.current, fpCanvasRef.current, bbCanvasRef.current, tpCanvasRef.current, cdCanvasRef.current, drawCanvasRef.current]) {
         if (c) { c.width = w; c.height = h; }
       }
       redrawAll();
@@ -1220,7 +1352,9 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
         return { time: b.ts, value: cvdSum };
       }));
     }
-    const showCvd = !!indicators?.cvdDiv;
+    // Continuous CVD line gated on its OWN toggle (cvdLine) so the divergence
+    // markers (cvdDiv) can show clean without the every-bar line clutter.
+    const showCvd = !!indicators?.cvdLine;
     cvdRef.current.applyOptions({ visible: showCvd });
     chartRef.current?.priceScale("cvd").applyOptions({ visible: showCvd });
 
@@ -1245,7 +1379,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       drawBubbles(bbCanvasRef.current, chartRef.current, candleRef.current,
                   detections?.big_trades || [], showBubbles, bars, bubbleHitsRef.current);
       drawCVDDivergence(cdCanvasRef.current, chartRef.current, candleRef.current,
-                        cvdDivergences, bars, !!indicators?.cvdDiv, divHitsRef.current);
+                        cvdDivergences, bars, !!indicators?.cvdDiv, !!indicators?.cvdEqDiv, divHitsRef.current);
     });
 
     if (chartMode === "footprint") {
@@ -1317,7 +1451,8 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   }, []);
 
   // Reload drawn lines when symbol changes (lines are price-level, symbol-scoped).
-  useEffect(() => { setLines(loadLines(symbol)); measureRef.current = null; }, [symbol]);
+  useEffect(() => { setLines(loadLines(symbol)); measureRef.current = null; setVpfr(null); }, [symbol]);
+  useEffect(() => { redrawRef.current?.(); }, [vpfr, vpfrExtend]);
 
   // Persist lines when the set changes.
   useEffect(() => { saveLines(symbol, lines); }, [lines, symbol]);
@@ -1377,6 +1512,17 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
     const onDown = (e) => {
       const tool = drawToolRef.current; if (!tool) return;
       const [mx, my] = xy(e);
+      if (tool === "vpfr") {                       // pick start, then end candle
+        const t = timeAt(mx); if (t == null) return;
+        let nb = null, best = Infinity;
+        for (const bb of barsRef.current) { const d = Math.abs(bb.ts - t); if (d < best) { best = d; nb = bb.ts; } }
+        if (nb == null) return;
+        const cur = vpfrRef.current;
+        if (!cur || cur.toTs != null) setVpfr({ fromTs: nb, toTs: null });   // start a new range
+        else setVpfr({ fromTs: cur.fromTs, toTs: nb });                       // close the range
+        redrawRef.current?.();
+        return;
+      }
       const p = priceAt(my); if (p == null) return;
       if (tool === "measure") {
         dragRef.current = { mode: "measure" };
@@ -1746,6 +1892,8 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       <canvas ref={tpCanvasRef} style={{ ...canvasStyle, zIndex: 4 }} />
       {/* VP overlay — always shown */}
       <canvas ref={vpCanvasRef} style={{ ...canvasStyle, zIndex: 5 }} />
+      {/* VPFR (fixed-range VP) overlay — drawn when a range is picked */}
+      <canvas ref={vpfrCanvasRef} style={{ ...canvasStyle, zIndex: 5 }} />
       {/* Bubble overlay — always rendered; visibility gated inside drawBubbles */}
       <canvas ref={bbCanvasRef} style={{ ...canvasStyle, zIndex: 6 }} />
       {/* CVD divergence overlay — visibility gated inside drawCVDDivergence */}
@@ -1761,7 +1909,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
         style={{
           ...canvasStyle, zIndex: 8,
           pointerEvents: drawTool ? "auto" : "none",
-          cursor: drawTool === "measure" ? "crosshair" : drawTool ? "ns-resize" : "default",
+          cursor: (drawTool === "measure" || drawTool === "vpfr") ? "crosshair" : drawTool ? "ns-resize" : "default",
         }}
       />
       {/* Bubble hover tooltip */}
@@ -1972,6 +2120,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
             { k: "measure", lbl: "📏", tip: "Measure: drag to read Δprice / % / bars" },
             { k: "ray",     lbl: "─",  tip: "Horizontal line (manual S/R, SL/TP). Click to place, drag to move, dbl-click to delete" },
             { k: "alert",   lbl: "🔔", tip: "Price alert: click to place; notifies when price crosses. Drag to move, dbl-click to delete" },
+            { k: "vpfr",    lbl: "▭VP", tip: "Fixed-range Volume Profile: click the start candle, then the end candle. Draws VP (POC/VAH/VAL) over that range. Toggle ↦ to extend the levels right." },
           ].map(t => {
             const on = drawTool === t.k;
             return (
@@ -2001,6 +2150,32 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
             >
               ✕{lines.length}
             </button>
+          )}
+          {vpfr && (
+            <>
+              <button
+                onClick={() => setVpfrExtend(x => !x)}
+                title="Extend the VPFR POC/VAH/VAL lines to the right edge"
+                style={{
+                  background: "rgba(26,26,26,0.85)",
+                  border: `1px solid ${vpfrExtend ? "#5c9eff" : "#2a2a2a"}`,
+                  color: vpfrExtend ? "#5c9eff" : "#888",
+                  padding: "2px 6px", cursor: "pointer", borderRadius: 3, lineHeight: 1.4,
+                }}
+              >
+                ↦
+              </button>
+              <button
+                onClick={() => { setVpfr(null); setVpfrExtend(false); }}
+                title="Clear the fixed-range volume profile"
+                style={{
+                  background: "rgba(26,26,26,0.85)", border: "1px solid #2a2a2a",
+                  color: "#888", padding: "2px 6px", cursor: "pointer", borderRadius: 3, lineHeight: 1.4,
+                }}
+              >
+                ✕VP
+              </button>
+            </>
           )}
         </div>
         {/* OHLC / Δ legend — follows crosshair (TV top-left readout) */}

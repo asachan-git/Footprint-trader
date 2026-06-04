@@ -5,7 +5,16 @@ import VoteBreakdown from "./components/VoteBreakdown.jsx";
 import DecisionCards from "./components/DecisionCards.jsx";
 import Positions from "./components/Positions.jsx";
 import ABStats from "./components/ABStats.jsx";
-import { fetchStrategyTrades, fetchGridTrades, fetchStrategyCycles, fetchGridCycles } from "./api.js";
+import { fetchStrategyTrades, fetchGridTrades, fetchStrategyCycles, fetchGridCycles, fetchStrategyOutcomes } from "./api.js";
+
+// Outcome-range presets → seconds back from now (null secs = all-time).
+const OUTCOME_RANGES = [
+  { key: "24h", label: "24h",    secs: 86400 },
+  { key: "7d",  label: "7d",     secs: 7 * 86400 },
+  { key: "30d", label: "30d",    secs: 30 * 86400 },
+  { key: "all", label: "All",    secs: null },
+  { key: "custom", label: "Custom", secs: undefined },
+];
 
 const SYMBOLS  = ["BTCUSDT", "XAUTUSDT"];
 const TFS      = ["1m", "5m", "15m"];
@@ -19,7 +28,8 @@ const DEFAULT_IND = {
   coupAbs:     false, coupRevAbs: false, coupAbsConf: false,
   coupTrades:  true,  demoTrades: true, repTrades: true,
   m1Trades:    false, m2Trades: false, cycleTrades: false,
-  vwap:        false, atrTrail: false, vpFull: false, cvdDiv: false, revPattern: false,
+  vwap:        false, atrTrail: false, vpFull: false, cvdDiv: false, cvdEqDiv: false, cvdLine: false, revPattern: false,
+  chochSetup:  false, waveSetup: false,
 };
 
 const IND_ITEMS = [
@@ -45,8 +55,12 @@ const IND_ITEMS = [
   { key: "vwap",         label: "VWAP + σ bands",         tip: "Session-anchored VWAP (UTC day) with volume-weighted ±1σ/±2σ bands. Dynamic SL/TP anchor; mean-revert target = VWAP, stretch target = ±2σ" },
   { key: "atrTrail",     label: "ATR Trail (SuperTrend)", tip: "ATR-based SuperTrend trailing stop. Sits below price in uptrend (green), above in downtrend (red). Visual TSL / trend filter" },
   { key: "vpFull",       label: "VP: full window",        tip: "Volume profile (left edge) scope: ON = whole loaded window, OFF = visible range only. Real bid/ask volume-at-price with POC + 70% value area + HVN/LVN" },
-  { key: "cvdDiv",       label: "CVD Divergence",         tip: "Cumulative Volume Delta line (secondary scale) + regular divergence markers: price makes a new swing extreme but CVD does not. Bear ▽ (red) at higher-high w/ lower CVD; bull △ (green) at lower-low w/ higher CVD. Hover for CVD values" },
+  { key: "cvdDiv",       label: "CVD Divergence (HH/LL)",  tip: "STRICT regular divergence at swing-HL pivots + current candle (no in-between). Bear ▽ (red) at higher-high w/ lower CVD; bull △ (green) at lower-low w/ higher CVD. Hollow = live (current bar, provisional). Toggle 'CVD Div (EqH/L)' for equal-high/low divergences separately" },
+  { key: "cvdEqDiv",     label: "CVD Div (EqH/L)",        tip: "EQUAL-high/low divergence: price retests the same extreme (±0.15%) but CVD makes a lower/higher value = distribution at the liquidity level. Same ▽/△ marker + a small '=' tick. Independent of the strict HH/LL toggle" },
+  { key: "cvdLine",      label: "CVD Line",               tip: "Continuous Cumulative Volume Delta line (secondary scale), every bar. Separate from the divergence markers so the markers can show clean without the line clutter" },
   { key: "revPattern",   label: "Reversal Pattern ⚑",     tip: "DIAGNOSTIC (not a trade signal — backtests ~breakeven). Climax pivot (vol≥2×med) + next-bar delta flip (closes reversal way + rev-delta swing ≥50). Rendered as TRADES (⚑, cyan): entry→exit box w/ structural SL (swing high/low + buffer) + 2R TP, win/loss colored, outcome resolved from bars; hover for reason/RR. Any TF" },
+  { key: "chochSetup",   label: "ChoCh→Fib ⤰",            tip: "reversal_choch setups (15m only). After a Change of Character (break of the last HL/LH) it arms a counter-trend reversal: LIMIT at the 0.705 fib retrace of the impulse leg, SL beyond the swing origin, TP at the 2.0 extension. Rendered as a trade box (entry→SL/TP, outcome resolved from bars); hover for the ChoCh dir + leg" },
+  { key: "waveSetup",    label: "Wave-Fib (3rd wave) ⤴", tip: "wave_fib continuation setups (15m only). After a two-wave trend confirms (HH+HL / LL+LH) it arms a WITH-trend 3rd-wave entry: LIMIT at the VP-value edge of the two-wave structure, SL beyond the HL/LH, TP at 2.0× the wave-1 measured move. Rendered as a trade box; hover for the wave structure" },
 ];
 
 function LayersToggle({ indicators, onChange }) {
@@ -169,6 +183,33 @@ export default function App() {
   const [stratCycles, setStratCycles] = useState({ coup: [], democracy: [], republic: [], m1: [] });
   const esRef = useRef(null);
 
+  // Per-strategy outcomes panel — range selector (preset or custom from/to).
+  const [outcomeRange, setOutcomeRange] = useState("24h");
+  const [outcomeFrom, setOutcomeFrom] = useState("");  // yyyy-mm-dd (custom)
+  const [outcomeTo, setOutcomeTo]     = useState("");
+  const [outcomeRows, setOutcomeRows] = useState([]);
+  useEffect(() => {
+    let cancel = false;
+    const load = async () => {
+      let from = null, to = null;
+      if (outcomeRange === "custom") {
+        if (!outcomeFrom) return;                       // wait for a start date
+        from = Math.floor(new Date(outcomeFrom + "T00:00:00").getTime() / 1000);
+        if (outcomeTo) to = Math.floor(new Date(outcomeTo + "T23:59:59").getTime() / 1000);
+      } else {
+        const r = OUTCOME_RANGES.find(x => x.key === outcomeRange);
+        from = r && r.secs != null ? Math.floor(Date.now() / 1000) - r.secs : 0;
+      }
+      try {
+        const rows = await fetchStrategyOutcomes(from, to);
+        if (!cancel) setOutcomeRows(rows);
+      } catch { /* keep last */ }
+    };
+    load();
+    const id = setInterval(load, 30000);
+    return () => { cancel = true; clearInterval(id); };
+  }, [outcomeRange, outcomeFrom, outcomeTo]);
+
   // Strategy + grid-mode trades + cycles for the chart overlay. coup =
   // backtest+live, democracy/republic = live paper, m1/m2 = grid-mode history.
   // Backend filters by symbol/tf; all entries are 15m. Refreshed on symbol/tf
@@ -199,6 +240,8 @@ export default function App() {
 
   // Merge enabled strategies/modes into one tagged array for the chart.
   const reversalPatterns = data?.reversal_patterns ?? [];
+  const chochSetups = data?.choch_setups ?? [];
+  const waveSetups  = data?.wave_setups ?? [];
   const strategyTrades = useMemo(() => {
     const tag = (arr, name) => (arr || []).map(t => ({ ...t, strategy: name }));
     const out = [];
@@ -208,6 +251,21 @@ export default function App() {
         strategy: "reversal", side: p.side,
         entry: p.entry, entry_ts: p.ts, sl: p.sl, tp: p.tp, open: true,
         rationale: `reversal: climax vol×${p.vol_ratio} + flip Δswing${p.delta_swing} · SL=${p.sl_basis}`,
+      })));
+    }
+    // ChoCh→Fib + Wave-Fib setups (15m only; armed at arm_ts, outcome from bars).
+    if (indicators.chochSetup) {
+      out.push(...(chochSetups || []).map(p => ({
+        strategy: "reversal_choch", side: p.side,
+        entry: p.entry, entry_ts: p.arm_ts, sl: p.sl, tp: p.tp, open: true,
+        rationale: `choch ${p.choch_dir}: fib ${p.fib_entry}/${p.fib_ext} · leg ${p.origin}→${p.extreme} · broke ${p.broken_level}`,
+      })));
+    }
+    if (indicators.waveSetup) {
+      out.push(...(waveSetups || []).map(p => ({
+        strategy: "wave_fib", side: p.side,
+        entry: p.entry, entry_ts: p.arm_ts, sl: p.sl, tp: p.tp, open: true,
+        rationale: `wave_fib ${p.entry_kind}: wave-1 ${p.origin}→${p.impulse} · pivot ${p.pullback} · ${p.fib_ext}× MM`,
       })));
     }
     if (tf !== "15m") return out;
@@ -225,7 +283,8 @@ export default function App() {
     return out;
   }, [stratTrades, stratCycles, indicators.coupTrades, indicators.demoTrades,
       indicators.repTrades, indicators.m1Trades, indicators.m2Trades, indicators.cycleTrades,
-      indicators.revPattern, reversalPatterns, tf]);
+      indicators.revPattern, reversalPatterns,
+      indicators.chochSetup, chochSetups, indicators.waveSetup, waveSetups, tf]);
   // Shared visible-time-range across FP ↔ Candle. Each pane writes on pan,
   // reads on becoming visible. Ref, not state, so no re-render loops.
   const rangeRef = useRef(null);  // {from: ts, to: ts} | null
@@ -436,8 +495,23 @@ export default function App() {
           <ABStats abStats={data?.ab_stats} />
         </div>
         <div style={{ flex: 1, overflow: "auto", padding: 8 }}>
-          <div className="panel-title">24h Outcomes</div>
-          <ABStats abStats={data?.ab_stats} outcomesOnly />
+          <div className="panel-title" style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span>Strategy Outcomes</span>
+            <select value={outcomeRange} onChange={e => setOutcomeRange(e.target.value)}
+                    style={{ fontSize: 11, padding: "1px 4px" }}>
+              {OUTCOME_RANGES.map(r => <option key={r.key} value={r.key}>{r.label}</option>)}
+            </select>
+            {outcomeRange === "custom" && (
+              <>
+                <input type="date" value={outcomeFrom} onChange={e => setOutcomeFrom(e.target.value)}
+                       style={{ fontSize: 11 }} />
+                <span style={{ color: "#888" }}>→</span>
+                <input type="date" value={outcomeTo} onChange={e => setOutcomeTo(e.target.value)}
+                       style={{ fontSize: 11 }} />
+              </>
+            )}
+          </div>
+          <ABStats abStats={data?.ab_stats} outcomesOnly strategyRows={outcomeRows} />
         </div>
       </div>
     </div>

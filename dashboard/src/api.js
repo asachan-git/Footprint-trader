@@ -9,6 +9,15 @@ export async function fetchState(symbol, tf, minutes, footprint = false) {
   return data;
 }
 
+// Per-strategy closed-trade outcomes over a range. from/to = epoch seconds (optional).
+export async function fetchStrategyOutcomes(from, to) {
+  const params = {};
+  if (from !== undefined && from !== null) params.from = from;
+  if (to !== undefined && to !== null) params.to = to;
+  const { data } = await axios.get("/strategies/outcomes", { params });
+  return data?.strategies ?? [];
+}
+
 export async function fetchStrategyTrades(name, symbol, tf, source = "all") {
   const params = { symbol, tf, source };
   const { data } = await axios.get(`/strategies/${name}/trades`, { params });
