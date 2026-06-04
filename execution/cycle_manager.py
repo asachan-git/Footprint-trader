@@ -257,6 +257,7 @@ def _check_cvd_divergence_exit(symbol: str, latest: Bar, settings: dict | None =
     from execution.position_store import position_store
     from pipeline.state_store import store as _store
     from pipeline.features.cvd_candlestick import detect as _cvd_detect
+    from pipeline.features.cvd_candlestick import scan_divergences as _scan_div
 
     closed: list[dict] = []
     pos_store = position_store()
@@ -266,17 +267,40 @@ def _check_cvd_divergence_exit(symbol: str, latest: Bar, settings: dict | None =
     conf_gate = float((settings or {}).get("cycle", {}).get("cvd_exit_conf", 0.65))
     exhaustion = {"divergence_bear", "divergence_bull", "hidden_buying",
                   "hidden_selling", "wick_trap"}
-    bars = _store().recent(symbol, latest.tf, 30)
+    bars = _store().recent(symbol, latest.tf, 60)
     sig = _cvd_detect(bars) if len(bars) >= 6 else None
-    if not sig or sig.pattern not in exhaustion or sig.confidence < conf_gate:
+    sig_ok = bool(sig and sig.pattern in exhaustion and sig.confidence >= conf_gate)
+
+    # Scan-based divergence (regular + EqH/EqL + live current bar) — catches the
+    # swing-pivot / equal-high distribution signals detect() misses. A divergence
+    # is actionable only if FRESH: confirmed within the last ~lookback+2 bars (or
+    # the live bar). strength gate via cvd_exit_div_strength (0 = any).
+    _LB = 3
+    divs = _scan_div(bars, lookback=_LB, include_live=True) if len(bars) >= (2 * _LB + 3) else []
+    fresh_ts = bars[-(_LB + 2)].close_ts if len(bars) >= (_LB + 2) else 0
+    div_str_gate = float((settings or {}).get("cycle", {}).get("cvd_exit_div_strength", 0.0))
+
+    def _opposing_div(side: str):
+        want = "bear" if side == "long" else "bull"
+        cand = [d for d in divs if d["type"] == want and d["ts"] >= fresh_ts
+                and d["strength"] >= div_str_gate]
+        return cand[-1] if cand else None
+
+    if not sig_ok and not divs:
         return closed
 
     c = latest.ohlc.c
     for pos in opens:
-        against = (pos.side == "long" and sig.side == "short") or \
-                  (pos.side == "short" and sig.side == "long")
-        if not against:
+        det_against = sig_ok and (
+            (pos.side == "long" and sig.side == "short") or
+            (pos.side == "short" and sig.side == "long"))
+        dv = _opposing_div(pos.side)
+        if not det_against and dv is None:
             continue
+        if det_against:
+            why = f"detect:{sig.pattern} conf={sig.confidence:.2f}"
+        else:
+            why = f"scan:{dv['type']}{'/eq' if dv.get('eq') else ''}{'/live' if dv.get('live') else ''} str={dv['strength']:.2f}"
         risk = abs(pos.avg_entry - (pos.stop_loss or 0)) or 1e-9
         pnl = (c - pos.avg_entry) if pos.side == "long" else (pos.avg_entry - c)
         realized_r = pnl / risk
@@ -285,9 +309,9 @@ def _check_cvd_divergence_exit(symbol: str, latest: Bar, settings: dict | None =
             _va_state.pop(pos.position_id, None)
             _trend_escape_state.pop(pos.position_id, None)
             closed.append({"position_id": pos.position_id, "realized_r": round(realized_r, 3),
-                           "pattern": sig.pattern})
+                           "pattern": why})
             LOG.info(f"[cycle] CVD-DIVERGENCE-EXIT {pos.position_id} {pos.side} @ {c:.2f} "
-                     f"R={realized_r:.2f} ({sig.pattern} conf={sig.confidence:.2f})")
+                     f"R={realized_r:.2f} ({why})")
     return closed
 
 

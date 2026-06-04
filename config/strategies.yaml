@@ -295,6 +295,8 @@ strategies:
       fib_entry: 0.705
       fib_ext: 2.0
       entry_expiry_bars: 6
+      cvd_divergence_exit: true   # validated 2026-06-04: reversal CVD-div exit +0.21R/15m vs +0.04R fixed
+      cvd_exit_conf: 0.65
 
   - name: reversal_choch_ext      # B — 0.705 / 1.618 (PF 1.57)
     class: reversal_choch
@@ -305,6 +307,8 @@ strategies:
       fib_entry: 0.705
       fib_ext: 1.618
       entry_expiry_bars: 6
+      cvd_divergence_exit: true
+      cvd_exit_conf: 0.65
 
   - name: reversal_choch_entry    # C — 0.618 / 2.0 (PF 1.29; entry-depth A/B)
     class: reversal_choch
@@ -314,4 +318,50 @@ strategies:
       decide_tf: 15m
       fib_entry: 0.618
       fib_ext: 2.0
+      entry_expiry_bars: 6
+      cvd_divergence_exit: true
+      cvd_exit_conf: 0.65
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # wave_fib — trend-CONTINUATION Fib (the with-trend complement to reversal_choch).
+  # WAIT for a two-wave structure to confirm (HH+HL = uptrend / LL+LH = downtrend),
+  # then join the 3rd wave: LIMIT into the wave-2 pullback (entry from the VP of the
+  # two-wave structure, or a Fib retrace), TP = fib_ext × wave-1 measured move from the
+  # pullback pivot, SL beyond the HL/LH (structure invalidation). 15m only.
+  # Tuned by scripts/wave_fib_backtest.py (BTC+XAU 15m, 2026-06-04): VP-value entry +
+  # 2.0× measured move = PF 3.36, +58.9R, n=35, POSITIVE on BOTH symbols (BTC PF 4.26,
+  # XAU 2.53). Low WR ~29% / high RR — fat targets carry it; PF somewhat tail-driven,
+  # n=35 moderate → PAPER. Variants A/B the entry source + TP.
+  # ──────────────────────────────────────────────────────────────────────────────
+  - name: wave_fib                # A — sweep winner: VP-value entry / 2.0× MM
+    class: wave_fib
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      decide_tf: 15m
+      entry_mode: vp
+      vp_level: value             # VAL (long) / VAH (short) — discount/premium edge
+      fib_ext: 2.0
+      entry_expiry_bars: 6
+
+  - name: wave_fib_ret            # B — explicit Fib-retrace entry: 0.5 / 2.0× MM (PF 2.45)
+    class: wave_fib
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      decide_tf: 15m
+      entry_mode: fib
+      fib_entry: 0.5
+      fib_ext: 2.0
+      entry_expiry_bars: 6
+
+  - name: wave_fib_ext            # C — VP-value entry / 1.618× MM (TP A/B; PF 2.76)
+    class: wave_fib
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      decide_tf: 15m
+      entry_mode: vp
+      vp_level: value
+      fib_ext: 1.618
       entry_expiry_bars: 6

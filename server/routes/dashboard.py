@@ -105,6 +105,58 @@ def _latest_m1_decision(symbol: str) -> dict | None:
     }
 
 
+def _strategy_outcomes(since_ts: int | None = None, until_ts: int | None = None) -> list[dict]:
+    """Per-strategy closed-trade summary over [since_ts, until_ts], read from each
+    enabled strategy's own data/strategies/<name>/positions.jsonl close events
+    (aggregated across symbols). since_ts None → last 24h; until_ts None → now.
+    Only strategies with ≥1 close in the window are returned, sorted by ΣR desc."""
+    cutoff = since_ts if since_ts is not None else int(time.time()) - 86400
+    try:
+        from strategies.registry import load_config
+        names = [e.get("name") for e in (load_config().get("strategies") or [])
+                 if e.get("enabled", True) and e.get("name")]
+    except Exception:
+        names = []
+    sdir = ROOT / "data" / "strategies"
+    out: list[dict] = []
+    for name in names:
+        f = sdir / name / "positions.jsonl"
+        if not f.exists():
+            continue
+        n = wins = tp = sl = 0
+        sum_r = 0.0
+        try:
+            for line in f.open():
+                line = line.strip()
+                if not line:
+                    continue
+                ev = json.loads(line)
+                if ev.get("type") != "close":
+                    continue
+                ts = int(ev.get("ts", 0))
+                if ts < cutoff or (until_ts is not None and ts > until_ts):
+                    continue
+                r = float(ev.get("realized_r", 0.0))
+                reason = ev.get("reason", "") or ""
+                n += 1
+                if r > 0:
+                    wins += 1
+                sum_r += r
+                if "tp" in reason:
+                    tp += 1
+                elif "sl" in reason or "escape" in reason:
+                    sl += 1
+        except Exception:
+            continue
+        if n == 0:
+            continue
+        out.append({"name": name, "n": n, "wins": wins,
+                    "wr": round(wins / n, 2), "sum_r": round(sum_r, 2),
+                    "tp": tp, "sl": sl})
+    out.sort(key=lambda d: d["sum_r"], reverse=True)
+    return out
+
+
 def _ab_stats(symbols: list[str]) -> dict:
     """Compute WR + total_R from positions.jsonl (M1) and positions_m2.jsonl (M2)."""
     def _scan(path: Path) -> dict[str, list[float]]:
@@ -174,6 +226,7 @@ def _ab_stats(symbols: list[str]) -> dict:
         pass
 
     result["outcomes_24h"] = outcomes_24h
+    result["strategies_24h"] = _strategy_outcomes()
     return result
 
 
@@ -903,7 +956,15 @@ def _build_snapshot(settings: dict, symbol: str, tf: str, minutes: int,
                 "reference_level": round(sig.reference_level, 4),
                 "reason":    sig.reason,
             }
-        cvd_divergences = scan_divergences(raw_bars, lookback=3)
+        # Divergence pairs CONSECUTIVE swing pivots that can span many hours; the
+        # display window (default 120 min ≈ 8 bars @15m) is far too short to detect
+        # any. Scan a wide history so pivots can pair, then keep only the markers
+        # inside the visible range so they render where the user is looking.
+        scan_bars = s.recent(symbol, tf, max(bar_count, 500))
+        _vis_lo = raw_bars[0].close_ts if raw_bars else 0
+        _vis_hi = raw_bars[-1].close_ts if raw_bars else 0
+        cvd_divergences = [d for d in scan_divergences(scan_bars, lookback=3)
+                           if _vis_lo <= d["ts"] <= _vis_hi]
     except Exception as e:
         LOG.debug(f"[dashboard] cvd_candles failed: {e}")
 
@@ -915,6 +976,25 @@ def _build_snapshot(settings: dict, symbol: str, tf: str, minutes: int,
                                        symbol=symbol, tf=tf, vp_filter=True)
     except Exception as e:
         LOG.debug(f"[dashboard] reversal_patterns failed: {e}")
+
+    # ChoCh→Fib reversal + two-wave continuation setups (diagnostic overlays for the
+    # reversal_choch / wave_fib strategies). 15m only — both decide on 15m structure;
+    # the walker is O(bars × swing-scan), so gate it to the decide TF.
+    choch_setups: list[dict] = []
+    wave_setups: list[dict] = []
+    if tf == "15m" and raw_bars:
+        try:
+            from strategies.reversal_choch import ReversalChoch
+            choch_setups = ReversalChoch.scan(raw_bars, symbol, tf,
+                                              {"fib_entry": 0.705, "fib_ext": 2.0})
+        except Exception as e:
+            LOG.debug(f"[dashboard] choch_setups failed: {e}")
+        try:
+            from strategies.wave_fib import WaveFib
+            wave_setups = WaveFib.scan(raw_bars, symbol, tf,
+                                       {"entry_mode": "vp", "vp_level": "value", "fib_ext": 2.0})
+        except Exception as e:
+            LOG.debug(f"[dashboard] wave_setups failed: {e}")
 
     # Strong zones (TP/SL targets) — long + short ladders around current price
     zones_out: dict = {"long": [], "short": []}
@@ -1010,6 +1090,8 @@ def _build_snapshot(settings: dict, symbol: str, tf: str, minutes: int,
         "cvd_signal": cvd_signal,
         "cvd_divergences": cvd_divergences,
         "reversal_patterns": reversal_patterns,
+        "choch_setups": choch_setups,
+        "wave_setups": wave_setups,
         "zones": zones_out,
         "ab_stats": ab_stats,
         "historical_sweeps": historical_sweeps,
@@ -1027,6 +1109,24 @@ def dashboard_state():
     session_align = request.args.get("session") == "today"
     snap = _build_snapshot(settings, symbol, tf, minutes, include_fp, session_align)
     resp = jsonify(snap)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@bp.get("/strategies/outcomes")
+def strategies_outcomes():
+    """Per-strategy closed-trade summary over an arbitrary range, for the dashboard
+    outcomes panel. ?from=&to= are epoch seconds (both optional; from omitted → 24h,
+    from=0 → all-time)."""
+    def _int(v):
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return None
+    since = _int(request.args.get("from"))
+    until = _int(request.args.get("to"))
+    resp = jsonify({"from": since, "to": until,
+                    "strategies": _strategy_outcomes(since, until)})
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
