@@ -46,6 +46,36 @@ strategies:
       sl_wall_buf_atr: 0.25   # SL = beyond the farthest favourable wall ± this×ATR
       sl_conf_tol_atr: 0.25   # wall∧VP confluence tolerance (tags wall_vp), ×ATR
 
+  # congress = democracy/republic vote, but ENTERED at the AGGRESSION-side stacked
+  # imbalance with the stop just below its low (long → buy-stack base; short → sell-
+  # stack high). LIMIT entry waits ≤entry_expiry_bars for a retrace touch into the
+  # imbalance (else voids), so the fill is at the ignition base, not chased. Tight
+  # stop → high R:R; republic VP TP supplies the target. Distinct from senate (stops
+  # beyond the DEFENSIVE wall). Two instances A/B the entry level. PROVISIONAL — paper.
+  # Live 24h (2026-06-04): congress_lvn +9.0R/40%/+0.90avg (BTC +9.2R, XAUT −0.2R);
+  # congress_start +3.4R. BTC-only edge — XAUT thin. Restored to main 2026-06-04.
+  - name: congress_start
+    class: congress
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      vote_tf: 15m
+      entry_mode: imb_start   # base where the aggression imbalance starts
+      entry_expiry_bars: 3
+      min_sl_atr_mult: 0.5
+      sl_atr_mult: 1.5        # republic fallback when no aggression imbalance
+
+  - name: congress_lvn
+    class: congress
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      vote_tf: 15m
+      entry_mode: imb_lvn     # low-vol gap inside the aggression imbalance
+      entry_expiry_bars: 3
+      min_sl_atr_mult: 0.5
+      sl_atr_mult: 1.5
+
   # coup = climax + next-bar delta-flip + VP-extreme (the validated reversal thesis),
   # ignition-bar entry. The old absorption→continuation trigger was RETIRED 2026-06-03
   # (live: coup family −4.3R, 9% WR; the extreme-zone aggressor read is a coin flip —
@@ -99,8 +129,11 @@ strategies:
   # data/strategies/reversal/. Market entry at the flip-bar close; structural SL =
   # trapped-side stacked-imbalance edge (swing high/low fallback); forced 2R TP;
   # flip + hard-SL exit (inherited from coup).
+  # DISABLED 2026-06-04 — REPLACED by the reversal_choch family below. The climax-
+  # pivot `reversal` ran net-negative in paper (2 closed: −0.16R, −1.0R) so its slot
+  # is handed to the ChoCh→Fib structure model. Class kept (reversal_si subclasses it).
   - name: reversal
-    enabled: true
+    enabled: false
     config:
       symbols: [BTCUSDT]
       decide_tf: 15m
@@ -208,9 +241,10 @@ strategies:
       cvd_divergence_exit: true # cut when CVD exhausts against the cycle
       cvd_exit_conf: 0.65
 
+  # DISABLED 2026-06-04 — replaced alongside its 15m twin (see reversal_choch family).
   - name: reversal_5m
     class: reversal
-    enabled: true
+    enabled: false
     config:
       symbols: [BTCUSDT]
       decide_tf: 5m
@@ -236,3 +270,48 @@ strategies:
       si_trail: true
       cvd_divergence_exit: true
       cvd_exit_conf: 0.65
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # reversal_choch — structure-flip reversal (replaces climax-pivot `reversal`).
+  # WAIT while 15m trend holds (no continuation trades); on a 15m ChoCh (break of the
+  # last HL/LH) arm a LONG (bull ChoCh) / SHORT (bear ChoCh) reversal: LIMIT at the
+  # fib_entry retrace of the impulse leg (origin swing → break extreme), TP at the
+  # fib_ext extension, SL beyond the swing origin. Three Fib A/B variants run in PAPER
+  # in parallel (separate stores) to find the best entry/extension pair. 15m only —
+  # the ChoCh is defined on 15m structure.
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Params tuned by scripts/reversal_choch_backtest.py (BTC+XAU 15m sweep, 2026-06-04):
+  # fib_ext is the dominant lever — 2.0 wins everywhere, 1.272 loses everywhere (this
+  # is a low-WR ~28% / high-RR system; short TPs starve it). fib_entry 0.705 (OTE) >
+  # 0.618 > 0.5. Best: 0.705/2.0 PF 2.03 (n=14). arm_within is inert (ChoCh breaks are
+  # always fresh in-sample) → left default 10. Thin sample → PAPER, A/B keeps entry/ext
+  # diversity around the winner. Symbols incl. XAU (it carried the edge; BTC was weak).
+  - name: reversal_choch          # A — sweep winner 0.705 / 2.0
+    class: reversal_choch
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      decide_tf: 15m
+      fib_entry: 0.705
+      fib_ext: 2.0
+      entry_expiry_bars: 6
+
+  - name: reversal_choch_ext      # B — 0.705 / 1.618 (PF 1.57)
+    class: reversal_choch
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      decide_tf: 15m
+      fib_entry: 0.705
+      fib_ext: 1.618
+      entry_expiry_bars: 6
+
+  - name: reversal_choch_entry    # C — 0.618 / 2.0 (PF 1.29; entry-depth A/B)
+    class: reversal_choch
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      decide_tf: 15m
+      fib_entry: 0.618
+      fib_ext: 2.0
+      entry_expiry_bars: 6

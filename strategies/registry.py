@@ -16,10 +16,12 @@ from .base import Strategy
 from .democracy import Democracy
 from .republic import Republic
 from .senate import Senate
+from .congress import Congress
 from .coup import Coup
 from .coup_reversal import CoupReversal
 from .reversal import Reversal
 from .reversal_si import ReversalSI
+from .reversal_choch import ReversalChoch
 
 LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
@@ -30,10 +32,12 @@ REGISTRY: dict[str, type[Strategy]] = {
     "democracy": Democracy,
     "republic": Republic,
     "senate": Senate,
+    "congress": Congress,
     "coup": Coup,
     "coup_reversal": CoupReversal,
     "reversal": Reversal,
     "reversal_si": ReversalSI,
+    "reversal_choch": ReversalChoch,
 }
 
 
