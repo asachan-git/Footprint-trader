@@ -39,10 +39,10 @@ FIB_EXTS = [1.272, 1.618, 2.0]
 ARM_WITHINS = [5, 10, 15]
 EXPIRYS = [4, 6, 9]
 
-# the three live variants (name, fib_entry, fib_ext)
-LIVE = [("A 0.618/1.618", 0.618, 1.618),
-        ("B 0.705/1.272 OTE", 0.705, 1.272),
-        ("C 0.5/2.0 deep", 0.5, 2.0)]
+# the three live variants (name, fib_entry, fib_ext) — mirror config/strategies.yaml
+LIVE = [("A reversal_choch 0.705/2.0",       0.705, 2.0),
+        ("B reversal_choch_ext 0.705/1.618", 0.705, 1.618),
+        ("C reversal_choch_entry 0.618/2.0", 0.618, 2.0)]
 
 
 def _sim_fill_then_exit(side, level, sl, tp, future, expiry_bars):
@@ -74,7 +74,7 @@ def _sim_fill_then_exit(side, level, sl, tp, future, expiry_bars):
     return None  # ran out of history while open → drop (not counted)
 
 
-def run_variant(bars_by_sym, fib_entry, fib_ext, arm_within, expiry):
+def run_variant(bars_by_sym, fib_entry, fib_ext, arm_within, expiry, tp_mode="fib"):
     """Walk every symbol's history with one strategy instance; collect trade Rs."""
     trades = []
     armed = filled = 0
@@ -83,6 +83,7 @@ def run_variant(bars_by_sym, fib_entry, fib_ext, arm_within, expiry):
             "symbols": [sym], "decide_tf": TF,
             "fib_entry": fib_entry, "fib_ext": fib_ext,
             "arm_within": arm_within, "entry_expiry_bars": expiry,
+            "tp_mode": tp_mode,
         })
         n = len(bars)
         block_until = -1
@@ -139,6 +140,19 @@ def main():
             sub = [t for t in trades if t["sym"] == s]
             if sub:
                 print(f"      {s:9s} {summarize(sub)}")
+
+    # ── 1b. VP-level TP vs fib_ext TP, at each fib_entry (arm=10, expiry=6) ──
+    print("\n=== 1b. TP source: VP-level vs fib_ext (arm_within=10, entry_expiry=6) ===")
+    for fe in FIB_ENTRIES:
+        t_fib, a_fib, f_fib = run_variant(bars_by_sym, fe, 2.0, 10, 6, tp_mode="fib")
+        t_vp,  a_vp,  f_vp  = run_variant(bars_by_sym, fe, 2.0, 10, 6, tp_mode="vp")
+        print(f"  entry {fe}:")
+        print(f"      fib_ext 2.0  {summarize(t_fib)}")
+        print(f"      VP-level     {summarize(t_vp)}")
+        for s in SYMBOLS:
+            sub = [t for t in t_vp if t["sym"] == s]
+            if sub:
+                print(f"        VP {s:9s} {summarize(sub)}")
 
     # ── 2. full sweep, ranked by PF (min 8 trades) ──
     print("\n=== 2. Full sweep: fib_entry × fib_ext × arm_within × entry_expiry ===")

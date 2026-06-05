@@ -26,6 +26,65 @@ function istFormatter(ts) {
 
 // ── volume profile overlay ────────────────────────────────────────────────────
 
+// Aggregate volume-at-price for a slice of bars and derive POC / 70% value area /
+// HVN-LVN thresholds / row step. Shared by drawVP (left-edge) and drawSessionVP
+// (per-day) so the VP math stays identical. Falls back to close-bucketing when
+// bars carry no ladders (synthetic history). Returns null when the slice is empty.
+function profileFromSlice(slice, dailyVpFallback) {
+  const prof = new Map();   // price -> {price, bid, ask}
+  let haveLadder = false;
+  const add = (p, bid, ask) => {
+    const e = prof.get(p) || { price: p, bid: 0, ask: 0 };
+    e.bid += bid; e.ask += ask; prof.set(p, e);
+  };
+  for (const b of slice) {
+    const nb = (b.bid_ladder?.length || 0) + (b.ask_ladder?.length || 0);
+    if (nb > 0) haveLadder = true;
+    (b.bid_ladder || []).forEach(l => add(l.p, l.v, 0));
+    (b.ask_ladder || []).forEach(l => add(l.p, 0, l.v));
+  }
+  if (!haveLadder) {
+    // Synthetic bars: no ladders — bucket by close price.
+    const poc0 = dailyVpFallback?.poc || slice[0]?.c || 1;
+    const step0 = Math.max(poc0 * 0.0003, 0.01);
+    for (const b of slice) add(Math.round(b.c / step0) * step0, b.bid_vol || 0, b.ask_vol || 0);
+  }
+
+  const rows = [...prof.values()].sort((a, b) => a.price - b.price);
+  if (!rows.length) return null;
+  const totals = rows.map(r => r.bid + r.ask);
+  const maxVol = Math.max(...totals, 1);
+  const grand  = totals.reduce((s, v) => s + v, 0) || 1;
+
+  // POC + 70% value area (expand around POC toward the larger neighbour).
+  let pocIdx = 0;
+  for (let i = 1; i < rows.length; i++) if (totals[i] > totals[pocIdx]) pocIdx = i;
+  let lo = pocIdx, hi = pocIdx, vaVol = totals[pocIdx];
+  const target = grand * 0.7;
+  while (vaVol < target && (lo > 0 || hi < rows.length - 1)) {
+    const below = lo > 0 ? totals[lo - 1] : -1;
+    const above = hi < rows.length - 1 ? totals[hi + 1] : -1;
+    if (above >= below) { hi++; vaVol += Math.max(0, above); }
+    else                { lo--; vaVol += Math.max(0, below); }
+  }
+  const pocPrice = rows[pocIdx].price;
+
+  // HVN/LVN thresholds by volume percentile of the profile.
+  const sortedTot = [...totals].sort((a, b) => a - b);
+  const pctl = (q) => sortedTot[Math.min(sortedTot.length - 1, Math.floor(q * sortedTot.length))];
+  const hvnT = pctl(0.80), lvnT = pctl(0.20);
+
+  // Row height from the smallest positive price step.
+  let step = Infinity;
+  for (let i = 1; i < rows.length; i++) {
+    const d = rows[i].price - rows[i - 1].price;
+    if (d > 0 && d < step) step = d;
+  }
+  if (!isFinite(step)) step = Math.max(pocPrice * 0.0001, 0.01);
+
+  return { rows, totals, maxVol, grand, pocIdx, lo, hi, pocPrice, hvnT, lvnT, step };
+}
+
 // True volume-at-price profile from bid/ask ladders.
 //   vpMode "visible" → only bars in the visible logical range (zoom-scoped,
 //   bounded cost); "full" → entire loaded window.
@@ -56,59 +115,10 @@ function drawVP(canvas, chart, candleSeries, dailyVp, bars, vpMode = "visible") 
     }
   }
 
-  // Aggregate real volume-at-price from ladders.
-  const prof = new Map();   // price -> {price, bid, ask}
-  let haveLadder = false;
-  const add = (p, bid, ask) => {
-    const e = prof.get(p) || { price: p, bid: 0, ask: 0 };
-    e.bid += bid; e.ask += ask; prof.set(p, e);
-  };
-  for (const b of slice) {
-    const nb = (b.bid_ladder?.length || 0) + (b.ask_ladder?.length || 0);
-    if (nb > 0) haveLadder = true;
-    (b.bid_ladder || []).forEach(l => add(l.p, l.v, 0));
-    (b.ask_ladder || []).forEach(l => add(l.p, 0, l.v));
-  }
-  if (!haveLadder) {
-    // Synthetic bars: no ladders — bucket by close price.
-    const poc0 = dailyVp?.poc || slice[0]?.c || 1;
-    const step0 = Math.max(poc0 * 0.0003, 0.01);
-    for (const b of slice) {
-      add(Math.round(b.c / step0) * step0, b.bid_vol || 0, b.ask_vol || 0);
-    }
-  }
-
-  const rows = [...prof.values()].sort((a, b) => a.price - b.price);
-  if (!rows.length) return;
-  const totals = rows.map(r => r.bid + r.ask);
-  const maxVol = Math.max(...totals, 1);
-  const grand  = totals.reduce((s, v) => s + v, 0) || 1;
-
-  // POC + 70% value area (expand around POC toward the larger neighbour).
-  let pocIdx = 0;
-  for (let i = 1; i < rows.length; i++) if (totals[i] > totals[pocIdx]) pocIdx = i;
-  let lo = pocIdx, hi = pocIdx, vaVol = totals[pocIdx];
-  const target = grand * 0.7;
-  while (vaVol < target && (lo > 0 || hi < rows.length - 1)) {
-    const below = lo > 0 ? totals[lo - 1] : -1;
-    const above = hi < rows.length - 1 ? totals[hi + 1] : -1;
-    if (above >= below) { hi++; vaVol += Math.max(0, above); }
-    else                { lo--; vaVol += Math.max(0, below); }
-  }
-  const pocPrice = rows[pocIdx].price;
-
-  // HVN/LVN thresholds by volume percentile of the profile.
-  const sortedTot = [...totals].sort((a, b) => a - b);
-  const pctl = (q) => sortedTot[Math.min(sortedTot.length - 1, Math.floor(q * sortedTot.length))];
-  const hvnT = pctl(0.80), lvnT = pctl(0.20);
-
-  // Row height from the smallest positive price step.
-  let step = Infinity;
-  for (let i = 1; i < rows.length; i++) {
-    const d = rows[i].price - rows[i - 1].price;
-    if (d > 0 && d < step) step = d;
-  }
-  if (!isFinite(step)) step = Math.max(pocPrice * 0.0001, 0.01);
+  // Aggregate real volume-at-price + POC/VA/HVN-LVN (shared helper).
+  const profile = profileFromSlice(slice, dailyVp);
+  if (!profile) return;
+  const { rows, totals, maxVol, pocIdx, lo, hi, pocPrice, hvnT, lvnT, step } = profile;
   const yA = candleSeries.priceToCoordinate(pocPrice);
   const yB = candleSeries.priceToCoordinate(pocPrice + step);
   const cellH = (yA != null && yB != null) ? Math.max(1, Math.abs(yA - yB)) : 2;
@@ -169,7 +179,9 @@ function drawVP(canvas, chart, candleSeries, dailyVp, bars, vpMode = "visible") 
 // VP computed over a user-picked candle range [fromTs, toTs], anchored at the range
 // on the time axis, with POC/VAH/VAL lines (optionally extended to the right edge).
 // Pure client-side from the bid/ask ladders (same source as drawVP).
-function drawVPFR(canvas, chart, candleSeries, bars, vpfr) {
+// Clear once, then render every committed VPFR plus the in-progress pick. Each
+// range is drawn by drawOneVPFR onto the shared canvas context.
+function drawVPFR(canvas, chart, candleSeries, bars, vpfrList, inProgress) {
   if (!canvas) return;
   const rect = canvas.getBoundingClientRect();
   const W = Math.round(rect.width)  || canvas.parentElement?.clientWidth  || 800;
@@ -178,7 +190,13 @@ function drawVPFR(canvas, chart, candleSeries, bars, vpfr) {
   if (canvas.height !== H) canvas.height = H;
   const ctx = canvas.getContext("2d");
   ctx.clearRect(0, 0, W, H);
-  if (!chart || !candleSeries || !vpfr || vpfr.fromTs == null || !bars.length) return;
+  if (!chart || !candleSeries || !bars.length) return;
+  for (const v of vpfrList || []) drawOneVPFR(ctx, chart, candleSeries, bars, v, W, H);
+  if (inProgress && inProgress.fromTs != null) drawOneVPFR(ctx, chart, candleSeries, bars, inProgress, W, H);
+}
+
+function drawOneVPFR(ctx, chart, candleSeries, bars, vpfr, W, H) {
+  if (!vpfr || vpfr.fromTs == null) return;
 
   const ts = chart.timeScale();
   const a = vpfr.fromTs, b = vpfr.toTs;
@@ -269,6 +287,164 @@ function drawVPFR(canvas, chart, candleSeries, bars, vpfr) {
   ctx.fillText(`VPFR ${slice.length}b${vpfr.extend ? " ↦" : ""}`, xLeft + 3, 3);
 }
 
+
+// ── per-day (session-segmented) volume profiles ──────────────────────────────
+// Session-anchored day key, matching the backend daily VP: XAU session opens
+// 03:30 IST, BTC/others 05:30 IST. Bars before the anchor belong to the prior
+// session. (IST = UTC+5:30 const defined at top of file.)
+function sessionDayKey(ts, symbol) {
+  const startSec = symbol?.startsWith("XAU") ? 12600 : 19800; // 03:30 / 05:30 IST
+  return Math.floor((ts + IST - startSec) / 86400);
+}
+
+// Market-profile look: one faint profile per session day, anchored to that day's
+// candle span on the time axis (grows rightward from the day's left edge), with
+// POC/VAH/VAL levels + HVN/LVN tint. Reuses profileFromSlice for the VP math.
+const MAX_SESSION_DAYS = 7;
+function drawSessionVP(canvas, chart, candleSeries, bars, symbol) {
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const W = Math.round(rect.width)  || canvas.parentElement?.clientWidth  || 800;
+  const H = Math.round(rect.height) || canvas.parentElement?.clientHeight || 400;
+  if (canvas.width !== W)  canvas.width  = W;
+  if (canvas.height !== H) canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, W, H);
+  if (!chart || !candleSeries || !bars.length) return;
+
+  // Group bars into ordered session-day buckets.
+  const buckets = new Map();   // key -> bars[]
+  for (const b of bars) {
+    const k = sessionDayKey(b.ts, symbol);
+    let arr = buckets.get(k);
+    if (!arr) { arr = []; buckets.set(k, arr); }
+    arr.push(b);
+  }
+  let keys = [...buckets.keys()].sort((a, b) => a - b);
+  if (keys.length > MAX_SESSION_DAYS) keys = keys.slice(keys.length - MAX_SESSION_DAYS);
+
+  // Single session loaded → nothing to segment per-day. Hint instead of blank.
+  if (keys.length < 2) {
+    ctx.fillStyle = "rgba(150,165,190,0.6)"; ctx.font = "10px JetBrains Mono, monospace";
+    ctx.textAlign = "left"; ctx.textBaseline = "top";
+    ctx.fillText("VP per-day: select 5D (window spans 1 session)", 6, H - 16);
+    return;
+  }
+
+  const ts = chart.timeScale();
+  for (let di = 0; di < keys.length; di++) {
+    const slice = buckets.get(keys[di]);
+    if (!slice.length) continue;
+
+    // Day x-span: left = first bar of this day; right = first bar of the next day
+    // (or chart right edge for the latest / in-progress day).
+    const xLeft = ts.timeToCoordinate(slice[0].ts);
+    if (xLeft == null) continue;
+    const nextKey = di + 1 < keys.length ? keys[di + 1] : null;
+    let xRight = nextKey != null ? ts.timeToCoordinate(buckets.get(nextKey)[0].ts) : null;
+    if (xRight == null) xRight = W;
+    if (xRight <= xLeft) continue;
+
+    const profile = profileFromSlice(slice, null);
+    if (!profile) continue;
+    const { rows, totals, maxVol, pocIdx, lo, hi, pocPrice, hvnT, lvnT, step } = profile;
+
+    const daySpanPx = xRight - xLeft;
+    const barMaxW   = Math.max(20, Math.min(daySpanPx * 0.9, 120));
+    const xEnd      = xLeft + barMaxW;
+
+    const yA = candleSeries.priceToCoordinate(pocPrice);
+    const yB = candleSeries.priceToCoordinate(pocPrice + step);
+    const cellH = (yA != null && yB != null) ? Math.max(1, Math.abs(yA - yB)) : 2;
+
+    // Day separator.
+    ctx.strokeStyle = "rgba(120,140,180,0.25)"; ctx.lineWidth = 1; ctx.setLineDash([2, 3]);
+    ctx.beginPath(); ctx.moveTo(xLeft, 0); ctx.lineTo(xLeft, H); ctx.stroke(); ctx.setLineDash([]);
+
+    // Faint value-area band.
+    const yVaTop = candleSeries.priceToCoordinate(rows[hi].price);
+    const yVaBot = candleSeries.priceToCoordinate(rows[lo].price);
+    if (yVaTop != null && yVaBot != null) {
+      ctx.fillStyle = "rgba(120,140,180,0.04)";
+      ctx.fillRect(xLeft, Math.min(yVaTop, yVaBot) - cellH / 2, barMaxW, Math.abs(yVaBot - yVaTop) + cellH);
+    }
+
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i], total = totals[i];
+      if (total <= 0) continue;
+      const y = candleSeries.priceToCoordinate(r.price);
+      if (y == null || y < -cellH || y > H + cellH) continue;
+      // HVN/LVN tint
+      if (total >= hvnT)      { ctx.fillStyle = "rgba(66,165,245,0.06)"; ctx.fillRect(xLeft, y - cellH / 2, barMaxW, cellH); }
+      else if (total <= lvnT) { ctx.fillStyle = "rgba(255,152,0,0.06)"; ctx.fillRect(xLeft, y - cellH / 2, barMaxW, cellH); }
+
+      const totalW = (total / maxVol) * barMaxW;
+      const bidW   = (r.bid / total) * totalW;
+      const askW   = totalW - bidW;
+      const isPoc  = i === pocIdx;
+      const inVA   = i >= lo && i <= hi;
+      const rh     = Math.max(1, cellH * 0.9);
+      // Lower base alpha than the left-edge VP so stacked days stay legible.
+      const aBid   = isPoc ? 0.5 : inVA ? 0.32 : 0.16;
+      const aAsk   = isPoc ? 0.5 : inVA ? 0.36 : 0.18;
+      ctx.fillStyle = `rgba(239,83,80,${aBid})`;
+      ctx.fillRect(xLeft, y - rh / 2, bidW, rh);
+      ctx.fillStyle = `rgba(38,166,154,${aAsk})`;
+      ctx.fillRect(xLeft + bidW, y - rh / 2, askW, rh);
+    }
+
+    // POC line + VAH/VAL edge ticks spanning only this day's profile width.
+    const yPoc = candleSeries.priceToCoordinate(pocPrice);
+    if (yPoc != null) {
+      ctx.strokeStyle = "rgba(255,215,0,0.6)"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(xLeft, yPoc); ctx.lineTo(xEnd, yPoc); ctx.stroke();
+    }
+    for (const yy of [yVaTop, yVaBot]) {
+      if (yy == null) continue;
+      ctx.strokeStyle = "rgba(120,140,180,0.35)"; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(xLeft, yy); ctx.lineTo(xEnd, yy); ctx.stroke(); ctx.setLineDash([]);
+    }
+
+    // Small session-date label at the day's top-left.
+    const d = new Date((slice[0].ts + IST) * 1000);
+    const lbl = `${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+    ctx.fillStyle = "rgba(150,165,190,0.55)"; ctx.font = "9px JetBrains Mono, monospace";
+    ctx.textAlign = "left"; ctx.textBaseline = "top";
+    ctx.fillText(lbl, xLeft + 3, 3);
+  }
+}
+
+// Session boundary vertical lines — independent of the per-day VP toggle. A
+// dashed line at each session start (= prior session's end), labeled w/ date.
+function drawSessionLines(canvas, chart, candleSeries, bars, symbol) {
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const W = Math.round(rect.width)  || canvas.parentElement?.clientWidth  || 800;
+  const H = Math.round(rect.height) || canvas.parentElement?.clientHeight || 400;
+  if (canvas.width !== W)  canvas.width  = W;
+  if (canvas.height !== H) canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, W, H);
+  if (!chart || !candleSeries || bars.length < 2) return;
+
+  const ts = chart.timeScale();
+  let prevKey = sessionDayKey(bars[0].ts, symbol);
+  ctx.font = "9px JetBrains Mono, monospace";
+  for (let i = 1; i < bars.length; i++) {
+    const k = sessionDayKey(bars[i].ts, symbol);
+    if (k === prevKey) continue;
+    prevKey = k;
+    const x = ts.timeToCoordinate(bars[i].ts);
+    if (x == null || x < 0 || x > W) continue;
+    ctx.strokeStyle = "rgba(120,140,180,0.5)"; ctx.lineWidth = 1; ctx.setLineDash([2, 4]);
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); ctx.setLineDash([]);
+    const d = new Date((bars[i].ts + IST) * 1000);
+    const lbl = `${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")} open`;
+    ctx.fillStyle = "rgba(150,165,190,0.75)";
+    ctx.textAlign = "left"; ctx.textBaseline = "top";
+    ctx.fillText(lbl, x + 3, 3);
+  }
+}
 
 function drawTradeBoxes(canvas, chart, candleSeries, trades, bars) {
   if (!canvas || !chart || !candleSeries) return;
@@ -434,6 +610,152 @@ function drawCVDDivergence(canvas, chart, candleSeries, divs, bars, showStrict, 
       ctx.moveTo(x - 4, ey + 1.5); ctx.lineTo(x + 4, ey + 1.5); ctx.stroke();
     }
     if (hitsOut) hitsOut.push({ x, y: ty, r: 9, d });
+  }
+}
+
+// ── CVD sweep study trades overlay ───────────────────────────────────────────
+// Renders simulated trades from data/reports/cvd_sweep_*.jsonl. Per setup:
+//   triangle at (entry_ts, entry), outcome-colored (T2 cyan, T3 indigo, T1
+//   green, SL red, TIME gray). Horizontal SL + T1/T2/T3 lines spanning the
+//   forward-outcome window (fwd_n bars per TF). Marker alpha encodes
+//   cvd_div_intact: 1.0 = thesis subset, 0.5 = no div.
+function drawCVDSweeps(canvas, chart, candleSeries, sweeps, bars, show, tf, hitsOut) {
+  if (!canvas) return;
+  // Fast skip when layer off — avoid clearRect cost on every crosshair tick
+  if (!show || !sweeps?.length) {
+    if (canvas._cvdSweepDirty) {
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      canvas._cvdSweepDirty = false;
+    }
+    if (hitsOut) hitsOut.length = 0;
+    return;
+  }
+  const rect = canvas.getBoundingClientRect();
+  const W = Math.round(rect.width)  || canvas.parentElement?.clientWidth  || 800;
+  const H = Math.round(rect.height) || canvas.parentElement?.clientHeight || 400;
+  const resized = (canvas.width !== W) || (canvas.height !== H);
+  if (resized) { canvas.width = W; canvas.height = H; }
+
+  // forward window matches cvd_sweep_study.py CFG (15m: 20 bars, 5m: 36 bars)
+  const fwdBars = tf === "5m" ? 36 : tf === "15m" ? 20 : 0;
+  if (!fwdBars) { if (hitsOut) hitsOut.length = 0; return; }
+  const step = (bars && bars.length > 1) ? (bars[1].ts - bars[0].ts)
+                                          : (tf === "5m" ? 300 : 900);
+  const fwdSpan = step * fwdBars;
+
+  const ts = chart.timeScale();
+  const vr = ts.getVisibleRange();
+  // Skip work if state unchanged since last paint (crosshair-move, mousemove
+  // and other no-op triggers all hit this path). Re-paint only when visible
+  // range, sweep set, tf, toggle, or canvas size actually changed.
+  const stateKey = `${vr?.from ?? "n"}|${vr?.to ?? "n"}|${sweeps.length}|${tf}|${W}x${H}|${sweeps[0]?.ts ?? "n"}`;
+  if (!resized && canvas._cvdSweepKey === stateKey) return;
+  canvas._cvdSweepKey = stateKey;
+
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, W, H);
+  if (hitsOut) hitsOut.length = 0;
+
+  // Cull to visible time window: only setups whose entry ts (or forward span)
+  // overlaps the visible range. Cuts the per-frame cost from O(all_setups) to
+  // O(visible_setups).
+  let tFrom = -Infinity, tTo = Infinity;
+  if (vr) {
+    tFrom = (vr.from ?? -Infinity) - fwdSpan;
+    tTo   = vr.to   ?? Infinity;
+  }
+  const visible = sweeps.filter(s => s.ts != null && s.ts >= tFrom && s.ts <= tTo);
+  if (!visible.length) { canvas._cvdSweepDirty = true; return; }
+  canvas._cvdSweepDirty = true;
+  const OUTCOME_COL = {
+    T2:   "#26c6da",  // cyan — full HVN→HVN traversal
+    T3:   "#5c6bc0",  // indigo — LVN extreme
+    T1:   "#66bb6a",  // green — opp HVN edge
+    SL:   "#ef5350",  // red
+    TIME: "#9e9e9e",  // gray
+  };
+
+  for (const s of visible) {
+    if (s.entry == null) continue;
+    const x1 = ts.timeToCoordinate(s.ts);
+    if (x1 == null) continue;
+    const x2raw = ts.timeToCoordinate(s.ts + fwdSpan);
+    const xEnd = x2raw == null ? Math.min(W - 4, x1 + 120) : x2raw;
+    const yE  = candleSeries.priceToCoordinate(s.entry);
+    if (yE == null) continue;
+    const ySL = s.sweep_price != null ? candleSeries.priceToCoordinate(s.sweep_price) : null;
+    const yT1 = s.t1 != null ? candleSeries.priceToCoordinate(s.t1) : null;
+    const yT2 = s.t2 != null ? candleSeries.priceToCoordinate(s.t2) : null;
+    const yT3 = s.t3 != null ? candleSeries.priceToCoordinate(s.t3) : null;
+    const col = OUTCOME_COL[s.outcome] || "#9e9e9e";
+    const long = s.side === "long";
+    const alpha = s.cvd_div_intact ? 1.0 : 0.5;
+
+    ctx.globalAlpha = alpha;
+
+    // SL — red dashed
+    if (ySL != null) {
+      ctx.strokeStyle = "rgba(239,83,80,0.7)";
+      ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(x1, ySL); ctx.lineTo(xEnd, ySL); ctx.stroke();
+    }
+    // T1 — green dashed (opp HVN edge)
+    if (yT1 != null) {
+      ctx.strokeStyle = "rgba(102,187,106,0.75)";
+      ctx.lineWidth = 1; ctx.setLineDash([4, 3]);
+      ctx.beginPath(); ctx.moveTo(x1, yT1); ctx.lineTo(xEnd, yT1); ctx.stroke();
+    }
+    // T2 — cyan dashed (next HVN far extreme)
+    if (yT2 != null) {
+      ctx.strokeStyle = "rgba(38,198,218,0.7)";
+      ctx.lineWidth = 1; ctx.setLineDash([6, 4]);
+      ctx.beginPath(); ctx.moveTo(x1, yT2); ctx.lineTo(xEnd, yT2); ctx.stroke();
+    }
+    // T3 — indigo dashed (LVN extreme between)
+    if (yT3 != null) {
+      ctx.strokeStyle = "rgba(92,107,192,0.6)";
+      ctx.lineWidth = 1; ctx.setLineDash([2, 4]);
+      ctx.beginPath(); ctx.moveTo(x1, yT3); ctx.lineTo(xEnd, yT3); ctx.stroke();
+    }
+    ctx.setLineDash([]);
+
+    // HVN band tint between hvn_low and hvn_high (the swept HVN)
+    if (s.hvn_low != null && s.hvn_high != null) {
+      const yHi = candleSeries.priceToCoordinate(s.hvn_high);
+      const yLo = candleSeries.priceToCoordinate(s.hvn_low);
+      if (yHi != null && yLo != null) {
+        ctx.fillStyle = "rgba(255,193,7,0.06)";
+        ctx.fillRect(x1, Math.min(yHi, yLo), xEnd - x1, Math.abs(yLo - yHi));
+      }
+    }
+
+    // entry triangle — outcome-colored
+    const t = 5;
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    if (long) {
+      ctx.moveTo(x1, yE - t); ctx.lineTo(x1 - t, yE + t); ctx.lineTo(x1 + t, yE + t);
+    } else {
+      ctx.moveTo(x1, yE + t); ctx.lineTo(x1 - t, yE - t); ctx.lineTo(x1 + t, yE - t);
+    }
+    ctx.closePath(); ctx.fill();
+
+    // outcome label
+    const label = s.outcome + (s.cvd_div_intact ? "★" : "");
+    ctx.font = "9px JetBrains Mono, monospace";
+    const lw = ctx.measureText(label).width;
+    const ly = long ? yE + 18 : yE - 10;
+    ctx.fillStyle = "rgba(13,13,13,0.78)";
+    ctx.fillRect(x1 - lw / 2 - 2, ly - 9, lw + 4, 11);
+    ctx.fillStyle = col;
+    ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+    ctx.fillText(label, x1, ly);
+    ctx.textAlign = "start";
+
+    ctx.globalAlpha = 1.0;
+
+    if (hitsOut) hitsOut.push({ x: x1, y: yE, r: 7, s });
   }
 }
 
@@ -1029,7 +1351,7 @@ function resolveTradeOutcome(t, bars) {
   return t;  // still running — no touch yet
 }
 
-export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, strategyTrades = [], cvd = [], cvdDivergences = [], symbol, chartMode, indicators, chartType = "candles", logScale = false }) {
+export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detections, positions, nakedPocs, historicalSweeps, swingPoints, strategyTrades = [], cvd = [], cvdDivergences = [], cvdSweeps = [], tf, symbol, chartMode, indicators, chartType = "candles", logScale = false }) {
   // lightweight-charts setData asserts strictly-asc UNIQUE timestamps. Long
   // windows (5D) can emit duplicate/out-of-order ts → crash. Sort asc + dedupe
   // by ts (keep last) once, feed everywhere downstream.
@@ -1044,6 +1366,8 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   }, [rawBars]);
   const containerRef = useRef(null);
   const vpCanvasRef  = useRef(null);
+  const sessionVpCanvasRef = useRef(null);   // per-day (session) volume profiles
+  const slCanvasRef  = useRef(null);         // session boundary vertical lines
   const fpCanvasRef  = useRef(null);
   const bbCanvasRef  = useRef(null);
   const tpCanvasRef  = useRef(null);   // trade position boxes
@@ -1075,6 +1399,16 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
     showCvdDivRef.current = !!indicators?.cvdDiv;
     showCvdEqRef.current  = !!indicators?.cvdEqDiv;
   }, [indicators]);
+  // CVD sweep study overlay refs
+  const csCanvasRef  = useRef(null);
+  const cvdSweepsRef = useRef(cvdSweeps);
+  cvdSweepsRef.current = cvdSweeps;
+  const tfRef = useRef(tf);
+  tfRef.current = tf;
+  const showCvdSweepsRef = useRef(!!indicators?.cvdSweeps);
+  useEffect(() => { showCvdSweepsRef.current = !!indicators?.cvdSweeps; }, [indicators]);
+  const sweepHitsRef = useRef([]);
+  const [hoverSweep, setHoverSweep] = useState(null);  // {s, x, y}
   const bigTradesRef = useRef([]);
   const showBubblesRef = useRef(showBubbles);
   useEffect(() => { bigTradesRef.current = detections?.big_trades || []; }, [detections]);
@@ -1093,9 +1427,11 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   const drawCanvasRef = useRef(null);
   const vpfrCanvasRef = useRef(null);                // fixed-range volume profile overlay
   const [drawTool, setDrawTool] = useState(null);    // null|'measure'|'ray'|'alert'|'vpfr'
-  const [vpfr, setVpfr] = useState(null);            // {fromTs, toTs|null} picked range
+  const [vpfr, setVpfr] = useState(null);            // {fromTs, toTs|null} in-progress pick
+  const [vpfrs, setVpfrs] = useState([]);            // committed ranges [{id, fromTs, toTs}]
   const [vpfrExtend, setVpfrExtend] = useState(false);
   const vpfrRef = useRef(null);       vpfrRef.current = vpfr;
+  const vpfrsRef = useRef([]);        vpfrsRef.current = vpfrs;
   const vpfrExtendRef = useRef(false); vpfrExtendRef.current = vpfrExtend;
   const [lines, setLines]       = useState(() => loadLines(symbol));
   const [hoverLineId, setHoverLineId] = useState(null);
@@ -1118,6 +1454,12 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   dailyVpRef.current = dailyVp;
   const vpModeRef    = useRef("visible");
   vpModeRef.current  = indicators?.vpFull ? "full" : "visible";
+  const vpDailyRef   = useRef(false);
+  vpDailyRef.current = !!indicators?.vpDaily;
+  const sessionLinesRef = useRef(true);
+  sessionLinesRef.current = indicators?.sessionLines !== false;
+  const symbolRef    = useRef(symbol);
+  symbolRef.current  = symbol;
 
   // Init chart once
   useEffect(() => {
@@ -1219,12 +1561,18 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
 
     const redrawAll = () => {
       drawVP(vpCanvasRef.current, chart, candleSeries, dailyVpRef.current, barsRef.current, vpModeRef.current);
+      drawSessionVP(sessionVpCanvasRef.current, chart, candleSeries,
+                    vpDailyRef.current ? barsRef.current : [], symbolRef.current);
+      drawSessionLines(slCanvasRef.current, chart, candleSeries,
+                       sessionLinesRef.current ? barsRef.current : [], symbolRef.current);
       drawFootprint(fpCanvasRef.current, chart, candleSeries, barsRef.current);
       drawBubbles(bbCanvasRef.current, chart, candleSeries, bigTradesRef.current, showBubblesRef.current, barsRef.current, bubbleHitsRef.current);
       drawTradeBoxes(tpCanvasRef.current, chart, candleSeries, stratTradesRef.current, barsRef.current);
       drawCVDDivergence(cdCanvasRef.current, chart, candleSeries, cvdDivRef.current, barsRef.current, showCvdDivRef.current, showCvdEqRef.current, divHitsRef.current);
+      drawCVDSweeps(csCanvasRef.current, chart, candleSeries, cvdSweepsRef.current, barsRef.current, showCvdSweepsRef.current, tfRef.current, sweepHitsRef.current);
       drawVPFR(vpfrCanvasRef.current, chart, candleSeries, barsRef.current,
-               vpfrRef.current ? { ...vpfrRef.current, extend: vpfrExtendRef.current } : null);
+               (vpfrsRef.current || []).map(v => ({ ...v, extend: vpfrExtendRef.current })),
+               vpfrRef.current);
       drawOverlay(drawCanvasRef.current, chart, candleSeries, drawLinesRef.current, measureRef.current, hoverLineRef.current);
     };
     redrawRef.current = redrawAll;
@@ -1266,8 +1614,18 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
         if (dHit && prev && prev.d === dHit.d) return { ...prev, x: mx, y: my };
         return dHit ? { d: dHit.d, x: mx, y: my } : null;
       });
+      // Hit-test CVD sweep entry markers.
+      let sHit = null;
+      for (const h of sweepHitsRef.current) {
+        if (Math.hypot(mx - h.x, my - h.y) <= h.r + 2) { sHit = h; break; }
+      }
+      setHoverSweep(prev => {
+        if (!sHit && !prev) return prev;
+        if (sHit && prev && prev.s === sHit.s) return { ...prev, x: mx, y: my };
+        return sHit ? { s: sHit.s, x: mx, y: my } : null;
+      });
     };
-    const onMouseLeave = () => { setHoverBubble(null); setHoverDiv(null); };
+    const onMouseLeave = () => { setHoverBubble(null); setHoverDiv(null); setHoverSweep(null); };
     const onMouseWheel = () => redrawAll();
     if (containerRef.current) {
       containerRef.current.addEventListener("mousemove", onMouseMoveAny);
@@ -1279,7 +1637,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       if (!containerRef.current) return;
       const { clientWidth: w, clientHeight: h } = containerRef.current;
       chart.applyOptions({ width: w, height: h });
-      for (const c of [vpCanvasRef.current, vpfrCanvasRef.current, fpCanvasRef.current, bbCanvasRef.current, tpCanvasRef.current, cdCanvasRef.current, drawCanvasRef.current]) {
+      for (const c of [vpCanvasRef.current, sessionVpCanvasRef.current, slCanvasRef.current, vpfrCanvasRef.current, fpCanvasRef.current, bbCanvasRef.current, tpCanvasRef.current, cdCanvasRef.current, csCanvasRef.current, drawCanvasRef.current]) {
         if (c) { c.width = w; c.height = h; }
       }
       redrawAll();
@@ -1373,6 +1731,10 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
     fitBarsRef.current = bars;
 
     drawVP(vpCanvasRef.current, chartRef.current, candleRef.current, dailyVp, bars, vpModeRef.current);
+    drawSessionVP(sessionVpCanvasRef.current, chartRef.current, candleRef.current,
+                  vpDailyRef.current ? bars : [], symbol);
+    drawSessionLines(slCanvasRef.current, chartRef.current, candleRef.current,
+                     sessionLinesRef.current ? bars : [], symbol);
     // Defer bubble draw a frame so chart's internal coordinate mapping is
     // up-to-date with the just-applied setData call.
     requestAnimationFrame(() => {
@@ -1380,12 +1742,23 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
                   detections?.big_trades || [], showBubbles, bars, bubbleHitsRef.current);
       drawCVDDivergence(cdCanvasRef.current, chartRef.current, candleRef.current,
                         cvdDivergences, bars, !!indicators?.cvdDiv, !!indicators?.cvdEqDiv, divHitsRef.current);
+      drawCVDSweeps(csCanvasRef.current, chartRef.current, candleRef.current,
+                    cvdSweeps, bars, !!indicators?.cvdSweeps, tf, sweepHitsRef.current);
     });
 
     if (chartMode === "footprint") {
       drawFootprintWithRetry(fpCanvasRef.current, chartRef.current, candleRef.current, bars);
     }
   }, [bars, symbol, detections, showBubbles, chartType, cvd, cvdDivergences, indicators]);
+
+  // Overlay-only redraw for CVD sweep layer — does NOT re-run setData. Fires
+  // when the sweep dataset, tf, or its toggle changes.
+  useEffect(() => {
+    if (!chartRef.current || !candleRef.current) return;
+    drawCVDSweeps(csCanvasRef.current, chartRef.current, candleRef.current,
+                  cvdSweeps, barsRef.current, !!indicators?.cvdSweeps, tf,
+                  sweepHitsRef.current);
+  }, [cvdSweeps, tf, indicators?.cvdSweeps]);
 
   // Chart-type visibility: candle body vs close-line.
   useEffect(() => {
@@ -1451,8 +1824,8 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   }, []);
 
   // Reload drawn lines when symbol changes (lines are price-level, symbol-scoped).
-  useEffect(() => { setLines(loadLines(symbol)); measureRef.current = null; setVpfr(null); }, [symbol]);
-  useEffect(() => { redrawRef.current?.(); }, [vpfr, vpfrExtend]);
+  useEffect(() => { setLines(loadLines(symbol)); measureRef.current = null; setVpfr(null); setVpfrs([]); }, [symbol]);
+  useEffect(() => { redrawRef.current?.(); }, [vpfr, vpfrs, vpfrExtend]);
 
   // Persist lines when the set changes.
   useEffect(() => { saveLines(symbol, lines); }, [lines, symbol]);
@@ -1518,8 +1891,14 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
         for (const bb of barsRef.current) { const d = Math.abs(bb.ts - t); if (d < best) { best = d; nb = bb.ts; } }
         if (nb == null) return;
         const cur = vpfrRef.current;
-        if (!cur || cur.toTs != null) setVpfr({ fromTs: nb, toTs: null });   // start a new range
-        else setVpfr({ fromTs: cur.fromTs, toTs: nb });                       // close the range
+        if (!cur) {
+          setVpfr({ fromTs: nb, toTs: null });                                // start a new range
+        } else {
+          // close the range → commit to the list (keeps prior VPFRs visible)
+          const fromTs = cur.fromTs;
+          if (nb !== fromTs) setVpfrs(prev => [...prev, { id: `${fromTs}_${nb}`, fromTs, toTs: nb }]);
+          setVpfr(null);
+        }
         redrawRef.current?.();
         return;
       }
@@ -1612,6 +1991,10 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   // Redraw VP when dailyVp changes
   useEffect(() => {
     drawVP(vpCanvasRef.current, chartRef.current, candleRef.current, dailyVp, bars, vpModeRef.current);
+    drawSessionVP(sessionVpCanvasRef.current, chartRef.current, candleRef.current,
+                  vpDailyRef.current ? bars : [], symbol);
+    drawSessionLines(slCanvasRef.current, chartRef.current, candleRef.current,
+                     sessionLinesRef.current ? bars : [], symbol);
   }, [dailyVp]);
 
   // VP price lines + detection markers + position lines
@@ -1890,6 +2273,10 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       <div ref={containerRef} style={{ width: "100%", height: "100%" }} />
       {/* Trade position boxes — under VP/bubbles so they read as background */}
       <canvas ref={tpCanvasRef} style={{ ...canvasStyle, zIndex: 4 }} />
+      {/* Per-day (session) volume profiles — background layer, under the left-edge VP */}
+      <canvas ref={sessionVpCanvasRef} style={{ ...canvasStyle, zIndex: 5 }} />
+      {/* Session boundary vertical lines */}
+      <canvas ref={slCanvasRef} style={{ ...canvasStyle, zIndex: 5 }} />
       {/* VP overlay — always shown */}
       <canvas ref={vpCanvasRef} style={{ ...canvasStyle, zIndex: 5 }} />
       {/* VPFR (fixed-range VP) overlay — drawn when a range is picked */}
@@ -1898,6 +2285,8 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       <canvas ref={bbCanvasRef} style={{ ...canvasStyle, zIndex: 6 }} />
       {/* CVD divergence overlay — visibility gated inside drawCVDDivergence */}
       <canvas ref={cdCanvasRef} style={{ ...canvasStyle, zIndex: 7 }} />
+      {/* CVD sweep study trades — visibility gated inside drawCVDSweeps */}
+      <canvas ref={csCanvasRef} style={{ ...canvasStyle, zIndex: 6 }} />
       {/* Footprint overlay — FP mode only */}
       <canvas
         ref={fpCanvasRef}
@@ -1977,6 +2366,48 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
             <div><span style={{ color: "#888" }}>cvd </span><span>{d.cvd}</span>
               <span style={{ color: "#888" }}> vs </span><span>{d.prev_cvd}</span></div>
             {tIst && <div><span style={{ color: "#888" }}>at </span><span>{tIst}</span></div>}
+          </div>
+        );
+      })()}
+      {/* CVD sweep trade hover tooltip */}
+      {hoverSweep && (() => {
+        const s = hoverSweep.s;
+        const OUTCOME_COL = { T2: "#26c6da", T3: "#5c6bc0", T1: "#66bb6a", SL: "#ef5350", TIME: "#9e9e9e" };
+        const color = OUTCOME_COL[s.outcome] || "#bbb";
+        const W = 260, H = 160;
+        const wrapRect = containerRef.current?.getBoundingClientRect() || { width: 800, height: 400 };
+        let tx = hoverSweep.x + 12, ty = hoverSweep.y + 12;
+        if (tx + W > wrapRect.width)  tx = hoverSweep.x - W - 12;
+        if (ty + H > wrapRect.height) ty = hoverSweep.y - H - 12;
+        const divTag = s.cvd_div_intact
+          ? (s.cvd_div_confirmed ? "confirmed-pivot" : s.cvd_div_live ? "live" : "yes")
+          : "no";
+        return (
+          <div style={{
+            position: "absolute", left: tx, top: ty,
+            background: "rgba(13,13,13,0.92)", border: `1px solid ${color}`,
+            borderRadius: 3, padding: "6px 8px", pointerEvents: "none",
+            zIndex: 20, minWidth: W, fontFamily: "JetBrains Mono, monospace",
+            fontSize: 11, color: "#bbb", lineHeight: 1.5,
+          }}>
+            <div style={{ color, fontWeight: 700 }}>
+              CVD SWEEP · {s.side?.toUpperCase()} → {s.outcome}
+            </div>
+            <div><span style={{ color: "#888" }}>HVN </span><span>{s.hvn_low} – {s.hvn_high}</span></div>
+            <div><span style={{ color: "#888" }}>sweep </span><span>{s.sweep_price}</span>
+                 <span style={{ color: "#888" }}>  pen </span><span>{s.penetration_atr}ATR</span></div>
+            <div><span style={{ color: "#888" }}>entry </span><span>{s.entry}</span>
+                 <span style={{ color: "#888" }}>  SL </span><span>{s.sweep_price}</span></div>
+            <div><span style={{ color: "#888" }}>T1 </span><span>{s.t1 ?? "—"}</span>
+                 <span style={{ color: "#888" }}>  T2 </span><span>{s.t2 ?? "—"}</span>
+                 <span style={{ color: "#888" }}>  T3 </span><span>{s.t3 ?? "—"}</span></div>
+            <div><span style={{ color: "#888" }}>Δ-tier </span><span>{s.delta_tier}</span>
+                 <span style={{ color: "#888" }}>  fav </span><span>{s.favorable_delta_ratio}</span></div>
+            <div><span style={{ color: "#888" }}>CVD-div </span><span>{divTag}</span>
+                 {s.div_strength > 0 && <><span style={{ color: "#888" }}>  str </span><span>{s.div_strength}</span></>}</div>
+            <div><span style={{ color: "#888" }}>MFE </span><span>{s.mfe_r}R</span>
+                 <span style={{ color: "#888" }}>  MAE </span><span>{s.mae_r}R</span></div>
+            <div><span style={{ color: "#888" }}>at </span><span>{s.ist}</span></div>
           </div>
         );
       })()}
@@ -2120,7 +2551,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
             { k: "measure", lbl: "📏", tip: "Measure: drag to read Δprice / % / bars" },
             { k: "ray",     lbl: "─",  tip: "Horizontal line (manual S/R, SL/TP). Click to place, drag to move, dbl-click to delete" },
             { k: "alert",   lbl: "🔔", tip: "Price alert: click to place; notifies when price crosses. Drag to move, dbl-click to delete" },
-            { k: "vpfr",    lbl: "▭VP", tip: "Fixed-range Volume Profile: click the start candle, then the end candle. Draws VP (POC/VAH/VAL) over that range. Toggle ↦ to extend the levels right." },
+            { k: "vpfr",    lbl: "▭VP", tip: "Fixed-range Volume Profile: click the start candle, then the end candle. Draws VP (POC/VAH/VAL) over that range. Draw multiple — each stays until cleared. ↦ extends all levels right, ⤺ undoes the last, ✕VP clears all." },
           ].map(t => {
             const on = drawTool === t.k;
             return (
@@ -2151,11 +2582,11 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
               ✕{lines.length}
             </button>
           )}
-          {vpfr && (
+          {(vpfr || vpfrs.length > 0) && (
             <>
               <button
                 onClick={() => setVpfrExtend(x => !x)}
-                title="Extend the VPFR POC/VAH/VAL lines to the right edge"
+                title="Extend every VPFR's POC/VAH/VAL lines to the right edge"
                 style={{
                   background: "rgba(26,26,26,0.85)",
                   border: `1px solid ${vpfrExtend ? "#5c9eff" : "#2a2a2a"}`,
@@ -2165,15 +2596,27 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
               >
                 ↦
               </button>
+              {vpfrs.length > 0 && (
+                <button
+                  onClick={() => setVpfrs(prev => prev.slice(0, -1))}
+                  title="Undo the last fixed-range volume profile"
+                  style={{
+                    background: "rgba(26,26,26,0.85)", border: "1px solid #2a2a2a",
+                    color: "#888", padding: "2px 6px", cursor: "pointer", borderRadius: 3, lineHeight: 1.4,
+                  }}
+                >
+                  ⤺
+                </button>
+              )}
               <button
-                onClick={() => { setVpfr(null); setVpfrExtend(false); }}
-                title="Clear the fixed-range volume profile"
+                onClick={() => { setVpfr(null); setVpfrs([]); setVpfrExtend(false); }}
+                title="Clear all fixed-range volume profiles"
                 style={{
                   background: "rgba(26,26,26,0.85)", border: "1px solid #2a2a2a",
                   color: "#888", padding: "2px 6px", cursor: "pointer", borderRadius: 3, lineHeight: 1.4,
                 }}
               >
-                ✕VP
+                ✕VP{vpfrs.length > 0 ? vpfrs.length : ""}
               </button>
             </>
           )}

@@ -81,6 +81,14 @@ const IMBALANCE_RATIO = 3.0;
 const STACKED_MIN     = 3;
 const IST = 19800;
 
+// Session-anchored day key, matching backend daily VP / CandleChart per-day VP:
+// XAU session opens 03:30 IST, BTC/others 05:30 IST. Bars before the anchor
+// belong to the prior session.
+function sessionDayKey(ts, symbol) {
+  const startSec = symbol?.startsWith("XAU") ? 12600 : 19800; // 03:30 / 05:30 IST
+  return Math.floor((ts + IST - startSec) / 86400);
+}
+
 function inferTickSize(bars) {
   // Smallest positive diff between adjacent ladder prices across all bars.
   let tick = 0;
@@ -300,6 +308,33 @@ export default function FootprintPane({
       const nearest = (ts - bars[lo].ts) < (bars[hi].ts - ts) ? lo : hi;
       return xCenterOfBar(nearest);
     };
+
+    // Session boundary vertical lines — session-anchored per symbol. A line at
+    // each session start (= prior session's end), labeled with the date.
+    if (indicators?.sessionLines !== false) {
+      ctx.save();
+      ctx.font = "9px JetBrains Mono, monospace";
+      for (let i = 1; i < slots.length; i++) {
+        if (sessionDayKey(slots[i - 1].bar.ts, symbol) === sessionDayKey(slots[i].bar.ts, symbol)) continue;
+        const xb = slots[i].slot * barW - subBarPx;
+        if (xb < 0 || xb > plotW) continue;
+        ctx.setLineDash([2, 4]);
+        ctx.strokeStyle = "rgba(120,140,180,0.5)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(xb, PAD_TOP);
+        ctx.lineTo(xb, PAD_TOP + plotH);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        const d = new Date((slots[i].bar.ts + IST) * 1000);
+        const lbl = `${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")} open`;
+        ctx.fillStyle = "rgba(150,165,190,0.75)";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "top";
+        ctx.fillText(lbl, xb + 3, PAD_TOP + 2);
+      }
+      ctx.restore();
+    }
 
     // HVN / LVN bands — labeled rectangle with dashed border
     const drawVpZone = (lo, hi, fill, bdr, label) => {

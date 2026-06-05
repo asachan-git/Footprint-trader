@@ -131,14 +131,18 @@ def _fill_pending_legs(symbol: str, latest: Bar) -> list[dict]:
     return filled
 
 
-def _check_cycle_tp(symbol: str, latest: Bar) -> list[dict]:
+def _check_cycle_tp(symbol: str, latest: Bar, settings: dict | None = None) -> list[dict]:
     """Close any cycle whose TP has been reached AND avg_entry is in profit.
 
     Guards:
       - TP must be on profit side of avg (else skip — partly-filled grid)
       - SWEEP CONTINUATION: if latest bar shows sweep-continuation in cycle
         direction, skip TP close on this bar to let momentum run.
+      - CVD CONTINUATION (opt-in, settings.cycle.cvd_continuation_hold): if the
+        latest bar is a high-CVD candle favoring continuation in the cycle
+        direction, hold the TP and let the move run.
     """
+    cvd_hold = bool((settings or {}).get("cycle", {}).get("cvd_continuation_hold"))
     from execution.pending_orders import pending_store
     from execution.position_store import position_store
     closed = []
@@ -152,6 +156,10 @@ def _check_cycle_tp(symbol: str, latest: Bar) -> list[dict]:
         # Sweep-continuation override — let TP run if a fresh sweep_reclaim aligns with cycle
         if _sweep_continuation_active(symbol, pos.side):
             LOG.info(f"[cycle] sweep_reclaim on {symbol} {pos.side} — TP held")
+            continue
+        # CVD-continuation override — let TP run while a high-CVD candle favors continuation
+        if cvd_hold and _cvd_continuation_active(symbol, pos.side, latest, settings):
+            LOG.info(f"[cycle] cvd_continuation on {symbol} {pos.side} — TP held")
             continue
         hit = False
         if pos.side == "long" and latest.ohlc.h >= tp:
@@ -351,6 +359,54 @@ def _check_si_trail(symbol: str, latest: Bar, settings: dict | None = None) -> l
             moved.append({"position_id": pos.position_id, "new_sl": round(new_sl, 4)})
             LOG.info(f"[cycle] SI-TRAIL {pos.position_id} {pos.side} SL {cur:.2f}→{new_sl:.2f}")
     return moved
+
+
+def _cvd_continuation_active(symbol: str, side: Literal["long", "short"],
+                             latest: Bar, settings: dict | None = None) -> bool:
+    """True if the latest bar is a HIGH-CVD candle whose order flow favors
+    CONTINUATION in the cycle direction — used to HOLD the cycle TP and let the
+    move run instead of banking a tiny target.
+
+    "High-CVD candle range favoring continuation" =
+      - the dominant CVD pattern is a continuation read aligned with the cycle
+        (long: breakout_long / hidden_buying; short: breakout_short / hidden_selling),
+        with confidence ≥ cvd_hold_conf, AND
+      - the current CVD candle's |delta| is genuinely large vs recent bars
+        (≥ cvd_hold_delta_mult × mean |delta| of the prior window) — i.e. price
+        is sitting in the range of a high-aggression candle, not a quiet one.
+
+    Opt-in: only consulted when settings.cycle.cvd_continuation_hold is set.
+    """
+    try:
+        from pipeline.state_store import store as _store
+        from pipeline.features.cvd_candlestick import detect as _cvd_detect
+        from pipeline.features.cvd_candlestick import build_cvd_candles as _build_cvd
+
+        cyc = (settings or {}).get("cycle", {})
+        conf_gate = float(cyc.get("cvd_hold_conf", 0.70))
+        delta_mult = float(cyc.get("cvd_hold_delta_mult", 1.3))
+
+        bars = _store().recent(symbol, latest.tf, 60)
+        if len(bars) < 6:
+            return False
+        sig = _cvd_detect(bars)
+        cont = {"long": {"breakout_long", "hidden_buying"},
+                "short": {"breakout_short", "hidden_selling"}}[side]
+        if sig.pattern not in cont or sig.confidence < conf_gate:
+            return False
+
+        # "High-CVD candle" gate: current candle's flow must dwarf the recent norm.
+        candles = _build_cvd(bars)
+        if len(candles) < 4:
+            return False
+        cur = abs(candles[-1].delta)
+        prior = [abs(c.delta) for c in candles[:-1][-20:]]
+        mean_prior = (sum(prior) / len(prior)) if prior else 0.0
+        if mean_prior <= 0 or cur < delta_mult * mean_prior:
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def _sweep_continuation_active(symbol: str, side: Literal["long", "short"]) -> bool:
@@ -772,7 +828,7 @@ def on_bar_close(symbol: str, primary_tf: str, latest: Bar, settings: dict | Non
         LOG.exception(f"[cycle] scale_out failed: {e}")
         actions["scale_out_error"] = str(e)
     try:
-        actions["closed_tp"] = _check_cycle_tp(symbol, latest)
+        actions["closed_tp"] = _check_cycle_tp(symbol, latest, settings)
     except Exception as e:
         LOG.exception(f"[cycle] check_tp failed: {e}")
         actions["tp_error"] = str(e)

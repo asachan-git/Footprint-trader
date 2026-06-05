@@ -31,10 +31,14 @@ from pipeline.types import Bar
 from pipeline.state_store import store
 from pipeline.features.atr import atr
 from pipeline.features.choch import detect_choch, impulse_leg
+from pipeline.features.volume_profile import compute as vp_compute, DEFAULT_BIN_SIZE
 
 from .coup import Coup, _clamp
 
 LOG = logging.getLogger(__name__)
+
+# VP window per tf for the VP-level-target mode (trailing volume profile).
+VP_WIN = {"1m": 1440, "5m": 288, "15m": 96}
 
 
 class ReversalChoch(Coup):
@@ -54,6 +58,8 @@ class ReversalChoch(Coup):
         cfg.setdefault("entry_expiry_bars", 6)  # bars a LIMIT waits for the retrace touch
         cfg.setdefault("sl_buf_atr", 0.10)      # buffer beyond the swing origin (× ATR)
         cfg.setdefault("min_sl_atr_mult", 0.5)  # floor on entry↔SL distance
+        cfg.setdefault("tp_mode", "fib")        # "fib" = fib_ext extension; "vp" = nearest VP level beyond the extreme
+        cfg.setdefault("vp_tp_min_rr", 1.0)     # vp-target must clear this RR, else fall back to fib_ext
         super().__init__(cfg)
         self._pending_entry: dict[str, dict] = {}   # symbol → armed LIMIT awaiting touch
         self._seen_choch: dict[str, int] = {}       # symbol → broken_at_ts already handled
@@ -92,6 +98,33 @@ class ReversalChoch(Coup):
             ),
             invalidation_note="price closes past the swing origin (leg invalidated) → structural SL",
         )
+
+    def _vp_tp(self, symbol: str, bars: list[Bar], decide_tf: str,
+               side: str, extreme: float) -> float | None:
+        """VP-level target: nearest volume-profile level (POC / VA edge / naked POC /
+        HVN-zone midpoint) BEYOND the impulse extreme in the trade direction. The fade
+        runs in the new ChoCh direction, so a long aims at the first VP level above the
+        break high, a short at the first below the break low. None → caller keeps fib TP."""
+        win_n = VP_WIN.get(decide_tf, 96)
+        seg = bars[-win_n:] if len(bars) > win_n else bars
+        if len(seg) < 20:
+            return None
+        try:
+            vp = vp_compute(seg, "intraday", bars[-1].ohlc.c,
+                            bin_size=DEFAULT_BIN_SIZE.get(symbol))
+        except Exception:
+            return None
+        levels: list[float] = []
+        for k in (vp.poc, vp.vah, vp.val, vp.naked_poc):
+            if k is not None:
+                levels.append(float(k))
+        for z in (vp.hvn_zones or []):
+            levels.append((float(z["low"]) + float(z["high"])) / 2.0)
+        cand = [L for L in levels if (L > extreme) if side == "long"] if side == "long" \
+            else [L for L in levels if L < extreme]
+        if not cand:
+            return None
+        return min(cand) if side == "long" else max(cand)   # nearest beyond the extreme
 
     def _arm_signal(self, symbol: str, bars: list[Bar], decide_tf: str) -> dict | None:
         """Detect a fresh 15m ChoCh and build the Fib retrace/extension levels."""
@@ -142,6 +175,18 @@ class ReversalChoch(Coup):
             sl = min(sl_raw - buf, entry - min_dist)
         else:
             sl = max(sl_raw + buf, entry + min_dist)
+
+        # TP source: fib_ext extension (default) or nearest VP level beyond the extreme.
+        # VP target must run the right way and clear vp_tp_min_rr, else keep the fib TP.
+        tp_src = "fib"
+        if str(cfg.get("tp_mode", "fib")) == "vp":
+            vp_tp = self._vp_tp(symbol, bars, decide_tf, side, extreme)
+            if vp_tp is not None:
+                risk = abs(entry - sl) or 1e-9
+                ok_dir = (vp_tp > entry) if side == "long" else (vp_tp < entry)
+                if ok_dir and abs(vp_tp - entry) / risk >= float(cfg.get("vp_tp_min_rr", 1.0)):
+                    tp, tp_src = float(vp_tp), "vp"
+
         if (side == "long" and not (sl < entry < tp)) or (side == "short" and not (tp < entry < sl)):
             self._seen_choch[symbol] = event.broken_at_ts
             return None
@@ -151,6 +196,7 @@ class ReversalChoch(Coup):
             "ts": event.broken_at_ts, "side": side, "entry": round(entry, 4),
             "sl": round(sl, 4), "tp": round(tp, 4), "origin": round(origin, 4),
             "extreme": round(extreme, 4), "fib_entry": fib_entry, "fib_ext": fib_ext,
+            "tp_src": tp_src,
             "choch_dir": event.direction, "last_trend": event.last_trend,
             "broken_level": round(event.broken_level, 4),
         }

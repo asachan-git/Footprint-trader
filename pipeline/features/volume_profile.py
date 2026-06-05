@@ -334,7 +334,7 @@ def _merge_zones(zones: list[dict], merge_tol: float) -> list[dict]:
 
 
 def _find_hvn_zones(
-    bins: np.ndarray, bin_size: float, price_min: float, top_n: int = 4
+    bins: np.ndarray, bin_size: float, price_min: float, top_n: int = 8
 ) -> list[dict]:
     """HVN via Gaussian-smoothed bins, prominence ≥ 0.5×avg, height ≥ avg.
     Adjacent zones within 2×bin_size are merged (Sierra/Bookmap convention).
@@ -357,7 +357,7 @@ def _find_hvn_zones(
 
 
 def _find_lvn_zones(
-    bins: np.ndarray, bin_size: float, price_min: float, top_n: int = 4
+    bins: np.ndarray, bin_size: float, price_min: float, top_n: int = 8
 ) -> list[dict]:
     """LVN via Gaussian-smoothed inverted signal, restricted to active range.
     Adjacent valleys within 2×bin_size are merged.

@@ -39,3 +39,12 @@ export async function fetchGridCycles(mode, symbol, tf) {
   const { data } = await axios.get(`/grid/${mode}/cycles`, { params: { symbol, tf } });
   return data?.cycles ?? [];
 }
+
+// CVD sweep study setups for chart overlay (from data/reports/cvd_sweep_*.jsonl).
+export async function fetchCvdSweeps(symbol, tf, { divOnly = false, tier = null } = {}) {
+  const params = { symbol, tf };
+  if (divOnly) params.div_intact = "true";
+  if (tier) params.tier = tier;
+  const { data } = await axios.get("/cvd_sweeps", { params });
+  return data?.sweeps ?? [];
+}

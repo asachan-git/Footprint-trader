@@ -5,7 +5,7 @@ import VoteBreakdown from "./components/VoteBreakdown.jsx";
 import DecisionCards from "./components/DecisionCards.jsx";
 import Positions from "./components/Positions.jsx";
 import ABStats from "./components/ABStats.jsx";
-import { fetchStrategyTrades, fetchGridTrades, fetchStrategyCycles, fetchGridCycles, fetchStrategyOutcomes } from "./api.js";
+import { fetchStrategyTrades, fetchGridTrades, fetchStrategyCycles, fetchGridCycles, fetchStrategyOutcomes, fetchCvdSweeps } from "./api.js";
 
 // Outcome-range presets → seconds back from now (null secs = all-time).
 const OUTCOME_RANGES = [
@@ -28,8 +28,9 @@ const DEFAULT_IND = {
   coupAbs:     false, coupRevAbs: false, coupAbsConf: false,
   coupTrades:  true,  demoTrades: true, repTrades: true,
   m1Trades:    false, m2Trades: false, cycleTrades: false,
-  vwap:        false, atrTrail: false, vpFull: false, cvdDiv: false, cvdEqDiv: false, cvdLine: false, revPattern: false,
+  vwap:        false, atrTrail: false, vpFull: false, vpDaily: false, sessionLines: true, cvdDiv: false, cvdEqDiv: false, cvdLine: false, revPattern: false,
   chochSetup:  false, waveSetup: false,
+  cvdSweeps:   false, cvdSweepsDivOnly: false,
 };
 
 const IND_ITEMS = [
@@ -55,12 +56,16 @@ const IND_ITEMS = [
   { key: "vwap",         label: "VWAP + σ bands",         tip: "Session-anchored VWAP (UTC day) with volume-weighted ±1σ/±2σ bands. Dynamic SL/TP anchor; mean-revert target = VWAP, stretch target = ±2σ" },
   { key: "atrTrail",     label: "ATR Trail (SuperTrend)", tip: "ATR-based SuperTrend trailing stop. Sits below price in uptrend (green), above in downtrend (red). Visual TSL / trend filter" },
   { key: "vpFull",       label: "VP: full window",        tip: "Volume profile (left edge) scope: ON = whole loaded window, OFF = visible range only. Real bid/ask volume-at-price with POC + 70% value area + HVN/LVN" },
+  { key: "vpDaily",      label: "VP: per-day",            tip: "Session-anchored volume profile PER DAY (XAU 03:30 IST / BTC 05:30 IST), anchored to each day's candle span (market-profile style). Faint per-day POC/VAH/VAL + HVN/LVN tint + day separators. Independent of the left-edge VP" },
+  { key: "sessionLines", label: "Session lines",          tip: "Vertical dashed lines at each session boundary (XAU 03:30 IST / BTC 05:30 IST) — marks the start of each day's session (= prior session's end), labeled with the date. Drawn on both OHLC and Footprint panes" },
   { key: "cvdDiv",       label: "CVD Divergence (HH/LL)",  tip: "STRICT regular divergence at swing-HL pivots + current candle (no in-between). Bear ▽ (red) at higher-high w/ lower CVD; bull △ (green) at lower-low w/ higher CVD. Hollow = live (current bar, provisional). Toggle 'CVD Div (EqH/L)' for equal-high/low divergences separately" },
   { key: "cvdEqDiv",     label: "CVD Div (EqH/L)",        tip: "EQUAL-high/low divergence: price retests the same extreme (±0.15%) but CVD makes a lower/higher value = distribution at the liquidity level. Same ▽/△ marker + a small '=' tick. Independent of the strict HH/LL toggle" },
   { key: "cvdLine",      label: "CVD Line",               tip: "Continuous Cumulative Volume Delta line (secondary scale), every bar. Separate from the divergence markers so the markers can show clean without the line clutter" },
   { key: "revPattern",   label: "Reversal Pattern ⚑",     tip: "DIAGNOSTIC (not a trade signal — backtests ~breakeven). Climax pivot (vol≥2×med) + next-bar delta flip (closes reversal way + rev-delta swing ≥50). Rendered as TRADES (⚑, cyan): entry→exit box w/ structural SL (swing high/low + buffer) + 2R TP, win/loss colored, outcome resolved from bars; hover for reason/RR. Any TF" },
   { key: "chochSetup",   label: "ChoCh→Fib ⤰",            tip: "reversal_choch setups (15m only). After a Change of Character (break of the last HL/LH) it arms a counter-trend reversal: LIMIT at the 0.705 fib retrace of the impulse leg, SL beyond the swing origin, TP at the 2.0 extension. Rendered as a trade box (entry→SL/TP, outcome resolved from bars); hover for the ChoCh dir + leg" },
   { key: "waveSetup",    label: "Wave-Fib (3rd wave) ⤴", tip: "wave_fib continuation setups (15m only). After a two-wave trend confirms (HH+HL / LL+LH) it arms a WITH-trend 3rd-wave entry: LIMIT at the VP-value edge of the two-wave structure, SL beyond the HL/LH, TP at 2.0× the wave-1 measured move. Rendered as a trade box; hover for the wave structure" },
+  { key: "cvdSweeps",    label: "CVD Sweep Trades ⚐",    tip: "Simulated trades from scripts/cvd_sweep_study.py (5m/15m only). HVN-extreme sweep + close-reclaim setups, with T1/T2/T3 horizontal lines (T1 opp HVN edge, T2 next HVN, T3 LVN extreme), SL = sweep wick. Entry triangle colored by outcome (T2 cyan, T3 indigo, T1 green, SL red, TIME gray). Solid marker = CVD div intact (thesis subset); faint = no div." },
+  { key: "cvdSweepsDivOnly", label: "CVD Sweep — div-intact only", tip: "Filter the CVD Sweep Trades layer to ONLY setups with CVD divergence intact (the thesis subset). Cuts the visual noise from the 80%+ no-div population. No effect unless 'CVD Sweep Trades' is also on." },
 ];
 
 function LayersToggle({ indicators, onChange }) {
@@ -181,6 +186,7 @@ export default function App() {
   const [lastTs,    setLastTs]    = useState(null);
   const [stratTrades, setStratTrades] = useState({ coup: [], democracy: [], republic: [], m1: [], m2: [] });
   const [stratCycles, setStratCycles] = useState({ coup: [], democracy: [], republic: [], m1: [] });
+  const [cvdSweeps,   setCvdSweeps]   = useState([]);
   const esRef = useRef(null);
 
   // Per-strategy outcomes panel — range selector (preset or custom from/to).
@@ -237,6 +243,22 @@ export default function App() {
     const id = setInterval(load, 30000);
     return () => { cancel = true; clearInterval(id); };
   }, [symbol, tf]);
+
+  // CVD sweep study setups — backtest output, only available for 5m/15m JSONLs.
+  useEffect(() => {
+    if (tf !== "5m" && tf !== "15m") { setCvdSweeps([]); return; }
+    let cancel = false;
+    fetchCvdSweeps(symbol, tf).then(rows => { if (!cancel) setCvdSweeps(rows); })
+                              .catch(() => { if (!cancel) setCvdSweeps([]); });
+    return () => { cancel = true; };
+  }, [symbol, tf]);
+
+  // Filter to thesis subset if the sub-toggle is on (else keep the whole list).
+  const cvdSweepsView = useMemo(() => {
+    if (!indicators.cvdSweeps) return [];
+    if (indicators.cvdSweepsDivOnly) return cvdSweeps.filter(s => s.cvd_div_intact);
+    return cvdSweeps;
+  }, [cvdSweeps, indicators.cvdSweeps, indicators.cvdSweepsDivOnly]);
 
   // Merge enabled strategies/modes into one tagged array for the chart.
   const reversalPatterns = data?.reversal_patterns ?? [];
@@ -458,6 +480,8 @@ export default function App() {
             strategyTrades={strategyTrades}
             cvd={data?.cvd ?? []}
             cvdDivergences={data?.cvd_divergences ?? []}
+            cvdSweeps={cvdSweepsView}
+            tf={tf}
             symbol={symbol}
             chartMode={chartMode}
             indicators={indicators}

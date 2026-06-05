@@ -25,6 +25,7 @@ LOG = logging.getLogger(__name__)
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 _STRAT_DIR = _ROOT / "data" / "strategies"
+_REPORT_DIR = _ROOT / "data" / "reports"
 
 
 def _backtest_trades(name: str, symbol: str | None, tf: str | None) -> list[dict]:
@@ -249,6 +250,39 @@ def grid_cycles(mode: str):
     cycles = _pair_cycles(pair[0], pair[1], symbol, tf, source=mode)
     cycles.sort(key=lambda t: t.get("entry_ts") or 0)
     return jsonify({"ok": True, "mode": mode, "cycles": cycles})
+
+
+@bp.get("/cvd_sweeps")
+def cvd_sweeps():
+    """Sweep setups produced by scripts/cvd_sweep_study.py for chart verification.
+
+    Each row carries: ts, side, entry, sweep_price (=SL), hvn_low/high,
+    t1/t2/t3 targets, hit_t{1,2,3}, sl_hit, outcome, mfe_r/mae_r,
+    delta_tier, cvd_div_intact (+ confirmed/live split), penetration_atr.
+
+    Query: symbol (required), tf (required, e.g. 5m|15m),
+           div_intact=true (optional filter), tier=high|weak|none (optional)."""
+    symbol = request.args.get("symbol")
+    tf = request.args.get("tf")
+    if not symbol or not tf:
+        return jsonify({"ok": False, "error": "symbol and tf required"}), 400
+    f = _REPORT_DIR / f"cvd_sweep_{symbol}_{tf}.jsonl"
+    if not f.exists():
+        return jsonify({"ok": True, "symbol": symbol, "tf": tf, "sweeps": []})
+    only_div = (request.args.get("div_intact", "").lower() in ("1", "true", "yes"))
+    tier = request.args.get("tier")
+    rows: list[dict] = []
+    for line in f.open():
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        if only_div and not r.get("cvd_div_intact"):
+            continue
+        if tier and r.get("delta_tier") != tier:
+            continue
+        rows.append(r)
+    rows.sort(key=lambda r: r.get("ts") or 0)
+    return jsonify({"ok": True, "symbol": symbol, "tf": tf, "sweeps": rows})
 
 
 @bp.post("/strategies/tick")

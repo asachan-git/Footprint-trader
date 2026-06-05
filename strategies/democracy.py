@@ -27,6 +27,20 @@ LOG = logging.getLogger(__name__)
 class Democracy(Strategy):
     name = "democracy"
 
+    def settings_override(self, settings: dict) -> dict:
+        """Hold cycle TP while a high-CVD candle favors continuation in the cycle
+        direction — lets winners run past the tiny mechanical TP instead of banking
+        sub-1R. Addresses democracy's high-WR / negative-R skew: wins were capping
+        at ~0.2R while disaster-floor losses took ~0.85R. Tunable via
+        cfg.cvd_hold_conf / cfg.cvd_hold_delta_mult."""
+        cyc = {
+            **(settings.get("cycle") or {}),
+            "cvd_continuation_hold": bool(self.config.get("cvd_continuation_hold", True)),
+            "cvd_hold_conf": float(self.config.get("cvd_hold_conf", 0.70)),
+            "cvd_hold_delta_mult": float(self.config.get("cvd_hold_delta_mult", 1.3)),
+        }
+        return {**settings, "cycle": cyc}
+
     def decide(self, symbol: str, tf: str, bar: Bar, settings: dict) -> Decision | None:
         # The direction engine votes on 15m structure regardless of the feed TF.
         vote_tf = str(self.config.get("vote_tf") or "15m")
