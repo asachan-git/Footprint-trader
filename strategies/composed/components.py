@@ -346,6 +346,33 @@ def _reversal_flip(params: dict):
     return run
 
 
+@trigger("vote_panel")
+def _vote_panel(params: dict):
+    """Weighted vote panel (execution.direction_engine.decide_direction). Port of
+    Democracy.decide — side + bias only; entry = bar close; SL/TP are PLACEHOLDERS
+    (the grid placer + cycle_manager set the real ones). Fires every non-flat bar
+    (no dedup — the downstream same-direction-cycle guard handles repeats)."""
+    def run(ctx: Ctx) -> Signal | None:
+        from execution.direction_engine import decide_direction
+        vote_tf = str(ctx.config.get("vote_tf") or "15m")
+        dd = decide_direction(ctx.symbol, vote_tf)
+        if dd.side == "flat":
+            return None
+        close = ctx.bar.ohlc.c
+        sl = close * (0.95 if dd.side == "long" else 1.05)
+        tp = close * (1.05 if dd.side == "long" else 0.95)
+
+        def rationale(e, s, t, _dd=dd):
+            return f"democracy: weighted vote score={_dd.score:.2f} bias={_dd.bias_strength}/5 | {_dd.note}"
+
+        return Signal(side=dd.side, entry_ref=close, sl_raw=sl, atr=0.0,
+                      dedup_key=ctx.bar.close_ts,
+                      confidence=min(1.0, dd.bias_strength / 5.0), bias_strength=dd.bias_strength,
+                      rationale_fn=rationale, invalidation_note="",
+                      kind="market", sl=sl, tp=tp)
+    return run
+
+
 # ── entry ───────────────────────────────────────────────────────────────────
 @entry("market")
 def _entry_market(params: dict):
@@ -457,6 +484,132 @@ def _exec_single_leg(params: dict):
         # single-leg tactical entry → no Claude hedge-eval (matches coup)
         return {"hedge_eval_enabled": False}
     run.policy = policy
+    return run
+
+
+# ── grid-execution helpers (ported from Republic/Senate) ─────────────────────
+def _atr15(symbol: str) -> float:
+    try:
+        from pipeline.features.atr import atr_from_store
+        a = atr_from_store(symbol, "15m", period=14)
+        if a <= 0:
+            a = atr_from_store(symbol, "1m", period=14) * 15
+        return a or 0.0
+    except Exception:
+        return 0.0
+
+
+def _sl_confluent(symbol: str, sl: float, atr: float, tol_atr: float) -> bool:
+    if atr <= 0:
+        return False
+    tol = tol_atr * atr
+    try:
+        from pipeline.features.vp_cache import get as vp_get
+    except Exception:
+        return False
+    for period in ("daily", "weekly"):
+        vp = vp_get(symbol, period)
+        if not vp:
+            continue
+        for hvn in vp.get("hvn_zones") or []:
+            if abs(sl - (hvn["low"] + hvn["high"]) / 2) <= tol:
+                return True
+        for key in ("poc", "vah", "val", "naked_poc"):
+            v = vp.get(key)
+            if isinstance(v, (int, float)) and v > 0 and abs(sl - v) <= tol:
+                return True
+        for lvn in vp.get("lvn_zones") or []:
+            if lvn["low"] <= sl <= lvn["high"]:
+                return True
+    return False
+
+
+def _favorable_walls(bar: Bar, side: str, anchor: float) -> list[float]:
+    want = "sell" if side == "short" else "buy"
+    out: list[float] = []
+    try:
+        from pipeline.footprint import build as build_fp
+        from pipeline.features.stacked_imbalance import stacked_imbalances
+        fp = build_fp(bar)
+        for z in stacked_imbalances(fp, min_stack=3, ratio=3.0):
+            if z.side != want:
+                continue
+            edge = z.price_high if side == "short" else z.price_low
+            if (side == "short" and edge >= anchor) or (side == "long" and edge <= anchor):
+                out.append(edge)
+    except Exception:
+        pass
+    try:
+        from pipeline.features.big_trade import get_recent_events
+        for e in get_recent_events(bar.symbol, bar.tf, n=20):
+            if e.aggressor != want:
+                continue
+            if (side == "short" and e.price >= anchor) or (side == "long" and e.price <= anchor):
+                out.append(e.price)
+    except Exception:
+        pass
+    return out
+
+
+@execution("grid_structural_sl")
+def _exec_grid_structural_sl(params: dict):
+    """Reshape the grid plan's safety SL + scale the TP — port of Republic.adjust_plan
+    (+ Senate via sl_anchor='wall'). SL anchor:
+      confluence — candle extreme ± buf×ATR, used only if VP/LVN-confluent; else ATR
+      wall       — beyond the farthest favourable footprint wall; else ATR
+    Then the bias≥N confirmation TP push (resolve_tp ≥ tp_conf_atr_mult×ATR)."""
+    sl_anchor = str(params.get("sl_anchor", "confluence"))
+    sl_atr_mult = float(params.get("sl_atr_mult", 1.5))
+    struct_buf = float(params.get("sl_struct_buf_atr", 0.2))
+    wall_buf = float(params.get("sl_wall_buf_atr", 0.25))
+    conf_tol = float(params.get("sl_conf_tol_atr", 0.25))
+    tp_bias_min = int(params.get("tp_conf_bias_min", 4))
+    tp_atr_mult = float(params.get("tp_conf_atr_mult", 3.0))
+
+    def _compute_sl(plan, bar, atr15, anchor):
+        atr_sl = (anchor + sl_atr_mult * atr15) if plan.side == "short" else (anchor - sl_atr_mult * atr15)
+        if sl_anchor == "wall":
+            walls = _favorable_walls(bar, plan.side, anchor)
+            if not walls:
+                return atr_sl, "atr_fallback"
+            w = max(walls) if plan.side == "short" else min(walls)
+            sl = (w + wall_buf * atr15) if plan.side == "short" else (w - wall_buf * atr15)
+            src = "wall_vp" if _sl_confluent(bar.symbol, w, atr15, conf_tol) else "wall"
+            return sl, src
+        # confluence (republic)
+        extreme = bar.ohlc.h if plan.side == "short" else bar.ohlc.l
+        sl_struct = (extreme + struct_buf * atr15) if plan.side == "short" else (extreme - struct_buf * atr15)
+        if _sl_confluent(bar.symbol, sl_struct, atr15, conf_tol):
+            return sl_struct, "struct_confluence"
+        return atr_sl, f"{sl_atr_mult}×ATR"
+
+    def run(plan, bar: Bar, ctx: Ctx):
+        atr15 = _atr15(bar.symbol)
+        if atr15 <= 0:
+            return plan
+        anchor = plan.anchor_price
+        new_sl, _src = _compute_sl(plan, bar, atr15, anchor)
+        if plan.safety_sl is not None:
+            new_sl = (max(new_sl, plan.safety_sl) if plan.side == "long"
+                      else min(new_sl, plan.safety_sl))
+        new_offset = (new_sl - anchor) / anchor if anchor > 0 else plan.safety_sl_offset_pct
+        new_tp, new_tp_source, new_tp_offset = plan.take_profit, plan.tp_source, plan.tp_offset_pct
+        if plan.bias_strength >= tp_bias_min and plan.legs:
+            try:
+                from execution.tp_resolver import resolve_tp
+                leg1 = plan.legs[0].price
+                cand = resolve_tp(bar.symbol, plan.side, anchor=leg1, min_distance=tp_atr_mult * atr15)
+                if cand is not None and (
+                    (plan.side == "long" and cand.price > plan.take_profit)
+                    or (plan.side == "short" and cand.price < plan.take_profit)
+                ):
+                    new_tp = cand.price
+                    new_tp_source = f"conf_tp:{cand.source}"
+                    new_tp_offset = (new_tp - anchor) / anchor if anchor > 0 else plan.tp_offset_pct
+            except Exception:
+                pass
+        return replace(plan, safety_sl=new_sl, safety_sl_offset_pct=new_offset,
+                       take_profit=new_tp, tp_source=new_tp_source, tp_offset_pct=new_tp_offset)
     return run
 
 
