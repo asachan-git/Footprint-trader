@@ -60,6 +60,15 @@ def build_enabled() -> list[Strategy]:
         # `class` lets a config entry instantiate a registered class under a
         # different instance name (e.g. name=coup_5m, class=coup) so a 5m and a 15m
         # instance get separate stores (data/strategies/<name>/). Falls back to name.
+        # engine: composed → the config-driven ComposedStrategy (components wired
+        # in config), instead of a bespoke registered class.
+        if entry.get("engine") == "composed":
+            from .composed.engine import ComposedStrategy
+            inst = ComposedStrategy(config={**(entry.get("config") or {}), "name": name})
+            inst.name = name
+            out.append(inst)
+            LOG.info(f"[registry] loaded composed strategy: {name}")
+            continue
         cls = REGISTRY.get(entry.get("class") or name)
         if cls is None:
             LOG.warning(f"[registry] unknown strategy {name!r} — skipping (not in REGISTRY)")
