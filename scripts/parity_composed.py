@@ -24,10 +24,13 @@ import pipeline.state_store as _ss
 import strategies.coup as _coupmod
 import strategies.reversal_choch as _chochmod
 import strategies.wave_fib as _wavemod
+import strategies.reversal_si as _simod
+import strategies.reversal as _revmod
 from strategies.coup import Coup
 from strategies.coup_reversal import CoupReversal
 from strategies.reversal_choch import ReversalChoch
 from strategies.wave_fib import WaveFib
+from strategies.reversal_si import ReversalSI
 from strategies.composed.engine import ComposedStrategy
 
 WARMUP = 215   # choch needs choch_lookback(200)+ bars before it can detect
@@ -102,6 +105,15 @@ CASES = [
      "composed": lambda: ComposedStrategy(config={"name": "wave_fib_ext", "engine": "composed", "decide_tf": "15m",
          "trigger": {"type": "wave_fib", "entry_mode": "vp", "vp_level": "value", "fib_ext": 1.618, "entry_expiry_bars": 6},
          "execution": {"type": "single_leg"}, "exits": [{"type": "hard_sl"}]})},
+    {"label": "reversal_si",
+     "legacy": lambda: ReversalSI(config={"symbols": ["BTCUSDT"], "decide_tf": "15m", "vol_mult": 2.0,
+         "delta_swing": 50.0, "vp_filter": True, "entry_mode": "si_flip", "target_mode": "vp_lvn",
+         "si_trail": True, "cvd_divergence_exit": True, "cvd_exit_conf": 0.65}),
+     "composed": lambda: ComposedStrategy(config={"name": "reversal_si", "engine": "composed", "decide_tf": "15m",
+         "trigger": {"type": "reversal_flip", "vol_mult": 2.0, "delta_swing": 50.0, "vp_filter": True, "entry_mode": "si_flip"},
+         "entry": {"type": "market"}, "tp": {"type": "vp_lvn_ladder"},
+         "execution": {"type": "single_leg"},
+         "exits": [{"type": "hard_sl"}, {"type": "absorption_flip"}, {"type": "cvd_divergence", "conf": 0.65}]})},
 ]
 
 
@@ -122,6 +134,8 @@ def main():
     _coupmod.store = lambda: fake
     _chochmod.store = lambda: fake
     _wavemod.store = lambda: fake
+    _simod.store = lambda: fake
+    _revmod.store = lambda: fake
     grand_mis = 0
     for case in CASES:
         print(f"\n=== {case['label']} ===")

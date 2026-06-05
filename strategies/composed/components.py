@@ -289,6 +289,63 @@ def _wave_fib(params: dict):
     return run
 
 
+@trigger("reversal_flip")
+def _reversal_flip(params: dict):
+    """VP-gated climax-pivot → next-bar delta-flip (reversal_pattern.detect). Port of
+    Reversal.decide. entry_mode=si_flip (market, fresh stacked-imbalance ignition) or
+    lvn/imbalance (limit). tp from the detector (2R); a tp component may retarget."""
+    vol_mult = float(params.get("vol_mult", 2.0))
+    delta_swing = float(params.get("delta_swing", 50.0))
+    vp_filter = bool(params.get("vp_filter", True))
+    entry_mode = str(params.get("entry_mode", "si_flip"))
+    expiry_bars = int(params.get("entry_expiry_bars", 3))
+
+    def run(ctx: Ctx) -> Signal | None:
+        from pipeline.features.reversal_pattern import detect as detect_reversals, VP_WIN
+        from pipeline.state_store import store
+        decide_tf = str(ctx.config.get("decide_tf") or "15m")
+        need = (VP_WIN.get(decide_tf, 96) if vp_filter else 30) + 30
+        bars = store().recent(ctx.symbol, decide_tf, need)
+        if len(bars) < 30:
+            return None
+        last = bars[-1]
+        markers = detect_reversals(bars, vol_mult=vol_mult, delta_swing=delta_swing,
+                                   symbol=ctx.symbol, tf=decide_tf, vp_filter=vp_filter,
+                                   entry_mode=entry_mode)
+        if not markers:
+            return None
+        m = markers[-1]
+        if m["ts"] != last.close_ts or ctx.state.get("acted", {}).get(ctx.symbol) == m["ts"]:
+            return None
+        entry, sl, tp = float(m["entry"]), float(m["sl"]), float(m["tp"])
+        if abs(entry - sl) <= 0:
+            return None
+        side = m["side"]
+        conf = _clamp(0.45 + (m["vol_ratio"] - vol_mult) * 0.05, 0.0, 0.9)
+        name = ctx.config.get("name", "reversal")
+        _m = m
+
+        def rationale(e, s, t, _m=_m, _name=name, _tp2r=tp, _side=side):
+            return (
+                f"reversal: {_side} fade of a value-area extreme — climax pivot "
+                f"(vol×{_m['vol_ratio']}) at {_m['near_level']} ({_m['vp_pos']}), next bar "
+                f"flipped delta (Δswing {_m['delta_swing']}) + closed the reversal way. "
+                f"entry[{_m['entry_kind']}] {e:.2f}, SL[{_m['sl_basis']}] {s:.2f}, 2R TP {_tp2r:.2f}."
+            )
+
+        sig = Signal(side=side, entry_ref=entry, sl_raw=sl, atr=0.0, dedup_key=m["ts"],
+                     confidence=conf, bias_strength=3, rationale_fn=rationale,
+                     invalidation_note="structural SL (trapped-side imbalance / swing) hit, or winner-side flip",
+                     meta={"m": m, "tp_base": tp})
+        if m.get("is_limit"):
+            sig.kind = "limit"; sig.entry_level = entry; sig.sl = sl; sig.tp = tp
+            sig.expiry_bars = expiry_bars
+        else:
+            sig.sl = sl   # market: sl fixed by detector; tp left to the tp component
+        return sig
+    return run
+
+
 # ── entry ───────────────────────────────────────────────────────────────────
 @entry("market")
 def _entry_market(params: dict):
@@ -322,6 +379,54 @@ def _tp_rr(params: dict):
         if risk <= 0:
             return None
         return entry + rr * risk if signal.side == "long" else entry - rr * risk
+    return run
+
+
+@tp_rule("vp_lvn_ladder")
+def _tp_vp_lvn(params: dict):
+    """Base TP = the detector's 2R (signal.meta['tp_base']); retarget to the nearest
+    opposite-side VP-LVN mid (≥1R away) in the profit direction, else next unfilled
+    FVG, else keep the 2R. Port of ReversalSI._vp_target + _build_decision retarget."""
+    def run(signal: Signal, entry: float, sl: float, ctx: Ctx) -> float | None:
+        base = float(signal.meta.get("tp_base"))
+        side = signal.side
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return base
+        tgt = None
+        try:
+            from pipeline.features.vp_cache import get as vp_get
+            vp = vp_get(ctx.symbol, "daily") or {}
+            mids = [(z["low"] + z["high"]) / 2 for z in (vp.get("lvn_zones") or [])]
+            if side == "long":
+                cand = [m for m in mids if m >= entry + risk]
+                if cand:
+                    tgt = min(cand)
+            else:
+                cand = [m for m in mids if m <= entry - risk]
+                if cand:
+                    tgt = max(cand)
+        except Exception:
+            pass
+        if tgt is None:
+            try:
+                from pipeline.features.fvg import detect_fvgs
+                from pipeline.state_store import store
+                bars = store().recent(ctx.symbol, str(ctx.config.get("decide_tf") or "15m"), 200)
+                fvgs = detect_fvgs(bars)
+                if side == "long":
+                    above = [f for f in fvgs if f.low >= entry + risk]
+                    if above:
+                        tgt = min(above, key=lambda f: f.low).low
+                else:
+                    below = [f for f in fvgs if f.high <= entry - risk]
+                    if below:
+                        tgt = max(below, key=lambda f: f.high).high
+            except Exception:
+                pass
+        if tgt is not None and ((side == "long" and tgt > entry) or (side == "short" and tgt < entry)):
+            return float(tgt)
+        return base
     return run
 
 
