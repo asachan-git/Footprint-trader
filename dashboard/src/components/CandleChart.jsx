@@ -474,7 +474,7 @@ function drawTradeBoxes(canvas, chart, candleSeries, trades, bars) {
     if (yE == null) continue;
     const ySL = t.sl != null ? candleSeries.priceToCoordinate(t.sl) : null;
     const yTP = t.tp != null ? candleSeries.priceToCoordinate(t.tp) : null;
-    const col = STRAT_COLORS[t.strategy] || "#fff";
+    const col = colorForStrategy(t.strategy);
     const cyc = !!t.is_cycle;   // cycles drawn dashed + lighter
 
     const aFill = cyc ? 0.12 : 0.24;   // cycles fainter
@@ -539,7 +539,7 @@ function drawTradeBoxes(canvas, chart, candleSeries, trades, bars) {
     let rr = null;
     if (t.sl != null && t.tp != null && t.entry !== t.sl)
       rr = Math.abs(t.tp - t.entry) / Math.abs(t.entry - t.sl);
-    const tag = STRAT_TAG[t.strategy] || "?";
+    const tag = tagForStrategy(t.strategy);
     const label = `${t.side === "long" ? "▲" : "▼"}${tag}`
                 + `${cyc && t.cycle_num != null ? `#${t.cycle_num}` : ""}`
                 + `${rr != null ? `  RR ${rr.toFixed(2)}` : ""}`
@@ -582,8 +582,14 @@ function drawCVDDivergence(canvas, chart, candleSeries, divs, bars, showStrict, 
     const bear = d.type === "bear";
     const col = bear ? COLORS.down : COLORS.up;
     const dir = bear ? -1 : 1;             // bear above (−), bull below (+)
-    const ty = bear ? y - 16 : y + 16;     // triangle tip offset from price
     const s = 6;                            // half-width
+    // Marker offset from price. Clamp inside the canvas so markers at the very
+    // top/bottom of the visible range stay visible (e.g. BTC bull divergences at
+    // successive lows in a downtrend would otherwise render below the floor and
+    // vanish). Reserve room for the half-triangle + the EqH/L "=" tick.
+    const MARGIN = s + 8;
+    let ty = bear ? y - 16 : y + 16;       // triangle tip offset from price
+    ty = Math.max(MARGIN, Math.min(H - MARGIN, ty));
     ctx.beginPath();
     if (bear) { ctx.moveTo(x, ty + s); ctx.lineTo(x - s, ty - s); ctx.lineTo(x + s, ty - s); }
     else      { ctx.moveTo(x, ty - s); ctx.lineTo(x - s, ty + s); ctx.lineTo(x + s, ty + s); }
@@ -604,7 +610,7 @@ function drawCVDDivergence(canvas, chart, candleSeries, divs, bars, showStrict, 
     ctx.setLineDash([]);
     // EqH/EqL divergence → small "=" tick beside the marker (price equal, CVD diverged)
     if (d.eq) {
-      const ey = bear ? ty - s - 5 : ty + s + 5;
+      const ey = Math.max(4, Math.min(H - 4, bear ? ty - s - 5 : ty + s + 5));
       ctx.lineWidth = 1.5;
       ctx.beginPath(); ctx.moveTo(x - 4, ey - 1.5); ctx.lineTo(x + 4, ey - 1.5);
       ctx.moveTo(x - 4, ey + 1.5); ctx.lineTo(x + 4, ey + 1.5); ctx.stroke();
@@ -1143,6 +1149,17 @@ const STRAT_COLORS = {
 };
 const STRAT_TAG = { coup: "C", democracy: "D", republic: "R", m1: "1", m2: "2", reversal: "⚑",
                     reversal_choch: "⤰", wave_fib: "⤴" };
+
+// Stable auto color/tag for any strategy without an explicit one (dynamic layers).
+function colorForStrategy(name) {
+  if (STRAT_COLORS[name]) return STRAT_COLORS[name];
+  let h = 0; for (const c of String(name)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return `hsl(${h % 360}, 65%, 62%)`;
+}
+function tagForStrategy(name) {
+  if (STRAT_TAG[name]) return STRAT_TAG[name];
+  return (String(name).replace(/_/g, "").slice(0, 2) || "?").toUpperCase();
+}
 
 // ── Indicator math (chart-only; no server coupling) ──────────────────────────
 
@@ -2221,9 +2238,9 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
     resolvedTrades.forEach(t => {
       const isLong = t.side === "long";
       const strat = t.strategy || "coup";
-      const col = STRAT_COLORS[strat] || COLORS.up;
+      const col = colorForStrategy(strat);
       const isOpen = t.open || !t.exit_ts;
-      const tag = STRAT_TAG[strat] || strat[0].toUpperCase();
+      const tag = tagForStrategy(strat);
       markers.push({
         time: t.entry_ts, position: isLong ? "belowBar" : "aboveBar",
         color: col, shape: isLong ? "arrowUp" : "arrowDown",

@@ -24,6 +24,12 @@ export async function fetchStrategyTrades(name, symbol, tf, source = "all") {
   return data?.trades ?? [];
 }
 
+// Live strategy names (for the dynamic Strategy-Trades layer section).
+export async function fetchStrategies() {
+  const { data } = await axios.get("/strategies");
+  return (data?.strategies ?? []).map(s => s.name).filter(Boolean);
+}
+
 // Grid-mode (m1 / m2) trade history.
 export async function fetchGridTrades(mode, symbol, tf) {
   const { data } = await axios.get(`/grid/${mode}/trades`, { params: { symbol, tf } });

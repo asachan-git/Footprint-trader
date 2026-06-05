@@ -106,6 +106,16 @@ function inferTickSize(bars) {
   return tick || 0.01;
 }
 
+// Stable auto color/tag for strategies without an explicit one (dynamic layers).
+// Same hash as CandleChart.colorForStrategy → identical colors across both panes.
+function _hashColor(name) {
+  let h = 0; for (const c of String(name)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return `hsl(${h % 360}, 65%, 62%)`;
+}
+function _hashTag(name) {
+  return (String(name).replace(/_/g, "").slice(0, 2) || "?").toUpperCase();
+}
+
 // Resolve an unresolved/open trade's outcome from future candles: first TP-or-SL
 // touch after entry wins. Trades already closed with a managed exit keep theirs.
 function resolveTradeOutcome(t, bars) {
@@ -1316,7 +1326,7 @@ export default function FootprintPane({
         if (yE < PAD_TOP - 50 || yE > PAD_TOP + plotH + 50) continue;
         const ySL = t.sl != null ? yOfPrice(t.sl) : null;
         const yTP = t.tp != null ? yOfPrice(t.tp) : null;
-        const col = SCOL[t.strategy] || "#fff";
+        const col = SCOL[t.strategy] || _hashColor(t.strategy);
         const cyc = !!t.is_cycle;
         const aFill = cyc ? 0.11 : 0.20;
         const bw = Math.max(3, xB - xA);
@@ -1372,7 +1382,7 @@ export default function FootprintPane({
         let rr = null;
         if (t.sl != null && t.tp != null && t.entry !== t.sl)
           rr = Math.abs(t.tp - t.entry) / Math.abs(t.entry - t.sl);
-        const label = `${t.side === "long" ? "▲" : "▼"}${STAG[t.strategy] || "?"}`
+        const label = `${t.side === "long" ? "▲" : "▼"}${STAG[t.strategy] || _hashTag(t.strategy)}`
                     + `${cyc && t.cycle_num != null ? `#${t.cycle_num}` : ""}`
                     + `${rr != null ? ` RR ${rr.toFixed(2)}` : ""}${t.open ? " ●" : ""}`;
         ctx.font = "10px JetBrains Mono, monospace";

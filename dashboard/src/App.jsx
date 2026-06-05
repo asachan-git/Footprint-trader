@@ -5,7 +5,11 @@ import VoteBreakdown from "./components/VoteBreakdown.jsx";
 import DecisionCards from "./components/DecisionCards.jsx";
 import Positions from "./components/Positions.jsx";
 import ABStats from "./components/ABStats.jsx";
-import { fetchStrategyTrades, fetchGridTrades, fetchStrategyCycles, fetchGridCycles, fetchStrategyOutcomes, fetchCvdSweeps } from "./api.js";
+import { fetchStrategyTrades, fetchGridTrades, fetchStrategyCycles, fetchGridCycles, fetchStrategyOutcomes, fetchCvdSweeps, fetchStrategies } from "./api.js";
+
+// Strategy-trade layers handled explicitly (own toggles + colors). Every OTHER
+// live strategy is auto-listed in the dynamic "Strategy Trades" layers section.
+const HARDCODED_STRATS = ["coup", "democracy", "republic"];
 
 // Outcome-range presets → seconds back from now (null secs = all-time).
 const OUTCOME_RANGES = [
@@ -68,7 +72,7 @@ const IND_ITEMS = [
   { key: "cvdSweepsDivOnly", label: "CVD Sweep — div-intact only", tip: "Filter the CVD Sweep Trades layer to ONLY setups with CVD divergence intact (the thesis subset). Cuts the visual noise from the 80%+ no-div population. No effect unless 'CVD Sweep Trades' is also on." },
 ];
 
-function LayersToggle({ indicators, onChange }) {
+function LayersToggle({ indicators, onChange, dynamicStrats = [] }) {
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
   useEffect(() => {
@@ -92,6 +96,7 @@ function LayersToggle({ indicators, onChange }) {
           padding: "4px 0", zIndex: 200, minWidth: 150,
           boxShadow: "0 4px 12px rgba(0,0,0,0.7)",
           fontFamily: "JetBrains Mono, monospace", fontSize: 11,
+          overflow: 'scroll', maxHeight: 600
         }}>
           {IND_ITEMS.map(item => {
             const on = indicators[item.key] !== false;
@@ -107,6 +112,30 @@ function LayersToggle({ indicators, onChange }) {
               >
                 <span style={{ color: on ? "#00bcd4" : "#333", fontSize: 13 }}>{on ? "◉" : "○"}</span>
                 {item.label}
+              </div>
+            );
+          })}
+          {dynamicStrats.length > 0 && (
+            <div style={{ padding: "6px 12px 2px", color: "#666", fontSize: 9,
+              letterSpacing: 1, borderTop: "1px solid #2a2a2a", marginTop: 4 }}>
+              STRATEGY TRADES
+            </div>
+          )}
+          {dynamicStrats.map(name => {
+            const key = `strat:${name}`;
+            const on = indicators[key] === true;     // default OFF (avoid flooding)
+            return (
+              <div
+                key={key}
+                onClick={() => onChange(key, !on)}
+                title={`${name} live/backtest trades on both panes`}
+                style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 12px",
+                  cursor: "pointer", color: on ? "#ccc" : "#444", userSelect: "none" }}
+                onMouseEnter={e => e.currentTarget.style.background = "#1a1a1a"}
+                onMouseLeave={e => e.currentTarget.style.background = ""}
+              >
+                <span style={{ color: on ? "#00bcd4" : "#333", fontSize: 13 }}>{on ? "◉" : "○"}</span>
+                {name}
               </div>
             );
           })}
@@ -187,6 +216,8 @@ export default function App() {
   const [stratTrades, setStratTrades] = useState({ coup: [], democracy: [], republic: [], m1: [], m2: [] });
   const [stratCycles, setStratCycles] = useState({ coup: [], democracy: [], republic: [], m1: [] });
   const [cvdSweeps,   setCvdSweeps]   = useState([]);
+  const [extraStrats, setExtraStrats] = useState([]);   // live strategy names minus HARDCODED_STRATS
+  const [extraTrades, setExtraTrades] = useState({});   // name → trades[] (dynamic Strategy-Trades layers)
   const esRef = useRef(null);
 
   // Per-strategy outcomes panel — range selector (preset or custom from/to).
@@ -244,6 +275,27 @@ export default function App() {
     return () => { cancel = true; clearInterval(id); };
   }, [symbol, tf]);
 
+  // Dynamic Strategy-Trades layers: fetch the live strategy list, then trades for
+  // every strategy NOT hardcoded above (congress, senate, reversal_si, choch/wave
+  // variants, …). Feeds the same `strategyTrades` array → both candle + FP panes.
+  useEffect(() => {
+    let cancel = false;
+    const load = async () => {
+      let names = [];
+      try { names = await fetchStrategies(); } catch { return; }
+      const extra = names.filter(n => !HARDCODED_STRATS.includes(n));
+      if (cancel) return;
+      setExtraStrats(extra);
+      const lists = await Promise.all(extra.map(n =>
+        fetchStrategyTrades(n, symbol, tf, "all").catch(() => [])));
+      if (cancel) return;
+      setExtraTrades(Object.fromEntries(extra.map((n, i) => [n, lists[i]])));
+    };
+    load();
+    const id = setInterval(load, 30000);
+    return () => { cancel = true; clearInterval(id); };
+  }, [symbol, tf]);
+
   // CVD sweep study setups — backtest output, only available for 5m/15m JSONLs.
   useEffect(() => {
     if (tf !== "5m" && tf !== "15m") { setCvdSweeps([]); return; }
@@ -290,6 +342,12 @@ export default function App() {
         rationale: `wave_fib ${p.entry_kind}: wave-1 ${p.origin}→${p.impulse} · pivot ${p.pullback} · ${p.fib_ext}× MM`,
       })));
     }
+    // Dynamic Strategy-Trades layers — any tf (each strategy's trades come back
+    // only for its own decide_tf, so 15m strats render on 15m, _5m on 5m). Default
+    // OFF (=== true) so the chart isn't flooded; toggled in the LAYERS dropdown.
+    for (const n of extraStrats) {
+      if (indicators[`strat:${n}`] === true) out.push(...tag(extraTrades[n], n));
+    }
     if (tf !== "15m") return out;
     if (indicators.coupTrades !== false) out.push(...tag(stratTrades.coup, "coup"));
     if (indicators.demoTrades !== false) out.push(...tag(stratTrades.democracy, "democracy"));
@@ -306,7 +364,8 @@ export default function App() {
   }, [stratTrades, stratCycles, indicators.coupTrades, indicators.demoTrades,
       indicators.repTrades, indicators.m1Trades, indicators.m2Trades, indicators.cycleTrades,
       indicators.revPattern, reversalPatterns,
-      indicators.chochSetup, chochSetups, indicators.waveSetup, waveSetups, tf]);
+      indicators.chochSetup, chochSetups, indicators.waveSetup, waveSetups, tf,
+      extraStrats, extraTrades, indicators]);
   // Shared visible-time-range across FP ↔ Candle. Each pane writes on pan,
   // reads on becoming visible. Ref, not state, so no re-render loops.
   const rangeRef = useRef(null);  // {from: ts, to: ts} | null
@@ -399,7 +458,7 @@ export default function App() {
           </button>
         ))}
         <span style={{ width: 1, height: 20, background: "var(--border)", margin: "0 4px" }} />
-        <LayersToggle indicators={indicators} onChange={toggleIndicator} />
+        <LayersToggle indicators={indicators} onChange={toggleIndicator} dynamicStrats={extraStrats} />
         <span style={{ width: 1, height: 20, background: "var(--border)", margin: "0 4px" }} />
         <button
           onClick={() => setChartMode(m => m === "ohlc" ? "footprint" : "ohlc")}
