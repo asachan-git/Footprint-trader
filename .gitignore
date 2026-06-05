@@ -68,3 +68,8 @@ data/iter_compare_*.md
 
 # MetaApi runtime cache
 .metaapi/
+
+# Per-strategy runtime stores + generated reports + cached sweeps (runtime, not source)
+data/strategies/
+data/reports/
+data/sweeps_*.jsonl
