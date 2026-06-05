@@ -22,11 +22,13 @@ _obs = _L("absorption_observations", "scripts/absorption_observations.py")
 
 import pipeline.state_store as _ss
 import strategies.coup as _coupmod
+import strategies.reversal_choch as _chochmod
 from strategies.coup import Coup
 from strategies.coup_reversal import CoupReversal
+from strategies.reversal_choch import ReversalChoch
 from strategies.composed.engine import ComposedStrategy
 
-WARMUP = 130
+WARMUP = 215   # choch needs choch_lookback(200)+ bars before it can detect
 
 # climax_flip composed template (shared by coup + coup_reversal — only params differ)
 def _composed(name, vol_mult, delta_swing):
@@ -39,6 +41,23 @@ def _composed(name, vol_mult, delta_swing):
         "execution": {"type": "single_leg"},
         "exits": [{"type": "hard_sl"}, {"type": "cvd_divergence", "conf": 0.65}],
     }
+
+def _composed_choch(name, fib_entry, fib_ext):
+    return {
+        "name": name, "engine": "composed", "decide_tf": "15m",
+        "trigger": {"type": "choch_fib", "fib_entry": fib_entry, "fib_ext": fib_ext,
+                    "entry_expiry_bars": 6},
+        "execution": {"type": "single_leg"},
+        "exits": [{"type": "hard_sl"}, {"type": "cvd_divergence", "conf": 0.65}],
+    }
+
+
+def _legacy_choch(name, fib_entry, fib_ext):
+    return ReversalChoch(config={
+        "symbols": ["BTCUSDT", "XAUTUSDT"], "decide_tf": "15m",
+        "fib_entry": fib_entry, "fib_ext": fib_ext, "entry_expiry_bars": 6,
+        "cvd_divergence_exit": True, "cvd_exit_conf": 0.65})
+
 
 CASES = [
     {
@@ -57,6 +76,12 @@ CASES = [
             "flip_exit": False, "cvd_divergence_exit": True, "cvd_exit_conf": 0.65}),
         "composed": lambda: ComposedStrategy(config=_composed("coup_reversal", 1.8, 0.0)),
     },
+    {"label": "reversal_choch", "legacy": lambda: _legacy_choch("reversal_choch", 0.705, 2.0),
+     "composed": lambda: ComposedStrategy(config=_composed_choch("reversal_choch", 0.705, 2.0))},
+    {"label": "reversal_choch_ext", "legacy": lambda: _legacy_choch("reversal_choch_ext", 0.705, 1.618),
+     "composed": lambda: ComposedStrategy(config=_composed_choch("reversal_choch_ext", 0.705, 1.618))},
+    {"label": "reversal_choch_entry", "legacy": lambda: _legacy_choch("reversal_choch_entry", 0.618, 2.0),
+     "composed": lambda: ComposedStrategy(config=_composed_choch("reversal_choch_entry", 0.618, 2.0))},
 ]
 
 
@@ -75,6 +100,7 @@ def main():
     fake = _FakeStore()
     _ss.store = lambda: fake
     _coupmod.store = lambda: fake
+    _chochmod.store = lambda: fake
     grand_mis = 0
     for case in CASES:
         print(f"\n=== {case['label']} ===")

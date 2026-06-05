@@ -45,6 +45,16 @@ class Signal:
     rationale_fn: Callable[[float, float, float], str]   # (entry, sl, tp) -> str
     invalidation_note: str = ""
     meta: dict = field(default_factory=dict)
+    # ── limit-entry signals (e.g. choch fib retrace) ──────────────────────────
+    # kind="market": immediate; entry via entry component, sl/tp via sl/tp comps.
+    # kind="limit": arm a resting limit at entry_level; engine waits ≤expiry_bars
+    #   for a touch then fills. sl/tp are PRECOMPUTED on the signal (coupled to the
+    #   fib leg), so the engine uses them directly (skips sl/tp components).
+    kind: str = "market"
+    entry_level: float | None = None
+    sl: float | None = None
+    tp: float | None = None
+    expiry_bars: int = 0
 
 
 def _clamp(x, lo, hi):
@@ -94,6 +104,95 @@ def _climax_flip(params: dict):
                       rationale_fn=rationale,
                       invalidation_note="structural SL (imbalance/swing) hit, or winner-side flip",
                       meta={"m": m, "vol_mult": vol_mult})
+    return run
+
+
+@trigger("choch_fib")
+def _choch_fib(params: dict):
+    """Structure-flip (ChoCh) → Fib retrace LIMIT. Faithful port of
+    ReversalChoch._arm_signal: detect a fresh 15m ChoCh, build the impulse-leg Fib
+    entry/SL/TP, arm a limit (kind="limit"). seen_choch dedup lives in ctx.state."""
+    swing_n = int(params.get("swing_n", 2))
+    lookback = int(params.get("choch_lookback", 200))
+    arm_within = int(params.get("arm_within", 10))
+    fib_entry = float(params.get("fib_entry", 0.618))
+    fib_ext = float(params.get("fib_ext", 1.618))
+    expiry_bars = int(params.get("entry_expiry_bars", 6))
+    sl_buf_atr = float(params.get("sl_buf_atr", 0.10))
+    min_sl_mult = float(params.get("min_sl_atr_mult", 0.5))
+
+    def run(ctx: Ctx) -> Signal | None:
+        from pipeline.features.choch import detect_choch, impulse_leg
+        from pipeline.features.atr import atr
+        from pipeline.state_store import store
+        decide_tf = str(ctx.config.get("decide_tf") or "15m")
+        need = lookback + 10
+        bars = store().recent(ctx.symbol, decide_tf, need)
+        if len(bars) < 2 * swing_n + 6:
+            return None
+        seen = ctx.state.setdefault("seen_choch", {})
+        win = bars[-lookback:] if len(bars) > lookback else bars
+        event = detect_choch(win, n=swing_n, lookback_bars=lookback)
+        if event is None:
+            return None
+        if seen.get(ctx.symbol) == event.broken_at_ts:
+            return None
+        leg = impulse_leg(win, event, n=swing_n)
+        if leg is None:
+            return None
+        origin, extreme, brk_idx = leg
+        if brk_idx < len(win) - arm_within:
+            seen[ctx.symbol] = event.broken_at_ts
+            return None
+        side = "long" if event.direction == "bull" else "short"
+        span = (extreme - origin) if side == "long" else (origin - extreme)
+        if span <= 0:
+            return None
+        if side == "long":
+            entry = extreme - fib_entry * span
+            sl_raw = origin
+            tp = extreme + (fib_ext - 1.0) * span
+        else:
+            entry = extreme + fib_entry * span
+            sl_raw = origin
+            tp = extreme - (fib_ext - 1.0) * span
+        last = bars[-1]
+        if (side == "long" and entry >= last.ohlc.c) or (side == "short" and entry <= last.ohlc.c):
+            seen[ctx.symbol] = event.broken_at_ts
+            return None
+        a = atr(bars) or 0.0
+        buf = sl_buf_atr * a
+        min_dist = max(buf, min_sl_mult * a, 1e-9)
+        if side == "long":
+            sl = min(sl_raw - buf, entry - min_dist)
+        else:
+            sl = max(sl_raw + buf, entry + min_dist)
+        if (side == "long" and not (sl < entry < tp)) or (side == "short" and not (tp < entry < sl)):
+            seen[ctx.symbol] = event.broken_at_ts
+            return None
+        seen[ctx.symbol] = event.broken_at_ts
+
+        entry, sl, tp = round(entry, 4), round(sl, 4), round(tp, 4)
+        risk = abs(entry - sl)
+        rr = abs(tp - entry) / risk if risk > 0 else 0.0
+        name = ctx.config.get("name", "reversal_choch")
+        _ev = event
+
+        def rationale(e, s, t, _ev=_ev, _name=name, _o=round(origin, 4), _x=round(extreme, 4)):
+            return (
+                f"{_name}: {side} after a 15m {_ev.direction} ChoCh "
+                f"(broke {_ev.broken_level:.2f}, prior trend {_ev.last_trend}). "
+                f"Impulse leg {_o:.2f}→{_x:.2f}; entry at "
+                f"{fib_entry} retrace ({e:.2f}), SL beyond origin {s:.2f}, "
+                f"TP at {fib_ext} extension {t:.2f}."
+            )
+
+        return Signal(side=side, entry_ref=entry, sl_raw=sl, atr=a,
+                      dedup_key=event.broken_at_ts,
+                      confidence=_clamp(0.45 + 0.05 * (rr - 1.0), 0.0, 0.9),
+                      bias_strength=3, rationale_fn=rationale,
+                      invalidation_note="price closes past the swing origin (leg invalidated) → structural SL",
+                      kind="limit", entry_level=entry, sl=sl, tp=tp, expiry_bars=expiry_bars)
     return run
 
 
