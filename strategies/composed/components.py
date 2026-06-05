@@ -196,6 +196,99 @@ def _choch_fib(params: dict):
     return run
 
 
+@trigger("wave_fib")
+def _wave_fib(params: dict):
+    """Two-wave (HH+HL / LL+LH) continuation → 3rd-wave LIMIT. Faithful port of
+    WaveFib._arm_signal: continuation_leg structure, VP/fib pullback entry, measured-
+    move TP, SL beyond the HL/LH pivot. Limit signal; seen dedup in ctx.state."""
+    swing_n = int(params.get("swing_n", 2))
+    struct_lookback = int(params.get("struct_lookback", 200))
+    arm_within = int(params.get("arm_within", 8))
+    entry_mode = str(params.get("entry_mode", "vp"))
+    vp_level = str(params.get("vp_level", "poc"))
+    fib_entry = float(params.get("fib_entry", 0.5))
+    fib_ext = float(params.get("fib_ext", 1.0))
+    expiry_bars = int(params.get("entry_expiry_bars", 6))
+    sl_buf_atr = float(params.get("sl_buf_atr", 0.10))
+    min_sl_mult = float(params.get("min_sl_atr_mult", 0.5))
+
+    def run(ctx: Ctx) -> Signal | None:
+        from pipeline.features.choch import continuation_leg
+        from pipeline.features.atr import atr
+        from pipeline.features.volume_profile import compute as vp_compute, DEFAULT_BIN_SIZE
+        from pipeline.state_store import store
+        decide_tf = str(ctx.config.get("decide_tf") or "15m")
+        bars = store().recent(ctx.symbol, decide_tf, struct_lookback + 10)
+        if len(bars) < 2 * swing_n + 6:
+            return None
+        win = bars[-struct_lookback:] if len(bars) > struct_lookback else bars
+        st = continuation_leg(win, n=swing_n)
+        if st is None:
+            return None
+        seen = ctx.state.setdefault("seen_wave", {})
+        key = win[st.pullback_idx].close_ts
+        if seen.get(ctx.symbol) == key:
+            return None
+        if st.pullback_idx < len(win) - arm_within:
+            seen[ctx.symbol] = key
+            return None
+        seen[ctx.symbol] = key
+        side = st.side
+        span = (st.impulse - st.origin) if side == "long" else (st.origin - st.impulse)
+        if span <= 0:
+            return None
+        last = win[-1]
+        lo, hi = (st.pullback, st.impulse) if side == "long" else (st.impulse, st.pullback)
+        entry = None
+        entry_kind = ""
+        if entry_mode == "vp":
+            seg = win[st.origin_idx:st.pullback_idx + 1]
+            if len(seg) >= 3:
+                vp = vp_compute(seg, "intraday", win[-1].ohlc.c, bin_size=DEFAULT_BIN_SIZE.get(ctx.symbol))
+                lvl = (vp.val if side == "long" else vp.vah) if vp_level == "value" else vp.poc
+                entry = float(lvl) if lvl is not None else None
+            entry_kind = f"vp_{vp_level}"
+        if entry is None or not (lo < entry < hi):
+            entry = (st.impulse - fib_entry * span) if side == "long" else (st.impulse + fib_entry * span)
+            entry_kind = f"fib_{fib_entry}"
+        if not (lo < entry < hi):
+            entry = (lo + hi) / 2
+            entry_kind = "mid"
+        if (side == "long" and entry >= last.ohlc.c) or (side == "short" and entry <= last.ohlc.c):
+            return None
+        a = atr(bars) or 0.0
+        buf = sl_buf_atr * a
+        min_dist = max(buf, min_sl_mult * a, 1e-9)
+        if side == "long":
+            sl = min(st.pullback - buf, entry - min_dist)
+            tp = st.pullback + fib_ext * span
+        else:
+            sl = max(st.pullback + buf, entry + min_dist)
+            tp = st.pullback - fib_ext * span
+        if (side == "long" and not (sl < entry < tp)) or (side == "short" and not (tp < entry < sl)):
+            return None
+        entry, sl, tp = round(entry, 4), round(sl, 4), round(tp, 4)
+        risk = abs(entry - sl)
+        rr = abs(tp - entry) / risk if risk > 0 else 0.0
+        name = ctx.config.get("name", "wave_fib")
+        _o, _i, _p, _ek = round(st.origin, 4), round(st.impulse, 4), round(st.pullback, 4), entry_kind
+
+        def rationale(e, s, t, _o=_o, _i=_i, _p=_p, _ek=_ek, _name=name, _side=side):
+            return (
+                f"{_name}: {_side} continuation — confirmed two-wave structure "
+                f"(wave-1 {_o:.2f}→{_i:.2f}, pullback pivot {_p:.2f}); 3rd-wave "
+                f"entry[{_ek}] {e:.2f}, SL beyond the {'HL' if _side == 'long' else 'LH'} {s:.2f}, "
+                f"TP {fib_ext}× measured move {t:.2f}."
+            )
+
+        return Signal(side=side, entry_ref=entry, sl_raw=sl, atr=a, dedup_key=key,
+                      confidence=_clamp(0.45 + 0.05 * (rr - 1.0), 0.0, 0.9), bias_strength=3,
+                      rationale_fn=rationale,
+                      invalidation_note="price breaks the pullback pivot (HL/LH) → structure invalid → SL",
+                      kind="limit", entry_level=entry, sl=sl, tp=tp, expiry_bars=expiry_bars)
+    return run
+
+
 # ── entry ───────────────────────────────────────────────────────────────────
 @entry("market")
 def _entry_market(params: dict):

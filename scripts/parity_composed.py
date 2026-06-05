@@ -23,9 +23,11 @@ _obs = _L("absorption_observations", "scripts/absorption_observations.py")
 import pipeline.state_store as _ss
 import strategies.coup as _coupmod
 import strategies.reversal_choch as _chochmod
+import strategies.wave_fib as _wavemod
 from strategies.coup import Coup
 from strategies.coup_reversal import CoupReversal
 from strategies.reversal_choch import ReversalChoch
+from strategies.wave_fib import WaveFib
 from strategies.composed.engine import ComposedStrategy
 
 WARMUP = 215   # choch needs choch_lookback(200)+ bars before it can detect
@@ -82,6 +84,24 @@ CASES = [
      "composed": lambda: ComposedStrategy(config=_composed_choch("reversal_choch_ext", 0.705, 1.618))},
     {"label": "reversal_choch_entry", "legacy": lambda: _legacy_choch("reversal_choch_entry", 0.618, 2.0),
      "composed": lambda: ComposedStrategy(config=_composed_choch("reversal_choch_entry", 0.618, 2.0))},
+    {"label": "wave_fib",
+     "legacy": lambda: WaveFib(config={"symbols": ["BTCUSDT", "XAUTUSDT"], "decide_tf": "15m",
+                                       "entry_mode": "vp", "vp_level": "value", "fib_ext": 2.0, "entry_expiry_bars": 6}),
+     "composed": lambda: ComposedStrategy(config={"name": "wave_fib", "engine": "composed", "decide_tf": "15m",
+         "trigger": {"type": "wave_fib", "entry_mode": "vp", "vp_level": "value", "fib_ext": 2.0, "entry_expiry_bars": 6},
+         "execution": {"type": "single_leg"}, "exits": [{"type": "hard_sl"}]})},
+    {"label": "wave_fib_ret",
+     "legacy": lambda: WaveFib(config={"symbols": ["BTCUSDT", "XAUTUSDT"], "decide_tf": "15m",
+                                       "entry_mode": "fib", "fib_entry": 0.5, "fib_ext": 2.0, "entry_expiry_bars": 6}),
+     "composed": lambda: ComposedStrategy(config={"name": "wave_fib_ret", "engine": "composed", "decide_tf": "15m",
+         "trigger": {"type": "wave_fib", "entry_mode": "fib", "fib_entry": 0.5, "fib_ext": 2.0, "entry_expiry_bars": 6},
+         "execution": {"type": "single_leg"}, "exits": [{"type": "hard_sl"}]})},
+    {"label": "wave_fib_ext",
+     "legacy": lambda: WaveFib(config={"symbols": ["BTCUSDT", "XAUTUSDT"], "decide_tf": "15m",
+                                       "entry_mode": "vp", "vp_level": "value", "fib_ext": 1.618, "entry_expiry_bars": 6}),
+     "composed": lambda: ComposedStrategy(config={"name": "wave_fib_ext", "engine": "composed", "decide_tf": "15m",
+         "trigger": {"type": "wave_fib", "entry_mode": "vp", "vp_level": "value", "fib_ext": 1.618, "entry_expiry_bars": 6},
+         "execution": {"type": "single_leg"}, "exits": [{"type": "hard_sl"}]})},
 ]
 
 
@@ -101,6 +121,7 @@ def main():
     _ss.store = lambda: fake
     _coupmod.store = lambda: fake
     _chochmod.store = lambda: fake
+    _wavemod.store = lambda: fake
     grand_mis = 0
     for case in CASES:
         print(f"\n=== {case['label']} ===")
