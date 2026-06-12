@@ -373,6 +373,64 @@ def _vote_panel(params: dict):
     return run
 
 
+def _agg_zone(bar: Bar, side: str):
+    """Aggression-side stacked imbalance on the bar (buy-stack for long / sell for
+    short), strongest by count. Port of Congress._agg_zone."""
+    from pipeline.footprint import build as build_fp
+    from pipeline.features.stacked_imbalance import stacked_imbalances
+    want = "buy" if side == "long" else "sell"
+    zones = [z for z in stacked_imbalances(build_fp(bar), min_stack=3, ratio=3.0) if z.side == want]
+    return max(zones, key=lambda z: z.count) if zones else None
+
+
+def _agg_entry_level(bar: Bar, side: str, mode: str):
+    z = _agg_zone(bar, side)
+    if z is None:
+        return None
+    if mode == "imb_lvn":
+        from pipeline.footprint import build as build_fp
+        fp = build_fp(bar)
+        cells = [c for c in fp.cells if c.total > 0 and z.price_low <= c.price <= z.price_high]
+        if cells:
+            return min(cells, key=lambda c: c.total).price
+    return z.price_low if side == "long" else z.price_high
+
+
+@trigger("vote_agg_imbalance")
+def _vote_agg_imbalance(params: dict):
+    """Vote direction → arm a LIMIT at the aggression-side stacked imbalance
+    (imb_start base / imb_lvn gap). Port of Congress.decide. Limit signal with
+    vote-placeholder SL/TP (grid placer + grid_structural_sl agg_imbalance set
+    the real SL)."""
+    entry_mode = str(params.get("entry_mode", "imb_start"))
+    expiry_bars = int(params.get("entry_expiry_bars", 3))
+
+    def run(ctx: Ctx) -> Signal | None:
+        from execution.direction_engine import decide_direction
+        vote_tf = str(ctx.config.get("vote_tf") or "15m")
+        dd = decide_direction(ctx.symbol, vote_tf)
+        if dd.side == "flat":
+            return None
+        bar = ctx.bar
+        level = _agg_entry_level(bar, dd.side, entry_mode)
+        if level is None:
+            return None
+        if (dd.side == "long" and level >= bar.ohlc.c) or (dd.side == "short" and level <= bar.ohlc.c):
+            return None
+        close = bar.ohlc.c
+        sl_ph = close * (0.95 if dd.side == "long" else 1.05)
+        tp_ph = close * (1.05 if dd.side == "long" else 0.95)
+
+        def rationale(e, s, t, _dd=dd):
+            return f"democracy: weighted vote score={_dd.score:.2f} bias={_dd.bias_strength}/5 | {_dd.note}"
+
+        return Signal(side=dd.side, entry_ref=float(level), sl_raw=sl_ph, atr=0.0,
+                      dedup_key=bar.close_ts, confidence=min(1.0, dd.bias_strength / 5.0),
+                      bias_strength=dd.bias_strength, rationale_fn=rationale, invalidation_note="",
+                      kind="limit", entry_level=float(level), sl=sl_ph, tp=tp_ph, expiry_bars=expiry_bars)
+    return run
+
+
 # ── entry ───────────────────────────────────────────────────────────────────
 @entry("market")
 def _entry_market(params: dict):
@@ -563,11 +621,19 @@ def _exec_grid_structural_sl(params: dict):
     struct_buf = float(params.get("sl_struct_buf_atr", 0.2))
     wall_buf = float(params.get("sl_wall_buf_atr", 0.25))
     conf_tol = float(params.get("sl_conf_tol_atr", 0.25))
+    min_sl_mult = float(params.get("min_sl_atr_mult", 0.5))
     tp_bias_min = int(params.get("tp_conf_bias_min", 4))
     tp_atr_mult = float(params.get("tp_conf_atr_mult", 3.0))
 
     def _compute_sl(plan, bar, atr15, anchor):
         atr_sl = (anchor + sl_atr_mult * atr15) if plan.side == "short" else (anchor - sl_atr_mult * atr15)
+        if sl_anchor == "agg_imbalance":
+            z = _agg_zone(bar, plan.side)
+            if z is not None:
+                floor = max(min_sl_mult * atr15, 1e-9)
+                return ((z.price_low - floor), "agg_imb_low") if plan.side == "long" \
+                    else ((z.price_high + floor), "agg_imb_high")
+            # fall through to confluence (republic fallback)
         if sl_anchor == "wall":
             walls = _favorable_walls(bar, plan.side, anchor)
             if not walls:

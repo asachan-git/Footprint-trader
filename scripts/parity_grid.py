@@ -25,9 +25,11 @@ _obs = _L("absorption_observations", "scripts/absorption_observations.py")
 
 import pipeline.state_store as _ss
 import strategies.democracy as _demomod
+import strategies.congress as _congressmod
 from strategies.democracy import Democracy
 from strategies.republic import Republic
 from strategies.senate import Senate
+from strategies.congress import Congress
 from strategies.composed.engine import ComposedStrategy
 from strategies.composed.components import Ctx
 from strategies.composed.registry import EXECUTION, resolve
@@ -66,23 +68,35 @@ def _mk_plan(symbol, side, anchor, bias, with_floor):
 
 
 def decide_parity():
-    fake = _FakeStore(); _ss.store = lambda: fake; _demomod.store = lambda: fake
-    comp = ComposedStrategy(config={"name": "democracy", "engine": "composed", "vote_tf": "15m",
-                                    "trigger": {"type": "vote_panel"}, "entry": {"type": "market"}})
-    demo = Democracy(config={"symbols": ["BTCUSDT", "XAUTUSDT"], "vote_tf": "15m"})
-    tot = mis = fires = 0
-    for sym in ("BTCUSDT", "XAUTUSDT"):
-        bars = _obs.load_bars(sym, "15m")
-        for i in range(max(0, len(bars) - 300), len(bars)):
-            fake._bars = bars[:i + 1]; bar = bars[i]
-            f1, f2 = _dfields(demo.decide(sym, "15m", bar, {})), _dfields(comp.decide(sym, "15m", bar, {}))
-            tot += 1
-            if f1 is not None: fires += 1
-            if f1 != f2:
-                mis += 1
-                if mis <= 4: print(f"  decide MISMATCH {sym}@{i}\n    demo={f1}\n    comp={f2}")
-    print(f"decide parity: {tot} bars, {fires} fires, {mis} mismatches {'✅' if mis == 0 else '❌'}")
-    return mis
+    fake = _FakeStore()
+    _ss.store = lambda: fake; _demomod.store = lambda: fake; _congressmod.store = lambda: fake
+    cc = lambda em: ComposedStrategy(config={"name": f"congress_{em}", "engine": "composed", "vote_tf": "15m",
+        "trigger": {"type": "vote_agg_imbalance", "entry_mode": em, "entry_expiry_bars": 3}})
+    lc = lambda em: Congress(config={"symbols": ["BTCUSDT", "XAUTUSDT"], "vote_tf": "15m",
+        "entry_mode": em, "entry_expiry_bars": 3, "min_sl_atr_mult": 0.5})
+    cases = [
+        ("democracy", Democracy(config={"symbols": ["BTCUSDT", "XAUTUSDT"], "vote_tf": "15m"}),
+         ComposedStrategy(config={"name": "democracy", "engine": "composed", "vote_tf": "15m",
+                                  "trigger": {"type": "vote_panel"}, "entry": {"type": "market"}})),
+        ("congress_start", lc("imb_start"), cc("imb_start")),
+        ("congress_lvn", lc("imb_lvn"), cc("imb_lvn")),
+    ]
+    grand = 0
+    for label, leg, comp in cases:
+        tot = mis = fires = 0
+        for sym in ("BTCUSDT", "XAUTUSDT"):
+            bars = _obs.load_bars(sym, "15m")
+            for i in range(max(0, len(bars) - 300), len(bars)):
+                fake._bars = bars[:i + 1]; bar = bars[i]
+                f1, f2 = _dfields(leg.decide(sym, "15m", bar, {})), _dfields(comp.decide(sym, "15m", bar, {}))
+                tot += 1
+                if f1 is not None: fires += 1
+                if f1 != f2:
+                    mis += 1
+                    if mis <= 4: print(f"  decide MISMATCH {label} {sym}@{i}\n    leg={f1}\n    comp={f2}")
+        print(f"  decide {label}: {tot} bars, {fires} fires, {mis} mismatches {'✅' if mis == 0 else '❌'}")
+        grand += mis
+    return grand
 
 
 def adjust_parity():
@@ -92,6 +106,8 @@ def adjust_parity():
          {"type": "grid_structural_sl", "sl_anchor": "confluence"}),
         ("senate", lambda: Senate(config={"sl_atr_mult": 1.5}),
          {"type": "grid_structural_sl", "sl_anchor": "wall"}),
+        ("congress", lambda: Congress(config={"entry_mode": "imb_start", "min_sl_atr_mult": 0.5}),
+         {"type": "grid_structural_sl", "sl_anchor": "agg_imbalance", "min_sl_atr_mult": 0.5}),
     ]
     for label, legacy_factory, comp_spec in cases:
         leg = legacy_factory()
