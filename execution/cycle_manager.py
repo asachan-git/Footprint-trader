@@ -323,6 +323,45 @@ def _check_cvd_divergence_exit(symbol: str, latest: Bar, settings: dict | None =
     return closed
 
 
+def _check_delta_divergence_exit(symbol: str, latest: Bar, settings: dict | None = None) -> list[dict]:
+    """Hard-close any open cycle when a fresh 15m delta divergence prints AGAINST it
+    — bullish divergence (sellers exhausting) vs a short, bearish vs a long.
+
+    The entry side mirror of the TP cap: counter-divergence cycles are −EV, so once
+    the divergence actually fires against an OPEN position we cut it rather than wait
+    for the disaster floor. Opt-in (settings.cycle.delta_divergence_exit). Realized R
+    marked to the bar close against the cycle's own risk denominator."""
+    from execution.pending_orders import pending_store
+    from execution.position_store import position_store
+    from pipeline.features.delta_divergence import against_side
+
+    closed: list[dict] = []
+    pos_store = position_store()
+    opens = pos_store.open_positions(symbol)
+    if not opens:
+        return closed
+    cyc = (settings or {}).get("cycle", {})
+    tf = str(cyc.get("delta_div_tf", "15m"))
+    win = int(cyc.get("delta_div_window", 15))
+    c = latest.ohlc.c
+    for pos in opens:
+        dd = against_side(symbol, pos.side, tf=tf, window=win)
+        if dd is None:
+            continue
+        risk = abs(pos.avg_entry - (pos.stop_loss or 0)) or 1e-9
+        pnl = (c - pos.avg_entry) if pos.side == "long" else (pos.avg_entry - c)
+        realized_r = pnl / risk
+        if pos_store.close_position(pos.position_id, reason="delta_divergence", realized_r=realized_r):
+            pending_store().cancel_for_position(pos.position_id)
+            _va_state.pop(pos.position_id, None)
+            _trend_escape_state.pop(pos.position_id, None)
+            closed.append({"position_id": pos.position_id, "realized_r": round(realized_r, 3),
+                           "direction": dd.direction})
+            LOG.info(f"[cycle] DELTA-DIVERGENCE-EXIT {pos.position_id} {pos.side} @ {c:.2f} "
+                     f"R={realized_r:.2f} ({dd.direction} {tf} div)")
+    return closed
+
+
 def _check_si_trail(symbol: str, latest: Bar, settings: dict | None = None) -> list[dict]:
     """Trail the stop under each new bar's TRADE-DIRECTION stacked imbalance — a
     footprint chandelier. Long: SL → strongest BUY-stack low − buf; short: SELL-stack
@@ -862,6 +901,16 @@ def on_bar_close(symbol: str, primary_tf: str, latest: Bar, settings: dict | Non
         except Exception as e:
             LOG.exception(f"[cycle] cvd_divergence check failed: {e}")
             actions["cvd_exit_error"] = str(e)
+
+    # Delta-divergence hard exit — OPT-IN (settings.cycle.delta_divergence_exit). Cut a
+    # cycle the bar a fresh 15m delta divergence prints against it. Pairs with the entry
+    # TP-halving cap (router.apply_delta_div_tp_cap).
+    if (settings or {}).get("cycle", {}).get("delta_divergence_exit"):
+        try:
+            actions["closed_delta_div"] = _check_delta_divergence_exit(symbol, latest, settings)
+        except Exception as e:
+            LOG.exception(f"[cycle] delta_divergence check failed: {e}")
+            actions["delta_div_exit_error"] = str(e)
 
     # SI-trail — OPT-IN (settings.cycle.si_trail_exit). Footprint chandelier stop for
     # the `reversal_si` strategy: tighten SL under each bar's stacked imbalance; the

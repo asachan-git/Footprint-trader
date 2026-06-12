@@ -67,8 +67,13 @@ class WaveFib(Coup):
                "hedge_eval_enabled": False,
                "coup_flip_exit": False,
                "cvd_divergence_exit": bool(cfg.get("cvd_divergence_exit", False)),
-               "cvd_exit_conf": float(cfg.get("cvd_exit_conf", 0.65))}
-        return {**settings, "cycle": cyc}
+               "cvd_exit_conf": float(cfg.get("cvd_exit_conf", 0.65)),
+               # 15m delta-divergence hard exit
+               "delta_divergence_exit": bool(cfg.get("delta_divergence_exit", True))}
+        # 15m delta-divergence alignment at entry: halve TP when against it
+        ent = {**(settings.get("entry") or {}),
+               "delta_div_half_tp": bool(cfg.get("delta_div_half_tp", True))}
+        return {**settings, "cycle": cyc, "entry": ent}
 
     # ── VP entry level over the two-wave structure ──────────────────────────────
     def _vp_entry(self, symbol: str, bars: list[Bar], st) -> float | None:

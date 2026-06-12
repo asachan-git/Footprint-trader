@@ -3,8 +3,12 @@
 Bearish: price > window max close, delta < window max delta  (buyers exhausting)
 Bullish: price < window min close, delta > window min delta  (sellers exhausting)
 
-Used as a hard gate in direction_engine — bearish divergence vetoes long entry,
-bullish divergence vetoes short entry.
+Consumed three ways:
+  - direction_engine — a SOFT weighted vote (weight 0.50). NOT a veto: it was
+    demoted from a hard gate 2026-05-30, so a bullish divergence can be (and is)
+    outvoted into a short. See against_side() below.
+  - entry TP cap — counter-divergence entries halve their TP distance (bank fast).
+  - cycle_manager hard exit — a fresh divergence against an open cycle closes it.
 """
 from __future__ import annotations
 
@@ -71,3 +75,18 @@ def from_store(symbol: str, tf: str, window: int = 5) -> DeltaDivergence:
         return detect(bars[-1], bars[:-1], window=window)
     except Exception:
         return _EMPTY
+
+
+def against_side(symbol: str, side: str, tf: str = "15m",
+                 window: int = 15) -> DeltaDivergence | None:
+    """Return the fired DeltaDivergence if it OPPOSES `side`, else None.
+
+    A bullish divergence (sellers exhausting) opposes a SHORT; a bearish
+    divergence (buyers exhausting) opposes a LONG. Used both to halve the TP on
+    counter-divergence ENTRIES and to hard-EXIT a cycle when divergence prints
+    against it. Reads the latest `tf` bars from state_store (default 15m)."""
+    dd = from_store(symbol, tf, window=window)
+    if not dd.fired:
+        return None
+    div_side = "long" if dd.direction == "bullish" else "short"
+    return dd if div_side != side else None

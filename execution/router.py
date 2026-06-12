@@ -167,6 +167,47 @@ def _build_grid_plan(decision: Decision, bar: Bar, settings: dict):
     )
 
 
+def apply_delta_div_tp_cap(plan, bar: Bar, settings: dict):
+    """Halve the TP distance when the entry opposes a fired 15m delta divergence.
+
+    Counter-divergence entries are −EV at full TP (verified: against avgR −0.38 vs
+    aligned +1.69) — so when a bullish 15m divergence is live and we're entering
+    SHORT (or bearish + LONG), pull the TP to half its distance from the anchor so
+    the trade banks fast instead of reaching for a target the flow argues against.
+
+    Opt-in via settings.entry.delta_div_half_tp. Applied as the FINAL TP step (after
+    the strategy's adjust_plan) so it caps every strategy's TP uniformly. Returns the
+    possibly-replaced (frozen) GridPlan."""
+    if not (settings or {}).get("entry", {}).get("delta_div_half_tp"):
+        return plan
+    try:
+        from dataclasses import replace
+        from pipeline.features.delta_divergence import against_side
+        ecfg = settings.get("entry") or {}
+        tf = str(ecfg.get("delta_div_tf", "15m"))
+        win = int(ecfg.get("delta_div_window", 15))
+        dd = against_side(bar.symbol, plan.side, tf=tf, window=win)
+        if dd is None:
+            return plan
+        anchor = plan.anchor_price or bar.ohlc.c
+        if anchor <= 0:
+            return plan
+        new_tp = anchor + 0.5 * (plan.take_profit - anchor)
+        new_offset = (new_tp - anchor) / anchor if anchor > 0 else plan.tp_offset_pct
+        import logging as _l
+        _l.getLogger(__name__).info(
+            f"[entry][delta_div] {bar.symbol} {plan.side} vs {dd.direction} {tf} div "
+            f"— TP halved {plan.take_profit:.2f}→{new_tp:.2f}"
+        )
+        return replace(plan, take_profit=round(new_tp, 4),
+                       tp_source=f"{plan.tp_source}+half_div",
+                       tp_offset_pct=new_offset)
+    except Exception as e:
+        import logging as _l
+        _l.getLogger(__name__).debug(f"[entry][delta_div] tp cap skipped: {e}")
+        return plan
+
+
 def dispatch_grid(plan, bar: Bar, settings: dict, parent_position_id: str | None = None) -> dict:
     """Route a GridPlan to the active executor in {paper, live}.
 
