@@ -20,6 +20,7 @@ from .routes.decide import bp as decide_bp
 from .routes.footprint_view import bp as footprint_bp
 from .routes.decide_multi import bp as decide_multi_bp
 from .routes.grid_tick import bp as grid_tick_bp
+from .routes.grid_levels import bp as grid_levels_bp
 from .routes.heatmap import bp as heatmap_bp
 from .routes.options_ingest import bp as options_ingest_bp
 from .routes.options_decide import bp as options_decide_bp
@@ -100,12 +101,19 @@ def create_app() -> Flask:
     app.config["FB_SETTINGS"] = settings
     _precompute_vp(settings)
     _backfill_sweeps(settings)
+    try:
+        from pipeline.feed_monitor import start as _start_gap_monitor
+        _start_gap_monitor(settings)
+    except Exception as e:
+        import logging as _l
+        _l.getLogger(__name__).warning(f"[startup] gap-monitor failed to start (non-fatal): {e}")
     app.register_blueprint(health_bp)
     app.register_blueprint(ingest_bp)
     app.register_blueprint(decide_bp)
     app.register_blueprint(footprint_bp)
     app.register_blueprint(decide_multi_bp)
     app.register_blueprint(grid_tick_bp)
+    app.register_blueprint(grid_levels_bp)
     app.register_blueprint(heatmap_bp)
     app.register_blueprint(options_ingest_bp)
     app.register_blueprint(options_decide_bp)

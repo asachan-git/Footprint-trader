@@ -1235,6 +1235,33 @@ function computeSuperTrend(bars, period = 10, mult = 3) {
   return out;
 }
 
+// Bollinger Bands — SMA(close, period) ± mult·stdev(close, period). Classic
+// 20/2 mean-reversion envelope: price riding the upper/lower band signals
+// stretch; the basis (SMA) is the mean-revert target. Period scales with TF.
+// Returns parallel arrays keyed to bars: {basis, upper, lower} (warmup → empty).
+function computeBollinger(bars, period = 20, mult = 2) {
+  const out = { basis: [], upper: [], lower: [] };
+  if (bars.length < period) return out;
+  let sum = 0, sum2 = 0;
+  for (let i = 0; i < bars.length; i++) {
+    const c = bars[i].c;
+    sum += c; sum2 += c * c;
+    if (i >= period) {
+      const old = bars[i - period].c;
+      sum -= old; sum2 -= old * old;
+    }
+    if (i < period - 1) continue;
+    const mean = sum / period;
+    const variance = Math.max(0, sum2 / period - mean * mean);
+    const sd = Math.sqrt(variance);
+    const t = bars[i].ts;
+    out.basis.push({ time: t, value: mean });
+    out.upper.push({ time: t, value: mean + mult * sd });
+    out.lower.push({ time: t, value: mean - mult * sd });
+  }
+  return out;
+}
+
 // Heikin-Ashi transform. HA close = avg(o,h,l,c); HA open = avg(prev HA o,c).
 function toHeikin(bars) {
   const out = [];
@@ -1438,6 +1465,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   const vwapRef      = useRef(null);
   const vwapBandRef  = useRef([]);     // [u1,l1,u2,l2] line series
   const stRef        = useRef(null);   // SuperTrend trail series
+  const bbRef        = useRef([]);     // Bollinger [basis,upper,lower] line series
   const [countdown, setCountdown] = useState("");
   const [legend, setLegend]       = useState(null);  // {o,h,l,c,delta,vol,up}
   // Drawing layer (measure / horizontal ray / alert)
@@ -1567,6 +1595,23 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       priceLineVisible: false, lastValueVisible: false, visible: false,
     });
 
+    // Bollinger Bands — basis (SMA) + ±2σ envelope. Price-scale series so they
+    // autoscale with the candles. Period scales with TF in the data effect.
+    const bbBasis = chart.addLineSeries({
+      color: "#26c6da", lineWidth: 1, priceLineVisible: false,
+      lastValueVisible: false, title: "BB", visible: false,
+    });
+    const mkBB = (color) => chart.addLineSeries({
+      color, lineWidth: 1, lineStyle: LineStyle.Solid,
+      priceLineVisible: false, lastValueVisible: false,
+      crosshairMarkerVisible: false, visible: false,
+    });
+    const bbBandSeries = [
+      bbBasis,
+      mkBB("rgba(38,198,218,0.55)"),  // upper
+      mkBB("rgba(38,198,218,0.55)"),  // lower
+    ];
+
     chartRef.current  = chart;
     candleRef.current = candleSeries;
     deltaRef.current  = deltaSeries;
@@ -1575,6 +1620,7 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
     vwapRef.current   = vwapSeries;
     vwapBandRef.current = bandSeries;
     stRef.current     = stSeries;
+    bbRef.current     = bbBandSeries;
 
     const redrawAll = () => {
       drawVP(vpCanvasRef.current, chart, candleSeries, dailyVpRef.current, barsRef.current, vpModeRef.current);
@@ -1703,6 +1749,15 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
       color: p.dir === 1 ? COLORS.up : COLORS.down,
     })));
 
+    // Bollinger Bands — 20-period SMA ±2σ of close.
+    const bb = computeBollinger(bars);
+    const bbSeries = bbRef.current;
+    if (bbSeries?.length === 3) {
+      bbSeries[0].setData(bb.basis);
+      bbSeries[1].setData(bb.upper);
+      bbSeries[2].setData(bb.lower);
+    }
+
     deltaRef.current.setData(bars.map(b => ({
       time: b.ts, value: b.delta,
       color: b.delta >= 0 ? COLORS.up : COLORS.down,
@@ -1800,10 +1855,12 @@ export default function CandleChart({ bars: rawBars, dailyVp, priorVp, detection
   useEffect(() => {
     const showVwap = indicators?.vwap === true;
     const showSt   = indicators?.atrTrail === true;
+    const showBB   = indicators?.bollinger === true;
     try {
       vwapRef.current?.applyOptions({ visible: showVwap });
       vwapBandRef.current?.forEach(s => s.applyOptions({ visible: showVwap }));
       stRef.current?.applyOptions({ visible: showSt });
+      bbRef.current?.forEach(s => s.applyOptions({ visible: showBB }));
     } catch {}
     redrawRef.current?.();   // vpFull mode change → repaint VP
   }, [indicators]);

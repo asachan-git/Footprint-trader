@@ -32,7 +32,7 @@ const DEFAULT_IND = {
   coupAbs:     false, coupRevAbs: false, coupAbsConf: false,
   coupTrades:  true,  demoTrades: true, repTrades: true,
   m1Trades:    false, m2Trades: false, cycleTrades: false,
-  vwap:        false, atrTrail: false, vpFull: false, vpDaily: false, sessionLines: true, cvdDiv: false, cvdEqDiv: false, cvdLine: false, revPattern: false,
+  vwap:        false, atrTrail: false, bollinger: false, vpFull: false, vpDaily: false, sessionLines: true, cvdDiv: false, cvdEqDiv: false, cvdLine: false, revPattern: false,
   chochSetup:  false, waveSetup: false,
   cvdSweeps:   false, cvdSweepsDivOnly: false,
 };
@@ -59,6 +59,7 @@ const IND_ITEMS = [
   { key: "cycleTrades",  label: "Cycle Trades",           tip: "Grid recovery cycles (dashed boxes) for the enabled strategies/modes. Shows cycle # + chain; hover for realized PnL + reason" },
   { key: "vwap",         label: "VWAP + σ bands",         tip: "Session-anchored VWAP (UTC day) with volume-weighted ±1σ/±2σ bands. Dynamic SL/TP anchor; mean-revert target = VWAP, stretch target = ±2σ" },
   { key: "atrTrail",     label: "ATR Trail (SuperTrend)", tip: "ATR-based SuperTrend trailing stop. Sits below price in uptrend (green), above in downtrend (red). Visual TSL / trend filter" },
+  { key: "bollinger",    label: "Bollinger Bands",        tip: "20-period SMA ±2σ envelope of close (per the selected TF). Basis = mean-revert target; price riding the upper/lower band = stretch. Cyan bands + center line" },
   { key: "vpFull",       label: "VP: full window",        tip: "Volume profile (left edge) scope: ON = whole loaded window, OFF = visible range only. Real bid/ask volume-at-price with POC + 70% value area + HVN/LVN" },
   { key: "vpDaily",      label: "VP: per-day",            tip: "Session-anchored volume profile PER DAY (XAU 03:30 IST / BTC 05:30 IST), anchored to each day's candle span (market-profile style). Faint per-day POC/VAH/VAL + HVN/LVN tint + day separators. Independent of the left-edge VP" },
   { key: "sessionLines", label: "Session lines",          tip: "Vertical dashed lines at each session boundary (XAU 03:30 IST / BTC 05:30 IST) — marks the start of each day's session (= prior session's end), labeled with the date. Drawn on both OHLC and Footprint panes" },

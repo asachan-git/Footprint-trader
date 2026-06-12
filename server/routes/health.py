@@ -85,6 +85,25 @@ def _check_last_ingest(settings: dict) -> dict:
         return {"ok": False, "detail": str(e), "age_s": None}
 
 
+def _check_feed_gaps() -> dict:
+    """Per-symbol feed health from the background gap-monitor (all configured
+    symbols, not just the primary). Non-critical: never 503s on its own — the
+    primary symbol is already covered by last_ingest."""
+    try:
+        from pipeline.feed_monitor import health as _feed_health
+        h = _feed_health()
+        if not h:
+            return {"ok": True, "detail": "monitor warming up", "symbols": {}}
+        stale = [s for s, v in h.items() if v.get("status") == "stale"]
+        return {
+            "ok": not stale,
+            "detail": ("all feeds fresh" if not stale else f"STALE: {', '.join(stale)}"),
+            "symbols": {s: {"age_s": v.get("age_s"), "status": v.get("status")} for s, v in h.items()},
+        }
+    except Exception as e:
+        return {"ok": True, "detail": f"unavailable: {e}", "symbols": {}}
+
+
 def _check_kill_switch(settings: dict) -> dict:
     try:
         import json
@@ -139,6 +158,7 @@ def health():
         "state_store":    _check_state_store(settings),
         "vp_cache":       _check_vp_cache(settings),
         "last_ingest":    _check_last_ingest(settings),
+        "feed_gaps":      _check_feed_gaps(),
         "kill_switch":    _check_kill_switch(settings),
         "pending_orders": _check_pending_orders(),
     }

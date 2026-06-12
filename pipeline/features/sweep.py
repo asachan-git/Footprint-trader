@@ -171,6 +171,12 @@ def _register_new_sweep(symbol: str, sig: SweepSignal) -> None:
             delta_confirms=sig.delta_confirms,
             rejection_pct=sig.rejection_pct,
             granularity=sig.granularity,
+            # Start at -1 so the SAME-bar tick_registry() call (callers run
+            # detect()→tick_registry() on one bar) advances this to age 0 WITHOUT
+            # consuming its one-shot follow-up window. The NEXT bar's tick then
+            # advances it to age 1, evaluating reclaim/acceptance + classification
+            # against the bar AFTER the sweep (where they're actually knowable).
+            age_bars=-1,
         ))
         _registry[symbol] = evs
 
