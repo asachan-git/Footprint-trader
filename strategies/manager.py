@@ -23,11 +23,32 @@ import traceback
 from pipeline.types import Bar
 
 from execution.paper import PaperExecutor
-from execution.router import _build_grid_plan
+from execution.router import _build_grid_plan, apply_delta_div_tp_cap
 from execution import cycle_manager
 
 from .base import StrategyContext, StrategyResult, Strategy
 from .registry import build_enabled
+
+
+def _cvd_div_opposes(symbol: str, side: str, tf: str = "15m", lookback: int = 120) -> bool:
+    """True if `side` OPPOSES the most recent confirmed CVD-divergence on `tf`
+    (bull div favours long, bear favours short). No div in the window → not opposing
+    (gate only removes counter-div entries). Causal: include_live marker from the
+    current bars. Used by the opt-in entry gate (config.cvd_div_gate)."""
+    try:
+        from pipeline.state_store import store
+        from pipeline.features.cvd_candlestick import scan_divergences
+        bars = store().recent(symbol, tf, lookback)
+        if len(bars) < 10:
+            return False
+        divs = scan_divergences(bars, lookback=3, include_live=True)
+        if not divs:
+            return False
+        last = max(divs, key=lambda d: d["ts"])          # most recent tf CVD-div
+        div_is_long = last["type"] == "bull"
+        return (side == "long") != div_is_long            # opposes?
+    except Exception:
+        return False
 
 LOG = logging.getLogger(__name__)
 
@@ -108,8 +129,24 @@ class StrategyManager:
         if decision is None or decision.side == "flat":
             return StrategyResult(strat.name, symbol, "flat", {})
 
+        # CVD-div ENTRY gate (opt-in, config.cvd_div_gate) — skip entries whose side
+        # OPPOSES the last confirmed 15m CVD-divergence. Validated as a net-positive
+        # 15m filter for vote/wave_fib/congress (dryrun_fleet: fleet +52→+80R over 824
+        # trades); live A/B vs the ungated twins. Uses 15m explicitly (primary_tf=1m,
+        # so the cvd_div_state cache is 1m — not what we want here).
+        if strat.config.get("cvd_div_gate") and _cvd_div_opposes(
+            symbol, decision.side,
+            tf=str(strat.config.get("cvd_div_gate_tf", "15m"))
+        ):
+            return StrategyResult(strat.name, symbol, "flat",
+                                  {"reason": "cvd_div_gate: side opposes last 15m CVD-div"})
+
         plan = _build_grid_plan(decision, bar, eff_settings)
         plan = strat.adjust_plan(plan, bar, eff_settings)   # strategy execution-policy hook
+        # Final TP step: halve TP when entering against a fired 15m delta divergence
+        # (opt-in, settings.entry.delta_div_half_tp). Runs LAST so it caps whatever
+        # TP the strategy's adjust_plan settled on.
+        plan = apply_delta_div_tp_cap(plan, bar, eff_settings)
         # No store args needed: ctx.scope() redirects position_store()/cycle_store()
         # at this strategy's stores, so submit_grid's internal getters land there.
         fill = PaperExecutor().submit_grid(plan, bar)

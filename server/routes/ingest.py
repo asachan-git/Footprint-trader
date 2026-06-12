@@ -479,6 +479,18 @@ def ingest():
         except Exception:
             pass
 
+    # Remember the last CVD divergence per symbol — populated every bar so the value
+    # is always current for any consumer (reversal_hvn filter, exits, dashboard),
+    # independent of which strategies happen to scan.
+    if bar.tf == primary_tf:
+        try:
+            from pipeline.features.cvd_candlestick import scan_divergences as _scan_div
+            from pipeline.features import cvd_div_state as _cdv
+            _cdv.record_from_scan(bar.symbol, _scan_div(store().recent(bar.symbol, primary_tf, 120),
+                                                        lookback=3, include_live=True))
+        except Exception:
+            pass
+
     # Big-trade detection — log on bar close so dashboard can render bubbles
     if bar.tf == primary_tf:
         try:
