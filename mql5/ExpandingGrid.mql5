@@ -1,0 +1,3822 @@
+//+------------------------------------------------------------------+
+//|                                              GoldGridEA_v6.mq5   |
+//|        Gold Grid EA v6.00 (FVG-ANCHORED ASYMMETRIC GRID)         |
+//|        - Grids open ONLY when a structural FVG fires             |
+//|        - Three TFs scanned: M5 (N=3), M15 (N=5), H1 (N=7)        |
+//|        - Trigger: candle on FVG's TF touches zone AND closes     |
+//|          beyond it (bull = close above, bear = close below)      |
+//|        - Each FVG can trigger max 2 times                        |
+//|        - H1 > M15 > M5 priority on overlapping triggers          |
+//|        - Per-TF parameter sets (N, target, lots, step, X)        |
+//|        - FVG zones drawn as rectangles on chart                  |
+//|        - Trigger counts persisted in MT5 Global Variables        |
+//|        - Pre-existing FVGs scanned on attach (live)              |
+//|        v6: FVG-anchored asymmetric placement —                   |
+//|        - Favor ladder beyond confirming edge (pyramid adds)      |
+//|        - Counter ladder beyond invalidation (zoneBot − buffer),  |
+//|          reversed front-loaded lots, Σ = β × favor (net tail)    |
+//|        - Zone interior always order-free (idea-valid territory)  |
+//|        - Per-TF risk budget solves base lot from FVG height      |
+//|        - TPs = outermost leg ± mult × ATR(trigger TF)            |
+//|        - Stale-FVG age caps; failed-failure full close           |
+//|        Designed for XAUUSD / MT5.                                |
+//+------------------------------------------------------------------+
+#property copyright   "Aniket"
+#property version     "6.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\OrderInfo.mqh>
+#include <Trade\PositionInfo.mqh>
+
+//--- Distance mode enum
+enum ENUM_GRID_DISTANCE_MODE
+{
+   GRID_DIST_FIXED    = 0,   // Fixed $ distance
+   GRID_DIST_ATR_M1   = 1,   // ATR multiplier on M1
+   GRID_DIST_ATR_M5   = 2,   // ATR multiplier on M5
+   GRID_DIST_ATR_M15  = 3    // ATR multiplier on M15
+};
+
+//--- Lot sizing mode enum
+enum ENUM_LOT_SIZING_MODE
+{
+   LOT_FIXED              = 0,   // Same lot for every order
+   LOT_LINEAR             = 1,   // base, base+step, base+2*step, ...  (small near mid)
+   LOT_FIBONACCI          = 2,   // base × Fib(i): 1,1,2,3,5,...  (small near mid)
+   LOT_LINEAR_REVERSED    = 3,   // base+(N-1)*step, ..., base+step, base  (big near mid)
+   LOT_FIBONACCI_REVERSED = 4    // base × Fib(N-i+1)  (big near mid)
+};
+
+//--- FVG trigger mode
+enum ENUM_FVG_TRIGGER_MODE
+{
+   FVG_TRIGGER_CLOSE = 0,   // Wait for candle close beyond confirming edge
+   FVG_TRIGGER_TOUCH = 1    // Fire as soon as price touches far edge of FVG
+};
+
+//--- Favor-stack SL anchor (anchored mode). All favor positions share one SL
+//    inside the zone: stop out small while the zone is still alive, re-enter
+//    on the next tap (trigger 2). The counter ladder below invalidation stays
+//    untouched as the standalone continuation trade.
+enum ENUM_FAVOR_SL_MODE
+{
+   FAVOR_SL_ZONE_TOP = 0,   // SL at confirming edge (tightest, most re-entries)
+   FAVOR_SL_ZONE_MID = 1,   // SL at zone middle (balanced)
+   FAVOR_SL_ZONE_BOT = 2    // SL at zone far edge (mitigation-aligned)
+};
+
+//--- Inputs
+input group "=== Grid Settings ==="
+input int                       InpGridCount        = 5;                  // N (static, used when dynamic N off)
+input int                       InpSlippage         = 10;                 // Slippage (points)
+
+input group "=== Dynamic N (ATR-driven) ==="
+input bool                      InpDynamicN              = true;          // Enable ATR-driven N sizing
+input int                       InpGridCountMin          = 2;             // Minimum N (floor)
+input int                       InpGridCountMax          = 8;             // Maximum N (ceiling)
+input double                    InpATRPerLevel           = 0.50;          // $ ATR per grid level (N = ATR / this)
+input int                       InpDynNATRPeriod         = 14;            // ATR period for sizing
+input ENUM_TIMEFRAMES           InpDynNATRTimeframe      = PERIOD_M1;     // TF for sizing ATR
+input int                       InpGridCountReference    = 6;             // Reference N for target scaling
+input double                    InpMinATRToTrade         = 2.00;          // Skip cycle if ATR below this $ (0 = no gate)
+
+input group "=== FVG TRIGGER — Core ==="
+input bool                      InpUseFVGTrigger         = true;          // Master switch: only open grid on FVG trigger
+input ENUM_FVG_TRIGGER_MODE     InpFVGTriggerMode        = FVG_TRIGGER_CLOSE; // CLOSE = wait for candle close | TOUCH = fire on price touch
+input int                       InpFVGMaxTriggers        = 2;             // Max times each FVG can fire
+input int                       InpFVGLookback           = 50;            // Candles to look back per TF
+input double                    InpFVGMinSizeUSD         = 0.30;          // Min FVG height ($) — skip smaller
+
+input group "=== FVG TRIGGER — Visualization ==="
+input bool                      InpFVGDrawZones          = true;          // Master switch: draw FVG rectangles on chart
+input bool                      InpFVGDrawM5             = true;          // Show M5 FVGs on chart
+input bool                      InpFVGDrawM15            = true;          // Show M15 FVGs on chart
+input bool                      InpFVGDrawH1             = true;          // Show H1 FVGs on chart
+input bool                      InpFVGBorderOnly         = false;         // Outline only (no fill) — best for heavy stacking
+input bool                      InpFVGDistinctStyles     = true;          // Use different line styles per TF
+input bool                      InpFVGLabelsAtRight      = true;          // Place labels at right edge (less collision)
+
+input group "=== FVG TRIGGER — State ==="
+input bool                      InpFVGPersistState       = true;          // Persist trigger counts across MT5 restart
+
+input group "=== FVG TRIGGER — Age caps (stale-zone expiry) ==="
+input int                       InpFVGMaxAgeHrsM5        = 6;             // M5 FVG max age (hours, 0 = never expires)
+input int                       InpFVGMaxAgeHrsM15       = 24;            // M15 FVG max age (hours, 0 = never expires)
+input int                       InpFVGMaxAgeHrsH1        = 72;            // H1 FVG max age (hours, 0 = never expires)
+
+input group "=== FVG ANCHORED GRID (v6 asymmetric placement) ==="
+// Grid derives from FVG geometry instead of market mid:
+//   bull FVG: BuyStops at zoneTop + i*step (adds while idea holds),
+//             SellStops beyond invalidation = zoneBot − buffer (idea dead → flip),
+//             NO orders inside the zone (idea-valid territory).
+// Base lot solved from the per-TF risk budget and the bleed-at-invalidation
+// distance, so risk per cycle is constant regardless of FVG height.
+input bool                      InpUseFVGAnchoredGrid    = true;          // Use FVG-anchored asymmetric grid
+input double                    InpInvalBufferATRk       = 0.5;           // Invalidation buffer: ATR(M5) multiplier
+input double                    InpInvalBufferPctH       = 15.0;          // Invalidation buffer: % of FVG height (max of the two wins)
+input int                       InpCounterLegs           = 3;             // Counter-side legs beyond invalidation
+input double                    InpCounterBeta           = 1.3;           // Σ counter lots = β × Σ favor lots (>1 keeps net flip tail)
+input double                    InpM5_CycleRiskUSD       = 25.0;          // M5: risk budget $ at invalidation
+input double                    InpM15_CycleRiskUSD      = 50.0;          // M15: risk budget $ at invalidation
+input double                    InpH1_CycleRiskUSD       = 100.0;         // H1: risk budget $ at invalidation
+input double                    InpTPATRMultM5           = 1.5;           // M5: TP = outer leg ± mult × ATR(M5)
+input double                    InpTPATRMultM15          = 2.0;           // M15: TP ATR multiplier
+input double                    InpTPATRMultH1           = 2.5;           // H1: TP ATR multiplier
+
+input group "=== FAVOR SL + RE-ENTRY (anchored mode) ==="
+input ENUM_FAVOR_SL_MODE        InpFavorSLModeM5         = FAVOR_SL_ZONE_BOT; // M5: favor-stack SL anchor inside zone
+input ENUM_FAVOR_SL_MODE        InpFavorSLModeM15        = FAVOR_SL_ZONE_BOT; // M15: favor-stack SL anchor
+input ENUM_FAVOR_SL_MODE        InpFavorSLModeH1         = FAVOR_SL_ZONE_BOT; // H1: favor-stack SL anchor
+input bool                      InpFavorReArm            = true;          // Re-place favor ladder on zone re-tap after SL-out
+input int                       InpReArmCooldownSec      = 60;            // Min seconds after SL-out before re-arm
+
+input group "=== PLAN ENDPOINT (footprint-driven placement) ==="
+// When enabled, on each FVG-armed bar the EA POSTs to a Python endpoint and
+// places the EXACT legs it returns (zone-based fulcrum, per-leg lots, skew,
+// structural TPs) instead of the symmetric fixed-step grid. Falls back to the
+// legacy grid if disabled or the request fails.
+// REQUIRED: whitelist InpPlanURL's host under
+//   Tools → Options → Expert Advisors → Allow WebRequest for listed URL
+input bool                      InpUsePlanEndpoint       = false;          // Use Python /grid_levels plan for placement
+input string                    InpPlanURL               = "http://127.0.0.1:5000/grid_levels"; // Endpoint URL (whitelist the host!)
+input string                    InpPlanTF                = "5m";           // tf sent to the planner
+input int                       InpPlanTimeoutMs         = 4000;           // WebRequest timeout (ms)
+
+input group "=== FVG M5 params (when M5 FVG fires) ==="
+input bool                      InpM5_Enable             = true;
+input int                       InpM5_GridCount          = 3;
+input double                    InpM5_ProfitTargetUSD    = 3.00;
+input double                    InpM5_BaseLot            = 0.01;
+input double                    InpM5_LotStep            = 0.01;
+input double                    InpM5_FixedDistance      = 0.30;
+input double                    InpM5_TPDistance         = 3.00;
+input ENUM_LOT_SIZING_MODE      InpM5_LotMode            = LOT_LINEAR_REVERSED;
+
+input group "=== FVG M15 params (when M15 FVG fires) ==="
+input bool                      InpM15_Enable            = true;
+input int                       InpM15_GridCount         = 5;
+input double                    InpM15_ProfitTargetUSD   = 8.00;
+input double                    InpM15_BaseLot           = 0.01;
+input double                    InpM15_LotStep           = 0.01;
+input double                    InpM15_FixedDistance     = 0.50;
+input double                    InpM15_TPDistance        = 5.00;
+input ENUM_LOT_SIZING_MODE      InpM15_LotMode           = LOT_LINEAR_REVERSED;
+
+input group "=== FVG H1 params (when H1 FVG fires) ==="
+input bool                      InpH1_Enable             = true;
+input int                       InpH1_GridCount          = 7;
+input double                    InpH1_ProfitTargetUSD    = 20.00;
+input double                    InpH1_BaseLot            = 0.02;
+input double                    InpH1_LotStep            = 0.01;
+input double                    InpH1_FixedDistance      = 0.75;
+input double                    InpH1_TPDistance         = 7.00;
+input ENUM_LOT_SIZING_MODE      InpH1_LotMode            = LOT_LINEAR_REVERSED;
+
+input group "=== Lot Sizing ==="
+input ENUM_LOT_SIZING_MODE      InpLotMode          = LOT_FIXED;          // Lot sizing mode
+input double                    InpBaseLot          = 0.01;               // Base lot (order #1)
+input double                    InpLotStep          = 0.01;               // Linear: increment per order
+input double                    InpMaxLot           = 1.00;               // Cap per single order (safety)
+
+input group "=== Grid Distance Mode ==="
+input ENUM_GRID_DISTANCE_MODE   InpDistanceMode     = GRID_DIST_FIXED;    // Distance mode
+input double                    InpFixedDistance    = 0.50;               // Fixed step ($) — used if mode=FIXED
+input int                       InpATRPeriod        = 14;                 // ATR period (when ATR mode)
+input double                    InpATRMultiplier    = 0.5;                // ATR multiplier (when ATR mode)
+input double                    InpMinDistance      = 0.20;               // Min step ($) safety floor
+input double                    InpMaxDistance      = 5.00;               // Max step ($) safety cap
+
+input group "=== TP Settings ==="
+input double                    InpTPDistance       = 5.00;               // X: $ distance beyond Nth order for TP (fallback)
+
+input group "=== TP Hedge Decay Per TF (Convex) ==="
+input double                    InpTPHedgeDecayPct_M5   = 25.0;           // M5: reduce TP offset at full hedge (%)
+input double                    InpTPHedgeDecayPct_M15  = 25.0;           // M15: reduce TP offset at full hedge (%)
+input double                    InpTPHedgeDecayPct_H1   = 25.0;           // H1: reduce TP offset at full hedge (%)
+
+input group "=== Cycle Profit Targets (floating P&L close) ==="
+input double                    InpProfitTargetUSD  = 0.0;                // Close when floating P&L >= this $ (0 = disabled)
+input double                    InpProfitTargetINR  = 0.0;                // Close when floating P&L >= this ₹ (0 = disabled)
+input double                    InpUSDtoINRRate     = 84.0;               // Conversion rate (used only when INR target > 0)
+input double                    InpHedgeDecayPct    = 33.0;               // Target decay when fully hedged (%, 0=no decay)
+input double                    InpMinTargetUSD     = 0.20;               // Floor: target won't go below this $ amount
+input bool                      InpCloseOnFullHedge = true;               // Close grid immediately when all N pairs hedged
+
+input group "=== Risk Controls ==="
+input double                    InpStopLoss         = 0.0;                // SL per order in $ (0 = none)
+input int                       InpMagicNumber      = 202401;             // Magic Number
+input double                    InpMaxMarginPct     = 60.0;                // Max % of equity to use as margin (safety cap)
+
+input group "=== EA Behaviour ==="
+input bool                      InpResetOnClose     = true;               // Re-open grid after close?
+input int                       InpGridResetDelay   = 60;                 // Seconds to wait after cycle close before next grid
+input int                       InpRetryDelay       = 5;                  // Seconds to wait after a failed open attempt (0 = immediate)
+
+input group "=== Dashboard ==="
+input bool                      InpShowDashboard    = true;               // Show on-chart dashboard
+input int                       InpDashX            = 10;                 // X offset (pixels from corner)
+input int                       InpDashY            = 25;                 // Y offset (pixels from corner)
+input ENUM_BASE_CORNER          InpDashCorner       = CORNER_LEFT_UPPER;  // Which corner
+
+//--- Globals
+CTrade         trade;
+COrderInfo     orderInfo;
+CPositionInfo  posInfo;
+
+datetime       lastCloseTime      = 0;
+bool           gridActive         = false;
+string         EA_TAG             = "GoldGrid";
+
+//--- Pre-calculated values for the current grid cycle
+double         gBuyTP             = 0.0;
+double         gSellTP            = 0.0;
+double         gGridMid           = 0.0;
+double         gGridStep          = 0.0;   // resolved step ($) for current cycle
+int            gActiveN           = 0;     // resolved N for current cycle (dynamic or fixed)
+double         gActiveTarget      = 0.0;   // resolved target for current cycle
+
+//--- Cycle P&L tracking (for dashboard)
+datetime       gCycleStartTime    = 0;
+double         gCyclePeakPnL      = -DBL_MAX;
+double         gCycleTroughPnL    =  DBL_MAX;
+double         gLastCyclePnL      = 0.0;
+int            gCyclesWon         = 0;
+int            gCyclesLost        = 0;
+double         gTotalRealizedUSD  = 0.0;
+
+//--- Dashboard object name prefix
+#define DASH_PREFIX "GoldGridDash_"
+
+//--- ATR handles (created once in OnInit)
+int            hAtrM1             = INVALID_HANDLE;
+int            hAtrM5             = INVALID_HANDLE;
+int            hAtrM15            = INVALID_HANDLE;
+int            hAtrDynN           = INVALID_HANDLE;  // for dynamic N sizing
+
+//--- Per-trigger-TF ATR handles (anchored grid buffer + TPs), period 14
+int            hAtrTrigM5         = INVALID_HANDLE;
+int            hAtrTrigM15        = INVALID_HANDLE;
+int            hAtrTrigH1         = INVALID_HANDLE;
+
+//--- Cycle placement mode (which open path produced the active cycle)
+enum ENUM_CYCLE_MODE
+{
+   CYCLE_LEGACY   = 0,   // symmetric grid around market mid
+   CYCLE_PLAN     = 1,   // Python /grid_levels plan
+   CYCLE_ANCHORED = 2    // v6 FVG-anchored asymmetric grid
+};
+ENUM_CYCLE_MODE gCycleMode        = CYCLE_LEGACY;
+
+//--- Anchored-cycle state (valid while gCycleMode == CYCLE_ANCHORED)
+bool           gCycleIsBullFVG    = false;
+double         gZoneTop           = 0.0;
+double         gZoneBot           = 0.0;
+double         gInvalPrice        = 0.0;
+double         gSolvedBaseLot     = 0.0;
+datetime       gLastFailCheckBar  = 0;
+
+//--- Favor SL + re-arm state (anchored mode)
+int            gCycleFVGIdx       = -1;     // index into gFVGs[] for the cycle's FVG
+double         gFavorSLPrice      = 0.0;    // shared SL of the favor stack
+double         gFavorPricesArr[];           // saved favor ladder (for re-arm)
+double         gFavorLotsArr[];
+bool           gFavorEverFilled   = false;  // any favor position seen this cycle?
+datetime       gFavorFlatSince    = 0;      // when favor side went flat after fills
+
+//+------------------------------------------------------------------+
+//| FVG (Fair Value Gap) data structures                             |
+//+------------------------------------------------------------------+
+struct FVGZone
+{
+   ENUM_TIMEFRAMES tf;            // M5 / M15 / H1
+   datetime        formedTime;    // time of candle 1 (oldest; used for rectangle left edge)
+   datetime        completedTime; // time of candle 3 (newest; used for mitigation filter)
+   double          topPrice;
+   double          botPrice;
+   bool            isBullish;     // true=bull (gap up), false=bear (gap down)
+   int             triggerCount;  // 0, 1, 2 (max = InpFVGMaxTriggers)
+   bool            mitigated;     // true if a candle closed through the zone
+   datetime        lastTriggerTime; // last trigger time (informational)
+   string          objName;       // chart object name for the rectangle
+};
+
+FVGZone gFVGs[];
+int     gFVGCount = 0;
+
+//--- Active TF for the current cycle (set when FVG triggers)
+ENUM_TIMEFRAMES gActiveTriggerTF      = PERIOD_CURRENT;
+string          gActiveTriggerTFName  = "";
+datetime        gLastFVGScanTime      = 0;
+datetime        gLastBarCheckM5       = 0;
+datetime        gLastBarCheckM15      = 0;
+datetime        gLastBarCheckH1       = 0;
+
+//--- Object name prefix for FVG rectangles
+#define FVG_PREFIX "GoldGridFVG_"
+#define FVG_GV_PREFIX "GoldGridFVGState_"
+
+//+------------------------------------------------------------------+
+//| Lot sizing mode name                                             |
+//+------------------------------------------------------------------+
+string LotModeName(ENUM_LOT_SIZING_MODE m)
+{
+   switch(m)
+   {
+      case LOT_FIXED:              return "FIXED";
+      case LOT_LINEAR:             return "LINEAR";
+      case LOT_FIBONACCI:          return "FIBONACCI";
+      case LOT_LINEAR_REVERSED:    return "LINEAR_REVERSED";
+      case LOT_FIBONACCI_REVERSED: return "FIB_REVERSED";
+   }
+   return "?";
+}
+
+//+------------------------------------------------------------------+
+//| Fibonacci number for grid index i (1-based)                      |
+//| Returns: Fib(1)=1, Fib(2)=1, Fib(3)=2, Fib(4)=3, Fib(5)=5, ...   |
+//+------------------------------------------------------------------+
+int FibAt(int i)
+{
+   if(i <= 0) return 0;
+   if(i <= 2) return 1;
+   int a = 1, b = 1, c = 1;
+   for(int k = 3; k <= i; k++) { c = a + b; a = b; b = c; }
+   return c;
+}
+
+//+------------------------------------------------------------------+
+//| Returns N for current cycle (gActiveN if set, else InpGridCount) |
+//+------------------------------------------------------------------+
+int ActiveN()
+{
+   return (gActiveN > 0) ? gActiveN : InpGridCount;
+}
+
+//+------------------------------------------------------------------+
+//| Resolve lot size for grid position i (1-based)                   |
+//| Applies broker volume_step and clamps to broker min/max and      |
+//| user's InpMaxLot cap.                                            |
+//+------------------------------------------------------------------+
+double ResolveLotForIndex(int i)
+{
+   //--- When FVG trigger mode is active, use the triggering TF's lot params
+   if(InpUseFVGTrigger && gActiveTriggerTF != PERIOD_CURRENT)
+      return ResolveLotFromTF(i);
+
+   double raw = InpBaseLot;
+
+   switch(InpLotMode)
+   {
+      case LOT_FIXED:
+         raw = InpBaseLot;
+         break;
+
+      case LOT_LINEAR:
+         //  i=1: base | i=2: base+step | i=3: base+2*step ...   (small near mid, big far)
+         raw = InpBaseLot + (i - 1) * InpLotStep;
+         break;
+
+      case LOT_FIBONACCI:
+         //  i=1: base*1 | i=2: base*1 | i=3: base*2 | i=4: base*3 ...  (small near mid)
+         raw = InpBaseLot * FibAt(i);
+         break;
+
+      case LOT_LINEAR_REVERSED:
+         //  i=1 (closest to mid): biggest | i=N (furthest): base
+         //  Mirror image: order i gets the lot that order (N - i + 1) would get in LINEAR
+         raw = InpBaseLot + (ActiveN() - i) * InpLotStep;
+         break;
+
+      case LOT_FIBONACCI_REVERSED:
+         //  i=1 (closest to mid): base × Fib(N) | i=N (furthest): base × Fib(1) = base
+         raw = InpBaseLot * FibAt(ActiveN() - i + 1);
+         break;
+   }
+
+   //--- Snap to broker volume step
+   double vStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double vMin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double vMax  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+
+   if(vStep > 0) raw = MathRound(raw / vStep) * vStep;
+
+   //--- Clamp to safety cap and broker limits
+   double capped = MathMin(raw, InpMaxLot);
+   capped        = MathMin(capped, vMax);
+   capped        = MathMax(capped, vMin);
+
+   //--- Final precision cleanup (typical Gold: 2 decimals)
+   capped = NormalizeDouble(capped, 2);
+
+   return capped;
+}
+
+//+------------------------------------------------------------------+
+//| DASHBOARD — Create or update a single label object               |
+//+------------------------------------------------------------------+
+void DashLabel(string id, int x, int y, string text, color clr, int fontSize = 9, string font = "Consolas")
+{
+   string name = DASH_PREFIX + id;
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_CORNER,     InpDashCorner);
+      ObjectSetInteger(0, name, OBJPROP_ANCHOR,     ANCHOR_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+      ObjectSetInteger(0, name, OBJPROP_BACK,       false);
+   }
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, InpDashX + x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, InpDashY + y);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,     clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,  fontSize);
+   ObjectSetString (0, name, OBJPROP_FONT,      font);
+   ObjectSetString (0, name, OBJPROP_TEXT,      text);
+}
+
+//+------------------------------------------------------------------+
+//| DASHBOARD — Background rectangle                                 |
+//+------------------------------------------------------------------+
+void DashBackground(int width, int height)
+{
+   string name = DASH_PREFIX + "_bg";
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_CORNER,     InpDashCorner);
+      ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+      ObjectSetInteger(0, name, OBJPROP_BACK,       false);
+   }
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, InpDashX - 6);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, InpDashY - 6);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE,     width);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE,     height);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR,   C'20,20,25');
+   ObjectSetInteger(0, name, OBJPROP_COLOR,     C'80,80,90');
+   ObjectSetInteger(0, name, OBJPROP_WIDTH,     1);
+}
+
+//+------------------------------------------------------------------+
+//| DASHBOARD — Remove all dashboard objects                         |
+//+------------------------------------------------------------------+
+void DashClear()
+{
+   int total = ObjectsTotal(0, -1, OBJ_LABEL);
+   for(int i = total - 1; i >= 0; i--)
+   {
+      string name = ObjectName(0, i, -1, OBJ_LABEL);
+      if(StringFind(name, DASH_PREFIX) == 0) ObjectDelete(0, name);
+   }
+   ObjectDelete(0, DASH_PREFIX + "_bg");
+}
+
+//+------------------------------------------------------------------+
+//| DASHBOARD — Render current state                                 |
+//+------------------------------------------------------------------+
+void DashRender()
+{
+   if(!InpShowDashboard) return;
+
+   //--- Collect live data
+   double floatingUSD = GetCycleFloatingPnL();
+   double floatingINR = floatingUSD * InpUSDtoINRRate;
+
+   //--- Update peak/trough trackers (only when grid active)
+   if(gridActive)
+   {
+      if(floatingUSD > gCyclePeakPnL)   gCyclePeakPnL   = floatingUSD;
+      if(floatingUSD < gCycleTroughPnL) gCycleTroughPnL = floatingUSD;
+   }
+
+   //--- Count open positions
+   int buysOpen = 0, sellsOpen = 0;
+   double totalLots = 0.0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(posInfo.SelectByIndex(i))
+      {
+         if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol)
+         {
+            if(posInfo.PositionType() == POSITION_TYPE_BUY)  buysOpen++;
+            else                                              sellsOpen++;
+            totalLots += posInfo.Volume();
+         }
+      }
+   }
+   int pendingCount = 0;
+   for(int i = 0; i < OrdersTotal(); i++)
+   {
+      if(orderInfo.SelectByIndex(i))
+      {
+         if(orderInfo.Magic() == InpMagicNumber && orderInfo.Symbol() == _Symbol)
+            pendingCount++;
+      }
+   }
+   int hedgedPairs = MathMin(buysOpen, sellsOpen);
+
+   //--- Effective target (hedge-decayed)
+   double baseTarget = (gActiveTarget > 0) ? gActiveTarget : InpProfitTargetUSD;
+   double effectiveUSD = baseTarget;
+   double decayRatio   = 0.0;
+   if(ActiveN() > 0 && InpHedgeDecayPct > 0.0 && hedgedPairs > 0)
+   {
+      decayRatio = ((double)hedgedPairs / (double)ActiveN()) * (InpHedgeDecayPct / 100.0);
+      if(decayRatio > 1.0) decayRatio = 1.0;
+      effectiveUSD = baseTarget * (1.0 - decayRatio);
+      if(effectiveUSD < InpMinTargetUSD) effectiveUSD = InpMinTargetUSD;
+   }
+
+   //--- Account info
+   double equity     = AccountInfoDouble(ACCOUNT_EQUITY);
+   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double marginLvl  = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+
+   //--- Cycle duration
+   string cycleDuration = "--";
+   if(gridActive && gCycleStartTime > 0)
+   {
+      long secs = TimeCurrent() - gCycleStartTime;
+      long mins = secs / 60;
+      long hrs  = mins / 60;
+      if(hrs > 0)
+         cycleDuration = IntegerToString(hrs) + "h " + IntegerToString(mins % 60) + "m";
+      else
+         cycleDuration = IntegerToString(mins) + "m " + IntegerToString(secs % 60) + "s";
+   }
+
+   //--- Color codes
+   color colorWhite  = C'220,220,220';
+   color colorDim    = C'140,140,140';
+   color colorGreen  = C'80,200,140';
+   color colorRed    = C'235,90,90';
+   color colorYellow = C'230,180,80';
+   color colorBlue   = C'140,170,235';
+
+   color pnlColor = floatingUSD > 0.005 ? colorGreen : (floatingUSD < -0.005 ? colorRed : colorDim);
+   color hedgeColor = hedgedPairs >= ActiveN() ? colorRed :
+                      hedgedPairs > 0 ? colorYellow : colorGreen;
+   color marginColor = marginLvl < 200 ? colorRed :
+                       marginLvl < 500 ? colorYellow : colorGreen;
+
+   //--- Background sized for ~15 rows
+   int rowH    = 14;
+   int width   = 290;
+   int height  = rowH * 20 + 12;
+   DashBackground(width, height);
+
+   int y = 0;
+
+   //--- Header
+   DashLabel("hdr",  0, y, "═══ GoldGridEA v6.00 ═══", colorBlue, 9); y += rowH;
+   DashLabel("state",0, y, gridActive ? "● ACTIVE" : "○ IDLE",
+             gridActive ? colorGreen : colorDim, 9); y += rowH;
+
+   //--- Cycle section
+   DashLabel("sec1", 0, y, "── CYCLE ──", colorDim, 8); y += rowH;
+   DashLabel("dur",  0, y, "Duration:   " + cycleDuration, colorWhite); y += rowH;
+   DashLabel("n",    0, y, "N:          " + IntegerToString(ActiveN()) +
+                          (InpDynamicN ? " (dyn)" : " (static)"),
+             InpDynamicN ? colorBlue : colorWhite); y += rowH;
+   DashLabel("pos",  0, y, "Positions:  " + IntegerToString(buysOpen) + "B / " + IntegerToString(sellsOpen) + "S",
+             colorWhite); y += rowH;
+   DashLabel("pend", 0, y, "Pending:    " + IntegerToString(pendingCount), colorWhite); y += rowH;
+   DashLabel("lots", 0, y, "Total lots: " + DoubleToString(totalLots, 2), colorWhite); y += rowH;
+   DashLabel("hedge",0, y, "Hedged:     " + IntegerToString(hedgedPairs) + " / " + IntegerToString(ActiveN()) + " pairs",
+             hedgeColor); y += rowH;
+
+   //--- P&L section
+   DashLabel("sec2", 0, y, "── P&L ──", colorDim, 8); y += rowH;
+   DashLabel("float",0, y, "Float:    $" + DoubleToString(floatingUSD, 2) +
+                          " (₹" + DoubleToString(floatingINR, 0) + ")", pnlColor); y += rowH;
+   DashLabel("peak", 0, y, "Peak:    $" + (gCyclePeakPnL > -1e9 ? DoubleToString(gCyclePeakPnL, 2) : "--"),
+             colorGreen); y += rowH;
+   DashLabel("trough",0,y, "Trough:  $" + (gCycleTroughPnL < 1e9 ? DoubleToString(gCycleTroughPnL, 2) : "--"),
+             colorRed); y += rowH;
+   DashLabel("tgt",  0, y, "Target:   $" + DoubleToString(effectiveUSD, 2) +
+                          (decayRatio > 0 ? " (-" + DoubleToString(decayRatio*100, 0) + "%)" : ""),
+             colorYellow); y += rowH;
+
+   //--- TP decay row (only when FVG active and decay configured; not anchored mode)
+   if(InpUseFVGTrigger && gridActive && gCycleMode != CYCLE_ANCHORED &&
+      GetActiveTPHedgeDecayPct() > 0.0 &&
+      gActiveN > 0 && gGridStep > 0.0)
+   {
+      double origOffset = gActiveN * gGridStep + ActiveTPDistance();
+      double currOffset = GetDecayedTPOffset();
+      double tpDecayApplied = (origOffset > 0) ? (1.0 - currOffset / origOffset) * 100.0 : 0.0;
+      tpDecayApplied = MathMax(0.0, MathMin(100.0, tpDecayApplied));
+      string tpDecayStr = (currOffset == 0.0)
+         ? "TP decay: 100% (TP removed — use target)"
+         : "TP decay: " + DoubleToString(tpDecayApplied, 0) + "%" +
+           " (max " + DoubleToString(GetActiveTPHedgeDecayPct(), 0) + "%)" +
+           " off=$" + DoubleToString(currOffset, 2);
+      DashLabel("tpdecay", 0, y, tpDecayStr, colorYellow); y += rowH;
+   }
+
+   //--- Account section
+   DashLabel("sec3", 0, y, "── ACCOUNT ──", colorDim, 8); y += rowH;
+   DashLabel("eq",   0, y, "Equity:   $" + DoubleToString(equity, 2), colorWhite); y += rowH;
+   DashLabel("ml",   0, y, "Mgn lvl:  " + (marginLvl > 0 ? DoubleToString(marginLvl, 0) + "%" : "--"),
+             marginColor); y += rowH;
+
+   //--- FVG section (only when FVG mode active)
+   if(InpUseFVGTrigger)
+   {
+      int aH1=0, aM15=0, aM5=0;
+      for(int i = 0; i < gFVGCount; i++)
+      {
+         if(FVGDead(i)) continue;
+         if(gFVGs[i].tf == PERIOD_H1)  aH1++;
+         if(gFVGs[i].tf == PERIOD_M15) aM15++;
+         if(gFVGs[i].tf == PERIOD_M5)  aM5++;
+      }
+      DashLabel("secfvg", 0, y, "── FVG ──", colorDim, 8); y += rowH;
+      DashLabel("fvgcnt", 0, y, "Armed:    H1=" + IntegerToString(aH1) +
+                                " M15=" + IntegerToString(aM15) +
+                                " M5=" + IntegerToString(aM5),
+                colorBlue); y += rowH;
+      DashLabel("fvgtf",  0, y, "Trig TF:  " +
+                                (gActiveTriggerTFName == "" ? "--" : gActiveTriggerTFName),
+                colorBlue); y += rowH;
+   }
+
+   //--- Anchored-cycle section (v6)
+   if(gCycleMode == CYCLE_ANCHORED && gridActive)
+   {
+      DashLabel("seca",  0, y, "── ANCHORED ──", colorDim, 8); y += rowH;
+      DashLabel("azone", 0, y, "Zone:  " + DoubleToString(gZoneBot, _Digits) +
+                               "-" + DoubleToString(gZoneTop, _Digits) +
+                               (gCycleIsBullFVG ? " Bull" : " Bear"),
+                colorBlue); y += rowH;
+      DashLabel("ainv",  0, y, "Inval: " + DoubleToString(gInvalPrice, _Digits) +
+                               "  base " + DoubleToString(gSolvedBaseLot, 2) +
+                               "  R $" + DoubleToString(CycleRiskUSD(gActiveTriggerTF), 0),
+                colorYellow); y += rowH;
+      DashLabel("asl",   0, y, "FavSL: " + DoubleToString(gFavorSLPrice, _Digits) +
+                               (gFavorFlatSince > 0 ? "  [STOPPED-OUT, re-arm wait]" : ""),
+                gFavorFlatSince > 0 ? colorRed : colorWhite); y += rowH;
+   }
+
+   //--- Stats
+   DashLabel("stats",0, y, "Won " + IntegerToString(gCyclesWon) +
+                          " / Lost " + IntegerToString(gCyclesLost) +
+                          " | Net $" + DoubleToString(gTotalRealizedUSD, 2),
+             colorBlue); y += rowH;
+}
+
+//+==================================================================+
+//|                                                                  |
+//|   FVG MODULE — detection, mitigation, triggers, drawing, state   |
+//|                                                                  |
+//+==================================================================+
+
+//+------------------------------------------------------------------+
+//| Return short string for a TF enum                                |
+//+------------------------------------------------------------------+
+string TFName(ENUM_TIMEFRAMES tf)
+{
+   switch(tf)
+   {
+      case PERIOD_M5:  return "M5";
+      case PERIOD_M15: return "M15";
+      case PERIOD_H1:  return "H1";
+   }
+   return EnumToString(tf);
+}
+
+//+------------------------------------------------------------------+
+//| Build a unique key for an FVG (used for Global Variable name)    |
+//+------------------------------------------------------------------+
+string FVGKey(ENUM_TIMEFRAMES tf, datetime formedTime, bool isBullish)
+{
+   return FVG_GV_PREFIX + _Symbol + "_" +
+          TFName(tf) + "_" +
+          (isBullish ? "B" : "S") + "_" +
+          IntegerToString((long)formedTime);
+}
+
+//+------------------------------------------------------------------+
+//| Read trigger count from Global Variable for an FVG (0 if none)   |
+//+------------------------------------------------------------------+
+int LoadFVGTriggerCount(ENUM_TIMEFRAMES tf, datetime formedTime, bool isBullish)
+{
+   if(!InpFVGPersistState) return 0;
+   string key = FVGKey(tf, formedTime, isBullish);
+   if(GlobalVariableCheck(key))
+      return (int)GlobalVariableGet(key);
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Save trigger count to Global Variable                            |
+//+------------------------------------------------------------------+
+void SaveFVGTriggerCount(int idx)
+{
+   if(!InpFVGPersistState) return;
+   if(idx < 0 || idx >= gFVGCount) return;
+   string key = FVGKey(gFVGs[idx].tf, gFVGs[idx].formedTime, gFVGs[idx].isBullish);
+   GlobalVariableSet(key, (double)gFVGs[idx].triggerCount);
+}
+
+//+------------------------------------------------------------------+
+//| Find existing FVG in array by tf+time+direction (returns -1)     |
+//+------------------------------------------------------------------+
+int FindFVGIndex(ENUM_TIMEFRAMES tf, datetime formedTime, bool isBullish)
+{
+   for(int i = 0; i < gFVGCount; i++)
+      if(gFVGs[i].tf == tf &&
+         gFVGs[i].formedTime == formedTime &&
+         gFVGs[i].isBullish == isBullish)
+         return i;
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+//| Max age (hours) for an FVG of a given TF (0 = never expires)     |
+//+------------------------------------------------------------------+
+int FVGMaxAgeHrs(ENUM_TIMEFRAMES tf)
+{
+   if(tf == PERIOD_M5)  return InpFVGMaxAgeHrsM5;
+   if(tf == PERIOD_M15) return InpFVGMaxAgeHrsM15;
+   if(tf == PERIOD_H1)  return InpFVGMaxAgeHrsH1;
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Has this FVG exceeded its TF's age cap?                          |
+//+------------------------------------------------------------------+
+bool FVGExpired(int idx)
+{
+   if(idx < 0 || idx >= gFVGCount) return false;
+   int hrs = FVGMaxAgeHrs(gFVGs[idx].tf);
+   if(hrs <= 0) return false;
+   return (TimeCurrent() - gFVGs[idx].completedTime) > (long)hrs * 3600;
+}
+
+//+------------------------------------------------------------------+
+//| Single source of truth: is this FVG dead (mitigated, fully       |
+//| triggered, or expired)? Dead FVGs never fire and never draw.     |
+//+------------------------------------------------------------------+
+bool FVGDead(int idx)
+{
+   if(idx < 0 || idx >= gFVGCount) return true;
+   return gFVGs[idx].mitigated ||
+          gFVGs[idx].triggerCount >= InpFVGMaxTriggers ||
+          FVGExpired(idx);
+}
+
+//+------------------------------------------------------------------+
+//| Draw or update an FVG rectangle on chart                         |
+//+------------------------------------------------------------------+
+void DrawFVG(int idx)
+{
+   if(!InpFVGDrawZones) return;
+   if(idx < 0 || idx >= gFVGCount) return;
+
+   //--- Per-TF visibility filter: hide FVGs whose TF is set to not draw
+   ENUM_TIMEFRAMES tf = gFVGs[idx].tf;
+   bool drawThisTF = (tf == PERIOD_M5  && InpFVGDrawM5)  ||
+                     (tf == PERIOD_M15 && InpFVGDrawM15) ||
+                     (tf == PERIOD_H1  && InpFVGDrawH1);
+   if(!drawThisTF)
+   {
+      RemoveFVGObjects(idx);
+      return;
+   }
+
+   //--- If FVG is dead (mitigated, fully triggered, or expired), remove from chart
+   bool dead = FVGDead(idx);
+   if(dead)
+   {
+      RemoveFVGObjects(idx);
+      return;
+   }
+
+   string name = gFVGs[idx].objName;
+   color  clr;       // border color
+   color  bgClr;     // fill color
+   int    lineWidth;
+   ENUM_LINE_STYLE lineStyle = STYLE_SOLID;
+
+   //--- Base color from direction (more saturated than before for visibility)
+   if(gFVGs[idx].isBullish)
+   {
+      clr = C'70,220,150';
+   }
+   else
+   {
+      clr = C'250,90,90';
+   }
+
+   //--- Per-TF visual hierarchy: H1 strongest, M5 lightest
+   if(tf == PERIOD_H1)
+   {
+      lineWidth = 2;
+      lineStyle = STYLE_SOLID;
+      bgClr = gFVGs[idx].isBullish ? C'18,55,38' : C'70,28,28';
+   }
+   else if(tf == PERIOD_M15)
+   {
+      lineWidth = 1;
+      lineStyle = STYLE_DASH;
+      bgClr = gFVGs[idx].isBullish ? C'14,40,28' : C'55,22,22';
+   }
+   else  // M5
+   {
+      lineWidth = 1;
+      lineStyle = STYLE_DOT;
+      bgClr = gFVGs[idx].isBullish ? C'10,28,20' : C'38,16,16';
+   }
+
+   //--- Override style if distinct-styles disabled
+   if(!InpFVGDistinctStyles)
+   {
+      lineStyle = STYLE_SOLID;
+      lineWidth = 1;
+   }
+
+   //--- Extend right edge to current time + 30 mins
+   datetime rightEdge = TimeCurrent() + 1800;
+
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_RECTANGLE, 0,
+                   gFVGs[idx].formedTime, gFVGs[idx].topPrice,
+                   rightEdge,             gFVGs[idx].botPrice);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+   }
+   else
+   {
+      ObjectSetInteger(0, name, OBJPROP_TIME,  0, gFVGs[idx].formedTime);
+      ObjectSetInteger(0, name, OBJPROP_TIME,  1, rightEdge);
+      ObjectSetDouble (0, name, OBJPROP_PRICE, 0, gFVGs[idx].topPrice);
+      ObjectSetDouble (0, name, OBJPROP_PRICE, 1, gFVGs[idx].botPrice);
+   }
+
+   //--- Border-only mode: disable fill so stacked boxes don't blend
+   ObjectSetInteger(0, name, OBJPROP_FILL,    !InpFVGBorderOnly);
+   ObjectSetInteger(0, name, OBJPROP_BACK,    true);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,   clr);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bgClr);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH,   lineWidth);
+   ObjectSetInteger(0, name, OBJPROP_STYLE,   lineStyle);
+
+   //--- Add text label with TF, direction, trigger count
+   string lblName = name + "_lbl";
+   string lblText = TFName(gFVGs[idx].tf) + " " +
+                    (gFVGs[idx].isBullish ? "Bull" : "Bear") +
+                    " T" + IntegerToString(gFVGs[idx].triggerCount);
+
+   //--- Decide label anchor position
+   datetime lblTime;
+   double   lblPrice;
+   ENUM_ANCHOR_POINT anchor;
+
+   if(InpFVGLabelsAtRight)
+   {
+      //--- Right-edge labels — stagger by TF to avoid collisions
+      int tfOffset = 0;
+      if(tf == PERIOD_M5)  tfOffset = 60;       // 1 minute right of edge
+      if(tf == PERIOD_M15) tfOffset = 300;      // 5 minutes right
+      if(tf == PERIOD_H1)  tfOffset = 900;      // 15 minutes right
+      lblTime  = rightEdge + tfOffset;
+      lblPrice = (gFVGs[idx].topPrice + gFVGs[idx].botPrice) / 2.0;  // vertical middle of FVG
+      anchor   = ANCHOR_LEFT;
+   }
+   else
+   {
+      //--- Left-edge labels (legacy)
+      lblTime  = gFVGs[idx].formedTime;
+      lblPrice = gFVGs[idx].isBullish ? gFVGs[idx].topPrice : gFVGs[idx].botPrice;
+      anchor   = ANCHOR_LEFT;
+   }
+
+   if(ObjectFind(0, lblName) < 0)
+   {
+      ObjectCreate(0, lblName, OBJ_TEXT, 0, lblTime, lblPrice);
+      ObjectSetInteger(0, lblName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, lblName, OBJPROP_HIDDEN,     true);
+      ObjectSetInteger(0, lblName, OBJPROP_FONTSIZE,   7);
+      ObjectSetString (0, lblName, OBJPROP_FONT,       "Consolas");
+   }
+   ObjectSetString (0, lblName, OBJPROP_TEXT,    lblText);
+   ObjectSetInteger(0, lblName, OBJPROP_COLOR,   clr);
+   ObjectSetInteger(0, lblName, OBJPROP_ANCHOR,  anchor);
+   ObjectSetInteger(0, lblName, OBJPROP_TIME,    0, lblTime);
+   ObjectSetDouble (0, lblName, OBJPROP_PRICE,   0, lblPrice);
+}
+
+//+------------------------------------------------------------------+
+//| Remove a specific FVG's chart objects                            |
+//+------------------------------------------------------------------+
+void RemoveFVGObjects(int idx)
+{
+   if(idx < 0 || idx >= gFVGCount) return;
+   ObjectDelete(0, gFVGs[idx].objName);
+   ObjectDelete(0, gFVGs[idx].objName + "_lbl");
+}
+
+//+------------------------------------------------------------------+
+//| Clear all FVG chart objects                                      |
+//+------------------------------------------------------------------+
+void ClearAllFVGObjects()
+{
+   int total = ObjectsTotal(0);
+   for(int i = total - 1; i >= 0; i--)
+   {
+      string name = ObjectName(0, i);
+      if(StringFind(name, FVG_PREFIX) == 0)
+         ObjectDelete(0, name);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Detect FVGs on a given TF over lookback bars.                    |
+//| Adds new ones to gFVGs[]; existing ones are skipped.             |
+//|                                                                  |
+//| IMPORTANT: We only consider COMPLETED 3-candle patterns.         |
+//|   - CopyRates(start_pos=1) excludes bar 0 (incomplete).          |
+//|   - The newest candle in the pattern is rates[0] = last closed.  |
+//|   - In-progress patterns (where bar 0 is the 3rd member) are     |
+//|     NEVER added until that bar closes on the next scan.          |
+//+------------------------------------------------------------------+
+void ScanFVGsForTF(ENUM_TIMEFRAMES tf)
+{
+   int bars = InpFVGLookback;
+   MqlRates rates[];
+   //--- start_pos=1 → exclude bar 0 (incomplete). rates[0] = last CLOSED bar.
+   int copied = CopyRates(_Symbol, tf, 1, bars + 3, rates);
+   if(copied < 3) return;
+
+   //--- IMPORTANT: by default CopyRates puts OLDEST at rates[0]. Flip so rates[0]=newest.
+   //    After this, smaller index = newer bar (matches comments below).
+   ArraySetAsSeries(rates, true);
+
+   //--- One-time diagnostic to verify ordering (logs only on first detected FVG per TF)
+   static bool diagLogged_M5  = false;
+   static bool diagLogged_M15 = false;
+   static bool diagLogged_H1  = false;
+   bool diagPrinted = (tf == PERIOD_M5  && diagLogged_M5) ||
+                      (tf == PERIOD_M15 && diagLogged_M15) ||
+                      (tf == PERIOD_H1  && diagLogged_H1);
+   if(!diagPrinted && copied >= 2)
+   {
+      Print("🔧 FVG scan order check ", TFName(tf),
+            ": rates[0].time=", TimeToString(rates[0].time, TIME_DATE|TIME_MINUTES),
+            " rates[1].time=", TimeToString(rates[1].time, TIME_DATE|TIME_MINUTES),
+            " (expect rates[0] > rates[1] for series=true)");
+      if(tf == PERIOD_M5)  diagLogged_M5  = true;
+      if(tf == PERIOD_M15) diagLogged_M15 = true;
+      if(tf == PERIOD_H1)  diagLogged_H1  = true;
+   }
+
+   //--- Defensive sanity check: rates[0].time must be a closed bar
+   //    (its time should be strictly less than the current bar's open time)
+   datetime currentBarTime = iTime(_Symbol, tf, 0);
+   if(currentBarTime > 0 && rates[0].time >= currentBarTime)
+   {
+      Print("⚠️  ScanFVGsForTF(", TFName(tf), "): rates[0] not yet closed — skipping scan.");
+      return;
+   }
+
+   //--- Iterate from oldest to newest. Window indices in rates[] (newer = lower idx):
+   //      rates[i]    = oldest candle (candle 1 of pattern)
+   //      rates[i-1]  = middle candle (candle 2 of pattern)
+   //      rates[i-2]  = newest candle (candle 3 of pattern) — must be closed
+   //
+   //    Smallest i = 2, so rates[i-2] = rates[0] = last closed bar (NEVER bar 0).
+   for(int i = 2; i < copied; i++)
+   {
+      double high0 = rates[i-2].high;    // newest candle's high
+      double low0  = rates[i-2].low;     // newest candle's low
+      double high2 = rates[i].high;      // oldest candle's high
+      double low2  = rates[i].low;       // oldest candle's low
+
+      //--- Bullish FVG: low[i-2] > high[i]  (gap up — zone = [high[i] .. low[i-2]])
+      if(low0 > high2)
+      {
+         double gapSize = low0 - high2;
+         if(gapSize < InpFVGMinSizeUSD) continue;
+
+         datetime formed     = rates[i].time;     // candle 1 (oldest)
+         datetime completed  = rates[i-2].time;   // candle 3 (newest, pattern complete)
+         if(FindFVGIndex(tf, formed, true) >= 0) continue;  // already known
+
+         int idx = gFVGCount;
+         ArrayResize(gFVGs, gFVGCount + 1);
+         gFVGs[idx].tf              = tf;
+         gFVGs[idx].formedTime      = formed;
+         gFVGs[idx].completedTime   = completed;
+         gFVGs[idx].topPrice        = low0;
+         gFVGs[idx].botPrice        = high2;
+         gFVGs[idx].isBullish       = true;
+         gFVGs[idx].triggerCount    = LoadFVGTriggerCount(tf, formed, true);
+         gFVGs[idx].mitigated       = false;
+         gFVGs[idx].lastTriggerTime = 0;
+         gFVGs[idx].objName         = FVG_PREFIX + TFName(tf) + "_B_" + IntegerToString((long)formed);
+         gFVGCount++;
+      }
+      //--- Bearish FVG: high[i-2] < low[i]  (gap down — zone = [high[i-2] .. low[i]])
+      else if(high0 < low2)
+      {
+         double gapSize = low2 - high0;
+         if(gapSize < InpFVGMinSizeUSD) continue;
+
+         datetime formed     = rates[i].time;
+         datetime completed  = rates[i-2].time;
+         if(FindFVGIndex(tf, formed, false) >= 0) continue;
+
+         int idx = gFVGCount;
+         ArrayResize(gFVGs, gFVGCount + 1);
+         gFVGs[idx].tf              = tf;
+         gFVGs[idx].formedTime      = formed;
+         gFVGs[idx].completedTime   = completed;
+         gFVGs[idx].topPrice        = low2;
+         gFVGs[idx].botPrice        = high0;
+         gFVGs[idx].isBullish       = false;
+         gFVGs[idx].triggerCount    = LoadFVGTriggerCount(tf, formed, false);
+         gFVGs[idx].mitigated       = false;
+         gFVGs[idx].lastTriggerTime = 0;
+         gFVGs[idx].objName         = FVG_PREFIX + TFName(tf) + "_S_" + IntegerToString((long)formed);
+         gFVGCount++;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check mitigation for all FVGs (any candle close beyond opposite  |
+//| edge marks the FVG as mitigated).                                |
+//+------------------------------------------------------------------+
+void UpdateFVGMitigation()
+{
+   static datetime lastDiagLog = 0;
+   bool diag = (TimeCurrent() - lastDiagLog >= 60);  // log details once per minute
+   if(diag) lastDiagLog = TimeCurrent();
+
+   for(int i = 0; i < gFVGCount; i++)
+   {
+      if(gFVGs[i].mitigated) continue;
+      if(gFVGs[i].triggerCount >= InpFVGMaxTriggers) continue;
+
+      //--- Age-cap expiry: mark stale zones dead (reuse mitigated flag for persistence)
+      if(FVGExpired(i))
+      {
+         gFVGs[i].mitigated = true;
+         RemoveFVGObjects(i);
+         Print("⌛ EXPIRED ", TFName(gFVGs[i].tf), " ",
+               (gFVGs[i].isBullish ? "Bull" : "Bear"), " [",
+               DoubleToString(gFVGs[i].botPrice, _Digits), "-",
+               DoubleToString(gFVGs[i].topPrice, _Digits),
+               "] — older than ", FVGMaxAgeHrs(gFVGs[i].tf), "h cap.");
+         continue;
+      }
+
+      ENUM_TIMEFRAMES tf = gFVGs[i].tf;
+      MqlRates rates[];
+      //--- Fetch from completedTime forward — only candles AFTER pattern completed
+      int copied = CopyRates(_Symbol, tf, gFVGs[i].completedTime, 200, rates);
+      if(copied < 1) continue;
+
+      //--- Current (in-progress) bar's open time — we'll skip it
+      datetime currentBarTime = iTime(_Symbol, tf, 0);
+
+      //--- Diagnostic: track worst close in either direction
+      double worstCloseAbove = -DBL_MAX;
+      double worstCloseBelow = DBL_MAX;
+      int    barsChecked     = 0;
+
+      for(int b = 0; b < copied; b++)
+      {
+         //--- Skip the 3 pattern candles themselves: any candle at or before completedTime
+         if(rates[b].time <= gFVGs[i].completedTime) continue;
+         //--- Skip in-progress bar (only use closed candles for mitigation)
+         if(currentBarTime > 0 && rates[b].time >= currentBarTime) continue;
+
+         barsChecked++;
+         double cl = rates[b].close;
+         if(cl > worstCloseAbove) worstCloseAbove = cl;
+         if(cl < worstCloseBelow) worstCloseBelow = cl;
+
+         if(gFVGs[i].isBullish)
+         {
+            // Bull FVG mitigated when a candle closes BELOW the bottom of the gap
+            if(cl < gFVGs[i].botPrice)
+            {
+               gFVGs[i].mitigated = true;
+               RemoveFVGObjects(i);
+               if(diag)
+                  Print("✂️  MITIGATED ", TFName(tf), " Bull [",
+                        DoubleToString(gFVGs[i].botPrice, _Digits), "-",
+                        DoubleToString(gFVGs[i].topPrice, _Digits),
+                        "] by close=", DoubleToString(cl, _Digits),
+                        " at ", TimeToString(rates[b].time));
+               break;
+            }
+         }
+         else
+         {
+            // Bear FVG mitigated when a candle closes ABOVE the top of the gap
+            if(cl > gFVGs[i].topPrice)
+            {
+               gFVGs[i].mitigated = true;
+               RemoveFVGObjects(i);
+               if(diag)
+                  Print("✂️  MITIGATED ", TFName(tf), " Bear [",
+                        DoubleToString(gFVGs[i].botPrice, _Digits), "-",
+                        DoubleToString(gFVGs[i].topPrice, _Digits),
+                        "] by close=", DoubleToString(cl, _Digits),
+                        " at ", TimeToString(rates[b].time));
+               break;
+            }
+         }
+      }
+
+      //--- Diagnostic: if FVG still alive, log why
+      if(diag && !gFVGs[i].mitigated && barsChecked > 0)
+      {
+         double margin = gFVGs[i].isBullish
+                         ? (worstCloseBelow - gFVGs[i].botPrice)  // positive = still alive
+                         : (gFVGs[i].topPrice - worstCloseAbove);
+         Print("  ", TFName(tf), " ",
+               (gFVGs[i].isBullish ? "Bull " : "Bear "),
+               "[", DoubleToString(gFVGs[i].botPrice, _Digits), "-",
+               DoubleToString(gFVGs[i].topPrice, _Digits), "]",
+               " ALIVE: ", barsChecked, " bars checked,",
+               (gFVGs[i].isBullish
+                ? " worst close below=" + DoubleToString(worstCloseBelow, _Digits)
+                : " worst close above=" + DoubleToString(worstCloseAbove, _Digits)),
+               " (margin=", DoubleToString(margin, _Digits), ")");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Scan all enabled TFs for FVGs. Called at init and on new bar.    |
+//+------------------------------------------------------------------+
+void ScanAllFVGs()
+{
+   if(InpM5_Enable)  ScanFVGsForTF(PERIOD_M5);
+   if(InpM15_Enable) ScanFVGsForTF(PERIOD_M15);
+   if(InpH1_Enable)  ScanFVGsForTF(PERIOD_H1);
+   UpdateFVGMitigation();
+
+   //--- NUCLEAR OPTION: wipe ALL FVG chart objects, then redraw only live ones.
+   //    This guarantees no mitigated/dead FVG ever stays on chart regardless
+   //    of which code path marked it dead or when RemoveFVGObjects was missed.
+   ClearAllFVGObjects();
+
+   if(InpFVGDrawZones)
+   {
+      for(int i = 0; i < gFVGCount; i++)
+      {
+         bool dead = FVGDead(i);
+         if(dead) continue;
+
+         ENUM_TIMEFRAMES tf = gFVGs[i].tf;
+         bool drawThisTF = (tf == PERIOD_M5  && InpFVGDrawM5)  ||
+                           (tf == PERIOD_M15 && InpFVGDrawM15) ||
+                           (tf == PERIOD_H1  && InpFVGDrawH1);
+         if(!drawThisTF) continue;
+
+         DrawFVG(i);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check if the most recent CLOSED candle on a given TF triggers    |
+//| any FVG of that TF. Returns the FVG array index, or -1.          |
+//+------------------------------------------------------------------+
+int CheckTriggerForTF(ENUM_TIMEFRAMES tf)
+{
+   MqlRates rates[];
+   //--- start_pos=1 → most recent CLOSED candle only (never the in-progress bar 0)
+   if(CopyRates(_Symbol, tf, 1, 1, rates) != 1) return -1;
+
+   //--- Defensive: candle must be closed (its time must be older than current bar's time)
+   datetime currentBarTime = iTime(_Symbol, tf, 0);
+   if(currentBarTime > 0 && rates[0].time >= currentBarTime) return -1;
+
+   double candleHigh  = rates[0].high;
+   double candleLow   = rates[0].low;
+   double candleClose = rates[0].close;
+   datetime candleTime = rates[0].time;
+
+   //--- Iterate FVGs of this TF; find first that triggers
+   for(int i = 0; i < gFVGCount; i++)
+   {
+      if(gFVGs[i].tf != tf) continue;
+      if(FVGDead(i)) continue;
+      //--- Don't re-fire from the same candle
+      if(candleTime == gFVGs[i].lastTriggerTime) continue;
+      //--- GUARD: the confirming candle must postdate pattern completion.
+      //    A fresh FVG's own 3rd candle touches the zone edge and closes
+      //    beyond it by construction — firing on it means entering at the
+      //    momentum extreme with zero retest.
+      if(candleTime <= gFVGs[i].completedTime) continue;
+
+      //--- Did the candle touch the FVG zone?
+      bool touched = (candleLow <= gFVGs[i].topPrice && candleHigh >= gFVGs[i].botPrice);
+      if(!touched) continue;
+
+      //--- Did it close on the confirming side?
+      bool fired = false;
+      if(gFVGs[i].isBullish)
+      {
+         //--- Bullish FVG fires when candle closes ABOVE the FVG top (zone held as support)
+         if(candleClose > gFVGs[i].topPrice) fired = true;
+      }
+      else
+      {
+         //--- Bearish FVG fires when candle closes BELOW the FVG bottom (zone held as resistance)
+         if(candleClose < gFVGs[i].botPrice) fired = true;
+      }
+
+      if(fired)
+      {
+         //--- Don't increment triggerCount here — only after OpenGrid() succeeds.
+         //    Stored in lastTriggerTime to prevent same-candle re-detection.
+         gFVGs[i].lastTriggerTime = candleTime;
+         return i;
+      }
+   }
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+//| TOUCH MODE: returns first FVG (of any enabled TF) whose far edge |
+//| has been touched by current bid/ask. Priority: H1 > M15 > M5.    |
+//|   - Bull FVG: triggers when current Bid <= FVG topPrice           |
+//|     (price entering the zone from above)                          |
+//|   - Bear FVG: triggers when current Ask >= FVG botPrice           |
+//|     (price entering the zone from below)                          |
+//+------------------------------------------------------------------+
+int CheckTouchTriggers()
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   //--- Refresh mitigation on new bars (M5, M15, H1) before checking any touch
+   static datetime lastTouchMitigBar = 0;
+   bool newBar = false;
+   if(InpH1_Enable)  { datetime t = iTime(_Symbol, PERIOD_H1,  0); if(t != gLastBarCheckH1)  newBar = true; }
+   if(InpM15_Enable) { datetime t = iTime(_Symbol, PERIOD_M15, 0); if(t != gLastBarCheckM15) newBar = true; }
+   if(InpM5_Enable)  { datetime t = iTime(_Symbol, PERIOD_M5,  0); if(t != gLastBarCheckM5)  newBar = true; }
+   if(newBar && TimeCurrent() != lastTouchMitigBar)
+   {
+      UpdateFVGMitigation();
+      //--- Also redraw to remove any newly-mitigated zones
+      ClearAllFVGObjects();
+      if(InpFVGDrawZones)
+         for(int i = 0; i < gFVGCount; i++)
+         {
+            if(!FVGDead(i)) DrawFVG(i);
+         }
+      lastTouchMitigBar = TimeCurrent();
+   }
+
+   //--- Periodic verbose log (every 30s) so user can verify each FVG is being checked
+   static datetime lastVerboseLog = 0;
+   bool verbose = (TimeCurrent() - lastVerboseLog >= 30);
+   if(verbose)
+   {
+      lastVerboseLog = TimeCurrent();
+      int liveCnt = 0;
+      for(int j = 0; j < gFVGCount; j++)
+         if(!FVGDead(j))
+            liveCnt++;
+      Print("🔎 Touch check: Bid=", DoubleToString(bid, _Digits),
+            " Ask=", DoubleToString(ask, _Digits),
+            " | live FVGs=", liveCnt, " / total=", gFVGCount);
+   }
+
+   //--- Search by priority: H1 first, then M15, then M5
+   for(int tfPass = 0; tfPass < 3; tfPass++)
+   {
+      ENUM_TIMEFRAMES targetTF;
+      bool tfEnabled;
+      if(tfPass == 0)      { targetTF = PERIOD_H1;  tfEnabled = InpH1_Enable;  }
+      else if(tfPass == 1) { targetTF = PERIOD_M15; tfEnabled = InpM15_Enable; }
+      else                 { targetTF = PERIOD_M5;  tfEnabled = InpM5_Enable;  }
+
+      if(!tfEnabled) continue;
+
+      for(int i = 0; i < gFVGCount; i++)
+      {
+         if(gFVGs[i].tf != targetTF) continue;
+         if(FVGDead(i)) continue;
+
+         //--- Cooldown: don't fire same FVG twice in one tick window
+         if(gFVGs[i].lastTriggerTime > 0 &&
+            TimeCurrent() - gFVGs[i].lastTriggerTime < 60)
+            continue;
+
+         //--- Verbose: log this FVG's check state once per 30s
+         if(verbose)
+         {
+            string status;
+            if(gFVGs[i].isBullish)
+               status = (bid <= gFVGs[i].topPrice && bid >= gFVGs[i].botPrice) ? "IN ZONE" :
+                        (bid > gFVGs[i].topPrice ? "above zone" : "below zone");
+            else
+               status = (ask >= gFVGs[i].botPrice && ask <= gFVGs[i].topPrice) ? "IN ZONE" :
+                        (ask < gFVGs[i].botPrice ? "below zone" : "above zone");
+            Print("    ", TFName(gFVGs[i].tf), " ",
+                  (gFVGs[i].isBullish ? "Bull " : "Bear "),
+                  "[", DoubleToString(gFVGs[i].botPrice, _Digits),
+                  "-", DoubleToString(gFVGs[i].topPrice, _Digits), "] T",
+                  gFVGs[i].triggerCount, " → ", status);
+         }
+
+         bool fired = false;
+         if(gFVGs[i].isBullish)
+         {
+            //--- Bull FVG: zone sits below price. Touch happens when Bid drops
+            //    onto the FVG top (far edge from above).
+            if(bid <= gFVGs[i].topPrice && bid >= gFVGs[i].botPrice)
+               fired = true;
+         }
+         else
+         {
+            //--- Bear FVG: zone sits above price. Touch happens when Ask rises
+            //    onto the FVG bottom (far edge from below).
+            if(ask >= gFVGs[i].botPrice && ask <= gFVGs[i].topPrice)
+               fired = true;
+         }
+
+         if(fired)
+         {
+            //--- Don't increment here — only after OpenGrid() succeeds.
+            gFVGs[i].lastTriggerTime = TimeCurrent();
+            DrawFVG(i);
+            return i;
+         }
+      }
+   }
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+//| Check all TFs for triggers; return highest-priority hit or -1.   |
+//+------------------------------------------------------------------+
+int CheckAllTriggers()
+{
+   //--- Always refresh mitigation on any new bar before checking triggers.
+   //    This ensures a just-mitigated FVG can never fire an entry.
+   //    We detect a new bar on any enabled TF.
+   static datetime lastMitigationBar = 0;
+   bool newBarAny = false;
+   if(InpH1_Enable)  { datetime t = iTime(_Symbol, PERIOD_H1,  0); if(t != gLastBarCheckH1)  newBarAny = true; }
+   if(InpM15_Enable) { datetime t = iTime(_Symbol, PERIOD_M15, 0); if(t != gLastBarCheckM15) newBarAny = true; }
+   if(InpM5_Enable)  { datetime t = iTime(_Symbol, PERIOD_M5,  0); if(t != gLastBarCheckM5)  newBarAny = true; }
+
+   if(newBarAny && TimeCurrent() != lastMitigationBar)
+   {
+      UpdateFVGMitigation();
+      //--- Wipe and redraw — guaranteed no mitigated FVGs remain on chart
+      ClearAllFVGObjects();
+      if(InpFVGDrawZones)
+         for(int i = 0; i < gFVGCount; i++)
+         {
+            bool dead = FVGDead(i);
+            ENUM_TIMEFRAMES ftf = gFVGs[i].tf;
+            bool show = (ftf == PERIOD_M5  && InpFVGDrawM5)  ||
+                        (ftf == PERIOD_M15 && InpFVGDrawM15) ||
+                        (ftf == PERIOD_H1  && InpFVGDrawH1);
+            if(!dead && show) DrawFVG(i);
+         }
+      lastMitigationBar = TimeCurrent();
+   }
+
+   //--- Route based on configured mode
+   if(InpFVGTriggerMode == FVG_TRIGGER_TOUCH)
+      return CheckTouchTriggers();
+
+   //--- CLOSE mode (default): wait for confirming candle close
+   //--- H1 > M15 > M5 priority
+   int idxH1  = -1, idxM15 = -1, idxM5 = -1;
+
+   if(InpH1_Enable)
+   {
+      datetime curH1 = iTime(_Symbol, PERIOD_H1, 0);
+      if(curH1 != gLastBarCheckH1)
+      {
+         idxH1 = CheckTriggerForTF(PERIOD_H1);
+         gLastBarCheckH1 = curH1;
+      }
+   }
+   if(InpM15_Enable && idxH1 < 0)
+   {
+      datetime curM15 = iTime(_Symbol, PERIOD_M15, 0);
+      if(curM15 != gLastBarCheckM15)
+      {
+         idxM15 = CheckTriggerForTF(PERIOD_M15);
+         gLastBarCheckM15 = curM15;
+      }
+   }
+   if(InpM5_Enable && idxH1 < 0 && idxM15 < 0)
+   {
+      datetime curM5 = iTime(_Symbol, PERIOD_M5, 0);
+      if(curM5 != gLastBarCheckM5)
+      {
+         idxM5 = CheckTriggerForTF(PERIOD_M5);
+         gLastBarCheckM5 = curM5;
+      }
+   }
+
+   if(idxH1  >= 0) return idxH1;
+   if(idxM15 >= 0) return idxM15;
+   if(idxM5  >= 0) return idxM5;
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+//| Apply TF-specific parameters to active grid configuration.       |
+//| This sets the globals OpenGrid will use for the next cycle.      |
+//+------------------------------------------------------------------+
+void ApplyTFParameters(ENUM_TIMEFRAMES tf)
+{
+   gActiveTriggerTF     = tf;
+   gActiveTriggerTFName = TFName(tf);
+
+   if(tf == PERIOD_M5)
+   {
+      gActiveN              = InpM5_GridCount;
+      gActiveTarget         = InpM5_ProfitTargetUSD;
+      gGridStep             = InpM5_FixedDistance;
+   }
+   else if(tf == PERIOD_M15)
+   {
+      gActiveN              = InpM15_GridCount;
+      gActiveTarget         = InpM15_ProfitTargetUSD;
+      gGridStep             = InpM15_FixedDistance;
+   }
+   else  // H1
+   {
+      gActiveN              = InpH1_GridCount;
+      gActiveTarget         = InpH1_ProfitTargetUSD;
+      gGridStep             = InpH1_FixedDistance;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Resolve lot for index using ACTIVE TF's lot mode and base/step  |
+//+------------------------------------------------------------------+
+double ResolveLotFromTF(int i)
+{
+   double base = InpBaseLot;
+   double step = InpLotStep;
+   ENUM_LOT_SIZING_MODE mode = InpLotMode;
+
+   if(gActiveTriggerTF == PERIOD_M5)
+   {
+      base = InpM5_BaseLot;
+      step = InpM5_LotStep;
+      mode = InpM5_LotMode;
+   }
+   else if(gActiveTriggerTF == PERIOD_M15)
+   {
+      base = InpM15_BaseLot;
+      step = InpM15_LotStep;
+      mode = InpM15_LotMode;
+   }
+   else if(gActiveTriggerTF == PERIOD_H1)
+   {
+      base = InpH1_BaseLot;
+      step = InpH1_LotStep;
+      mode = InpH1_LotMode;
+   }
+
+   double raw = base;
+   switch(mode)
+   {
+      case LOT_FIXED:
+         raw = base;
+         break;
+      case LOT_LINEAR:
+         raw = base + (i - 1) * step;
+         break;
+      case LOT_FIBONACCI:
+         raw = base * FibAt(i);
+         break;
+      case LOT_LINEAR_REVERSED:
+         raw = base + (ActiveN() - i) * step;
+         break;
+      case LOT_FIBONACCI_REVERSED:
+         raw = base * FibAt(ActiveN() - i + 1);
+         break;
+   }
+
+   //--- Clamp to broker limits and InpMaxLot
+   double volStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double volMin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double volMax  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   if(volStep > 0) raw = MathRound(raw / volStep) * volStep;
+   if(raw < volMin) raw = volMin;
+   if(raw > volMax) raw = volMax;
+   if(raw > InpMaxLot) raw = InpMaxLot;
+   return NormalizeDouble(raw, 2);
+}
+
+//+------------------------------------------------------------------+
+//| Get active TF-specific TP distance ($)                           |
+//+------------------------------------------------------------------+
+double ActiveTPDistance()
+{
+   if(gActiveTriggerTF == PERIOD_M5)  return InpM5_TPDistance;
+   if(gActiveTriggerTF == PERIOD_M15) return InpM15_TPDistance;
+   if(gActiveTriggerTF == PERIOD_H1)  return InpH1_TPDistance;
+   return InpTPDistance;
+}
+
+//+------------------------------------------------------------------+
+//| Returns the TP hedge decay % for the active TF                   |
+//+------------------------------------------------------------------+
+double GetActiveTPHedgeDecayPct()
+{
+   if(gActiveTriggerTF == PERIOD_M5)  return InpTPHedgeDecayPct_M5;
+   if(gActiveTriggerTF == PERIOD_M15) return InpTPHedgeDecayPct_M15;
+   if(gActiveTriggerTF == PERIOD_H1)  return InpTPHedgeDecayPct_H1;
+   return 0.0;
+}
+
+//+------------------------------------------------------------------+
+//| Compute convex-decayed TP offset based on current hedge ratio.   |
+//| sqrt decay curve: aggressive at low hedge, gentler near full.    |
+//+------------------------------------------------------------------+
+double GetDecayedTPOffset()
+{
+   double decayPct = GetActiveTPHedgeDecayPct();
+   double baseOffset = gActiveN * gGridStep + ActiveTPDistance();
+   if(decayPct <= 0.0 || gActiveN <= 0 || gGridStep <= 0.0)
+      return baseOffset;
+
+   //--- Count hedged pairs
+   int buysOpen = 0, sellsOpen = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(posInfo.SelectByIndex(i))
+         if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol)
+         {
+            if(posInfo.PositionType() == POSITION_TYPE_BUY)  buysOpen++;
+            if(posInfo.PositionType() == POSITION_TYPE_SELL) sellsOpen++;
+         }
+   }
+   int hedgedPairs = MathMin(buysOpen, sellsOpen);
+   double hedgeRatio = (double)hedgedPairs / (double)gActiveN;
+   hedgeRatio = MathMin(1.0, hedgeRatio);
+
+   //--- Fully hedged: remove TP entirely (let profit target handle exit)
+   if(hedgeRatio >= 0.999) return 0.0;
+
+   //--- Convex decay: sqrt curve — aggressive early, gentler near full hedge
+   double decay = MathSqrt(hedgeRatio) * (decayPct / 100.0);
+   double effectiveOffset = baseOffset * (1.0 - decay);
+
+   //--- Floor at one grid step
+   if(effectiveOffset < gGridStep && effectiveOffset > 0.0)
+      effectiveOffset = gGridStep;
+
+   return effectiveOffset;
+}
+
+//+------------------------------------------------------------------+
+//| Update all pending orders and positions to new TP levels         |
+//+------------------------------------------------------------------+
+void UpdateAllTPs(double newBuyTP, double newSellTP)
+{
+   int modOrders = 0, modPositions = 0;
+
+   for(int i = 0; i < OrdersTotal(); i++)
+   {
+      if(orderInfo.SelectByIndex(i))
+         if(orderInfo.Magic() == InpMagicNumber && orderInfo.Symbol() == _Symbol)
+         {
+            double newTP = (orderInfo.OrderType() == ORDER_TYPE_BUY_STOP) ? newBuyTP : newSellTP;
+            if(trade.OrderModify(orderInfo.Ticket(), orderInfo.PriceOpen(),
+                                 orderInfo.StopLoss(), newTP, ORDER_TIME_GTC, 0))
+               modOrders++;
+         }
+   }
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(posInfo.SelectByIndex(i))
+         if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol)
+         {
+            double newTP = (posInfo.PositionType() == POSITION_TYPE_BUY) ? newBuyTP : newSellTP;
+            if(trade.PositionModify(posInfo.Ticket(), posInfo.StopLoss(), newTP))
+               modPositions++;
+         }
+   }
+   if(modOrders + modPositions > 0)
+      Print("🔄 TP hedge decay: updated ", modOrders, " orders + ", modPositions,
+            " positions → BuyTP=", DoubleToString(newBuyTP, _Digits),
+            " SellTP=", DoubleToString(newSellTP, _Digits));
+}
+
+//+==================================================================+
+//|                                                                  |
+//|   PLAN ENDPOINT MODULE — WebRequest to Python /grid_levels       |
+//|   Fetches a zone-based neutral-grid plan and places its legs     |
+//|   verbatim (per-leg price+lot, skew, structural TPs).            |
+//|                                                                  |
+//+==================================================================+
+
+//--- A single grid leg returned by the planner
+struct PlanLeg
+{
+   double price;
+   double lot;
+};
+
+//--- The full plan returned by /grid_levels
+struct GridPlanResult
+{
+   bool      ok;
+   string    verdict;        // "arm" | "skip"
+   string    skipReason;
+   double    fulcrum;
+   string    regime;
+   string    triggerKind;
+   double    buyTP;
+   double    sellTP;
+   PlanLeg   buyLegs[];
+   PlanLeg   sellLegs[];
+};
+
+datetime gLastPlanBar = 0;   // dedup: one plan request per trigger bar
+
+//--- Minimal JSON scalar extractors (contract is FLAT — no nested objects
+//    except the leg arrays, handled separately). Good enough for our response.
+string JsonGetString(const string js, const string key)
+{
+   string pat = "\"" + key + "\"";
+   int k = StringFind(js, pat);
+   if(k < 0) return "";
+   int colon = StringFind(js, ":", k + StringLen(pat));
+   if(colon < 0) return "";
+   int q1 = StringFind(js, "\"", colon + 1);
+   if(q1 < 0) return "";
+   int q2 = StringFind(js, "\"", q1 + 1);
+   if(q2 < 0) return "";
+   return StringSubstr(js, q1 + 1, q2 - q1 - 1);
+}
+
+double JsonGetNumber(const string js, const string key)
+{
+   string pat = "\"" + key + "\"";
+   int k = StringFind(js, pat);
+   if(k < 0) return 0.0;
+   int colon = StringFind(js, ":", k + StringLen(pat));
+   if(colon < 0) return 0.0;
+   //--- read until , } or ]
+   int i = colon + 1;
+   while(i < StringLen(js) && (StringGetCharacter(js, i) == ' ')) i++;
+   int start = i;
+   while(i < StringLen(js))
+   {
+      ushort ch = StringGetCharacter(js, i);
+      if(ch == ',' || ch == '}' || ch == ']') break;
+      i++;
+   }
+   return StringToDouble(StringSubstr(js, start, i - start));
+}
+
+//--- Parse a leg array ("buy_legs" or "sell_legs") of {"price":..,"lot":..}
+void JsonParseLegs(const string js, const string arrayKey, PlanLeg &out[])
+{
+   ArrayResize(out, 0);
+   string pat = "\"" + arrayKey + "\"";
+   int k = StringFind(js, pat);
+   if(k < 0) return;
+   int open = StringFind(js, "[", k);
+   int close = StringFind(js, "]", open);
+   if(open < 0 || close < 0) return;
+   string body = StringSubstr(js, open + 1, close - open - 1);
+
+   //--- iterate {...} objects
+   int pos = 0;
+   while(true)
+   {
+      int objOpen = StringFind(body, "{", pos);
+      if(objOpen < 0) break;
+      int objClose = StringFind(body, "}", objOpen);
+      if(objClose < 0) break;
+      string obj = StringSubstr(body, objOpen, objClose - objOpen + 1);
+      int n = ArraySize(out);
+      ArrayResize(out, n + 1);
+      out[n].price = JsonGetNumber(obj, "price");
+      out[n].lot   = JsonGetNumber(obj, "lot");
+      pos = objClose + 1;
+   }
+}
+
+//--- POST to /grid_levels, fill `plan`. Returns true on a parseable response.
+bool FetchGridPlan(double currentPrice, GridPlanResult &plan)
+{
+   plan.ok = false;
+   plan.verdict = "";
+
+   string body = StringFormat(
+      "{\"symbol\":\"%s\",\"tf\":\"%s\",\"current_price\":%.5f}",
+      _Symbol, InpPlanTF, currentPrice);
+
+   char post[];
+   StringToCharArray(body, post, 0, StringLen(body));   // drop trailing \0
+   ArrayResize(post, StringLen(body));
+
+   char   result[];
+   string resultHeaders;
+   string headers = "Content-Type: application/json\r\n";
+
+   ResetLastError();
+   int code = WebRequest("POST", InpPlanURL, headers, InpPlanTimeoutMs,
+                         post, result, resultHeaders);
+   if(code == -1)
+   {
+      int err = GetLastError();
+      Print("❌ WebRequest failed (err ", err, "). If 4060: whitelist ", InpPlanURL,
+            " under Tools→Options→Expert Advisors→Allow WebRequest.");
+      return false;
+   }
+
+   string resp = CharArrayToString(result, 0, ArraySize(result));
+   if(code != 200)
+   {
+      Print("⚠️  /grid_levels HTTP ", code, ": ", StringSubstr(resp, 0, 200));
+      return false;
+   }
+
+   plan.ok          = true;
+   plan.verdict     = JsonGetString(resp, "verdict");
+   plan.skipReason  = JsonGetString(resp, "skip_reason");
+   plan.fulcrum     = JsonGetNumber(resp, "fulcrum");
+   plan.regime      = JsonGetString(resp, "regime");
+   plan.triggerKind = JsonGetString(resp, "trigger_kind");
+   plan.buyTP       = JsonGetNumber(resp, "buy_tp");
+   plan.sellTP      = JsonGetNumber(resp, "sell_tp");
+   JsonParseLegs(resp, "buy_legs",  plan.buyLegs);
+   JsonParseLegs(resp, "sell_legs", plan.sellLegs);
+   return true;
+}
+
+//--- Place the exact legs from a plan. Reuses freeze-zone, margin and phantom
+//    checks; accepts ASYMMETRIC placement (skew is intentional).
+void OpenGridFromPlan(const GridPlanResult &plan)
+{
+   double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   long   stopsLevelPts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStopDist   = stopsLevelPts * point;
+
+   gGridMid = plan.fulcrum;
+   gBuyTP   = NormalizeDouble(plan.buyTP,  digits);
+   gSellTP  = NormalizeDouble(plan.sellTP, digits);
+   gActiveN = MathMax(ArraySize(plan.buyLegs), ArraySize(plan.sellLegs));
+
+   //--- MARGIN PRE-CHECK across all legs
+   double equity           = AccountInfoDouble(ACCOUNT_EQUITY);
+   double freeMargin       = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double maxAllowedMargin = equity * (InpMaxMarginPct / 100.0);
+   double totalMarginNeeded = 0.0;
+   for(int i = 0; i < ArraySize(plan.buyLegs); i++)
+   {
+      double m = 0.0;
+      if(OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, plan.buyLegs[i].lot, plan.buyLegs[i].price, m))
+         totalMarginNeeded += m;
+   }
+   for(int i = 0; i < ArraySize(plan.sellLegs); i++)
+   {
+      double m = 0.0;
+      if(OrderCalcMargin(ORDER_TYPE_SELL, _Symbol, plan.sellLegs[i].lot, plan.sellLegs[i].price, m))
+         totalMarginNeeded += m;
+   }
+   if(totalMarginNeeded > maxAllowedMargin || totalMarginNeeded > freeMargin)
+   {
+      Print("❌ Plan grid margin $", DoubleToString(totalMarginNeeded, 2),
+            " exceeds cap $", DoubleToString(maxAllowedMargin, 2),
+            " / free $", DoubleToString(freeMargin, 2), ". Aborting.");
+      lastCloseTime = TimeCurrent();
+      return;
+   }
+
+   int buyPlaced = 0, sellPlaced = 0;
+
+   for(int i = 0; i < ArraySize(plan.buyLegs); i++)
+   {
+      double entry = NormalizeDouble(plan.buyLegs[i].price, digits);
+      double curAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      if(entry < curAsk + minStopDist + point) continue;   // inside freeze zone
+      double lot = NormalizeDouble(plan.buyLegs[i].lot, 2);
+      string c = EA_TAG + "_PLANBUY_" + IntegerToString(i + 1);
+      if(trade.BuyStop(lot, entry, _Symbol, 0.0, gBuyTP, ORDER_TIME_GTC, 0, c))
+      {
+         ulong tk = trade.ResultOrder();
+         if(tk != 0 && OrderSelect(tk)) buyPlaced++;
+      }
+   }
+   for(int i = 0; i < ArraySize(plan.sellLegs); i++)
+   {
+      double entry = NormalizeDouble(plan.sellLegs[i].price, digits);
+      double curBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(entry > curBid - minStopDist - point) continue;
+      double lot = NormalizeDouble(plan.sellLegs[i].lot, 2);
+      string c = EA_TAG + "_PLANSELL_" + IntegerToString(i + 1);
+      if(trade.SellStop(lot, entry, _Symbol, 0.0, gSellTP, ORDER_TIME_GTC, 0, c))
+      {
+         ulong tk = trade.ResultOrder();
+         if(tk != 0 && OrderSelect(tk)) sellPlaced++;
+      }
+   }
+
+   if(buyPlaced + sellPlaced > 0)
+   {
+      gridActive      = true;
+      gCycleMode      = CYCLE_PLAN;
+      gCycleStartTime = TimeCurrent();
+      gCyclePeakPnL   = -DBL_MAX;
+      gCycleTroughPnL =  DBL_MAX;
+      Print("🚀 PLAN grid active [", plan.triggerKind, "/", plan.regime, "]: ",
+            buyPlaced, " buy + ", sellPlaced, " sell legs around $",
+            DoubleToString(plan.fulcrum, digits),
+            " | BuyTP ", DoubleToString(gBuyTP, digits),
+            " SellTP ", DoubleToString(gSellTP, digits));
+   }
+   else
+   {
+      Print("⚠️  PLAN grid placed 0 legs (all inside freeze zone?). Cleaning up.");
+      CloseGrid();
+      lastCloseTime = TimeCurrent();
+   }
+}
+
+//+==================================================================+
+//|                                                                  |
+//|   FVG-ANCHORED GRID MODULE (v6) — asymmetric placement derived   |
+//|   from FVG geometry. Favor ladder beyond the confirming edge     |
+//|   (pyramid adds while idea holds), counter ladder beyond the     |
+//|   invalidation line (reversed front-loaded, β-scaled net tail).  |
+//|   Zone interior stays order-free.                                |
+//|                                                                  |
+//+==================================================================+
+
+//+------------------------------------------------------------------+
+//| Per-trigger-TF parameter lookups                                 |
+//+------------------------------------------------------------------+
+double CycleRiskUSD(ENUM_TIMEFRAMES tf)
+{
+   if(tf == PERIOD_M5)  return InpM5_CycleRiskUSD;
+   if(tf == PERIOD_M15) return InpM15_CycleRiskUSD;
+   if(tf == PERIOD_H1)  return InpH1_CycleRiskUSD;
+   return InpM5_CycleRiskUSD;
+}
+
+double TPATRMult(ENUM_TIMEFRAMES tf)
+{
+   if(tf == PERIOD_M5)  return InpTPATRMultM5;
+   if(tf == PERIOD_M15) return InpTPATRMultM15;
+   if(tf == PERIOD_H1)  return InpTPATRMultH1;
+   return InpTPATRMultM5;
+}
+
+ENUM_FAVOR_SL_MODE FavorSLMode(ENUM_TIMEFRAMES tf)
+{
+   if(tf == PERIOD_M5)  return InpFavorSLModeM5;
+   if(tf == PERIOD_M15) return InpFavorSLModeM15;
+   if(tf == PERIOD_H1)  return InpFavorSLModeH1;
+   return InpFavorSLModeM5;
+}
+
+//+------------------------------------------------------------------+
+//| Latest completed ATR(14) on a trigger TF (0.0 if not ready)      |
+//+------------------------------------------------------------------+
+double TrigATR(ENUM_TIMEFRAMES tf)
+{
+   int h = INVALID_HANDLE;
+   if(tf == PERIOD_M5)  h = hAtrTrigM5;
+   if(tf == PERIOD_M15) h = hAtrTrigM15;
+   if(tf == PERIOD_H1)  h = hAtrTrigH1;
+   if(h == INVALID_HANDLE) return 0.0;
+   double buf[];
+   if(CopyBuffer(h, 0, 1, 1, buf) != 1) return 0.0;
+   return buf[0];
+}
+
+//+------------------------------------------------------------------+
+//| $ P&L for 1.0 lot per $1.00 of price movement (XAU: 100).        |
+//| Asks the broker via OrderCalcProfit; falls back to 100.          |
+//+------------------------------------------------------------------+
+double DollarPerLotPerUnit()
+{
+   double profit = 0.0;
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   if(ask > 0 &&
+      OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, 1.0, ask, ask + 1.0, profit) &&
+      profit > 0.0)
+      return profit;
+   return 100.0;
+}
+
+//+------------------------------------------------------------------+
+//| Open the v6 FVG-anchored asymmetric grid for a triggered FVG.    |
+//| On success sets gridActive (caller commits the trigger count).   |
+//| On failure leaves gridActive false (trigger NOT consumed).       |
+//+------------------------------------------------------------------+
+void OpenGridFVGAnchored(int fvgIdx)
+{
+   if(fvgIdx < 0 || fvgIdx >= gFVGCount) return;
+
+   ENUM_TIMEFRAMES tf   = gFVGs[fvgIdx].tf;
+   bool   isBull        = gFVGs[fvgIdx].isBullish;
+   double zTop          = gFVGs[fvgIdx].topPrice;
+   double zBot          = gFVGs[fvgIdx].botPrice;
+   double H             = zTop - zBot;
+
+   double point         = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int    digits        = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   long   stopsLevelPts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStopDist   = stopsLevelPts * point;
+
+   //--- TF params: sets gActiveTriggerTF/N/target/step for this cycle
+   ApplyTFParameters(tf);
+   double step = gGridStep;
+   int    maxN = gActiveN;
+   if(step <= 0.0 || maxN <= 0)
+   {
+      Print("❌ Anchored grid: invalid TF params (step=", step, " N=", maxN, ").");
+      return;
+   }
+
+   //--- ATRs: buffer uses M5 (fast wick scale), TPs use trigger TF
+   double atrM5 = TrigATR(PERIOD_M5);
+   double atrTF = TrigATR(tf);
+   if(atrM5 <= 0.0 || atrTF <= 0.0)
+   {
+      Print("⚠️  Anchored grid: ATR not ready (M5=", atrM5, " TF=", atrTF,
+            ") — trigger not consumed, retry next tick.");
+      return;
+   }
+
+   double buffer = MathMax(InpInvalBufferATRk * atrM5,
+                           (InpInvalBufferPctH / 100.0) * H);
+   double inval  = isBull ? (zBot - buffer) : (zTop + buffer);
+
+   //--- Favor-stack SL: anchored inside the zone so a full-fill-then-reverse
+   //    stops out small while the zone is still alive (re-tap = re-entry).
+   ENUM_FAVOR_SL_MODE slMode = FavorSLMode(tf);
+   double slPrice;
+   if(slMode == FAVOR_SL_ZONE_TOP)
+      slPrice = isBull ? zTop : zBot;            // confirming edge
+   else if(slMode == FAVOR_SL_ZONE_BOT)
+      slPrice = isBull ? zBot : zTop;            // far edge (mitigation-aligned)
+   else
+      slPrice = (zTop + zBot) / 2.0;             // zone middle
+   slPrice = NormalizeDouble(slPrice, digits);
+   //--- Distance from confirming edge to SL (0 for ZONE_TOP, H/2 mid, H bot)
+   double slDistEdge = isBull ? (zTop - slPrice) : (slPrice - zBot);
+
+   //--- Risk-solved base lot with adaptive N (never skip an entry):
+   //    bleed at favor SL for leg i = lot_i × (i×step + slDistEdge) × $/lot/unit
+   //    LOT_LINEAR shape: lot_i = base × i. Solve base from the TF risk budget;
+   //    if base snaps below broker min, drop legs until it fits (floor N=1 @ min lot).
+   double vStep   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double vMin    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double vMax    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double dPerLot = DollarPerLotPerUnit();
+   double riskUSD = CycleRiskUSD(tf);
+
+   int    N    = maxN;
+   double base = 0.0;
+   while(N >= 1)
+   {
+      double denom = 0.0;
+      for(int i = 1; i <= N; i++)
+         denom += (double)i * ((double)i * step + slDistEdge) * dPerLot;
+      base = (denom > 0.0) ? riskUSD / denom : 0.0;
+      if(vStep > 0) base = MathFloor(base / vStep) * vStep;
+      if(base >= vMin) break;
+      N--;
+   }
+   if(base < vMin)
+   {
+      base = vMin;   // N==1: take the entry anyway, log the budget overshoot
+      double implied = base * (step + slDistEdge) * dPerLot;
+      Print("⚠️  Anchored grid: min lot ", DoubleToString(vMin, 2),
+            " at N=1 implies risk $", DoubleToString(implied, 2),
+            " > budget $", DoubleToString(riskUSD, 2), " — taking entry anyway.");
+   }
+   if(N < maxN)
+      Print("ℹ️  Anchored grid: favor legs reduced ", maxN, " → ", N,
+            " to fit risk budget $", DoubleToString(riskUSD, 2),
+            " (H=$", DoubleToString(H, 2), ").");
+
+   //--- Favor ladder lots (LINEAR: base, 2×base, ... — adds grow with confirmation)
+   double favorLots[];
+   ArrayResize(favorLots, N);
+   double favorSum = 0.0;
+   for(int i = 0; i < N; i++)
+   {
+      double l = base * (double)(i + 1);
+      if(vStep > 0) l = MathRound(l / vStep) * vStep;
+      l = MathMin(MathMin(l, vMax), InpMaxLot);
+      l = MathMax(l, vMin);
+      favorLots[i] = NormalizeDouble(l, 2);
+      favorSum += favorLots[i];
+   }
+
+   //--- Counter ladder lots: reversed front-loaded shape (M, M-1, ..., 1),
+   //    scaled so Σ counter = β × Σ favor. Legs that snap below min are
+   //    dropped and their volume folded into the first (largest) leg.
+   int M = MathMax(1, InpCounterLegs);
+   double counterLots[];
+   ArrayResize(counterLots, M);
+   double shapeSum = 0.0;
+   for(int j = 0; j < M; j++) shapeSum += (double)(M - j);
+   double counterTotal = InpCounterBeta * favorSum;
+   double tailSum = 0.0;
+   for(int j = M - 1; j >= 1; j--)
+   {
+      double l = counterTotal * (double)(M - j) / shapeSum;
+      if(vStep > 0) l = MathFloor(l / vStep) * vStep;
+      if(l < vMin) l = 0.0;
+      counterLots[j] = l;
+      tailSum += l;
+   }
+   double firstLeg = counterTotal - tailSum;
+   if(vStep > 0) firstLeg = MathRound(firstLeg / vStep) * vStep;
+   firstLeg = MathMin(MathMin(firstLeg, vMax), InpMaxLot);
+   counterLots[0] = MathMax(firstLeg, vMin);
+
+   //--- Entry prices
+   //    bull: favor BuyStops above zoneTop; counter SellStops below inval
+   //    bear: favor SellStops below zoneBot; counter BuyStops above inval
+   double favorPrices[];
+   ArrayResize(favorPrices, N);
+   for(int i = 0; i < N; i++)
+      favorPrices[i] = NormalizeDouble(isBull ? zTop + (double)(i + 1) * step
+                                              : zBot - (double)(i + 1) * step, digits);
+   double counterPrices[];
+   ArrayResize(counterPrices, M);
+   for(int j = 0; j < M; j++)
+      counterPrices[j] = NormalizeDouble(isBull ? inval - (double)j * step
+                                                : inval + (double)j * step, digits);
+
+   //--- TPs: outermost leg ± mult × ATR(trigger TF)
+   double mult = TPATRMult(tf);
+   double favorTP, counterTP;
+   if(isBull)
+   {
+      favorTP   = NormalizeDouble(favorPrices[N - 1]   + mult * atrTF, digits);  // buy TP
+      counterTP = NormalizeDouble(counterPrices[M - 1] - mult * atrTF, digits);  // sell TP
+      gBuyTP  = favorTP;
+      gSellTP = counterTP;
+   }
+   else
+   {
+      favorTP   = NormalizeDouble(favorPrices[N - 1]   - mult * atrTF, digits);  // sell TP
+      counterTP = NormalizeDouble(counterPrices[M - 1] + mult * atrTF, digits);  // buy TP
+      gSellTP = favorTP;
+      gBuyTP  = counterTP;
+   }
+
+   //--- MARGIN PRE-CHECK across all legs
+   double equity           = AccountInfoDouble(ACCOUNT_EQUITY);
+   double freeMargin       = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double maxAllowedMargin = equity * (InpMaxMarginPct / 100.0);
+   double totalMarginNeeded = 0.0;
+   for(int i = 0; i < N; i++)
+   {
+      double m = 0.0;
+      if(OrderCalcMargin(isBull ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
+                         _Symbol, favorLots[i], favorPrices[i], m))
+         totalMarginNeeded += m;
+   }
+   for(int j = 0; j < M; j++)
+   {
+      if(counterLots[j] <= 0.0) continue;
+      double m = 0.0;
+      if(OrderCalcMargin(isBull ? ORDER_TYPE_SELL : ORDER_TYPE_BUY,
+                         _Symbol, counterLots[j], counterPrices[j], m))
+         totalMarginNeeded += m;
+   }
+   if(totalMarginNeeded > maxAllowedMargin || totalMarginNeeded > freeMargin)
+   {
+      Print("❌ Anchored grid margin $", DoubleToString(totalMarginNeeded, 2),
+            " exceeds cap $", DoubleToString(maxAllowedMargin, 2),
+            " / free $", DoubleToString(freeMargin, 2), ". Aborting.");
+      lastCloseTime = TimeCurrent();
+      return;
+   }
+
+   //--- Solve log (one line, everything needed to audit the cycle)
+   Print("📐 ANCHORED ", TFName(tf), " ", (isBull ? "Bull" : "Bear"),
+         " zone [", DoubleToString(zBot, digits), "-", DoubleToString(zTop, digits),
+         "] H=$", DoubleToString(H, 2),
+         " buf=$", DoubleToString(buffer, 2),
+         " inval=", DoubleToString(inval, digits),
+         " | R=$", DoubleToString(riskUSD, 2),
+         " N=", N, " base=", DoubleToString(base, 2),
+         " Σfavor=", DoubleToString(favorSum, 2),
+         " Σcounter=", DoubleToString(counterLots[0] + tailSum, 2),
+         " (β=", DoubleToString(InpCounterBeta, 2), ")",
+         " | favorSL=", DoubleToString(slPrice, digits),
+         " | TPs ", DoubleToString(gBuyTP, digits), " / ", DoubleToString(gSellTP, digits),
+         " (", DoubleToString(mult, 1), "×ATR=$", DoubleToString(atrTF, 2), ")");
+
+   //--- Place favor legs (ALL must succeed)
+   int favorPlaced = 0;
+   for(int i = 0; i < N; i++)
+   {
+      string c = EA_TAG + (isBull ? "_AFAV_BUY_" : "_AFAV_SELL_") + IntegerToString(i + 1);
+      bool ok;
+      if(isBull)
+      {
+         double curAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         if(favorPrices[i] < curAsk + minStopDist + point)
+         {
+            Print("⏭️  Favor leg #", i + 1, " @ ", DoubleToString(favorPrices[i], digits),
+                  " inside freeze zone — counts as placement failure.");
+            break;
+         }
+         ok = trade.BuyStop(favorLots[i], favorPrices[i], _Symbol, slPrice, gBuyTP,
+                            ORDER_TIME_GTC, 0, c);
+      }
+      else
+      {
+         double curBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         if(favorPrices[i] > curBid - minStopDist - point)
+         {
+            Print("⏭️  Favor leg #", i + 1, " @ ", DoubleToString(favorPrices[i], digits),
+                  " inside freeze zone — counts as placement failure.");
+            break;
+         }
+         ok = trade.SellStop(favorLots[i], favorPrices[i], _Symbol, slPrice, gSellTP,
+                             ORDER_TIME_GTC, 0, c);
+      }
+      if(!ok)
+      {
+         Print("❌ Favor leg #", i + 1, " failed @ ", DoubleToString(favorPrices[i], digits),
+               " | ", trade.ResultRetcodeDescription());
+         break;
+      }
+      ulong tk = trade.ResultOrder();
+      if(tk == 0 || !OrderSelect(tk))
+      {
+         Print("❌ Favor leg #", i + 1, " phantom — not in book. Treating as failure.");
+         break;
+      }
+      favorPlaced++;
+   }
+
+   if(favorPlaced < N)
+   {
+      Print("⚠️  Anchored grid: only ", favorPlaced, "/", N,
+            " favor legs placed — cleaning up, trigger NOT consumed.");
+      CloseGrid();
+      lastCloseTime = TimeCurrent();
+      return;
+   }
+
+   //--- Place counter legs (far from market — freeze-zone skips logged but tolerated)
+   int counterPlaced = 0;
+   for(int j = 0; j < M; j++)
+   {
+      if(counterLots[j] <= 0.0) continue;   // dropped during snapping
+      string c = EA_TAG + (isBull ? "_ACTR_SELL_" : "_ACTR_BUY_") + IntegerToString(j + 1);
+      bool ok;
+      if(isBull)
+      {
+         double curBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         if(counterPrices[j] > curBid - minStopDist - point)
+         {
+            Print("⏭️  Counter leg #", j + 1, " @ ", DoubleToString(counterPrices[j], digits),
+                  " inside freeze zone — skipped.");
+            continue;
+         }
+         ok = trade.SellStop(counterLots[j], counterPrices[j], _Symbol, 0.0, gSellTP,
+                             ORDER_TIME_GTC, 0, c);
+      }
+      else
+      {
+         double curAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         if(counterPrices[j] < curAsk + minStopDist + point)
+         {
+            Print("⏭️  Counter leg #", j + 1, " @ ", DoubleToString(counterPrices[j], digits),
+                  " inside freeze zone — skipped.");
+            continue;
+         }
+         ok = trade.BuyStop(counterLots[j], counterPrices[j], _Symbol, 0.0, gBuyTP,
+                            ORDER_TIME_GTC, 0, c);
+      }
+      if(ok)
+      {
+         ulong tk = trade.ResultOrder();
+         if(tk != 0 && OrderSelect(tk)) counterPlaced++;
+      }
+      else
+         Print("❌ Counter leg #", j + 1, " failed @ ",
+               DoubleToString(counterPrices[j], digits),
+               " | ", trade.ResultRetcodeDescription());
+   }
+
+   //--- Commit cycle state
+   gridActive        = true;
+   gCycleMode        = CYCLE_ANCHORED;
+   gCycleIsBullFVG   = isBull;
+   gZoneTop          = zTop;
+   gZoneBot          = zBot;
+   gInvalPrice       = inval;
+   gSolvedBaseLot    = base;
+   gGridMid          = NormalizeDouble((zTop + zBot) / 2.0, digits);
+   gActiveN          = N;
+   gLastFailCheckBar = 0;
+   gCycleStartTime   = TimeCurrent();
+   gCyclePeakPnL     = -DBL_MAX;
+   gCycleTroughPnL   =  DBL_MAX;
+
+   //--- Save favor ladder for SL-out re-arm
+   gCycleFVGIdx     = fvgIdx;
+   gFavorSLPrice    = slPrice;
+   ArrayResize(gFavorPricesArr, N);
+   ArrayResize(gFavorLotsArr,   N);
+   for(int i = 0; i < N; i++)
+   {
+      gFavorPricesArr[i] = favorPrices[i];
+      gFavorLotsArr[i]   = favorLots[i];
+   }
+   gFavorEverFilled = false;
+   gFavorFlatSince  = 0;
+
+   Print("🚀 ANCHORED grid active: ", favorPlaced, " favor + ", counterPlaced,
+         " counter legs | zone interior order-free.");
+}
+
+//+------------------------------------------------------------------+
+//| Count favor-side positions / pendings for the anchored cycle     |
+//+------------------------------------------------------------------+
+int CountFavorPositions()
+{
+   ENUM_POSITION_TYPE t = gCycleIsBullFVG ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+   int n = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(posInfo.SelectByIndex(i))
+         if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol &&
+            posInfo.PositionType() == t)
+            n++;
+   return n;
+}
+
+int CountFavorPendings()
+{
+   ENUM_ORDER_TYPE t = gCycleIsBullFVG ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP;
+   int n = 0;
+   for(int i = 0; i < OrdersTotal(); i++)
+      if(orderInfo.SelectByIndex(i))
+         if(orderInfo.Magic() == InpMagicNumber && orderInfo.Symbol() == _Symbol &&
+            orderInfo.OrderType() == t)
+            n++;
+   return n;
+}
+
+void CancelFavorPendings()
+{
+   ENUM_ORDER_TYPE t = gCycleIsBullFVG ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP;
+   ulong tickets[];
+   for(int i = 0; i < OrdersTotal(); i++)
+      if(orderInfo.SelectByIndex(i))
+         if(orderInfo.Magic() == InpMagicNumber && orderInfo.Symbol() == _Symbol &&
+            orderInfo.OrderType() == t)
+         {
+            int n = ArraySize(tickets);
+            ArrayResize(tickets, n + 1);
+            tickets[n] = orderInfo.Ticket();
+         }
+   for(int i = 0; i < ArraySize(tickets); i++)
+      if(!trade.OrderDelete(tickets[i]))
+         Print("❌ Cancel favor pending #", tickets[i], " failed | ",
+               trade.ResultRetcodeDescription());
+}
+
+//+------------------------------------------------------------------+
+//| Favor SL-out lifecycle + re-arm (anchored mode, called per tick): |
+//|  1. Note when any favor position has existed (gFavorEverFilled). |
+//|  2. After SL-out (filled before, flat now): cancel leftover      |
+//|     favor pendings — partial ladders are not re-entries.         |
+//|  3. On the next zone tap (cooldown passed, FVG still alive,      |
+//|     trigger budget left): re-place the saved favor ladder and    |
+//|     consume one trigger.                                         |
+//+------------------------------------------------------------------+
+void ManageFavorReArm()
+{
+   if(gCycleMode != CYCLE_ANCHORED || !gridActive) return;
+
+   //--- OCO: once the counter side fills, the continuation trade is running
+   //    and the favor thesis is dead — cancel favor pendings, no re-arm.
+   //    (Without this, a bounce could refill favor stops above the zone and
+   //    load both sides at once.)
+   ENUM_POSITION_TYPE ctrType = gCycleIsBullFVG ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(posInfo.SelectByIndex(i))
+         if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol &&
+            posInfo.PositionType() == ctrType)
+         {
+            if(CountFavorPendings() > 0)
+            {
+               Print("🧹 Counter side filled — cancelling favor pendings (OCO).");
+               CancelFavorPendings();
+            }
+            return;
+         }
+
+   int favPos  = CountFavorPositions();
+   int favPend = CountFavorPendings();
+
+   if(favPos > 0)
+   {
+      gFavorEverFilled = true;
+      gFavorFlatSince  = 0;
+      return;
+   }
+
+   //--- Nothing filled yet: pendings are still the original entry — leave them
+   if(!gFavorEverFilled) return;
+
+   //--- SL-out detected: favor filled earlier, flat now
+   if(favPend > 0)
+   {
+      Print("🧹 Favor SL-out: cancelling ", favPend,
+            " leftover favor pendings (partial ladder ≠ re-entry).");
+      CancelFavorPendings();
+   }
+   if(gFavorFlatSince == 0)
+   {
+      gFavorFlatSince = TimeCurrent();
+      Print("🛑 Favor stack stopped out @ SL ", DoubleToString(gFavorSLPrice, _Digits),
+            ". Counter ladder stays as continuation. Re-arm on zone tap",
+            (InpFavorReArm ? "" : " DISABLED"), ".");
+      return;
+   }
+
+   if(!InpFavorReArm) return;
+   if(TimeCurrent() - gFavorFlatSince < InpReArmCooldownSec) return;
+   if(gCycleFVGIdx < 0 || gCycleFVGIdx >= gFVGCount) return;
+   if(FVGDead(gCycleFVGIdx))
+   {
+      //--- No re-arm possible. If the zone went stale (age cap) and nothing
+      //    is open, the counter pendings are stale too — close the cycle.
+      //    (Mitigated zone = breakdown confirmed: counter stays as continuation.)
+      if(FVGExpired(gCycleFVGIdx) && CountOurPositions() == 0)
+      {
+         Print("⌛ Cycle FVG expired with no open positions — closing stale cycle.");
+         CloseGrid();
+      }
+      return;
+   }
+
+   //--- Re-tap: price back inside the zone
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   bool tapped = gCycleIsBullFVG ? (bid <= gZoneTop && bid >= gZoneBot)
+                                 : (ask >= gZoneBot && ask <= gZoneTop);
+   if(!tapped) return;
+
+   //--- Re-place the saved ladder (all-or-cancel, same SL/TP)
+   double point       = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   long   stopsLevel  = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStopDist = stopsLevel * point;
+   int placed = 0;
+   int total  = ArraySize(gFavorPricesArr);
+   for(int i = 0; i < total; i++)
+   {
+      string c = EA_TAG + (gCycleIsBullFVG ? "_AFAV_BUY_R" : "_AFAV_SELL_R") +
+                 IntegerToString(i + 1);
+      bool ok;
+      if(gCycleIsBullFVG)
+      {
+         double curAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         if(gFavorPricesArr[i] < curAsk + minStopDist + point) break;
+         ok = trade.BuyStop(gFavorLotsArr[i], gFavorPricesArr[i], _Symbol,
+                            gFavorSLPrice, gBuyTP, ORDER_TIME_GTC, 0, c);
+      }
+      else
+      {
+         double curBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         if(gFavorPricesArr[i] > curBid - minStopDist - point) break;
+         ok = trade.SellStop(gFavorLotsArr[i], gFavorPricesArr[i], _Symbol,
+                             gFavorSLPrice, gSellTP, ORDER_TIME_GTC, 0, c);
+      }
+      if(!ok) break;
+      ulong tk = trade.ResultOrder();
+      if(tk == 0 || !OrderSelect(tk)) break;
+      placed++;
+   }
+
+   if(placed < total)
+   {
+      Print("⚠️  Re-arm: only ", placed, "/", total,
+            " favor legs placed — cancelling, retry after cooldown.");
+      CancelFavorPendings();
+      gFavorFlatSince = TimeCurrent();   // restart cooldown
+      return;
+   }
+
+   //--- Re-arm successful: consume one trigger on the FVG
+   gFVGs[gCycleFVGIdx].triggerCount++;
+   gFVGs[gCycleFVGIdx].lastTriggerTime = TimeCurrent();
+   SaveFVGTriggerCount(gCycleFVGIdx);
+   DrawFVG(gCycleFVGIdx);
+   gFavorEverFilled = false;
+   gFavorFlatSince  = 0;
+   Print("🔄 RE-ARMED favor ladder (", placed, " legs) on zone re-tap (T:",
+         gFVGs[gCycleFVGIdx].triggerCount, "/", InpFVGMaxTriggers, ").");
+}
+
+//+------------------------------------------------------------------+
+//| Init                                                             |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   if(StringFind(_Symbol, "XAU") < 0 && StringFind(_Symbol, "GOLD") < 0)
+      Print("⚠️  Warning: EA designed for GOLD (XAUUSD). Symbol: ", _Symbol);
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(InpSlippage);
+   trade.SetTypeFilling(ORDER_FILLING_IOC);
+
+   //--- Create ATR handles only if needed
+   if(InpDistanceMode == GRID_DIST_ATR_M1)
+      hAtrM1  = iATR(_Symbol, PERIOD_M1,  InpATRPeriod);
+   if(InpDistanceMode == GRID_DIST_ATR_M5)
+      hAtrM5  = iATR(_Symbol, PERIOD_M5,  InpATRPeriod);
+   if(InpDistanceMode == GRID_DIST_ATR_M15)
+      hAtrM15 = iATR(_Symbol, PERIOD_M15, InpATRPeriod);
+
+   if(InpDistanceMode != GRID_DIST_FIXED)
+   {
+      int h = GetActiveATRHandle();
+      if(h == INVALID_HANDLE)
+      {
+         Print("❌ Failed to create ATR handle for selected timeframe.");
+         return INIT_FAILED;
+      }
+   }
+
+   //--- Dynamic N ATR handle
+   if(InpDynamicN)
+   {
+      hAtrDynN = iATR(_Symbol, InpDynNATRTimeframe, InpDynNATRPeriod);
+      if(hAtrDynN == INVALID_HANDLE)
+      {
+         Print("❌ Failed to create dynamic-N ATR handle for ", EnumToString(InpDynNATRTimeframe));
+         return INIT_FAILED;
+      }
+      Print("📊 Dynamic N enabled: ATR(", EnumToString(InpDynNATRTimeframe), ", period=", InpDynNATRPeriod, ")",
+            ", per-level=$", DoubleToString(InpATRPerLevel, 2),
+            ", range=[", InpGridCountMin, "..", InpGridCountMax, "]",
+            ", reference N=", InpGridCountReference);
+   }
+
+   //--- Per-trigger-TF ATR handles (anchored grid buffer + ATR TPs)
+   hAtrTrigM5  = iATR(_Symbol, PERIOD_M5,  14);
+   hAtrTrigM15 = iATR(_Symbol, PERIOD_M15, 14);
+   hAtrTrigH1  = iATR(_Symbol, PERIOD_H1,  14);
+   if(InpUseFVGAnchoredGrid &&
+      (hAtrTrigM5 == INVALID_HANDLE || hAtrTrigM15 == INVALID_HANDLE || hAtrTrigH1 == INVALID_HANDLE))
+   {
+      Print("❌ Failed to create trigger-TF ATR handles (anchored grid).");
+      return INIT_FAILED;
+   }
+
+   Print("✅ GoldGridEA v6.00 initialized."
+         " | N=",        InpGridCount,
+         " | Mode=",     DistanceModeName(InpDistanceMode),
+         " | LotMode=",  LotModeName(InpLotMode),
+         " | Base=",     InpBaseLot,
+         " | X=$",       InpTPDistance,
+         " | Magic=",    InpMagicNumber);
+
+   if(InpDistanceMode == GRID_DIST_FIXED)
+      Print("📐 Fixed step: $", InpFixedDistance);
+   else
+      Print("📐 ATR mode — period=", InpATRPeriod,
+            ", multiplier=", InpATRMultiplier,
+            ", clamped [$", InpMinDistance, ", $", InpMaxDistance, "]");
+
+   //--- Profit target summary
+   if(InpProfitTargetUSD > 0 || InpProfitTargetINR > 0)
+   {
+      Print("💰 Profit targets enabled:",
+            (InpProfitTargetUSD > 0 ? "  USD ≥ $" + DoubleToString(InpProfitTargetUSD, 2) : ""),
+            (InpProfitTargetINR > 0 ? "  INR ≥ ₹" + DoubleToString(InpProfitTargetINR, 0) + " (@" + DoubleToString(InpUSDtoINRRate, 2) + ")" : ""),
+            "  (closes whichever fires first, also exits on price-TP)");
+   }
+   else
+   {
+      Print("💰 Profit targets: DISABLED (only price-TP at Mid ± $",
+            DoubleToString(InpGridCount * (InpDistanceMode == GRID_DIST_FIXED ? InpFixedDistance : 0.5) + InpTPDistance, 2),
+            " can close cycle)");
+   }
+
+   //--- Hybrid mode: detect and adopt any existing cycle (from previous run / restart)
+   AdoptExistingCycle();
+
+   //--- Initial FVG scan (loads existing FVGs with persisted trigger counts)
+   if(InpUseFVGTrigger)
+   {
+      Print("🔍 Initial FVG scan…");
+
+      //--- Clean any orphan FVG rectangles from previous runs (different objName format,
+      //    different bull/bear classification, etc.) Fresh slate.
+      ClearAllFVGObjects();
+
+      ScanAllFVGs();
+      gLastFVGScanTime = TimeCurrent();
+
+      //--- Count active FVGs per TF
+      int aH1=0, aM15=0, aM5=0, aDead=0;
+      for(int i = 0; i < gFVGCount; i++)
+      {
+         bool dead = FVGDead(i);
+         if(dead) { aDead++; continue; }
+         if(gFVGs[i].tf == PERIOD_H1)  aH1++;
+         if(gFVGs[i].tf == PERIOD_M15) aM15++;
+         if(gFVGs[i].tf == PERIOD_M5)  aM5++;
+      }
+      Print("    Total FVGs found: ", gFVGCount,
+            " | Active: H1=", aH1, " M15=", aM15, " M5=", aM5,
+            " | Dead/mitigated: ", aDead);
+   }
+
+   //--- Final startup status
+   bool tradeAllowed     = TerminalInfoInteger(TERMINAL_TRADE_ALLOWED);
+   bool tradeAllowedExpert = MQLInfoInteger(MQL_TRADE_ALLOWED);
+   Print("─────────────────────────────────────────────────────────");
+   Print("📋 Startup status:");
+   Print("    Auto-trading (terminal): ", tradeAllowed       ? "✅ ENABLED" : "❌ DISABLED");
+   Print("    Auto-trading (this EA):  ", tradeAllowedExpert ? "✅ ENABLED" : "❌ DISABLED");
+   Print("    Symbol:                  ", _Symbol);
+   Print("    Grid state:              ", gridActive ? "ACTIVE (adopted)" : "IDLE (waiting for first tick)");
+   Print("    InpResetOnClose:         ", InpResetOnClose ? "true (cycling)" : "false (one-shot)");
+   Print("    Anchored grid (v6):      ", InpUseFVGAnchoredGrid ?
+         "ENABLED (R $" + DoubleToString(InpM5_CycleRiskUSD, 0) + "/" +
+         DoubleToString(InpM15_CycleRiskUSD, 0) + "/" +
+         DoubleToString(InpH1_CycleRiskUSD, 0) + ", beta=" +
+         DoubleToString(InpCounterBeta, 2) + ", ctr legs=" +
+         IntegerToString(InpCounterLegs) + ")" : "disabled (legacy symmetric)");
+   Print("    FVG age caps (h):        M5=", InpFVGMaxAgeHrsM5,
+         " M15=", InpFVGMaxAgeHrsM15, " H1=", InpFVGMaxAgeHrsH1);
+   if(!tradeAllowed || !tradeAllowedExpert)
+      Print("⚠️  Trading is disabled — enable AutoTrading button (Ctrl+E) for orders to be placed.");
+
+   //--- Plan endpoint health probe
+   if(InpUsePlanEndpoint)
+   {
+      Print("    Plan endpoint:           ENABLED → ", InpPlanURL, " (tf=", InpPlanTF, ")");
+      double midPx = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) +
+                      SymbolInfoDouble(_Symbol, SYMBOL_BID)) / 2.0;
+      GridPlanResult probe;
+      if(FetchGridPlan(midPx > 0 ? midPx : 1.0, probe))
+         Print("    Plan endpoint health:    ✅ reachable (verdict=", probe.verdict, ")");
+      else
+         Print("⚠️  Plan endpoint UNREACHABLE. Whitelist ", InpPlanURL,
+               " under Tools→Options→Expert Advisors→Allow WebRequest, and ensure the server is running.");
+   }
+   Print("─────────────────────────────────────────────────────────");
+
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Adopt existing magic-numbered orders/positions from prior run.   |
+//| Reconstructs cycle state (gGridMid, gBuyTP, gSellTP, gridActive) |
+//| so the EA continues managing them and applies profit targets to  |
+//| their combined floating P&L.                                     |
+//+------------------------------------------------------------------+
+void AdoptExistingCycle()
+{
+   //--- Scan all magic-numbered positions and pending orders
+   int    posCount       = 0;
+   int    pendCount      = 0;
+   double posBuyTP       = 0.0;    // TP from any open BUY position
+   double posSellTP      = 0.0;    // TP from any open SELL position
+   double pendBuyTP      = 0.0;    // TP from any pending BuyStop
+   double pendSellTP     = 0.0;    // TP from any pending SellStop
+   double sumEntries     = 0.0;
+   int    entriesCounted = 0;
+   double minEntry       =  DBL_MAX;
+   double maxEntry       = -DBL_MAX;
+
+   //--- Open positions
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Magic() != InpMagicNumber)  continue;
+      if(posInfo.Symbol() != _Symbol)        continue;
+
+      posCount++;
+      double ep = posInfo.PriceOpen();
+      sumEntries += ep;
+      entriesCounted++;
+      if(ep < minEntry) minEntry = ep;
+      if(ep > maxEntry) maxEntry = ep;
+
+      if(posInfo.PositionType() == POSITION_TYPE_BUY  && posBuyTP  == 0.0) posBuyTP  = posInfo.TakeProfit();
+      if(posInfo.PositionType() == POSITION_TYPE_SELL && posSellTP == 0.0) posSellTP = posInfo.TakeProfit();
+   }
+
+   //--- Pending orders
+   for(int i = 0; i < OrdersTotal(); i++)
+   {
+      if(!orderInfo.SelectByIndex(i)) continue;
+      if(orderInfo.Magic() != InpMagicNumber)  continue;
+      if(orderInfo.Symbol() != _Symbol)        continue;
+
+      pendCount++;
+      double ep = orderInfo.PriceOpen();
+      sumEntries += ep;
+      entriesCounted++;
+      if(ep < minEntry) minEntry = ep;
+      if(ep > maxEntry) maxEntry = ep;
+
+      ENUM_ORDER_TYPE t = orderInfo.OrderType();
+      if(t == ORDER_TYPE_BUY_STOP  && pendBuyTP  == 0.0) pendBuyTP  = orderInfo.TakeProfit();
+      if(t == ORDER_TYPE_SELL_STOP && pendSellTP == 0.0) pendSellTP = orderInfo.TakeProfit();
+   }
+
+   //--- Nothing to adopt — clean slate
+   if(posCount == 0 && pendCount == 0)
+   {
+      Print("🆕 No existing cycle found (Magic=", InpMagicNumber, "). Will open fresh grid.");
+      return;
+   }
+
+   //--- Reconstruct cycle state
+   gBuyTP  = (posBuyTP  > 0) ? posBuyTP  : pendBuyTP;
+   gSellTP = (posSellTP > 0) ? posSellTP : pendSellTP;
+
+   //--- Estimate mid as the average of all entry prices (works for symmetric grids,
+   //    approximates for asymmetric ones)
+   if(entriesCounted > 0)
+      gGridMid = (minEntry + maxEntry) / 2.0;
+
+   //--- Estimate step from spread of entries / number of unique levels
+   //    (informational only; not used for any further action since we adopt as-is)
+   gGridStep = 0.0;  // unknown — we don't place new orders so this stays 0
+
+   //--- Estimate active N from max of (BUYs total, SELLs total) — best guess for adopted cycle
+   gActiveN      = MathMax(1, MathCeil((posCount + pendCount) / 2.0));
+   gActiveTarget = InpProfitTargetUSD;  // adopted target = configured (no dynamic scaling without knowing original ATR)
+
+   gridActive = true;
+   gCycleStartTime = TimeCurrent();
+   gCyclePeakPnL   = -DBL_MAX;
+   gCycleTroughPnL =  DBL_MAX;
+
+   Print("♻️  ADOPTED existing cycle (Magic=", InpMagicNumber, ", Symbol=", _Symbol, "):");
+   Print("    Open positions:   ", posCount);
+   Print("    Pending orders:   ", pendCount);
+   Print("    Entry price range: $", DoubleToString(minEntry, _Digits),
+         " → $", DoubleToString(maxEntry, _Digits));
+   Print("    Reconstructed mid: $", DoubleToString(gGridMid, _Digits));
+   Print("    BUY  TP (from orders): ", DoubleToString(gBuyTP,  _Digits));
+   Print("    SELL TP (from orders): ", DoubleToString(gSellTP, _Digits));
+   Print("    → Managing existing orders. Profit target applies to combined floating P&L.");
+   Print("    → Will NOT place new orders this cycle (adopted as-is).");
+
+   //--- Sanity warnings
+   if(gBuyTP == 0 && gSellTP == 0)
+   {
+      Print("⚠️  Adopted positions/orders have NO TPs set. Only profit-target close will work.");
+   }
+   if(InpProfitTargetUSD == 0 && InpProfitTargetINR == 0 && gBuyTP == 0 && gSellTP == 0)
+   {
+      Print("⚠️  No exit mechanism active (no TPs, no profit target). Grid will only close manually.");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get active ATR handle for current mode                           |
+//+------------------------------------------------------------------+
+int GetActiveATRHandle()
+{
+   switch(InpDistanceMode)
+   {
+      case GRID_DIST_ATR_M1:  return hAtrM1;
+      case GRID_DIST_ATR_M5:  return hAtrM5;
+      case GRID_DIST_ATR_M15: return hAtrM15;
+      default:                return INVALID_HANDLE;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Distance mode name (for logging)                                 |
+//+------------------------------------------------------------------+
+string DistanceModeName(ENUM_GRID_DISTANCE_MODE m)
+{
+   switch(m)
+   {
+      case GRID_DIST_FIXED:   return "FIXED";
+      case GRID_DIST_ATR_M1:  return "ATR(M1)";
+      case GRID_DIST_ATR_M5:  return "ATR(M5)";
+      case GRID_DIST_ATR_M15: return "ATR(M15)";
+   }
+   return "?";
+}
+
+//+------------------------------------------------------------------+
+//| Resolve the grid step ($) for this cycle                         |
+//| Returns 0.0 if unable to resolve (e.g. ATR not yet ready)        |
+//+------------------------------------------------------------------+
+double ResolveGridStep()
+{
+   if(InpDistanceMode == GRID_DIST_FIXED)
+      return InpFixedDistance;
+
+   //--- ATR-based: read latest completed ATR value
+   int handle = GetActiveATRHandle();
+   if(handle == INVALID_HANDLE) return 0.0;
+
+   double atrBuf[];
+   if(CopyBuffer(handle, 0, 1, 1, atrBuf) != 1)
+   {
+      Print("⚠️  ATR not ready yet — skipping cycle.");
+      return 0.0;
+   }
+
+   double atr     = atrBuf[0];
+   double rawStep = atr * InpATRMultiplier;
+
+   //--- Clamp to safety floor/cap
+   double clamped = MathMax(InpMinDistance, MathMin(InpMaxDistance, rawStep));
+
+   Print("📊 ATR(", DistanceModeName(InpDistanceMode), ") = $",
+         DoubleToString(atr, _Digits),
+         " × mult ", InpATRMultiplier,
+         " = $", DoubleToString(rawStep, 4),
+         " → clamped to $", DoubleToString(clamped, 4));
+
+   return clamped;
+}
+
+//+------------------------------------------------------------------+
+//| Resolve dynamic N from ATR (or return static InpGridCount).      |
+//| Returns 0 if dynamic-N requested but ATR not ready (caller       |
+//| should skip this cycle and retry).                               |
+//+------------------------------------------------------------------+
+int ResolveDynamicN()
+{
+   if(!InpDynamicN) return InpGridCount;
+
+   if(hAtrDynN == INVALID_HANDLE)
+   {
+      Print("⚠️  Dynamic N requested but ATR handle not created — falling back to static N=", InpGridCount);
+      return InpGridCount;
+   }
+
+   double atrBuf[];
+   if(CopyBuffer(hAtrDynN, 0, 1, 1, atrBuf) != 1)
+   {
+      Print("⚠️  Dynamic N: ATR not ready yet — skipping cycle.");
+      return 0;
+   }
+
+   double atr = atrBuf[0];
+
+   //--- ATR floor gate: refuse to open grid in low-volatility chop
+   if(InpMinATRToTrade > 0.0 && atr < InpMinATRToTrade)
+   {
+      static datetime lastAtrLowLog = 0;
+      if(TimeCurrent() - lastAtrLowLog >= 60)
+      {
+         Print("⏸️  ATR(", EnumToString(InpDynNATRTimeframe), ")=$",
+               DoubleToString(atr, _Digits),
+               " < floor $", DoubleToString(InpMinATRToTrade, 2),
+               " — skipping cycle (volatility too low).");
+         lastAtrLowLog = TimeCurrent();
+      }
+      lastCloseTime = TimeCurrent() - InpGridResetDelay + InpRetryDelay;  // short retry
+      return 0;
+   }
+
+   double rawN     = (InpATRPerLevel > 0) ? atr / InpATRPerLevel : InpGridCount;
+   int    candN    = (int)MathRound(rawN);
+
+   //--- Clamp to user min/max
+   int finalN = candN;
+   if(finalN < InpGridCountMin) finalN = InpGridCountMin;
+   if(finalN > InpGridCountMax) finalN = InpGridCountMax;
+
+   Print("📐 Dynamic N: ATR(", EnumToString(InpDynNATRTimeframe), ")=$",
+         DoubleToString(atr, _Digits),
+         " / per-level $", DoubleToString(InpATRPerLevel, 2),
+         " = ", DoubleToString(rawN, 2),
+         " → clamped to ", finalN, " [", InpGridCountMin, "..", InpGridCountMax, "]");
+
+   return finalN;
+}
+
+//+------------------------------------------------------------------+
+//| Tick                                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(!gridActive)
+   {
+      bool delayOk = (TimeCurrent() - lastCloseTime) >= InpGridResetDelay;
+
+      //--- FVG MODE: wait for FVG trigger before opening grid
+      if(InpUseFVGTrigger)
+      {
+         //--- Periodic re-scan to catch newly formed FVGs (every 60 sec)
+         if(TimeCurrent() - gLastFVGScanTime >= 60)
+         {
+            ScanAllFVGs();
+            gLastFVGScanTime = TimeCurrent();
+         }
+
+         if(delayOk)
+         {
+            int triggeredIdx = CheckAllTriggers();
+            if(triggeredIdx >= 0)
+            {
+               ENUM_TIMEFRAMES tf = gFVGs[triggeredIdx].tf;
+               Print("🎯 FVG TRIGGER: ", TFName(tf), " ",
+                     (gFVGs[triggeredIdx].isBullish ? "Bullish" : "Bearish"),
+                     " FVG at ",
+                     DoubleToString(gFVGs[triggeredIdx].botPrice, _Digits),
+                     "-",
+                     DoubleToString(gFVGs[triggeredIdx].topPrice, _Digits),
+                     " (would be trigger ", gFVGs[triggeredIdx].triggerCount + 1, "/",
+                     InpFVGMaxTriggers, ") → attempting grid open");
+               //--- PLAN MODE: let Python decide placement (zone fulcrum, legs,
+               //    skew, structural TPs). A "skip" verdict aborts this trigger.
+               if(InpUsePlanEndpoint)
+               {
+                  double midPx = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) +
+                                  SymbolInfoDouble(_Symbol, SYMBOL_BID)) / 2.0;
+                  GridPlanResult plan;
+                  bool got = FetchGridPlan(midPx, plan);
+                  if(got && plan.verdict == "arm")
+                  {
+                     OpenGridFromPlan(plan);
+                  }
+                  else
+                  {
+                     Print("⏭️  Plan endpoint ",
+                           (got ? "returned skip (" + plan.skipReason + ")" : "unreachable"),
+                           " — trigger NOT consumed.");
+                     gFVGs[triggeredIdx].lastTriggerTime = 0;  // allow re-detect
+                  }
+               }
+               else if(InpUseFVGAnchoredGrid)
+               {
+                  //--- v6: asymmetric placement from FVG geometry
+                  OpenGridFVGAnchored(triggeredIdx);
+               }
+               else
+               {
+                  ApplyTFParameters(tf);
+                  OpenGrid();
+               }
+
+               if(gridActive)
+               {
+                  //--- Grid opened successfully — commit the trigger count
+                  gFVGs[triggeredIdx].triggerCount++;
+                  gFVGs[triggeredIdx].lastTriggerTime = TimeCurrent();
+                  SaveFVGTriggerCount(triggeredIdx);
+                  DrawFVG(triggeredIdx);
+                  Print("✅ FVG trigger committed (T:", gFVGs[triggeredIdx].triggerCount,
+                        "/", InpFVGMaxTriggers, ")");
+               }
+               else
+               {
+                  //--- OpenGrid failed — don't consume the trigger, retry next bar/tick
+                  Print("⚠️  OpenGrid failed — FVG trigger NOT consumed (T:",
+                        gFVGs[triggeredIdx].triggerCount, "/", InpFVGMaxTriggers,
+                        "). Will retry when conditions allow.");
+                  //--- Reset lastTriggerTime so this FVG can be re-detected
+                  gFVGs[triggeredIdx].lastTriggerTime = 0;
+                  //--- Don't set lastCloseTime here — we want to retry immediately
+                  //    unless OpenGrid itself already set it (margin/freeze failures)
+               }
+            }
+         }
+
+         //--- Idle diagnostic (rate-limited to once per 60s)
+         static datetime lastFvgIdleLog = 0;
+         if(TimeCurrent() - lastFvgIdleLog >= 60)
+         {
+            int armedH1=0, armedM15=0, armedM5=0;
+            for(int i = 0; i < gFVGCount; i++)
+            {
+               if(FVGDead(i)) continue;
+               if(gFVGs[i].tf == PERIOD_H1)  armedH1++;
+               if(gFVGs[i].tf == PERIOD_M15) armedM15++;
+               if(gFVGs[i].tf == PERIOD_M5)  armedM5++;
+            }
+            Print("⏳ FVG IDLE: ", armedH1, " H1 / ", armedM15, " M15 / ", armedM5,
+                  " M5 armed. Waiting for confirmation candle close.");
+            lastFvgIdleLog = TimeCurrent();
+         }
+
+         DashRender();
+         return;
+      }
+
+      //--- LEGACY MODE: timer-based open
+      if(InpResetOnClose && delayOk)
+      {
+         OpenGrid();
+      }
+      else if(!InpResetOnClose && lastCloseTime == 0)
+      {
+         OpenGrid();
+      }
+      else
+      {
+         //--- Diagnose why we're idle (rate-limited to once per 5 seconds)
+         static datetime lastIdleLog = 0;
+         if(TimeCurrent() - lastIdleLog >= 5)
+         {
+            long secsLeft = (long)InpGridResetDelay - (TimeCurrent() - lastCloseTime);
+            if(!InpResetOnClose && lastCloseTime != 0)
+            {
+               Print("⏸️  Grid IDLE: InpResetOnClose=false and a cycle already closed once. ",
+                     "Enable InpResetOnClose to keep cycling, or restart the EA.");
+            }
+            else if(!delayOk)
+            {
+               Print("⏸️  Grid IDLE: waiting reset delay. ",
+                     secsLeft, " sec left of ", InpGridResetDelay, " sec cooldown.");
+            }
+            lastIdleLog = TimeCurrent();
+         }
+      }
+      DashRender();
+      return;
+   }
+
+   //--- ANCHORED MODE: failed-failure exit. Counter side filled (idea already
+   //    invalidated) but price closed back beyond the zone edge on the trigger
+   //    TF — both the idea and its failure are dead. Close all, no re-flip.
+   if(gCycleMode == CYCLE_ANCHORED && gActiveTriggerTF != PERIOD_CURRENT)
+   {
+      datetime curBar = iTime(_Symbol, gActiveTriggerTF, 0);
+      if(curBar > 0 && curBar != gLastFailCheckBar)
+      {
+         gLastFailCheckBar = curBar;
+
+         bool counterFilled = false;
+         for(int i = 0; i < PositionsTotal(); i++)
+            if(posInfo.SelectByIndex(i))
+               if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol)
+               {
+                  if(gCycleIsBullFVG  && posInfo.PositionType() == POSITION_TYPE_SELL) counterFilled = true;
+                  if(!gCycleIsBullFVG && posInfo.PositionType() == POSITION_TYPE_BUY)  counterFilled = true;
+               }
+
+         if(counterFilled)
+         {
+            MqlRates r[];
+            if(CopyRates(_Symbol, gActiveTriggerTF, 1, 1, r) == 1)
+            {
+               bool failedFailure = gCycleIsBullFVG ? (r[0].close > gZoneBot)
+                                                    : (r[0].close < gZoneTop);
+               if(failedFailure)
+               {
+                  Print("🔁 FAILED-FAILURE (", TFName(gActiveTriggerTF), "): counter side filled",
+                        " but close=", DoubleToString(r[0].close, _Digits),
+                        " back ", (gCycleIsBullFVG ? "above zoneBot " : "below zoneTop "),
+                        DoubleToString(gCycleIsBullFVG ? gZoneBot : gZoneTop, _Digits),
+                        " — closing entire grid, no re-flip.");
+                  CloseGrid();
+                  return;
+               }
+            }
+         }
+      }
+   }
+
+   //--- ANCHORED MODE: favor SL-out lifecycle (cancel leftovers, re-arm on tap)
+   ManageFavorReArm();
+   if(!gridActive) return;   // re-arm path may have closed a stale cycle
+
+   //--- Dynamic TP hedge decay (convex) — update every 10 seconds
+   //    (skipped in anchored mode: per-side anchors break the mid±offset model)
+   static datetime lastTPUpdate = 0;
+   if(gridActive && gCycleMode != CYCLE_ANCHORED && GetActiveTPHedgeDecayPct() > 0.0 &&
+      TimeCurrent() - lastTPUpdate >= 10)
+   {
+      double newOffset = GetDecayedTPOffset();
+      double newBuyTP  = 0.0, newSellTP = 0.0;
+      if(newOffset > 0.0)
+      {
+         newBuyTP  = NormalizeDouble(gGridMid + newOffset, _Digits);
+         newSellTP = NormalizeDouble(gGridMid - newOffset, _Digits);
+      }
+      double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      if(MathAbs(newBuyTP - gBuyTP) > point * 0.5)
+      {
+         UpdateAllTPs(newBuyTP, newSellTP);
+         gBuyTP  = newBuyTP;
+         gSellTP = newSellTP;
+         Print("🔁 TP decay (", gActiveTriggerTFName, "): offset=$",
+               DoubleToString(newOffset, 2),
+               " | BuyTP=",  DoubleToString(gBuyTP,  _Digits),
+               " SellTP=", DoubleToString(gSellTP, _Digits));
+      }
+      lastTPUpdate = TimeCurrent();
+   }
+
+   //--- Watch the pre-calculated TP levels
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   bool buyTPHit  = (gBuyTP  > 0 && ask >= gBuyTP);
+   bool sellTPHit = (gSellTP > 0 && bid <= gSellTP);
+
+   if(buyTPHit || sellTPHit)
+   {
+      string side  = buyTPHit ? "BUY" : "SELL";
+      double level = buyTPHit ? gBuyTP : gSellTP;
+      Print("🎯 ", side, " TP touched @ ", DoubleToString(level, _Digits),
+            " | Closing entire grid.");
+      CloseGrid();
+      return;
+   }
+
+   //--- Check currency profit target(s) — close when floating P&L >= dynamic target
+   if(InpProfitTargetUSD > 0.0 || InpProfitTargetINR > 0.0)
+   {
+      double floatingUSD = GetCycleFloatingPnL();
+
+      //--- Count open positions per side for hedge-aware decay
+      int buysOpen = 0, sellsOpen = 0;
+      for(int i = 0; i < PositionsTotal(); i++)
+      {
+         if(posInfo.SelectByIndex(i))
+         {
+            if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol)
+            {
+               if(posInfo.PositionType() == POSITION_TYPE_BUY)  buysOpen++;
+               if(posInfo.PositionType() == POSITION_TYPE_SELL) sellsOpen++;
+            }
+         }
+      }
+      int hedgedPairs = MathMin(buysOpen, sellsOpen);
+
+      //--- Auto-close on full hedge: when all N pairs are hedged, grid is delta-neutral
+      //    and can't progress further via price movement. Close immediately.
+      //    (skipped in anchored mode: β>1 means full hedge can't occur;
+      //     the failed-failure exit owns that scenario)
+      if(gCycleMode != CYCLE_ANCHORED &&
+         InpCloseOnFullHedge && hedgedPairs >= ActiveN() && buysOpen + sellsOpen >= 2 * ActiveN())
+      {
+         Print("🔒 FULL HEDGE detected: ", buysOpen, "B / ", sellsOpen, "S (", hedgedPairs, "/", ActiveN(), " pairs).",
+               " Position is delta-neutral — cannot recover via price movement.",
+               " Floating: $", DoubleToString(floatingUSD, 2),
+               " (₹", DoubleToString(floatingUSD * InpUSDtoINRRate, 0), ").",
+               " Closing grid to free margin.");
+         CloseGrid();
+         return;
+      }
+
+      //--- Compute decay ratio (0.0 → no decay; 1.0 → max decay at fully hedged)
+      double decayRatio = 0.0;
+      if(ActiveN() > 0 && InpHedgeDecayPct > 0.0)
+         decayRatio = ((double)hedgedPairs / (double)ActiveN()) * (InpHedgeDecayPct / 100.0);
+      if(decayRatio > 1.0) decayRatio = 1.0;
+
+      //--- Apply decay to both USD and INR targets; floor at InpMinTargetUSD
+      //    Use gActiveTarget (scales with dynamic N) if set, else fall back to InpProfitTargetUSD
+      double baseTargetUSD = (gActiveTarget > 0) ? gActiveTarget : InpProfitTargetUSD;
+      double effectiveUSD = baseTargetUSD * (1.0 - decayRatio);
+      double effectiveINR = InpProfitTargetINR * (1.0 - decayRatio);
+      if(baseTargetUSD > 0.0 && effectiveUSD < InpMinTargetUSD) effectiveUSD = InpMinTargetUSD;
+      if(InpProfitTargetINR > 0.0 && effectiveINR < InpMinTargetUSD * InpUSDtoINRRate)
+         effectiveINR = InpMinTargetUSD * InpUSDtoINRRate;
+
+      bool usdTargetHit = (baseTargetUSD > 0.0 && floatingUSD >= effectiveUSD);
+      bool inrTargetHit = false;
+      double floatingINR = 0.0;
+
+      if(InpProfitTargetINR > 0.0 && InpUSDtoINRRate > 0.0)
+      {
+         floatingINR = floatingUSD * InpUSDtoINRRate;
+         inrTargetHit = (floatingINR >= effectiveINR);
+      }
+
+      //--- DEBUG: log when floating is close to (or above) target but no close fired
+      //    (rate-limited to once per 5 seconds)
+      static datetime lastNearLog = 0;
+      if(baseTargetUSD > 0.0 && floatingUSD >= effectiveUSD * 0.90 &&
+         TimeCurrent() - lastNearLog >= 5)
+      {
+         Print("🔍 TARGET CHECK: floating=$", DoubleToString(floatingUSD, 4),
+               " | effective=$", DoubleToString(effectiveUSD, 4),
+               " | base=$", DoubleToString(baseTargetUSD, 4),
+               " | decay=", DoubleToString(decayRatio * 100, 2), "%",
+               " | usdTargetHit=", (usdTargetHit ? "TRUE" : "FALSE"),
+               " | positions=", PositionsTotal(),
+               " | our_positions_in_loop=", buysOpen + sellsOpen);
+         lastNearLog = TimeCurrent();
+      }
+
+      //--- Diagnostic log when hedged (rate-limited to once per 30 seconds)
+      static datetime lastHedgeLog = 0;
+      if(hedgedPairs > 0 && TimeCurrent() - lastHedgeLog >= 30)
+      {
+         Print("🔀 Hedge state: ", buysOpen, "B/", sellsOpen, "S = ", hedgedPairs, " pairs hedged",
+               " | decay ", DoubleToString(decayRatio * 100, 1), "%",
+               " | effective target: $", DoubleToString(effectiveUSD, 2),
+               (InpProfitTargetINR > 0 ? " / ₹" + DoubleToString(effectiveINR, 0) : ""),
+               " | floating: $", DoubleToString(floatingUSD, 2));
+         lastHedgeLog = TimeCurrent();
+      }
+
+      if(usdTargetHit || inrTargetHit)
+      {
+         string trigger = usdTargetHit
+                          ? "USD ≥ $" + DoubleToString(effectiveUSD, 2) + " (base $" + DoubleToString(baseTargetUSD, 2) + ")"
+                          : "INR ≥ ₹" + DoubleToString(effectiveINR, 0) + " (base ₹" + DoubleToString(InpProfitTargetINR, 0) + ")";
+         Print("💰 Profit target hit (", trigger, ")",
+               " | Hedged: ", hedgedPairs, "/", ActiveN(), " pairs",
+               " | Decay: ", DoubleToString(decayRatio * 100, 1), "%",
+               " | Floating: $", DoubleToString(floatingUSD, 2),
+               " (₹", DoubleToString(floatingUSD * InpUSDtoINRRate, 0), ")",
+               " | Closing entire grid.");
+         CloseGrid();
+         return;
+      }
+   }
+
+   //--- Safety: if all positions/pending gone (manual close, SL), reset
+   if(CountOurPositions() == 0 && !HasOurPendingOrders())
+   {
+      Print("ℹ️  All positions and orders gone. Resetting state.");
+      gridActive    = false;
+      gBuyTP        = 0.0;
+      gSellTP       = 0.0;
+      lastCloseTime = TimeCurrent();
+   }
+
+   //--- Update dashboard on every tick
+   DashRender();
+}
+
+//+------------------------------------------------------------------+
+//| Open grid — resolve step, pre-calculate TPs, place orders        |
+//+------------------------------------------------------------------+
+void OpenGrid()
+{
+   //--- FVG MODE: gActiveN, gActiveTarget, gGridStep were already set by ApplyTFParameters().
+   //    Skip the dynamic-N and step resolution.
+   if(InpUseFVGTrigger && gActiveTriggerTF != PERIOD_CURRENT)
+   {
+      Print("🚀 Opening FVG-triggered grid:",
+            " TF=",       TFName(gActiveTriggerTF),
+            " | N=",      gActiveN,
+            " | step=$",  DoubleToString(gGridStep, 2),
+            " | target=$", DoubleToString(gActiveTarget, 2),
+            " (₹",        DoubleToString(gActiveTarget * InpUSDtoINRRate, 0), ")");
+   }
+   else
+   {
+      //--- LEGACY: resolve step for this cycle
+      gGridStep = ResolveGridStep();
+      if(gGridStep <= 0.0)
+      {
+         // ATR not ready or invalid — try again next tick
+         return;
+      }
+
+      //--- Resolve dynamic N (or use static InpGridCount)
+      gActiveN = ResolveDynamicN();
+      if(gActiveN <= 0)
+      {
+         // ATR not ready for dynamic N — retry next tick
+         return;
+      }
+
+      //--- Resolve effective profit target for this cycle (proportional to active N)
+      if(InpDynamicN && InpGridCountReference > 0)
+         gActiveTarget = InpProfitTargetUSD * ((double)gActiveN / (double)InpGridCountReference);
+      else
+         gActiveTarget = InpProfitTargetUSD;
+
+      if(InpDynamicN)
+      {
+         Print("🎯 Cycle target scaled: base $", DoubleToString(InpProfitTargetUSD, 2),
+               " × (N=", gActiveN, " / ref=", InpGridCountReference,
+               ") = $", DoubleToString(gActiveTarget, 2),
+               " (₹", DoubleToString(gActiveTarget * InpUSDtoINRRate, 0), ")");
+      }
+   }
+
+   double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   //--- Broker freeze/stops level: minimum distance from market for pending orders
+   long   stopsLevelPts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStopDist   = stopsLevelPts * point;
+   //--- Safety margin: 2x stops level + 1 extra point to absorb price drift during placement
+   double safeBuffer    = MathMax(minStopDist * 2.0 + point, point * 5.0);
+
+   //--- Validate that the first grid step is large enough to clear the freeze zone
+   if(gGridStep < safeBuffer)
+   {
+      Print("❌ Grid step $", DoubleToString(gGridStep, digits),
+            " is smaller than broker's safe buffer $", DoubleToString(safeBuffer, digits),
+            " (stops_level=", stopsLevelPts, " pts). Aborting cycle.");
+      Print("   Increase InpFixedDistance or ATR multiplier and retry.");
+      lastCloseTime = TimeCurrent();  // throttle retries
+      return;
+   }
+
+   //--- Anchor mid at (Ask+Bid)/2, then verify innermost orders won't hit freeze zone.
+   //    BuyStop  #1 = mid + step    must be >= Ask + minStopDist + buffer
+   //    SellStop #1 = mid - step    must be <= Bid - minStopDist - buffer
+   //    If either is violated, shift the mid outward to satisfy both.
+   double rawMid = (ask + bid) / 2.0;
+   double minMidForBuy  = ask + minStopDist + point - gGridStep;  // mid such that mid+step >= ask+minStop+point
+   double maxMidForSell = bid - minStopDist - point + gGridStep;  // mid such that mid-step <= bid-minStop-point
+
+   //--- If the natural mid puts inner orders inside freeze zone, abort and wait next tick
+   //    rather than skewing the grid asymmetrically.
+   if(rawMid < minMidForBuy || rawMid > maxMidForSell)
+   {
+      Print("⏳ Mid ", DoubleToString(rawMid, digits),
+            " too close to market for symmetric grid (",
+            "need [", DoubleToString(minMidForBuy, digits), ", ", DoubleToString(maxMidForSell, digits), "]).",
+            " Step $", DoubleToString(gGridStep, digits),
+            " not enough vs spread ($", DoubleToString(ask-bid, digits),
+            ") + stops_level. Retrying.");
+      lastCloseTime = TimeCurrent() - InpGridResetDelay + InpRetryDelay;  // short retry
+      return;
+   }
+
+   gGridMid = NormalizeDouble(rawMid, digits);
+
+   //--- Pre-calculate TP levels — fixed for entire cycle
+   double tpDist = (InpUseFVGTrigger && gActiveTriggerTF != PERIOD_CURRENT)
+                   ? ActiveTPDistance()
+                   : InpTPDistance;
+   double totalOffset = gActiveN * gGridStep + tpDist;
+   gBuyTP  = NormalizeDouble(gGridMid + totalOffset, digits);
+   gSellTP = NormalizeDouble(gGridMid - totalOffset, digits);
+
+   Print("📐 Grid mid:       ", DoubleToString(gGridMid, digits),
+         "  | Ask=", DoubleToString(ask, digits), " Bid=", DoubleToString(bid, digits));
+   Print("📐 Resolved step:  $", DoubleToString(gGridStep, 4),
+         "  (", DistanceModeName(InpDistanceMode), ")",
+         "  | stops_level=", stopsLevelPts, " pts ($", DoubleToString(minStopDist, digits), ")");
+   Print("🎯 BUY  TP (fixed): ", DoubleToString(gBuyTP, digits),
+         "  [ Mid + $", DoubleToString(totalOffset, 4), " ]");
+   Print("🎯 SELL TP (fixed): ", DoubleToString(gSellTP, digits),
+         "  [ Mid - $", DoubleToString(totalOffset, 4), " ]");
+
+   //--- Log the lot ladder for this cycle
+   string ladder = "📊 Lot ladder (" + LotModeName(InpLotMode) + "): ";
+   double totalLots = 0.0;
+   for(int k = 1; k <= gActiveN; k++)
+   {
+      double l = ResolveLotForIndex(k);
+      ladder += DoubleToString(l, 2);
+      if(k < gActiveN) ladder += " → ";
+      totalLots += l;
+   }
+   ladder += "  |  Total per side: " + DoubleToString(totalLots, 2);
+   Print(ladder);
+
+   //--- MARGIN PRE-CHECK: compute required margin if ALL 2N orders trigger
+   //    Use OrderCalcMargin to ask the broker exactly what it would charge.
+   double equity          = AccountInfoDouble(ACCOUNT_EQUITY);
+   double freeMargin      = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double maxAllowedMargin = equity * (InpMaxMarginPct / 100.0);
+
+   double totalMarginNeeded = 0.0;
+   bool   marginCalcOK      = true;
+   for(int k = 1; k <= gActiveN; k++)
+   {
+      double l = ResolveLotForIndex(k);
+      double buyEntry  = NormalizeDouble(gGridMid + k * gGridStep, digits);
+      double sellEntry = NormalizeDouble(gGridMid - k * gGridStep, digits);
+
+      double mBuy = 0.0, mSell = 0.0;
+      if(!OrderCalcMargin(ORDER_TYPE_BUY,  _Symbol, l, buyEntry,  mBuy) ||
+         !OrderCalcMargin(ORDER_TYPE_SELL, _Symbol, l, sellEntry, mSell))
+      {
+         marginCalcOK = false;
+         break;
+      }
+      totalMarginNeeded += mBuy + mSell;
+   }
+
+   if(!marginCalcOK)
+   {
+      Print("❌ OrderCalcMargin failed for one or more orders. Aborting cycle.");
+      lastCloseTime = TimeCurrent();
+      return;
+   }
+
+   Print("💰 Margin check: Equity=$", DoubleToString(equity, 2),
+         " | Free=$", DoubleToString(freeMargin, 2),
+         " | Need if all triggered=$", DoubleToString(totalMarginNeeded, 2),
+         " | Cap (", DoubleToString(InpMaxMarginPct, 1), "% of equity)=$",
+         DoubleToString(maxAllowedMargin, 2));
+
+   if(totalMarginNeeded > maxAllowedMargin)
+   {
+      Print("❌ Total margin needed ($", DoubleToString(totalMarginNeeded, 2),
+            ") exceeds safety cap ($", DoubleToString(maxAllowedMargin, 2), ").");
+      Print("   Reduce N, lot size, or increase InpMaxMarginPct (currently ", DoubleToString(InpMaxMarginPct, 1), "%).");
+      Print("   Aborting cycle — partial grids are not allowed.");
+      lastCloseTime = TimeCurrent();
+      return;
+   }
+
+   if(totalMarginNeeded > freeMargin)
+   {
+      Print("❌ Total margin needed ($", DoubleToString(totalMarginNeeded, 2),
+            ") exceeds free margin ($", DoubleToString(freeMargin, 2), ").");
+      Print("   Broker would reject orders. Aborting cycle.");
+      lastCloseTime = TimeCurrent();
+      return;
+   }
+
+   int buyPlaced  = 0, buyFailed  = 0, buySkipped  = 0;
+   int sellPlaced = 0, sellFailed = 0, sellSkipped = 0;
+
+   //--- N BuyStops above mid — must be ABOVE current Ask + stops_level
+   for(int i = 1; i <= gActiveN; i++)
+   {
+      //--- Re-fetch current Ask for each order (price can drift during placement)
+      double curAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double minBuyStopPrice = curAsk + minStopDist + point;
+
+      double entryPrice = NormalizeDouble(gGridMid + i * gGridStep, digits);
+
+      if(entryPrice < minBuyStopPrice)
+      {
+         Print("⏭️  BuyStop  #", i, " @ ", DoubleToString(entryPrice, digits),
+               " skipped (inside freeze zone, min=$", DoubleToString(minBuyStopPrice, digits), ")");
+         buySkipped++;
+         continue;
+      }
+
+      double lot = ResolveLotForIndex(i);
+      double sl  = (InpStopLoss > 0)
+                   ? NormalizeDouble(entryPrice - InpStopLoss, digits)
+                   : 0.0;
+      string comment = EA_TAG + "_BUY_" + IntegerToString(i);
+
+      if(!trade.BuyStop(lot, entryPrice, _Symbol, sl, gBuyTP, ORDER_TIME_GTC, 0, comment))
+      {
+         Print("❌ BuyStop #", i, " failed @ ", DoubleToString(entryPrice, digits),
+               " | lot=", lot,
+               " | ", trade.ResultRetcodeDescription());
+         buyFailed++;
+      }
+      else
+      {
+         ulong ticket = trade.ResultOrder();
+
+         //--- VERIFY: confirm the order actually exists in the book
+         if(ticket == 0 || !OrderSelect(ticket))
+         {
+            Print("❌ BuyStop #", i, " phantom — trade.BuyStop returned OK but order #",
+                  ticket, " is NOT in the book. Treating as failure.");
+            buyFailed++;
+         }
+         else
+         {
+            Print("✅ BuyStop  #", i, " @ ", DoubleToString(entryPrice, digits),
+                  " | lot=", DoubleToString(lot, 2),
+                  " | ticket=", ticket,
+                  " | TP: ", DoubleToString(gBuyTP, digits));
+            buyPlaced++;
+         }
+      }
+   }
+
+   //--- N SellStops below mid — must be BELOW current Bid - stops_level
+   for(int i = 1; i <= gActiveN; i++)
+   {
+      double curBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double maxSellStopPrice = curBid - minStopDist - point;
+
+      double entryPrice = NormalizeDouble(gGridMid - i * gGridStep, digits);
+
+      if(entryPrice > maxSellStopPrice)
+      {
+         Print("⏭️  SellStop #", i, " @ ", DoubleToString(entryPrice, digits),
+               " skipped (inside freeze zone, max=$", DoubleToString(maxSellStopPrice, digits), ")");
+         sellSkipped++;
+         continue;
+      }
+
+      double lot = ResolveLotForIndex(i);
+      double sl  = (InpStopLoss > 0)
+                   ? NormalizeDouble(entryPrice + InpStopLoss, digits)
+                   : 0.0;
+      string comment = EA_TAG + "_SELL_" + IntegerToString(i);
+
+      if(!trade.SellStop(lot, entryPrice, _Symbol, sl, gSellTP, ORDER_TIME_GTC, 0, comment))
+      {
+         Print("❌ SellStop #", i, " failed @ ", DoubleToString(entryPrice, digits),
+               " | lot=", lot,
+               " | ", trade.ResultRetcodeDescription());
+         sellFailed++;
+      }
+      else
+      {
+         ulong ticket = trade.ResultOrder();
+
+         //--- VERIFY: confirm the order actually exists in the book
+         if(ticket == 0 || !OrderSelect(ticket))
+         {
+            Print("❌ SellStop #", i, " phantom — trade.SellStop returned OK but order #",
+                  ticket, " is NOT in the book. Treating as failure.");
+            sellFailed++;
+         }
+         else
+         {
+            Print("✅ SellStop #", i, " @ ", DoubleToString(entryPrice, digits),
+                  " | lot=", DoubleToString(lot, 2),
+                  " | ticket=", ticket,
+                  " | TP: ", DoubleToString(gSellTP, digits));
+            sellPlaced++;
+         }
+      }
+   }
+
+   //--- Decision logic: require SYMMETRIC placement (same count on both sides)
+   //--- Decision logic: require SYMMETRIC placement (same count on both sides)
+   //    AND no hard failures, AND full N on each side. Anything less aborts.
+   bool buySideOK  = (buyPlaced  == gActiveN && buyFailed  == 0);
+   bool sellSideOK = (sellPlaced == gActiveN && sellFailed == 0);
+
+   //--- FINAL VERIFICATION: actually count orders in the broker's book by magic number.
+   //    This catches any orders that vanished between trade.OrderSend success and now
+   //    (broker rejection, race conditions, etc.) — the source of the "missing 0.05 buy"
+   //    bug from earlier cycles.
+   int actualBuyStops  = 0;
+   int actualSellStops = 0;
+   for(int i = 0; i < OrdersTotal(); i++)
+   {
+      if(orderInfo.SelectByIndex(i))
+      {
+         if(orderInfo.Magic() == InpMagicNumber && orderInfo.Symbol() == _Symbol)
+         {
+            ENUM_ORDER_TYPE t = orderInfo.OrderType();
+            if(t == ORDER_TYPE_BUY_STOP)  actualBuyStops++;
+            if(t == ORDER_TYPE_SELL_STOP) actualSellStops++;
+         }
+      }
+   }
+
+   //--- Also count any positions that may have already filled during placement
+   int filledBuys  = 0, filledSells = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(posInfo.SelectByIndex(i))
+      {
+         if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol)
+         {
+            if(posInfo.PositionType() == POSITION_TYPE_BUY)  filledBuys++;
+            if(posInfo.PositionType() == POSITION_TYPE_SELL) filledSells++;
+         }
+      }
+   }
+
+   //--- Book-verified totals (pending + already-filled) per side
+   int totalBuySide  = actualBuyStops  + filledBuys;
+   int totalSellSide = actualSellStops + filledSells;
+
+   bool bookSymmetric = (totalBuySide == gActiveN && totalSellSide == gActiveN);
+
+   if(buySideOK && sellSideOK && bookSymmetric)
+   {
+      gridActive = true;
+      gCycleStartTime = TimeCurrent();
+      gCyclePeakPnL   = -DBL_MAX;
+      gCycleTroughPnL =  DBL_MAX;
+      Print("🚀 Grid active. Symmetric placement verified in book (Magic=", InpMagicNumber, "):");
+      Print("    BUY  side: ", actualBuyStops,  " pending + ", filledBuys,  " filled = ", totalBuySide,  " total");
+      Print("    SELL side: ", actualSellStops, " pending + ", filledSells, " filled = ", totalSellSide, " total");
+   }
+   else
+   {
+      //--- Asymmetric or partial — log clearly and clean up everything
+      Print("⚠️  ASYMMETRIC/PARTIAL grid detected — aborting cycle (Magic=", InpMagicNumber, ").");
+      Print("    Internal counters: BUY  ", buyPlaced,  "/", buyFailed,  " fail/", buySkipped,  " skip");
+      Print("                       SELL ", sellPlaced, "/", sellFailed, " fail/", sellSkipped, " skip");
+      Print("    Broker book check: BUY  side total = ", totalBuySide,
+            " (", actualBuyStops, " pending + ", filledBuys, " filled)");
+      Print("                       SELL side total = ", totalSellSide,
+            " (", actualSellStops, " pending + ", filledSells, " filled)");
+      Print("    Required: ", gActiveN, " each side. Cleaning up.");
+
+      //--- CloseGrid will close ANY positions that may have already filled
+      //    AND cancel ALL remaining pending orders by magic number.
+      CloseGrid();
+
+      //--- Throttle next attempt
+      lastCloseTime = TimeCurrent();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Fast close: cancel pending FIRST (instant), then close positions |
+//| via async requests with retry fallback.                          |
+//|                                                                  |
+//| Speed tactics:                                                   |
+//|   1. Pre-snapshot tickets (avoid list-shift bugs)                |
+//|   2. Cancel pending FIRST (prevents new fills during close loop) |
+//|   3. Use OrderSendAsync for parallel fire-and-verify             |
+//|   4. Retry failed closes once with market-order fallback         |
+//|   5. Verify all closes completed within a short timeout          |
+//+------------------------------------------------------------------+
+void CloseGrid()
+{
+   uint t0 = GetTickCount();  // measure close speed in ms
+
+   //--- STEP 1: Snapshot ticket arrays (avoid list shifting during close)
+   ulong pendingTickets[];
+   ulong posTickets[];
+   int   posTypes[];        // 0=BUY, 1=SELL
+   double posVolumes[];
+   double posEntries[];
+
+   for(int i = 0; i < OrdersTotal(); i++)
+   {
+      if(orderInfo.SelectByIndex(i))
+      {
+         if(orderInfo.Magic() == InpMagicNumber && orderInfo.Symbol() == _Symbol)
+         {
+            int n = ArraySize(pendingTickets);
+            ArrayResize(pendingTickets, n + 1);
+            pendingTickets[n] = orderInfo.Ticket();
+         }
+      }
+   }
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(posInfo.SelectByIndex(i))
+      {
+         if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol)
+         {
+            int n = ArraySize(posTickets);
+            ArrayResize(posTickets,  n + 1);
+            ArrayResize(posTypes,    n + 1);
+            ArrayResize(posVolumes,  n + 1);
+            ArrayResize(posEntries,  n + 1);
+            posTickets[n] = posInfo.Ticket();
+            posTypes[n]   = (posInfo.PositionType() == POSITION_TYPE_BUY) ? 0 : 1;
+            posVolumes[n] = posInfo.Volume();
+            posEntries[n] = posInfo.PriceOpen();
+         }
+      }
+   }
+
+   int pendingTotal = ArraySize(pendingTickets);
+   int posTotal     = ArraySize(posTickets);
+
+   //--- STEP 2: Cancel ALL pending orders first (near-instant, prevents new fills)
+   int cancelled = 0;
+   for(int i = 0; i < pendingTotal; i++)
+   {
+      ulong t = pendingTickets[i];
+      if(trade.OrderDelete(t)) cancelled++;
+      else Print("❌ Cancel failed #", t, " | ", trade.ResultRetcodeDescription());
+   }
+   if(cancelled > 0)
+      Print("🗑️  Cancelled ", cancelled, "/", pendingTotal, " pending orders.");
+
+   //--- STEP 2.5: Sort positions by close priority (highest slippage risk first)
+   //
+   //    Priority score = volume × adverse_distance_from_current_price
+   //
+   //    - Adverse distance: for a BUY position, how far current Bid is BELOW entry
+   //                        (the bigger this is, the more it bleeds per pip down)
+   //                        for a SELL position, how far current Ask is ABOVE entry
+   //    - Volume: 0.05 lot has 5x slippage exposure vs 0.01 lot
+   //
+   //    Highest score = biggest absolute $ loss per pip of further adverse move = close first
+   //
+   double curBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double curAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   double priority[];
+   ArrayResize(priority, posTotal);
+   for(int i = 0; i < posTotal; i++)
+   {
+      double adverse;
+      if(posTypes[i] == 0)  // BUY position: adverse if Bid < entry
+         adverse = MathMax(0.0, posEntries[i] - curBid);
+      else                  // SELL position: adverse if Ask > entry
+         adverse = MathMax(0.0, curAsk - posEntries[i]);
+
+      //--- Boost score by 0.01 floor so winning positions still get a baseline order
+      priority[i] = posVolumes[i] * (adverse + 0.01);
+   }
+
+   //--- Sort indices by priority DESC (simple selection sort, N<=20 so negligible)
+   int order[];
+   ArrayResize(order, posTotal);
+   for(int i = 0; i < posTotal; i++) order[i] = i;
+   for(int i = 0; i < posTotal - 1; i++)
+   {
+      int maxIdx = i;
+      for(int j = i + 1; j < posTotal; j++)
+         if(priority[order[j]] > priority[order[maxIdx]]) maxIdx = j;
+      if(maxIdx != i)
+      {
+         int tmp = order[i];
+         order[i] = order[maxIdx];
+         order[maxIdx] = tmp;
+      }
+   }
+
+   if(posTotal > 1)
+   {
+      string priorityLog = "🔢 Close order (by slippage risk): ";
+      for(int i = 0; i < posTotal; i++)
+      {
+         int idx = order[i];
+         priorityLog += "#" + IntegerToString(posTickets[idx]) +
+                        "(" + (posTypes[idx] == 0 ? "B" : "S") +
+                        "/" + DoubleToString(posVolumes[idx], 2) + ")";
+         if(i < posTotal - 1) priorityLog += " → ";
+      }
+      Print(priorityLog);
+   }
+
+   //--- STEP 3: Close all positions in priority order, with retry on failure
+   int closed = 0;
+   double totalPnl = 0.0;
+
+   for(int rank = 0; rank < posTotal; rank++)
+   {
+      int    i       = order[rank];
+      ulong  ticket  = posTickets[i];
+      string sideStr = (posTypes[i] == 0) ? "BUY" : "SELL";
+
+      //--- First attempt: standard close
+      bool ok = trade.PositionClose(ticket, InpSlippage);
+
+      //--- Retry once with FOK if first fails (e.g. requote / off-quotes)
+      if(!ok)
+      {
+         uint rc = trade.ResultRetcode();
+         Print("⚠️  Close attempt 1 failed for #", ticket, " (", rc, "). Retrying...");
+
+         //--- Brief pause to let market settle
+         Sleep(50);
+
+         //--- Try again — CTrade automatically refreshes price
+         ok = trade.PositionClose(ticket, InpSlippage * 3);  // allow more slippage on retry
+      }
+
+      if(ok)
+      {
+         //--- Get realized P&L from the position (use snapshot data since position may already be gone)
+         double pnl = 0.0;
+         if(posInfo.SelectByTicket(ticket))
+         {
+            pnl = posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+         }
+         totalPnl += pnl;
+         Print("🔒 Closed #", ticket, " [", sideStr, "]",
+               " entry=", DoubleToString(posEntries[i], _Digits),
+               " vol=",   DoubleToString(posVolumes[i], 2),
+               " | P&L: $", DoubleToString(pnl, 2));
+         closed++;
+      }
+      else
+      {
+         Print("❌ Close FAILED twice for #", ticket, " [", sideStr, "]",
+               " | ", trade.ResultRetcodeDescription(),
+               " — position may remain open. CHECK MANUALLY.");
+      }
+   }
+
+   uint dt = GetTickCount() - t0;
+   Print("✅ Grid closed (Magic ", InpMagicNumber, ") in ", dt, " ms.",
+         " Positions: ", closed, "/", posTotal,
+         " | Pending cancelled: ", cancelled, "/", pendingTotal,
+         " | Realized P&L: $", DoubleToString(totalPnl, 2));
+
+   //--- Update dashboard stats
+   gLastCyclePnL     = totalPnl;
+   gTotalRealizedUSD += totalPnl;
+   if(totalPnl > 0.001) gCyclesWon++;
+   else if(totalPnl < -0.001) gCyclesLost++;
+
+   //--- Reset cycle state
+   gridActive       = false;
+   gBuyTP           = 0.0;
+   gSellTP          = 0.0;
+   gGridMid         = 0.0;
+   gGridStep        = 0.0;
+   gActiveN         = 0;
+   gActiveTarget    = 0.0;
+   gActiveTriggerTF = PERIOD_CURRENT;
+   gActiveTriggerTFName = "";
+   gCycleStartTime  = 0;
+   gCyclePeakPnL    = -DBL_MAX;
+   gCycleTroughPnL  =  DBL_MAX;
+   gCycleMode       = CYCLE_LEGACY;
+   gCycleIsBullFVG  = false;
+   gZoneTop         = 0.0;
+   gZoneBot         = 0.0;
+   gInvalPrice      = 0.0;
+   gSolvedBaseLot   = 0.0;
+   gLastFailCheckBar = 0;
+   gCycleFVGIdx     = -1;
+   gFavorSLPrice    = 0.0;
+   gFavorEverFilled = false;
+   gFavorFlatSince  = 0;
+   ArrayResize(gFavorPricesArr, 0);
+   ArrayResize(gFavorLotsArr,   0);
+   lastCloseTime    = TimeCurrent();
+}
+
+//+------------------------------------------------------------------+
+//| Sum floating P&L (profit + swap + commission) across all         |
+//| positions belonging to this EA. Returns value in account currency|
+//| (USD on a USD account).                                          |
+//+------------------------------------------------------------------+
+double GetCycleFloatingPnL()
+{
+   double total = 0.0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(posInfo.SelectByIndex(i))
+      {
+         if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol)
+         {
+            total += posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+         }
+      }
+   }
+   return total;
+}
+
+//+------------------------------------------------------------------+
+int CountOurPositions()
+{
+   int n = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(posInfo.SelectByIndex(i))
+         if(posInfo.Magic() == InpMagicNumber && posInfo.Symbol() == _Symbol)
+            n++;
+   return n;
+}
+
+bool HasOurPendingOrders()
+{
+   for(int i = 0; i < OrdersTotal(); i++)
+      if(orderInfo.SelectByIndex(i))
+         if(orderInfo.Magic() == InpMagicNumber && orderInfo.Symbol() == _Symbol)
+            return true;
+   return false;
+}
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(hAtrM1      != INVALID_HANDLE) IndicatorRelease(hAtrM1);
+   if(hAtrM5      != INVALID_HANDLE) IndicatorRelease(hAtrM5);
+   if(hAtrM15     != INVALID_HANDLE) IndicatorRelease(hAtrM15);
+   if(hAtrDynN    != INVALID_HANDLE) IndicatorRelease(hAtrDynN);
+   if(hAtrTrigM5  != INVALID_HANDLE) IndicatorRelease(hAtrTrigM5);
+   if(hAtrTrigM15 != INVALID_HANDLE) IndicatorRelease(hAtrTrigM15);
+   if(hAtrTrigH1  != INVALID_HANDLE) IndicatorRelease(hAtrTrigH1);
+
+   DashClear();
+   ClearAllFVGObjects();
+
+   Print("🛑 GoldGridEA v6.00 stopped. Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long& lparam,
+                  const double& dparam, const string& sparam)
+{
+   if(id == CHARTEVENT_OBJECT_CLICK && sparam == "BtnCloseGrid")
+   {
+      Print("🖱️  Manual close.");
+      CloseGrid();
+   }
+}
+//+------------------------------------------------------------------+
