@@ -154,6 +154,100 @@ strategies:
       cvd_divergence_exit: true
       cvd_exit_conf: 0.65   # min CVD-signal confidence to trigger the exit
 
+  # reversal_eqhl = fade a SWEPT equal-high/low liquidity cluster back to value.
+  # Trigger: a fresh, delta-confirmed sweep of an EqH/EqL stop cluster (from the
+  # sweep registry — swept EqH → fade SHORT, swept EqL → fade LONG). CVD divergence
+  # is OPTIONAL sauce (confirming bear/bull div → +conf/+bias, not required). TP =
+  # OPPOSITE value-area extreme (cached daily VP: short→VAL, long→VAH; POC magnet
+  # fallback, else 2R). SL just beyond the sweep wick extreme. Reuses coup exits
+  # (hard-SL + CVD-divergence + POC-trail). PROVISIONAL — paper, accruing samples.
+  # DISABLED 2026-06-06 — REFUTED. Bracket backtest: PF 0.55 (avgR −0.35), negative
+  # across every variant. Fading swept levels has no edge; the edge is trading WITH
+  # the delta (see reversal_anchor). Kept registered for reference.
+  - name: reversal_eqhl
+    enabled: false
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      decide_tf: 15m
+      max_sweep_age: 3        # bars since the grab — must be fresh
+      require_reclaim: false  # true = only fade swept+reclaimed clusters (stricter)
+      # Selectivity (added 2026-06-06 — was firing on ~every candle): reuse the
+      # maintained swing H/L list and keep only swept levels that span a real swing
+      # range and are CLOSE to current price.
+      min_swing_range_atr: 2.5  # swing leg (to nearest opposite pivot) ≥ this×ATR
+      proximity_atr: 2.0        # swept level must be within this×ATR of current price
+      # XAUT forms more near-price significant eq-structure → runs hotter at the same
+      # gates; tighten it per-symbol (BTC ~5%, XAUT ~8% of bars).
+      per_symbol:
+        XAUTUSDT:
+          min_swing_range_atr: 3.5
+          proximity_atr: 1.5
+      sl_buf_atr: 0.10
+      min_sl_atr_mult: 0.5
+      max_rr: 4.0             # TP = POC magnet (opposite VA extreme backup), capped at 4R
+      # CVD sauce now uses the shared remembered-div cache (cvd_div_state), same as
+      # reversal_hvn: an aligned div within cvd_div_window bars → +conf/+bias.
+      cvd_div_window: 2
+      cvd_div_strength: 0.0   # min div strength for the sauce (0 = any)
+      cvd_divergence_exit: true
+      cvd_exit_conf: 0.65
+
+  # reversal_hvn = fade a candle that SWEEPS a prior swing/eq High-Low sitting at an
+  # HVN extreme and CLOSES BACK INSIDE the HVN (breakout rejected into value).
+  # swept HVN top→fade SHORT, swept HVN low→fade LONG. FILTER (required): a CVD
+  # divergence on the CURRENT candle aligned with the fade (live scan_divergences
+  # marker). HVN from rolling N-bar VP (cached-daily fallback). TP = POC magnet
+  # (opposite VA extreme backup) RR-clamped; SL beyond the sweep wick. Coup exits
+  # (hard-SL + CVD-divergence + POC-trail). PROVISIONAL — paper, accruing samples.
+  # DISABLED 2026-06-06 — REFUTED (fade). Bracket backtest PF 0.38 (avgR −0.56).
+  # Same lesson as reversal_eqhl: don't fade swept levels. Kept registered.
+  - name: reversal_hvn
+    enabled: false
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      decide_tf: 15m
+      coincide_atr: 0.3       # HVN extreme must sit within 0.3×ATR of a prior swing
+      # Significance + proximity (same as reversal_eqhl): the coinciding prior swing
+      # must span a real range and sit near price. Per-symbol overrides supported.
+      min_swing_range_atr: 2.5
+      proximity_atr: 2.0
+      per_symbol:
+        XAUTUSDT:
+          min_swing_range_atr: 2.5   # dialed back from 3.5 (hvn already sparse — don't starve)
+          proximity_atr: 1.5
+      cvd_div_strength: 0.0   # min CVD-div strength to pass the filter (0 = any)
+      cvd_div_window: 2       # accept an aligned CVD div from the last N bars (not just live)
+      sl_buf_atr: 0.10
+      min_sl_atr_mult: 0.5
+      max_rr: 4.0
+      min_rr: 1.0
+      cvd_divergence_exit: true
+      cvd_exit_conf: 0.65
+
+  # reversal_anchor = DEFEND a high-delta anchor zone, trade WITH the anchor's delta,
+  # gated to WITH-TREND. The validated inversion of the refuted fades: price re-enters
+  # an anchor_bar zone (vol>2σ,|delta|>2σ) and defends in the anchor's delta direction
+  # (bullish anchor→long, bearish→short) → join it. Regime gate is the big lever —
+  # bracket backtest (15m, BTC+XAUT, 2R): ALL PF 1.69 → with-trend PF 2.91 (+0.73R);
+  # counter-trend loses. SL beyond the anchor extreme; 2R TP. coup single-entry + hard-
+  # SL. PROVISIONAL — paper, IN-SAMPLE only (n=21 with-trend); needs out-of-sample.
+  # DISABLED 2026-06-06 — REFUTED on REAL delta. The PF 2.7-2.9 was a synthetic-data
+  # artifact (½ the history was kline-synthetic). On clean 30d Binance aggTrade delta:
+  # ALL PF 0.71, with-trend PF 0.58 (LOSING). EqHL-continuation PF 0.92 — also dead.
+  # Whole sweep/anchor reversal family has no edge on real data. Kept registered.
+  - name: reversal_anchor
+    enabled: false
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      decide_tf: 15m
+      require_with_trend: true  # only trade when side agrees with the 20-bar trend
+      allow_range: false        # set true to also take range-regime (marginal, PF~1.2)
+      regime_n: 20              # trend window (bars)
+      trend_t: 2.0              # |slope| ≥ this×ATR over regime_n = trend
+      rr_target: 2.0            # TP = rr_target × risk (matches the validated bracket)
+      sl_buf_atr: 0.10
+      min_sl_atr_mult: 0.5
+
   # reversal_si = reversal pattern, stacked-imbalance IGNITION entry + footprint-
   # managed exit. Separate store; runs alongside `reversal` (lvn entry / 2R) for a
   # live A/B. Entry: the VP-gated flip must ALSO print a fresh trade-direction
@@ -365,3 +459,58 @@ strategies:
       vp_level: value
       fib_ext: 1.618
       entry_expiry_bars: 6
+
+  # ── CVD-div ENTRY-GATE A/B ──────────────────────────────────────────────────
+  # Gated twins of the vote / wave_fib / congress families: same signal, but skip
+  # entries whose side OPPOSES the last confirmed 15m CVD-divergence (manager-level
+  # gate, config.cvd_div_gate). The ungated originals above are the A arm; these
+  # _cvd instances are B. Validated net-positive on 15m in dryrun_fleet (fleet
+  # +52→+80R over 824 trades, vote PF 1.06→1.27) — live paper A/B to confirm out of
+  # sample. (Gate is 15m explicitly; primary_tf=1m so the cvd_div_state cache is 1m.)
+  - name: democracy_cvd
+    class: democracy
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      vote_tf: 15m
+      cvd_div_gate: true
+
+  - name: congress_start_cvd
+    class: congress
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      vote_tf: 15m
+      entry_mode: imb_start
+      entry_expiry_bars: 3
+      min_sl_atr_mult: 0.5
+      sl_atr_mult: 1.5
+      cvd_div_gate: true
+
+  - name: wave_fib_cvd
+    class: wave_fib
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      decide_tf: 15m
+      entry_mode: vp
+      vp_level: value
+      fib_ext: 2.0
+      entry_expiry_bars: 6
+      cvd_div_gate: true
+
+  - name: reversal_si_cvd          # gated twin (clean-delta dryrun: −8.53→+0.62R)
+    class: reversal_si
+    enabled: true
+    config:
+      symbols: [BTCUSDT]            # match ungated reversal_si for a fair A/B
+      decide_tf: 15m
+      vol_mult: 2.0
+      delta_swing: 50.0
+      vp_filter: true
+      entry_mode: si_flip
+      target_mode: vp_lvn
+      si_trail: true
+      cvd_divergence_exit: true
+      cvd_exit_conf: 0.65
+      cvd_div_gate: true

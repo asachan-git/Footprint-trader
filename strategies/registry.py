@@ -20,6 +20,9 @@ from .congress import Congress
 from .coup import Coup
 from .coup_reversal import CoupReversal
 from .reversal import Reversal
+from .reversal_eqhl import ReversalEqHL
+from .reversal_hvn import ReversalHVN
+from .reversal_anchor import ReversalAnchor
 from .reversal_si import ReversalSI
 from .reversal_choch import ReversalChoch
 from .wave_fib import WaveFib
@@ -37,6 +40,9 @@ REGISTRY: dict[str, type[Strategy]] = {
     "coup": Coup,
     "coup_reversal": CoupReversal,
     "reversal": Reversal,
+    "reversal_eqhl": ReversalEqHL,
+    "reversal_hvn": ReversalHVN,
+    "reversal_anchor": ReversalAnchor,
     "reversal_si": ReversalSI,
     "reversal_choch": ReversalChoch,
     "wave_fib": WaveFib,
