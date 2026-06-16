@@ -200,6 +200,58 @@ def exec_test_order():
     })
 
 
+@bp.post("/exec/zones")
+def exec_zones():
+    """Current rolling-VP HVN/LVN zones for symbol/tf, rebased onto the account's
+    cached venue price, for the EA to draw on the chart.
+
+    Body: {account, symbol(broker or analysis), tf}.
+    Returns {ok, zones:[{kind:"hvn"|"lvn", lo, hi}], venue_mid}. Empty if no quote
+    or no profile yet.
+    """
+    if not _auth_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    settings = current_app.config["FB_SETTINGS"]
+    body = request.get_json(silent=True) or {}
+    account = str(body.get("account") or "")
+    req_symbol = body.get("symbol") or settings["instrument"]["symbol"]
+    tf = body.get("tf") or "15m"
+
+    symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
+    broker_to_analysis = {v: k for k, v in symbol_map.items()}
+    symbol = broker_to_analysis.get(req_symbol, req_symbol)
+    broker_symbol = symbol_map.get(symbol, req_symbol)
+
+    quote = ExecBridge.get_quote(account, broker_symbol)
+    if not quote:
+        return jsonify({"ok": True, "zones": [], "reason": "no venue quote cached"})
+
+    from pipeline.state_store import store
+    from pipeline.features.volume_profile import compute as vp_compute, DEFAULT_BIN_SIZE
+    _VP_WIN = {"15m": 96, "5m": 288, "1m": 1440}
+    win = _VP_WIN.get(tf, 96)
+    bars = store().recent(symbol, tf, win)
+    if len(bars) < 20:
+        return jsonify({"ok": True, "zones": [], "reason": "not enough bars"})
+
+    analysis_anchor = float(bars[-1].ohlc.c)
+    ratio = float(quote["mid"]) / analysis_anchor if analysis_anchor > 0 else 1.0
+    try:
+        vp = vp_compute(bars, "daily", analysis_anchor, bin_size=DEFAULT_BIN_SIZE.get(symbol))
+    except Exception as e:
+        return jsonify({"ok": True, "zones": [], "reason": f"vp_error:{e}"})
+
+    zones = []
+    for z in (vp.hvn_zones or []):
+        zones.append({"kind": "hvn", "lo": round(float(z["low"]) * ratio, 5),
+                      "hi": round(float(z["high"]) * ratio, 5)})
+    for z in (vp.lvn_zones or []):
+        zones.append({"kind": "lvn", "lo": round(float(z["low"]) * ratio, 5),
+                      "hi": round(float(z["high"]) * ratio, 5)})
+    return jsonify({"ok": True, "zones": zones, "venue_mid": quote["mid"],
+                    "symbol": symbol, "broker_symbol": broker_symbol})
+
+
 @bp.get("/exec/queue")
 def exec_queue():
     if not _auth_ok():

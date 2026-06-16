@@ -32,11 +32,21 @@ input int    InpMagic       = 770001;                  // Magic number for bridg
 input int    InpSlippage    = 20;                      // Deviation (points)
 input bool   InpVerbose     = true;                    // Log every command
 
+input group "=== HVN/LVN zone drawing ==="
+input bool   InpDrawZones      = true;          // Draw HVN/LVN zones on the chart
+input string InpZoneTF         = "15m";         // TF whose VP zones to draw (5m|15m)
+input int    InpZoneRefreshSec = 30;            // Zone redraw interval (s)
+input color  InpHVNColor       = clrSteelBlue;  // HVN zone fill
+input color  InpLVNColor       = clrSandyBrown; // LVN zone fill
+
 CTrade        trade;
 COrderInfo    orderInfo;
 CPositionInfo posInfo;
 
-string gAccount = "";
+string   gAccount       = "";
+datetime gLastZoneFetch = 0;
+
+#define ZONE_PREFIX "FBZone_"
 
 //+------------------------------------------------------------------+
 //| Minimal flat-JSON scalar extractors (contract is flat per object)|
@@ -78,10 +88,10 @@ double JsonGetNumber(const string js, const string key)
 //| Split the "commands":[ {..},{..} ] array into object substrings  |
 //| Returns count; fills out[] with each {...} object string.        |
 //+------------------------------------------------------------------+
-int JsonSplitCommands(const string js, string &out[])
+int JsonSplitArray(const string js, const string arrKey, string &out[])
 {
    ArrayResize(out, 0);
-   int k = StringFind(js, "\"commands\"");
+   int k = StringFind(js, "\"" + arrKey + "\"");
    if(k < 0) return 0;
    int open = StringFind(js, "[", k);
    if(open < 0) return 0;
@@ -104,6 +114,8 @@ int JsonSplitCommands(const string js, string &out[])
    }
    return ArraySize(out);
 }
+
+int JsonSplitCommands(const string js, string &out[]) { return JsonSplitArray(js, "commands", out); }
 
 //+------------------------------------------------------------------+
 //| HTTP POST helper. Returns HTTP code (-1 on transport error).     |
@@ -308,6 +320,69 @@ void PollAndExecute()
 }
 
 //+------------------------------------------------------------------+
+//| HVN/LVN zone drawing (rebased zones fetched from /exec/zones)     |
+//+------------------------------------------------------------------+
+void ClearZones()
+{
+   int total = ObjectsTotal(0, -1, OBJ_RECTANGLE);
+   for(int i = total - 1; i >= 0; i--)
+   {
+      string name = ObjectName(0, i, -1, OBJ_RECTANGLE);
+      if(StringFind(name, ZONE_PREFIX) == 0) ObjectDelete(0, name);
+   }
+}
+
+void DrawZone(int idx, const string kind, double lo, double hi)
+{
+   string name  = ZONE_PREFIX + IntegerToString(idx);
+   int    secs  = PeriodSeconds(PERIOD_CURRENT);
+   datetime tL  = TimeCurrent() - 120 * secs;
+   datetime tR  = TimeCurrent() + 20 * secs;
+   color  clr   = (kind == "hvn") ? InpHVNColor : InpLVNColor;
+   bool   fill  = (kind == "hvn");   // HVN filled, LVN outline → visually distinct
+
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_RECTANGLE, 0, tL, lo, tR, hi);
+      ObjectSetInteger(0, name, OBJPROP_BACK,       true);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+   }
+   else
+   {
+      ObjectSetInteger(0, name, OBJPROP_TIME,  0, tL);
+      ObjectSetInteger(0, name, OBJPROP_TIME,  1, tR);
+      ObjectSetDouble (0, name, OBJPROP_PRICE, 0, lo);
+      ObjectSetDouble (0, name, OBJPROP_PRICE, 1, hi);
+   }
+   ObjectSetInteger(0, name, OBJPROP_FILL,    fill);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,   clr);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH,   1);
+}
+
+void FetchAndDrawZones()
+{
+   string body = StringFormat("{\"account\":\"%s\",\"symbol\":\"%s\",\"tf\":\"%s\"}",
+                              gAccount, _Symbol, InpZoneTF);
+   string resp;
+   int code = HttpPost(InpBridgeURL + "/exec/zones", body, resp);
+   if(code != 200) return;
+
+   string zs[];
+   int n = JsonSplitArray(resp, "zones", zs);
+   ClearZones();
+   for(int i = 0; i < n; i++)
+   {
+      string kind = JsonGetString(zs[i], "kind");
+      double lo   = JsonGetNumber(zs[i], "lo");
+      double hi   = JsonGetNumber(zs[i], "hi");
+      if(lo > 0 && hi > 0) DrawZone(i, kind, lo, hi);
+   }
+   if(InpVerbose && n > 0) Print("🟦 Drew ", n, " ", InpZoneTF, " HVN/LVN zones.");
+}
+
+//+------------------------------------------------------------------+
 int OnInit()
 {
    trade.SetExpertMagicNumber(InpMagic);
@@ -346,11 +421,19 @@ int OnInit()
 void OnTimer()
 {
    PollAndExecute();
+
+   //--- redraw HVN/LVN zones on a slower cadence (they change per bar, not per tick)
+   if(InpDrawZones && TimeCurrent() - gLastZoneFetch >= InpZoneRefreshSec)
+   {
+      FetchAndDrawZones();
+      gLastZoneFetch = TimeCurrent();
+   }
 }
 
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   ClearZones();
    Print("🛑 FBExecBridge stopped. Reason: ", reason);
 }
 
