@@ -47,10 +47,19 @@ def grid_levels():
     settings = current_app.config["FB_SETTINGS"]
     body = request.get_json(silent=True) or {}
 
-    symbol = body.get("symbol") or settings["instrument"]["symbol"]
+    req_symbol = body.get("symbol") or settings["instrument"]["symbol"]
     tf = body.get("tf") or settings["instrument"]["primary_tf"]
     trigger_hint = str(body.get("trigger_hint") or "")
     dry_run = bool(body.get("dry_run", False))
+
+    # The EA sends its BROKER symbol (e.g. "XAUUSD+"); structure/VP/bars are keyed in
+    # the ANALYSIS frame ("XAUTUSDT"). Reverse the execution.symbol_map
+    # (analysis→broker) so a broker symbol resolves to its analysis symbol. A symbol
+    # already in the analysis frame (dashboard/sim) passes through unchanged.
+    symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
+    broker_to_analysis = {v: k for k, v in symbol_map.items()}
+    symbol = broker_to_analysis.get(req_symbol, req_symbol)
+    broker_symbol = symbol_map.get(symbol, req_symbol)
 
     # Structure (HVN/VP/ATR) is computed in the ANALYSIS frame (Binance/Bybit) off
     # the latest stored close. The EA's `current_price` is its EXECUTION-venue
@@ -61,7 +70,8 @@ def grid_levels():
     latest = store().latest(symbol, tf)
     if latest is None:
         return jsonify({"ok": False, "verdict": "skip",
-                        "skip_reason": f"no bars stored for {symbol} {tf}"}), 404
+                        "skip_reason": f"no bars stored for {symbol} {tf} "
+                                       f"(requested {req_symbol})"}), 404
     analysis_price = float(latest.ohlc.c)
 
     venue_raw = body.get("current_price")
@@ -76,10 +86,11 @@ def grid_levels():
         return jsonify({"ok": False, "verdict": "skip",
                         "skip_reason": f"planner_error:{e}"}), 500
 
-    out = {"ok": True, **asdict(plan)}
+    out = {"ok": True, "symbol": symbol, "broker_symbol": broker_symbol, **asdict(plan)}
 
     if dry_run:
-        _log_plan({"symbol": symbol, "tf": tf, "analysis_price": analysis_price,
-                   "venue_price": venue_price, **asdict(plan)})
+        _log_plan({"symbol": symbol, "broker_symbol": broker_symbol, "tf": tf,
+                   "analysis_price": analysis_price, "venue_price": venue_price,
+                   **asdict(plan)})
 
     return jsonify(out)
