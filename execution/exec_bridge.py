@@ -74,6 +74,25 @@ class ExecBridge:
     _lock = threading.Lock()
     _cmds: dict[str, Command] = {}          # id → Command
     _seq: list[str] = []                    # insertion order (FIFO dispatch)
+    _quotes: dict[tuple, dict] = {}         # (account, broker_symbol) → {bid,ask,mid,ts}
+
+    # ── venue quote cache (EA reports its live price on each poll) ─────────────
+    @classmethod
+    def set_quote(cls, account: str, symbol: str, bid: float, ask: float,
+                  now: float | None = None) -> None:
+        if bid <= 0 or ask <= 0:
+            return
+        with cls._lock:
+            cls._quotes[(str(account), symbol)] = {
+                "bid": float(bid), "ask": float(ask), "mid": (bid + ask) / 2.0,
+                "ts": now if now is not None else time.time(),
+            }
+
+    @classmethod
+    def get_quote(cls, account: str, symbol: str) -> dict | None:
+        with cls._lock:
+            q = cls._quotes.get((str(account), symbol))
+            return dict(q) if q else None
 
     # ── audit ────────────────────────────────────────────────────────────────
     @classmethod
@@ -178,3 +197,4 @@ class ExecBridge:
         with cls._lock:
             cls._cmds.clear()
             cls._seq.clear()
+            cls._quotes.clear()

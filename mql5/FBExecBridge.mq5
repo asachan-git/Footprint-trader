@@ -240,7 +240,12 @@ bool ExecCloseAll(const string cmd, int &closed, int &cancelled, string &err)
 //+------------------------------------------------------------------+
 void PollAndExecute()
 {
-   string pollBody = StringFormat("{\"account\":\"%s\"}", gAccount);
+   //--- report this terminal's live quote so the server can rebase plans onto it
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   string pollBody = StringFormat(
+      "{\"account\":\"%s\",\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f}",
+      gAccount, _Symbol, bid, ask);
    string resp;
    int code = HttpPost(InpBridgeURL + "/exec/poll", pollBody, resp);
    if(code != 200) return;
@@ -321,10 +326,14 @@ int OnInit()
    Print("    AutoTrade: ", tradeAllowed ? "✅ ENABLED" : "❌ DISABLED (Ctrl+E)");
    Print("    Token:     ", (InpToken == "" ? "none" : "set"));
 
-   //--- health probe: one poll (also surfaces a missing WebRequest whitelist)
+   //--- health probe: one poll (also surfaces a missing WebRequest whitelist
+   //    and seeds the server's venue-quote cache)
    string resp;
    int code = HttpPost(InpBridgeURL + "/exec/poll",
-                       StringFormat("{\"account\":\"%s\"}", gAccount), resp);
+                       StringFormat("{\"account\":\"%s\",\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f}",
+                                    gAccount, _Symbol,
+                                    SymbolInfoDouble(_Symbol, SYMBOL_BID),
+                                    SymbolInfoDouble(_Symbol, SYMBOL_ASK)), resp);
    if(code == 200) Print("    Bridge health: ✅ reachable");
    else            Print("⚠️  Bridge UNREACHABLE (code ", code,
                          "). Whitelist the URL and start the Python server.");
