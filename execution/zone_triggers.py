@@ -10,11 +10,15 @@ All five detectors normalise to one `Trigger` interface so the planner
 which detector produced it.
 
 Detectors (v1):
-  imbalance  — 5m/15m per-level 3:1 diagonal imbalance (REUSE imbalance_per_level)
-  hvn_edge   — nearest HVN boundary; node width sizes the grid (REUSE vp_cache)
-  anchor     — high-vol+high-delta anchor candle retest (REUSE anchor_bar)
-  va         — VAL/VAH reclaim-or-break-sustain, regime-aware (NEW interpretation)
-  cvd_div    — CVD divergence pivot (REUSE delta_divergence + cvd_div_state)
+  imbalance        — 5m/15m per-level 3:1 diagonal imbalance (REUSE imbalance_per_level)
+  hvn_edge         — nearest HVN boundary; node width sizes the grid (REUSE vp_cache)
+  hvn_inside_touch — candle CLOSED INSIDE an HVN, then (≤2 bars) TOUCHED an edge →
+                     straddle the touched edge; node width sizes the grid. HVN source
+                     is session-aware (NY=rolling, London/Overlap=rolling+cached,
+                     Asia/Off=cached).
+  anchor           — high-vol+high-delta anchor candle retest (REUSE anchor_bar)
+  va               — VAL/VAH reclaim-or-break-sustain, regime-aware (NEW interpretation)
+  cvd_div          — CVD divergence pivot (REUSE delta_divergence + cvd_div_state)
 
 BB-extreme is NOT a trigger here — it is a confluence multiplier applied by the
 planner's scorer.
@@ -26,6 +30,22 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pipeline.types import Bar
+
+# ~24h trailing VP window per TF (matches reversal_hvn / continuation_hvn).
+_VP_WIN = {"15m": 96, "5m": 288, "1m": 1440}
+
+# Which HVN source(s) feed the inside-touch trigger, per session. London/Overlap
+# (deep, two-sided liquidity) use BOTH the price-tracking rolling profile and the
+# stable cached-daily node; NY trusts the rolling profile; the thin Asia/Off books
+# use only the cached structural node.
+_SESSION_HVN_SRC = {
+    "NY":      ("rolling",),
+    "London":  ("rolling", "cached"),
+    "Overlap": ("rolling", "cached"),
+    "Asia":    ("cached",),
+    "Off":     ("cached",),
+}
+_HVN_TOUCH_WITHIN = 2   # touch must land ≤ this many bars after the closed-inside bar
 
 
 @dataclass
@@ -123,6 +143,103 @@ def _t_hvn_edge(symbol: str, current_price: float) -> Trigger | None:
         raw_range=float(width),
         confidence=float(conf),
         context={"bias": "none"},
+    )
+
+
+# ── session-aware HVN sources (for the inside-touch trigger) ─────────────────
+
+def _rolling_hvn(symbol: str, tf: str, bars: list[Bar]) -> list[tuple[float, float]]:
+    """Price-tracking rolling-VP HVN zones over the ~24h window for `tf`."""
+    win = _VP_WIN.get(tf, 96)
+    if len(bars) < win:
+        return []
+    try:
+        from pipeline.features.volume_profile import compute as vp_compute, DEFAULT_BIN_SIZE
+        vp = vp_compute(bars[-win:], "daily", bars[-1].ohlc.c,
+                        bin_size=DEFAULT_BIN_SIZE.get(symbol))
+        return [(float(z["low"]), float(z["high"])) for z in (vp.hvn_zones or [])]
+    except Exception:
+        return []
+
+
+def _cached_hvn(symbol: str) -> list[tuple[float, float]]:
+    """Stable cached-daily HVN zones (the session-anchored structural node)."""
+    try:
+        from pipeline.features.vp_cache import get as vp_get
+        vp = vp_get(symbol, "daily") or {}
+        return [(float(z["low"]), float(z["high"])) for z in (vp.get("hvn_zones") or [])]
+    except Exception:
+        return []
+
+
+def _session_hvn_zones(symbol: str, tf: str, bars: list[Bar]) -> tuple[list[tuple[float, float]], str]:
+    """HVN zones for the current session per `_SESSION_HVN_SRC`. Returns (zones, session)."""
+    from pipeline.features.session import current_session
+    ts = bars[-1].close_ts if bars else None
+    sess = current_session(ts, symbol).session
+    srcs = _SESSION_HVN_SRC.get(sess, ("cached",))
+    zones: list[tuple[float, float]] = []
+    if "rolling" in srcs:
+        zones += _rolling_hvn(symbol, tf, bars)
+    if "cached" in srcs:
+        zones += _cached_hvn(symbol)
+    return zones, sess
+
+
+def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger | None:
+    """A candle CLOSED INSIDE an HVN, then within `_HVN_TOUCH_WITHIN` bars price
+    TOUCHED an edge of that same node → straddle the touched edge (the fulcrum).
+    Node width is raw_range → the planner sizes more legs into wider nodes.
+
+    Stateless / causal: the touch bar is the latest bar; the closed-inside bar is one
+    of the prior `_HVN_TOUCH_WITHIN` bars. Reconstructed from the bar series so it
+    behaves identically live and in the truncated-series sim.
+    """
+    from pipeline.state_store import store
+    win = _VP_WIN.get(tf, 96)
+    bars = store().recent(symbol, tf, win + 5)
+    if len(bars) < 3:
+        return None
+    zones, sess = _session_hvn_zones(symbol, tf, bars)
+    if not zones:
+        return None
+
+    cur = bars[-1]                                   # the touch candidate
+    priors = bars[-1 - _HVN_TOUCH_WITHIN:-1]         # the ≤2 bars before it
+
+    best = None   # (dist_to_price, edge, width, edge_side, inside_n)
+    for lo, hi in zones:
+        width = hi - lo
+        if width <= 0:
+            continue
+        # a prior bar must have CLOSED strictly inside this node
+        inside_n = sum(1 for p in priors if lo < p.ohlc.c < hi)
+        if inside_n == 0:
+            continue
+        touch_top = cur.ohlc.h >= hi
+        touch_bot = cur.ohlc.l <= lo
+        if not (touch_top or touch_bot):
+            continue
+        # which edge: if both pierced (cur engulfs the node), take the one nearer price
+        if touch_top and touch_bot:
+            edge, side = (hi, "top") if abs(hi - current_price) <= abs(lo - current_price) else (lo, "bottom")
+        else:
+            edge, side = (hi, "top") if touch_top else (lo, "bottom")
+        dist = abs(edge - current_price)
+        if best is None or dist < best[0]:
+            best = (dist, edge, width, side, inside_n)
+    if best is None:
+        return None
+
+    _dist, edge, width, side, inside_n = best
+    # cleaner setup (both priors coiled inside) earns a little more confidence.
+    conf = min(0.85, 0.55 + 0.15 * inside_n)
+    return Trigger(
+        kind="hvn_inside_touch",
+        fulcrum_price=float(edge),
+        raw_range=float(width),
+        confidence=float(conf),
+        context={"bias": "none", "edge": side, "session": sess, "inside_n": inside_n},
     )
 
 
@@ -261,6 +378,7 @@ def detect_all(symbol: str, tf: str, current_price: float, regime,
     for t in (
         _t_imbalance(symbol, tf, current_price),
         _t_hvn_edge(symbol, current_price),
+        _t_hvn_inside_touch(symbol, tf, current_price),
         _t_anchor(symbol, current_price, atr, latest),
         _t_va(symbol, current_price, regime, daily_vp),
         _t_cvd_div(symbol, tf, current_price, latest),

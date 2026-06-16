@@ -31,8 +31,15 @@ import pipeline.state_store as ss
 from execution.grid_planner import plan_grid_levels
 
 
-def _label(plan, future_bars):
+def _label(plan, future_bars, ref_price: float = 0.0):
     """Simulate the straddle's real P&L lifecycle over future_bars.
+
+    `ref_price` = market price at placement (the decision-bar close). Pending STOP
+    orders are only valid on their correct side of it: a BuyStop must sit ABOVE the
+    market, a SellStop BELOW. Legs on the wrong side cannot be placed as stops (MT5
+    rejects them), so they are dropped — this prevents the fake instant-fill wins
+    that a stale/far fulcrum produced (e.g. a 66k "buy leg" filling while price is
+    80k, then tagging a 66.4k "TP").
 
     Models the EA's actual close semantics:
       - Each leg is a stop order: a BuyStop fills when High >= its price; a
@@ -49,9 +56,17 @@ def _label(plan, future_bars):
     (outcome, pnl_units) where outcome ∈ {'win','loss','open'} and pnl_units is
     realised price-points×lot (sign = profit/loss).
     """
-    buys = sorted(plan.buy_legs, key=lambda l: l.price)      # nearest-mid first
-    sells = sorted(plan.sell_legs, key=lambda l: l.price, reverse=True)
+    # Keep only legs that are VALID stop orders relative to the placement price:
+    # BuyStops above the market, SellStops below. Wrong-side legs are unplaceable.
+    if ref_price > 0:
+        buys = sorted((l for l in plan.buy_legs if l.price > ref_price), key=lambda l: l.price)
+        sells = sorted((l for l in plan.sell_legs if l.price < ref_price), key=lambda l: l.price, reverse=True)
+    else:
+        buys = sorted(plan.buy_legs, key=lambda l: l.price)      # nearest-mid first
+        sells = sorted(plan.sell_legs, key=lambda l: l.price, reverse=True)
     n_buy, n_sell = len(buys), len(sells)
+    if n_buy == 0 and n_sell == 0:
+        return "open", 0.0
     buy_filled = [False] * n_buy
     sell_filled = [False] * n_sell
 
@@ -67,21 +82,34 @@ def _label(plan, future_bars):
 
     for b in future_bars:
         h, lo, c = b.ohlc.h, b.ohlc.l, b.ohlc.c
-        # 1) fills this bar
+        # 1) TP / full-hedge resolve FIRST, against fills accumulated on PRIOR bars
+        #    only. A leg that fills this bar cannot also realise its TP this same bar
+        #    (a single candle reaching both the stop and the TP is path-ambiguous and
+        #    was the source of fake instant-fill wins for at-price fulcrums).
+        buy_tp_hit = bool(plan.buy_tp) and h >= plan.buy_tp and any(buy_filled)
+        sell_tp_hit = bool(plan.sell_tp) and lo <= plan.sell_tp and any(sell_filled)
+        if buy_tp_hit and sell_tp_hit:
+            # both targets printed in one bar = whipsaw, intrabar path unknown →
+            # pessimistic: take the worse side.
+            pnl = min(_pnl_at(plan.buy_tp), _pnl_at(plan.sell_tp))
+            return ("win" if pnl > 0 else "loss"), pnl
+        if buy_tp_hit:
+            pnl = _pnl_at(plan.buy_tp)
+            return ("win" if pnl > 0 else "loss"), pnl
+        if sell_tp_hit:
+            pnl = _pnl_at(plan.sell_tp)
+            return ("win" if pnl > 0 else "loss"), pnl
+        if all(buy_filled) and all(sell_filled) and n_buy and n_sell:
+            pnl = _pnl_at(c)
+            return "loss", pnl
+        # 2) NOW apply this bar's fills (TP-eligible only from the next bar onward)
         for i, l in enumerate(buys):
             if not buy_filled[i] and h >= l.price:
                 buy_filled[i] = True
         for i, l in enumerate(sells):
             if not sell_filled[i] and lo <= l.price:
                 sell_filled[i] = True
-        # 2) TP touch closes whole grid (win if net positive)
-        if plan.buy_tp and h >= plan.buy_tp and any(buy_filled):
-            pnl = _pnl_at(plan.buy_tp)
-            return ("win" if pnl > 0 else "loss"), pnl
-        if plan.sell_tp and lo <= plan.sell_tp and any(sell_filled):
-            pnl = _pnl_at(plan.sell_tp)
-            return ("win" if pnl > 0 else "loss"), pnl
-        # 3) full hedge → force close at this bar's close (delta-neutral loss)
+        # full hedge that COMPLETES on this bar's fills → force close at the close
         if all(buy_filled) and all(sell_filled) and n_buy and n_sell:
             pnl = _pnl_at(c)
             return "loss", pnl
@@ -98,6 +126,7 @@ def main() -> None:
     ap.add_argument("--stride", type=int, default=1, help="sample every Nth bar")
     ap.add_argument("--lookahead", type=int, default=40, help="bars forward for labeling")
     ap.add_argument("--warmup", type=int, default=120, help="min history before first decision")
+    ap.add_argument("--trigger-hint", default="", help="restrict the planner to one trigger kind")
     args = ap.parse_args()
 
     st = ss.store()
@@ -121,7 +150,8 @@ def main() -> None:
         st._bars[key] = series[: i + 1]
         decision_bar = series[i]
         try:
-            plan = plan_grid_levels(args.symbol, args.tf, decision_bar.ohlc.c)
+            plan = plan_grid_levels(args.symbol, args.tf, decision_bar.ohlc.c,
+                                    trigger_hint=args.trigger_hint)
         except Exception as e:
             skips[f"error:{type(e).__name__}"] += 1
             continue
@@ -130,7 +160,7 @@ def main() -> None:
             continue
         armed += 1
         future = series[i + 1: i + 1 + args.lookahead]
-        outcome, pnl = _label(plan, future)
+        outcome, pnl = _label(plan, future, ref_price=decision_bar.ohlc.c)
         s = stats[plan.trigger_kind]
         s["arm"] += 1
         s[outcome] += 1

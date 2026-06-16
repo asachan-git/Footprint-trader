@@ -144,9 +144,9 @@ def _should_skip(trigger: Trigger | None, regime, fulcrum: float,
     """Don't arm a straddle where price will oscillate through both ladders."""
     if trigger is None:
         return True, "no_trigger"
-    # HVN-edge triggers ARE meant to sit at the edge; only skip non-HVN fulcrums
-    # that fall *inside* a node body.
-    if trigger.kind != "hvn_edge" and _price_inside_hvn(fulcrum, daily_vp):
+    # HVN-edge / inside-touch triggers ARE meant to sit at a node edge; only skip
+    # non-HVN fulcrums that fall *inside* a node body.
+    if trigger.kind not in ("hvn_edge", "hvn_inside_touch") and _price_inside_hvn(fulcrum, daily_vp):
         return True, "chop:inside_hvn"
     if daily_vp and daily_vp.get("current_position") == "at_poc":
         return True, "chop:at_poc"
@@ -205,11 +205,24 @@ def _candle_conviction(symbol: str, tf: str) -> float:
 
 
 def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
-               conviction: float) -> tuple[int, float]:
+               conviction: float, hvn_max_legs: int = 8) -> tuple[int, float]:
     """N (capped by regime.max_legs) and step ($) from ATR + swing range +
     candle conviction. HVN node width floors the step so legs span the node."""
     rtype = getattr(regime, "type", "uncertain")
     step_mult = TREND_STEP_MULT if rtype in ("trend_up", "trend_down") else MEAN_REV_STEP_MULT
+    max_legs = int(getattr(regime, "max_legs", 5) or 5)
+
+    # hvn_inside_touch: spacing is pure ATR-mult; leg count = node_width / step so a
+    # WIDER node gets MORE legs (the user's rule). No width-floor on the step (that
+    # would widen spacing on big nodes → fewer legs, the opposite of intended). Uses
+    # its OWN cap (hvn_max_legs), not the regime chop cap — the skip-gate already
+    # filters genuine chop, and width-driven count is the whole point here.
+    if trigger.kind == "hvn_inside_touch":
+        step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
+        n = int(round(trigger.raw_range / step)) if step > 0 else 2
+        n = max(2, min(hvn_max_legs, n))
+        return n, round(step, 4)
+
     step = step_mult * atr if atr > 0 else max(trigger.raw_range / 4.0, 1e-6)
 
     # HVN node width: ensure legs straddle the whole node, not a sliver of it.
@@ -218,7 +231,6 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
     if step <= 0:
         step = max(swing_range / 5.0, 1e-6)
 
-    max_legs = int(getattr(regime, "max_legs", 5) or 5)
     legs_to_cover = int(swing_range / step) if step > 0 else max_legs
     n = max(2, min(max_legs, legs_to_cover))
     # conviction scales N upward toward the cap.
@@ -316,6 +328,7 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     base_lot = float(grid_cfg.get("base_lot", 0.01))
     lot_step = float(grid_cfg.get("lot_step", 0.01))
     tp_mult = float(grid_cfg.get("tp_atr_mult", 1.5))
+    hvn_max_legs = int(grid_cfg.get("hvn_max_legs", 8))
 
     from pipeline.state_store import store
     from pipeline.features.atr import atr_from_store
@@ -364,7 +377,8 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     skew, skew_reason = _resolve_skew(fulcrum_t, regime)
     swing_range = _opposing_swing_range(symbol, fulcrum, skew, daily_vp, atr)
     conviction = _candle_conviction(symbol, tf)
-    n, step = _size_grid(fulcrum_t, regime, atr, swing_range, conviction)
+    n, step = _size_grid(fulcrum_t, regime, atr, swing_range, conviction,
+                         hvn_max_legs=hvn_max_legs)
     buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
     buy_tp, sell_tp = _resolve_tps(symbol, fulcrum, buy_legs, sell_legs, atr, tp_mult)
 
