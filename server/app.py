@@ -21,6 +21,7 @@ from .routes.footprint_view import bp as footprint_bp
 from .routes.decide_multi import bp as decide_multi_bp
 from .routes.grid_tick import bp as grid_tick_bp
 from .routes.grid_levels import bp as grid_levels_bp
+from .routes.exec_bridge import bp as exec_bridge_bp
 from .routes.heatmap import bp as heatmap_bp
 from .routes.options_ingest import bp as options_ingest_bp
 from .routes.options_decide import bp as options_decide_bp
@@ -114,6 +115,7 @@ def create_app() -> Flask:
     app.register_blueprint(decide_multi_bp)
     app.register_blueprint(grid_tick_bp)
     app.register_blueprint(grid_levels_bp)
+    app.register_blueprint(exec_bridge_bp)
     app.register_blueprint(heatmap_bp)
     app.register_blueprint(options_ingest_bp)
     app.register_blueprint(options_decide_bp)
