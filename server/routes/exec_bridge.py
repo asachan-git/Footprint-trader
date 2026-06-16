@@ -119,6 +119,65 @@ def exec_emit_grid():
     })
 
 
+@bp.post("/exec/test_order")
+def exec_test_order():
+    """Forced round-trip test — bypasses all strategy/arm logic.
+
+    Default: enqueue ONE tiny pending stop a safe distance from market (won't fill
+    → no risk), so you can confirm the EA delivers→places→acks. Then call again
+    with {"close_only": true} to CLOSE_ALL (cancels it). Proves the bridge round
+    trip on a DEMO account before trusting the arm logic.
+
+    Body: {account, symbol(broker or analysis), [side=buy|sell],
+           [offset_pct=0.005], [lot=0.01], [close_only=false]}.
+    Requires the EA to have polled once (cached venue quote).
+    """
+    if not _auth_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    from execution.exec_bridge import PLACE_PENDING, CLOSE_ALL
+    settings = current_app.config["FB_SETTINGS"]
+    body = request.get_json(silent=True) or {}
+    account = str(body.get("account") or "")
+    if not account:
+        return jsonify({"ok": False, "error": "missing account"}), 400
+
+    symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
+    broker_to_analysis = {v: k for k, v in symbol_map.items()}
+    req_symbol = body.get("symbol") or settings["instrument"]["symbol"]
+    analysis = broker_to_analysis.get(req_symbol, req_symbol)
+    broker_symbol = symbol_map.get(analysis, req_symbol)
+
+    if bool(body.get("close_only", False)):
+        cmd = ExecBridge.enqueue(account, CLOSE_ALL, broker_symbol)
+        LOG.info(f"[exec] test_order CLOSE_ALL {account} {broker_symbol}")
+        return jsonify({"ok": True, "action": "close_all", "broker_symbol": broker_symbol,
+                        "command_id": cmd.id})
+
+    quote = ExecBridge.get_quote(account, broker_symbol)
+    if not quote:
+        return jsonify({"ok": False, "error": f"no venue quote cached for "
+                        f"{account}/{broker_symbol} (EA must poll first)"}), 409
+
+    side = str(body.get("side") or "buy").lower()
+    offset_pct = float(body.get("offset_pct", 0.005))   # 0.5% away → stays pending
+    lot = float(body.get("lot", 0.01))
+    if side == "buy":
+        order_type, price = "buy_stop", quote["ask"] * (1.0 + offset_pct)
+    else:
+        order_type, price = "sell_stop", quote["bid"] * (1.0 - offset_pct)
+
+    cmd = ExecBridge.enqueue(account, PLACE_PENDING, broker_symbol,
+                             order_type=order_type, price=price, lot=lot,
+                             sl=0.0, tp=0.0, comment="FB|test")
+    LOG.info(f"[exec] test_order {account} {broker_symbol} {order_type} @ {price:.5f} lot {lot}")
+    return jsonify({
+        "ok": True, "action": "place_pending", "broker_symbol": broker_symbol,
+        "order_type": order_type, "price": round(price, 5), "lot": lot,
+        "venue_mid": quote["mid"], "command_id": cmd.id,
+        "note": "stays pending (away from market). Call with close_only:true to cancel.",
+    })
+
+
 @bp.get("/exec/queue")
 def exec_queue():
     if not _auth_ok():
