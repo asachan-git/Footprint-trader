@@ -439,6 +439,18 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
     buy_tp, sell_tp = _resolve_tps(symbol, fulcrum, buy_legs, sell_legs, atr, tp_mult)
 
+    # hvn_inside_touch: target HVN structure, not generic zones — buy_tp = next
+    # node-top above the tapped edge, sell_tp = next node-bottom below (same-node
+    # opposite edge, or next HVN's far edge across the LVN). Falls back to the
+    # _resolve_tps result if a structural target is missing or on the wrong side.
+    if fulcrum_t.kind == "hvn_inside_touch":
+        tp_up = float(fulcrum_t.context.get("tp_up", 0.0) or 0.0)
+        tp_down = float(fulcrum_t.context.get("tp_down", 0.0) or 0.0)
+        if tp_up > fulcrum:
+            buy_tp = round(tp_up, 4)
+        if 0.0 < tp_down < fulcrum:
+            sell_tp = round(tp_down, 4)
+
     plan = GridPlan(
         verdict="arm",
         fulcrum=round(fulcrum, 4),

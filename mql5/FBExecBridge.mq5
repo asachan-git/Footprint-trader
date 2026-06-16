@@ -248,16 +248,37 @@ bool ExecCloseAll(const string cmd, int &closed, int &cancelled, string &err)
 }
 
 //+------------------------------------------------------------------+
+//| Count this EA's open positions / pending orders (magic + symbol). |
+//+------------------------------------------------------------------+
+int CountMyPositions()
+{
+   int n = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(posInfo.SelectByIndex(i))
+         if(posInfo.Magic() == InpMagic && posInfo.Symbol() == _Symbol) n++;
+   return n;
+}
+
+int CountMyPendings()
+{
+   int n = 0;
+   for(int i = 0; i < OrdersTotal(); i++)
+      if(orderInfo.SelectByIndex(i))
+         if(orderInfo.Magic() == InpMagic && orderInfo.Symbol() == _Symbol) n++;
+   return n;
+}
+
+//+------------------------------------------------------------------+
 //| Poll the queue, execute commands, build + POST the ack array.    |
 //+------------------------------------------------------------------+
 void PollAndExecute()
 {
-   //--- report this terminal's live quote so the server can rebase plans onto it
+   //--- report live quote (for venue rebasing) + open-state (for the re-arm gate)
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    string pollBody = StringFormat(
-      "{\"account\":\"%s\",\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f}",
-      gAccount, _Symbol, bid, ask);
+      "{\"account\":\"%s\",\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f,\"positions\":%d,\"pendings\":%d}",
+      gAccount, _Symbol, bid, ask, CountMyPositions(), CountMyPendings());
    string resp;
    int code = HttpPost(InpBridgeURL + "/exec/poll", pollBody, resp);
    if(code != 200) return;

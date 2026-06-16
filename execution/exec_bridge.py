@@ -77,6 +77,22 @@ class ExecBridge:
     _quotes: dict[tuple, dict] = {}         # (account, broker_symbol) → {bid,ask,mid,ts}
     _last_emit: dict[tuple, float] = {}     # (account, symbol, tf) → last emitted fulcrum
     _last_arm: dict[tuple, dict] = {}       # (account, broker_symbol) → last armed grid metadata
+    _open: dict[tuple, dict] = {}           # (account, broker_symbol) → {positions, pendings, ts}
+
+    # ── live open-state (EA reports its position/order counts on each poll) ────
+    @classmethod
+    def set_open(cls, account: str, symbol: str, positions: int, pendings: int,
+                 now: float | None = None) -> None:
+        with cls._lock:
+            cls._open[(str(account), symbol)] = {
+                "positions": int(positions), "pendings": int(pendings),
+                "ts": now if now is not None else time.time(),
+            }
+
+    @classmethod
+    def get_open(cls, account: str, symbol: str) -> dict:
+        with cls._lock:
+            return dict(cls._open.get((str(account), symbol), {"positions": 0, "pendings": 0}))
 
     # ── last-armed grid (ground truth for chart drawing + diagnostics) ─────────
     @classmethod
@@ -232,3 +248,4 @@ class ExecBridge:
             cls._quotes.clear()
             cls._last_emit.clear()
             cls._last_arm.clear()
+            cls._open.clear()

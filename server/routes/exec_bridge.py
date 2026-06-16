@@ -57,6 +57,9 @@ def exec_poll():
     ExecBridge.last_poll_body = dict(body)   # DEBUG: surface the EA's raw poll body
     if sym and bid and ask:
         ExecBridge.set_quote(account, sym, float(bid), float(ask))
+    if sym and ("positions" in body or "pendings" in body):
+        ExecBridge.set_open(account, sym, int(body.get("positions", 0)),
+                            int(body.get("pendings", 0)))
     commands = ExecBridge.poll(account)
     if commands:
         LOG.info(f"[exec] poll account={account} → {len(commands)} command(s)")
@@ -137,17 +140,18 @@ def exec_emit_grid():
                         "skip_reason": f"no_{trigger_hint}_trigger (got {plan.trigger_kind})",
                         "symbol": symbol, "broker_symbol": broker_symbol})
 
-    # Dedup: the trigger arms on most bars while price sits in a node. Emit only on a
-    # NEW touched-edge episode (fulcrum moved > half a leg-step), not every bar.
-    tol = max(plan.step * 0.5, plan.fulcrum * 0.0005)
-    if not bool(body.get("force", False)) and \
-            not ExecBridge.should_emit(account, symbol, tf, plan.fulcrum, tol):
-        return jsonify({"ok": True, "verdict": "skip", "skip_reason": "dedup:same_episode",
+    # Re-arm gate: keep placing on each touch WHILE FLAT, but never stack onto a live
+    # position. If a leg has filled (position open) → skip until it closes. With no
+    # position, each touch re-arms: close_first cancels stale pendings and places a
+    # fresh straddle at the new edge. (Gate on positions, not pendings — pendings are
+    # meant to be refreshed each touch.)
+    open_state = ExecBridge.get_open(account, broker_symbol)
+    if not bool(body.get("force", False)) and open_state.get("positions", 0) > 0:
+        return jsonify({"ok": True, "verdict": "skip", "skip_reason": "position_open",
                         "symbol": symbol, "broker_symbol": broker_symbol,
-                        "fulcrum": plan.fulcrum})
+                        "open": open_state})
 
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan, close_first=close_first)
-    ExecBridge.mark_emit(account, symbol, tf, plan.fulcrum)
     edge = plan.trigger_context.get("edge", "")
     # ground truth: the touched edge (= fulcrum), TF, side, and full leg ladder
     ExecBridge.set_last_arm(account, broker_symbol, fulcrum=plan.fulcrum, tf=tf, edge=edge,

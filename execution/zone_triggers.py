@@ -234,13 +234,24 @@ def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger |
 
     _dist, edge, width, side, reject_frac = best
     conf = min(0.9, 0.55 + min(reject_frac, 0.3))   # cleaner/deeper rejection → higher
+
+    # HVN→HVN momentum targets (the thesis): upside TP = the first node-TOP above the
+    # tapped edge; downside TP = the first node-BOTTOM below it. When the edge is the
+    # NEAR side of its node this is the SAME node's opposite edge; when it's the FAR
+    # side, it's the NEXT HVN's far edge across the LVN between. None if none exists.
+    tops_above = [hi for lo, hi in zones if hi > edge]
+    bots_below = [lo for lo, hi in zones if lo < edge]
+    tp_up = min(tops_above) if tops_above else 0.0
+    tp_down = max(bots_below) if bots_below else 0.0
+
     return Trigger(
         kind="hvn_inside_touch",
         fulcrum_price=float(edge),
         raw_range=float(width),
         confidence=float(conf),
         context={"bias": "none", "edge": side, "session": sess,
-                 "reject_frac": round(reject_frac, 4)},
+                 "reject_frac": round(reject_frac, 4),
+                 "tp_up": float(tp_up), "tp_down": float(tp_down)},
     )
 
 
