@@ -45,7 +45,6 @@ _SESSION_HVN_SRC = {
     "Asia":    ("cached",),
     "Off":     ("cached",),
 }
-_HVN_TOUCH_WITHIN = 2   # touch must land ≤ this many bars after the closed-inside bar
 
 
 @dataclass
@@ -187,59 +186,61 @@ def _session_hvn_zones(symbol: str, tf: str, bars: list[Bar]) -> tuple[list[tupl
 
 
 def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger | None:
-    """A candle CLOSED INSIDE an HVN, then within `_HVN_TOUCH_WITHIN` bars price
-    TOUCHED an edge of that same node → straddle the touched edge (the fulcrum).
+    """The just-closed candle CLOSES INSIDE an HVN *and* TAPS one of its edges — its
+    wick reaches the boundary but the body closes back inside (the edge held). That
+    rejection-at-edge candle is the trigger; straddle the tapped edge (the fulcrum).
     Node width is raw_range → the planner sizes more legs into wider nodes.
 
-    Stateless / causal: the touch bar is the latest bar; the closed-inside bar is one
-    of the prior `_HVN_TOUCH_WITHIN` bars. Reconstructed from the bar series so it
-    behaves identically live and in the truncated-series sim.
+    One candle, not a multi-bar sequence: requires lo < close < hi AND (high ≥ hi or
+    low ≤ lo). A candle that closes BEYOND the edge is a breakout, not this setup, and
+    is excluded. Stateless / causal — behaves identically live and in the sim.
     """
     from pipeline.state_store import store
     win = _VP_WIN.get(tf, 96)
     bars = store().recent(symbol, tf, win + 5)
-    if len(bars) < 3:
+    if len(bars) < 2:
         return None
     zones, sess = _session_hvn_zones(symbol, tf, bars)
     if not zones:
         return None
 
-    cur = bars[-1]                                   # the touch candidate
-    priors = bars[-1 - _HVN_TOUCH_WITHIN:-1]         # the ≤2 bars before it
+    cur = bars[-1]
+    c, h, lo_p = cur.ohlc.c, cur.ohlc.h, cur.ohlc.l
 
-    best = None   # (dist_to_price, edge, width, edge_side, inside_n)
+    best = None   # (dist_to_close, edge, width, edge_side, reject_frac)
     for lo, hi in zones:
         width = hi - lo
         if width <= 0:
             continue
-        # a prior bar must have CLOSED strictly inside this node
-        inside_n = sum(1 for p in priors if lo < p.ohlc.c < hi)
-        if inside_n == 0:
+        if not (lo < c < hi):            # the candle must CLOSE inside this node
             continue
-        touch_top = cur.ohlc.h >= hi
-        touch_bot = cur.ohlc.l <= lo
-        if not (touch_top or touch_bot):
+        touch_top = h >= hi
+        touch_bot = lo_p <= lo
+        if not (touch_top or touch_bot):  # …and tap an edge with its wick
             continue
-        # which edge: if both pierced (cur engulfs the node), take the one nearer price
+        # which edge: if both wicks pierced, take the one the close sits nearer
         if touch_top and touch_bot:
-            edge, side = (hi, "top") if abs(hi - current_price) <= abs(lo - current_price) else (lo, "bottom")
+            edge, side = (hi, "top") if abs(hi - c) <= abs(lo - c) else (lo, "bottom")
         else:
             edge, side = (hi, "top") if touch_top else (lo, "bottom")
-        dist = abs(edge - current_price)
+        # rejection strength: how far the wick poked beyond the edge, in node-widths
+        poke = (h - hi) if side == "top" else (lo - lo_p)
+        reject_frac = max(0.0, poke) / width
+        dist = abs(edge - c)
         if best is None or dist < best[0]:
-            best = (dist, edge, width, side, inside_n)
+            best = (dist, edge, width, side, reject_frac)
     if best is None:
         return None
 
-    _dist, edge, width, side, inside_n = best
-    # cleaner setup (both priors coiled inside) earns a little more confidence.
-    conf = min(0.85, 0.55 + 0.15 * inside_n)
+    _dist, edge, width, side, reject_frac = best
+    conf = min(0.9, 0.55 + min(reject_frac, 0.3))   # cleaner/deeper rejection → higher
     return Trigger(
         kind="hvn_inside_touch",
         fulcrum_price=float(edge),
         raw_range=float(width),
         confidence=float(conf),
-        context={"bias": "none", "edge": side, "session": sess, "inside_n": inside_n},
+        context={"bias": "none", "edge": side, "session": sess,
+                 "reject_frac": round(reject_frac, 4)},
     )
 
 
