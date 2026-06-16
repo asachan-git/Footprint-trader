@@ -75,6 +75,25 @@ class ExecBridge:
     _cmds: dict[str, Command] = {}          # id → Command
     _seq: list[str] = []                    # insertion order (FIFO dispatch)
     _quotes: dict[tuple, dict] = {}         # (account, broker_symbol) → {bid,ask,mid,ts}
+    _last_emit: dict[tuple, float] = {}     # (account, symbol, tf) → last emitted fulcrum
+
+    # ── emit dedup (one grid per HVN-touch episode, not per bar) ───────────────
+    @classmethod
+    def should_emit(cls, account: str, symbol: str, tf: str, fulcrum: float, tol: float) -> bool:
+        """True if this fulcrum is a NEW touched-edge episode (no prior, or moved
+        more than `tol` from the last emitted edge). Prevents re-arming the same
+        node every bar while price sits in it."""
+        last = cls._last_emit.get((str(account), symbol, tf))
+        return last is None or abs(fulcrum - last) > tol
+
+    @classmethod
+    def mark_emit(cls, account: str, symbol: str, tf: str, fulcrum: float) -> None:
+        cls._last_emit[(str(account), symbol, tf)] = fulcrum
+
+    @classmethod
+    def clear_emit(cls, account: str, symbol: str, tf: str) -> None:
+        """Episode ended (no arm this bar) → next arm is a fresh touch."""
+        cls._last_emit.pop((str(account), symbol, tf), None)
 
     # ── venue quote cache (EA reports its live price on each poll) ─────────────
     @classmethod
@@ -198,3 +217,4 @@ class ExecBridge:
             cls._cmds.clear()
             cls._seq.clear()
             cls._quotes.clear()
+            cls._last_emit.clear()

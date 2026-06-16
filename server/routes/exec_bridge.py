@@ -105,10 +105,22 @@ def exec_emit_grid():
                             trigger_hint=trigger_hint, settings=settings,
                             venue_price=float(quote["mid"]))
     if plan.verdict != "arm":
+        # episode ended → next arm on this symbol/tf is a fresh touch
+        ExecBridge.clear_emit(account, symbol, tf)
         return jsonify({"ok": True, "verdict": "skip", "skip_reason": plan.skip_reason,
                         "symbol": symbol, "broker_symbol": broker_symbol})
 
+    # Dedup: the trigger arms on most bars while price sits in a node. Emit only on a
+    # NEW touched-edge episode (fulcrum moved > half a leg-step), not every bar.
+    tol = max(plan.step * 0.5, plan.fulcrum * 0.0005)
+    if not bool(body.get("force", False)) and \
+            not ExecBridge.should_emit(account, symbol, tf, plan.fulcrum, tol):
+        return jsonify({"ok": True, "verdict": "skip", "skip_reason": "dedup:same_episode",
+                        "symbol": symbol, "broker_symbol": broker_symbol,
+                        "fulcrum": plan.fulcrum})
+
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan, close_first=close_first)
+    ExecBridge.mark_emit(account, symbol, tf, plan.fulcrum)
     LOG.info(f"[exec] emit_grid {account} {broker_symbol} {tf} → armed, "
              f"{len(cmds)} command(s) (venue_mid={quote['mid']:.2f})")
     return jsonify({
