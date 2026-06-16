@@ -514,3 +514,36 @@ strategies:
       cvd_divergence_exit: true
       cvd_exit_conf: 0.65
       cvd_div_gate: true
+
+  # continuation_hvn = the CONTINUATION half of the HVN/LVN model (reversal_hvn = the
+  # fade half). High-vol + high-delta ignition bar, windowed-CVD-agree gate, MARKET
+  # entry, ride the next HVN→HVN; stop just beyond the nearest HVN-support against the
+  # trade. Validated offline (validate_continuation.py) + re-confirmed on repaired
+  # real-tick footprint 2026-06-16: +0.323R / 23% WR (CVD-agree, HVN-support stop).
+  - name: continuation_hvn
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      decide_tf: 15m
+      vol_mult: 1.5
+      delta_ratio: 0.35
+      cvd_window: 20
+      min_hvn_dist: 1.0
+      stop_mode: hvn
+      min_sl_atr_mult: 0.5
+
+  # SL-A/B twin: same trigger/target, LVN-stop instead of HVN-support. On repaired
+  # data LVN-stop scored higher (+0.705R / 40% WR) — under test vs the documented HVN
+  # form. See [[project_continuation_cvddiv]], [[project_sl_ab]].
+  - name: continuation_hvn_lvn
+    class: continuation_hvn
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      decide_tf: 15m
+      vol_mult: 1.5
+      delta_ratio: 0.35
+      cvd_window: 20
+      min_hvn_dist: 1.0
+      stop_mode: lvn
+      min_sl_atr_mult: 0.5
