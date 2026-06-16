@@ -40,6 +40,7 @@ def exec_poll():
     # can rebase analysis-frame plans onto the venue price at build time.
     sym = body.get("symbol")
     bid, ask = body.get("bid"), body.get("ask")
+    ExecBridge.last_poll_body = dict(body)   # DEBUG: surface the EA's raw poll body
     if sym and bid and ask:
         ExecBridge.set_quote(account, sym, float(bid), float(ask))
     commands = ExecBridge.poll(account)
@@ -183,4 +184,5 @@ def exec_queue():
     if not _auth_ok():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     account = request.args.get("account")
-    return jsonify({"ok": True, "commands": ExecBridge.snapshot(account)})
+    return jsonify({"ok": True, "commands": ExecBridge.snapshot(account),
+                    "last_poll_body": getattr(ExecBridge, "last_poll_body", None)})
