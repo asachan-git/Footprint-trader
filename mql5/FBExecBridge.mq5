@@ -379,7 +379,29 @@ void FetchAndDrawZones()
       double hi   = JsonGetNumber(zs[i], "hi");
       if(lo > 0 && hi > 0) DrawZone(i, kind, lo, hi);
    }
-   if(InpVerbose && n > 0) Print("🟦 Drew ", n, " ", InpZoneTF, " HVN/LVN zones.");
+
+   //--- draw the last-armed grid's fulcrum (the touched edge the straddle anchors on)
+   double fulcrum  = JsonGetNumber(resp, "fulcrum");
+   string emitTF   = JsonGetString(resp, "emit_tf");
+   string emitEdge = JsonGetString(resp, "emit_edge");
+   string fname    = ZONE_PREFIX + "fulcrum";
+   if(fulcrum > 0)
+   {
+      if(ObjectFind(0, fname) < 0)
+         ObjectCreate(0, fname, OBJ_HLINE, 0, 0, fulcrum);
+      ObjectSetDouble (0, fname, OBJPROP_PRICE, 0, fulcrum);
+      ObjectSetInteger(0, fname, OBJPROP_COLOR, clrMagenta);
+      ObjectSetInteger(0, fname, OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0, fname, OBJPROP_WIDTH, 2);
+      ObjectSetInteger(0, fname, OBJPROP_BACK,  false);
+      ObjectSetInteger(0, fname, OBJPROP_SELECTABLE, false);
+      ObjectSetString (0, fname, OBJPROP_TEXT, "fulcrum " + emitTF + " " + emitEdge);
+   }
+   else ObjectDelete(0, fname);
+
+   if(InpVerbose && n > 0)
+      Print("🟦 Drew ", n, " ", InpZoneTF, " zones | fulcrum ",
+            DoubleToString(fulcrum, _Digits), " (", emitTF, " ", emitEdge, ")");
 }
 
 //+------------------------------------------------------------------+

@@ -10,14 +10,28 @@ set the token in any networked deployment.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
+from pathlib import Path
 
 from flask import Blueprint, current_app, jsonify, request
 
 from execution.exec_bridge import ExecBridge
 
 bp = Blueprint("exec_bridge", __name__)
+_EMIT_LOG = Path(__file__).resolve().parent.parent.parent / "data" / "exec_emit.jsonl"
+
+
+def _emit_audit(row: dict) -> None:
+    """Append one emit decision (arm or skip) — ground truth for diagnostics."""
+    try:
+        _EMIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _EMIT_LOG.open("a") as fh:
+            fh.write(json.dumps({"ts": time.time(), **row}) + "\n")
+    except Exception:
+        pass  # audit must never break execution
 LOG = logging.getLogger(__name__)
 
 
@@ -107,6 +121,8 @@ def exec_emit_grid():
     if plan.verdict != "arm":
         # episode ended → next arm on this symbol/tf is a fresh touch
         ExecBridge.clear_emit(account, symbol, tf)
+        _emit_audit({"account": account, "symbol": symbol, "tf": tf, "verdict": "skip",
+                     "skip_reason": plan.skip_reason})
         return jsonify({"ok": True, "verdict": "skip", "skip_reason": plan.skip_reason,
                         "symbol": symbol, "broker_symbol": broker_symbol})
 
@@ -115,6 +131,8 @@ def exec_emit_grid():
     # hvn_edge/va/etc. grid. Mismatch → treat as no-arm.
     if trigger_hint and plan.trigger_kind != trigger_hint:
         ExecBridge.clear_emit(account, symbol, tf)
+        _emit_audit({"account": account, "symbol": symbol, "tf": tf, "verdict": "skip",
+                     "skip_reason": f"trigger_mismatch:{plan.trigger_kind}"})
         return jsonify({"ok": True, "verdict": "skip",
                         "skip_reason": f"no_{trigger_hint}_trigger (got {plan.trigger_kind})",
                         "symbol": symbol, "broker_symbol": broker_symbol})
@@ -130,8 +148,21 @@ def exec_emit_grid():
 
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan, close_first=close_first)
     ExecBridge.mark_emit(account, symbol, tf, plan.fulcrum)
-    LOG.info(f"[exec] emit_grid {account} {broker_symbol} {tf} → armed, "
-             f"{len(cmds)} command(s) (venue_mid={quote['mid']:.2f})")
+    edge = plan.trigger_context.get("edge", "")
+    # ground truth: the touched edge (= fulcrum), TF, side, and full leg ladder
+    ExecBridge.set_last_arm(account, broker_symbol, fulcrum=plan.fulcrum, tf=tf, edge=edge,
+                            trigger_kind=plan.trigger_kind, venue_mid=quote["mid"],
+                            n_per_side=plan.n_per_side, step=plan.step, ts=time.time())
+    _emit_audit({"account": account, "symbol": symbol, "broker_symbol": broker_symbol,
+                 "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind, "edge": edge,
+                 "fulcrum": plan.fulcrum, "venue_mid": quote["mid"],
+                 "analysis_anchor": plan.analysis_anchor, "n_per_side": plan.n_per_side,
+                 "step": plan.step,
+                 "buy_legs": [l.price for l in plan.buy_legs],
+                 "sell_legs": [l.price for l in plan.sell_legs],
+                 "buy_tp": plan.buy_tp, "sell_tp": plan.sell_tp})
+    LOG.info(f"[exec] emit_grid {account} {broker_symbol} {tf} → armed [{plan.trigger_kind} "
+             f"edge={edge} fulcrum={plan.fulcrum}], {len(cmds)} command(s)")
     return jsonify({
         "ok": True, "verdict": "arm", "symbol": symbol, "broker_symbol": broker_symbol,
         "venue_mid": quote["mid"], "fulcrum": plan.fulcrum, "n_per_side": plan.n_per_side,
@@ -248,8 +279,12 @@ def exec_zones():
     for z in (vp.lvn_zones or []):
         zones.append({"kind": "lvn", "lo": round(float(z["low"]) * ratio, 5),
                       "hi": round(float(z["high"]) * ratio, 5)})
+    # surface the last-armed grid so the EA can draw the fulcrum (touched edge)
+    arm = ExecBridge.get_last_arm(account, broker_symbol) or {}
     return jsonify({"ok": True, "zones": zones, "venue_mid": quote["mid"],
-                    "symbol": symbol, "broker_symbol": broker_symbol})
+                    "symbol": symbol, "broker_symbol": broker_symbol,
+                    "fulcrum": arm.get("fulcrum", 0.0), "emit_tf": arm.get("tf", ""),
+                    "emit_edge": arm.get("edge", "")})
 
 
 @bp.get("/exec/queue")

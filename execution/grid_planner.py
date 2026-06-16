@@ -67,6 +67,7 @@ class GridPlan:
     analysis_anchor: float = 0.0
     venue_anchor: float = 0.0
     rebased: bool = False
+    trigger_context: dict = field(default_factory=dict)   # detector metadata (edge side, session…)
 
 
 # ── confluence scoring (the edge) ───────────────────────────────────────────
@@ -458,6 +459,7 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         plan_id=plan_id,
         analysis_anchor=round(current_price, 4),
         venue_anchor=round(current_price, 4),
+        trigger_context=dict(fulcrum_t.context or {}),
     )
 
     # Re-anchor onto the execution venue's live price (if the EA supplied one).

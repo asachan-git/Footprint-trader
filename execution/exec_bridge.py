@@ -76,6 +76,19 @@ class ExecBridge:
     _seq: list[str] = []                    # insertion order (FIFO dispatch)
     _quotes: dict[tuple, dict] = {}         # (account, broker_symbol) → {bid,ask,mid,ts}
     _last_emit: dict[tuple, float] = {}     # (account, symbol, tf) → last emitted fulcrum
+    _last_arm: dict[tuple, dict] = {}       # (account, broker_symbol) → last armed grid metadata
+
+    # ── last-armed grid (ground truth for chart drawing + diagnostics) ─────────
+    @classmethod
+    def set_last_arm(cls, account: str, broker_symbol: str, **meta) -> None:
+        with cls._lock:
+            cls._last_arm[(str(account), broker_symbol)] = dict(meta)
+
+    @classmethod
+    def get_last_arm(cls, account: str, broker_symbol: str) -> dict | None:
+        with cls._lock:
+            m = cls._last_arm.get((str(account), broker_symbol))
+            return dict(m) if m else None
 
     # ── emit dedup (one grid per HVN-touch episode, not per bar) ───────────────
     @classmethod
@@ -218,3 +231,4 @@ class ExecBridge:
             cls._seq.clear()
             cls._quotes.clear()
             cls._last_emit.clear()
+            cls._last_arm.clear()
