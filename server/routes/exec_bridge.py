@@ -110,6 +110,15 @@ def exec_emit_grid():
         return jsonify({"ok": True, "verdict": "skip", "skip_reason": plan.skip_reason,
                         "symbol": symbol, "broker_symbol": broker_symbol})
 
+    # Strict: plan_grid_levels falls back to ALL triggers when the hinted one is
+    # absent — but emit must fire ONLY the requested strategy, never a stray
+    # hvn_edge/va/etc. grid. Mismatch → treat as no-arm.
+    if trigger_hint and plan.trigger_kind != trigger_hint:
+        ExecBridge.clear_emit(account, symbol, tf)
+        return jsonify({"ok": True, "verdict": "skip",
+                        "skip_reason": f"no_{trigger_hint}_trigger (got {plan.trigger_kind})",
+                        "symbol": symbol, "broker_symbol": broker_symbol})
+
     # Dedup: the trigger arms on most bars while price sits in a node. Emit only on a
     # NEW touched-edge episode (fulcrum moved > half a leg-step), not every bar.
     tol = max(plan.step * 0.5, plan.fulcrum * 0.0005)
