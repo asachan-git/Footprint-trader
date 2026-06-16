@@ -52,18 +52,25 @@ def grid_levels():
     trigger_hint = str(body.get("trigger_hint") or "")
     dry_run = bool(body.get("dry_run", False))
 
-    current_price = body.get("current_price")
-    if current_price in (None, 0, 0.0):
-        latest = store().latest(symbol, tf)
-        if latest is None:
-            return jsonify({"ok": False, "verdict": "skip",
-                            "skip_reason": f"no bars stored for {symbol} {tf}"}), 404
-        current_price = latest.ohlc.c
-    current_price = float(current_price)
+    # Structure (HVN/VP/ATR) is computed in the ANALYSIS frame (Binance/Bybit) off
+    # the latest stored close. The EA's `current_price` is its EXECUTION-venue
+    # (Vantage) live price — the rebase target so legs land on the correct side of
+    # the broker's market. They differ by spread/markup/feed (the price gap the EA
+    # path must handle). A caller that omits current_price gets an in-frame (no-op)
+    # rebase.
+    latest = store().latest(symbol, tf)
+    if latest is None:
+        return jsonify({"ok": False, "verdict": "skip",
+                        "skip_reason": f"no bars stored for {symbol} {tf}"}), 404
+    analysis_price = float(latest.ohlc.c)
+
+    venue_raw = body.get("current_price")
+    venue_price = float(venue_raw) if venue_raw not in (None, 0, 0.0) else analysis_price
 
     try:
-        plan = plan_grid_levels(symbol, tf, current_price,
-                                trigger_hint=trigger_hint, settings=settings)
+        plan = plan_grid_levels(symbol, tf, analysis_price,
+                                trigger_hint=trigger_hint, settings=settings,
+                                venue_price=venue_price)
     except Exception as e:
         LOG.error(f"[grid_levels] planner failed: {e}\n{traceback.format_exc()}")
         return jsonify({"ok": False, "verdict": "skip",
@@ -72,6 +79,7 @@ def grid_levels():
     out = {"ok": True, **asdict(plan)}
 
     if dry_run:
-        _log_plan({"symbol": symbol, "tf": tf, "current_price": current_price, **asdict(plan)})
+        _log_plan({"symbol": symbol, "tf": tf, "analysis_price": analysis_price,
+                   "venue_price": venue_price, **asdict(plan)})
 
     return jsonify(out)

@@ -23,7 +23,7 @@ Reused: day_type, zone_triggers, zone_collector, atr_from_store, grid_modes.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from execution import zone_triggers
 from execution.zone_triggers import Trigger
@@ -61,6 +61,12 @@ class GridPlan:
     atr: float = 0.0
     swing_range: float = 0.0
     plan_id: str = ""
+    # Venue rebasing: the plan is computed in the ANALYSIS frame (Binance/Bybit)
+    # then re-anchored on the EXECUTION venue's live price before it reaches the
+    # broker. analysis_anchor / venue_anchor record both ends; rebased flags it.
+    analysis_anchor: float = 0.0
+    venue_anchor: float = 0.0
+    rebased: bool = False
 
 
 # ── confluence scoring (the edge) ───────────────────────────────────────────
@@ -317,11 +323,52 @@ def _resolve_tps(symbol: str, fulcrum: float, buy_legs: list[Leg],
     return round(buy_tp, 4), round(sell_tp, 4)
 
 
+# ── venue rebasing ───────────────────────────────────────────────────────────
+
+def _rebase_to_venue(plan: GridPlan, analysis_anchor: float, venue_price: float) -> GridPlan:
+    """Re-anchor a plan computed in the analysis frame (Binance/Bybit) onto the
+    execution venue's live price (Vantage). Every absolute level — fulcrum, each
+    leg, both TPs, the step — is scaled by the ratio venue/analysis, preserving the
+    structural % geometry while moving it to where the broker actually quotes. Same
+    principle as execution.venue_translator, applied to the neutral grid.
+
+    Why this is mandatory: a BuyStop must sit above the venue ask and a SellStop
+    below the venue bid. Binance-frame absolute prices won't satisfy that on Vantage
+    → MT5 rejects the orders. (Tick-rounding + broker min-stop-distance are enforced
+    EA-side, since only the terminal knows the symbol's stopsLevel.)
+    """
+    if analysis_anchor <= 0 or venue_price <= 0:
+        return plan
+    ratio = venue_price / analysis_anchor
+    if abs(ratio - 1.0) < 1e-9:
+        # in-frame caller (dashboard/sim) — identity, just stamp the anchors
+        return replace(plan, analysis_anchor=round(analysis_anchor, 4),
+                       venue_anchor=round(venue_price, 4), rebased=False)
+    return replace(
+        plan,
+        fulcrum=round(plan.fulcrum * ratio, 4),
+        step=round(plan.step * ratio, 4),
+        buy_legs=[Leg(price=round(l.price * ratio, 4), lot=l.lot) for l in plan.buy_legs],
+        sell_legs=[Leg(price=round(l.price * ratio, 4), lot=l.lot) for l in plan.sell_legs],
+        buy_tp=round(plan.buy_tp * ratio, 4),
+        sell_tp=round(plan.sell_tp * ratio, 4),
+        analysis_anchor=round(analysis_anchor, 4),
+        venue_anchor=round(venue_price, 4),
+        rebased=True,
+    )
+
+
 # ── public entry ────────────────────────────────────────────────────────────
 
 def plan_grid_levels(symbol: str, tf: str, current_price: float,
-                     trigger_hint: str = "", settings: dict | None = None) -> GridPlan:
-    """Compute a neutral-grid plan for `symbol`/`tf` at `current_price`.
+                     trigger_hint: str = "", settings: dict | None = None,
+                     venue_price: float | None = None) -> GridPlan:
+    """Compute a neutral-grid plan for `symbol`/`tf`.
+
+    `current_price` is the ANALYSIS-frame price (Binance/Bybit) used for structure.
+    `venue_price`, when given, is the EXECUTION-venue (Vantage) live price the EA
+    sent: the finished plan is rebased onto it so the legs land on the correct side
+    of the broker's market. Omitted → no rebase (in-frame callers).
     Returns GridPlan(verdict="arm"|"skip")."""
     settings = settings or {}
     grid_cfg = (settings.get("grid_levels") or {}) if isinstance(settings, dict) else {}
@@ -329,6 +376,7 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     lot_step = float(grid_cfg.get("lot_step", 0.01))
     tp_mult = float(grid_cfg.get("tp_atr_mult", 1.5))
     hvn_max_legs = int(grid_cfg.get("hvn_max_legs", 8))
+    max_fulcrum_dist_pct = float(grid_cfg.get("max_fulcrum_dist_pct", 0.05))
 
     from pipeline.state_store import store
     from pipeline.features.atr import atr_from_store
@@ -368,6 +416,14 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     skip, reason = _should_skip(fulcrum_t, regime,
                                 fulcrum_t.fulcrum_price if fulcrum_t else current_price,
                                 daily_vp)
+    # Proximity gate: reject a fulcrum sitting too far from current price (a stale /
+    # far cached-HVN edge). Measured in the ANALYSIS frame, before any rebase. Such a
+    # fulcrum both rebases to a garbage offset and places stops far off the venue's
+    # market. Catches the stale-HVN bug the honest sim labeler exposed.
+    if not skip and fulcrum_t is not None and current_price > 0 and max_fulcrum_dist_pct > 0:
+        dist_pct = abs(fulcrum_t.fulcrum_price - current_price) / current_price
+        if dist_pct > max_fulcrum_dist_pct:
+            skip, reason = True, f"fulcrum_too_far:{dist_pct:.3f}>{max_fulcrum_dist_pct}"
     if skip:
         return GridPlan(verdict="skip", skip_reason=reason,
                         regime=getattr(regime, "type", "unknown"),
@@ -382,7 +438,7 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
     buy_tp, sell_tp = _resolve_tps(symbol, fulcrum, buy_legs, sell_legs, atr, tp_mult)
 
-    return GridPlan(
+    plan = GridPlan(
         verdict="arm",
         fulcrum=round(fulcrum, 4),
         regime=getattr(regime, "type", "unknown"),
@@ -400,4 +456,11 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         atr=round(atr, 4),
         swing_range=round(swing_range, 4),
         plan_id=plan_id,
+        analysis_anchor=round(current_price, 4),
+        venue_anchor=round(current_price, 4),
     )
+
+    # Re-anchor onto the execution venue's live price (if the EA supplied one).
+    if venue_price and venue_price > 0:
+        plan = _rebase_to_venue(plan, current_price, venue_price)
+    return plan
