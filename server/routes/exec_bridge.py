@@ -327,7 +327,24 @@ def exec_zones():
 
     quote = ExecBridge.get_quote(account, broker_symbol) or {}
     arm = ExecBridge.get_last_arm(account, broker_symbol) or {}
-    return jsonify({"ok": True, "zones": zones, "levels": levels,
+
+    # ict_fvg paper-strategy overlay (entry/SL/TP, fib zone, FVGs, ChoCh) — published in
+    # the ANALYSIS frame; rebase onto the venue (ratio = venue_mid / analysis_anchor) so
+    # the EA can draw why it triggered. Dropped if no quote / stale (>12h).
+    ict_out = None
+    ov = ExecBridge.get_ict_overlay(symbol)
+    mid = float(quote.get("mid") or 0.0)
+    if ov and mid > 0 and float(ov.get("anchor") or 0.0) > 0:
+        fresh = (not ov.get("ts")) or (time.time() - float(ov["ts"]) <= 12 * 3600)
+        if fresh:
+            ratio = mid / float(ov["anchor"])
+            pk = ("entry", "sl", "tp", "fib_lo", "fib_hi", "fvg_low", "fvg_high",
+                  "htf_fvg_low", "htf_fvg_high", "choch_level")
+            ict_out = {k: round(float(ov[k]) * ratio, 5) for k in pk if ov.get(k)}
+            ict_out["side"] = ov.get("side", "")
+            ict_out["status"] = ov.get("status", "")
+
+    return jsonify({"ok": True, "zones": zones, "levels": levels, "ict": ict_out,
                     "venue_mid": quote.get("mid", 0.0),
                     "symbol": symbol, "broker_symbol": broker_symbol,
                     "fulcrum": arm.get("fulcrum", 0.0), "emit_tf": arm.get("tf", ""),

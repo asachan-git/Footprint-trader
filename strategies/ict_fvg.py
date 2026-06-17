@@ -203,7 +203,27 @@ class IctFvg(Coup):
         return {"ts": event.broken_at_ts, "side": side, "entry": round(entry, 4),
                 "sl": round(sl, 4), "tp": round(tp, 4), "origin": round(origin, 4),
                 "extreme": round(extreme, 4), "tp_src": tp_src, "choch_dir": event.direction,
-                "fvg_low": round(chosen.low, 4), "fvg_high": round(chosen.high, 4)}
+                "fvg_low": round(chosen.low, 4), "fvg_high": round(chosen.high, 4),
+                "fib_lo": round(band_lo, 4), "fib_hi": round(band_hi, 4),
+                "choch_level": round(float(event.broken_level), 4),
+                "htf_fvg_low": round(float(ht["fvg"].low), 4),
+                "htf_fvg_high": round(float(ht["fvg"].high), 4)}
+
+    def _publish_overlay(self, symbol: str, m: dict, status: str, anchor: float) -> None:
+        """Publish the active setup (analysis frame) for the EA to draw on the venue
+        chart. The bridge rebases by venue_mid/anchor — see /exec/zones."""
+        try:
+            from execution.exec_bridge import ExecBridge
+            ExecBridge.set_ict_overlay(symbol, {
+                "symbol": symbol, "status": status, "side": m["side"],
+                "entry": m["entry"], "sl": m["sl"], "tp": m["tp"],
+                "fib_lo": m.get("fib_lo"), "fib_hi": m.get("fib_hi"),
+                "fvg_low": m.get("fvg_low"), "fvg_high": m.get("fvg_high"),
+                "htf_fvg_low": m.get("htf_fvg_low"), "htf_fvg_high": m.get("htf_fvg_high"),
+                "choch_level": m.get("choch_level"),
+                "anchor": float(anchor), "ts": m.get("ts")})
+        except Exception:
+            pass   # drawing must never break the strategy
 
     def _build_decision(self, symbol: str, m: dict, entry: float) -> Decision:
         sl, tp = float(m["sl"]), float(m["tp"])
@@ -242,6 +262,7 @@ class IctFvg(Coup):
                 self._pending_entry.pop(symbol, None)
             elif last.ohlc.l <= pe["level"] <= last.ohlc.h:
                 self._pending_entry.pop(symbol, None)
+                self._publish_overlay(symbol, pe["m"], "filled", last.ohlc.c)
                 return self._build_decision(symbol, pe["m"], pe["level"])
             else:
                 return None
@@ -260,6 +281,7 @@ class IctFvg(Coup):
             "m": m, "level": float(m["entry"]),
             "expiry_ts": last.close_ts + int(cfg.get("entry_expiry_bars", 30)) * self._TF_SEC.get("1m", 60),
         }
+        self._publish_overlay(symbol, m, "armed", last.ohlc.c)
         LOG.info(f"[{self.name}] {symbol} {m['side'].upper()} armed — LIMIT @{m['entry']:.2f} "
                  f"(premium-zone 1m FVG), waiting ≤{cfg.get('entry_expiry_bars', 30)} 1m bars for touch")
         return None

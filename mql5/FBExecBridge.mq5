@@ -493,6 +493,73 @@ void DrawZone(int idx, const string kind, double lo, double hi)
    ObjectSetInteger(0, name, OBJPROP_WIDTH,   1);
 }
 
+//--- ICT overlay primitives (named with ZONE_PREFIX so ClearZones sweeps them) -----
+void IctHLine(const string suf, double price, color clr, int style, int width, const string text)
+{
+   if(price <= 0) return;
+   string name = ZONE_PREFIX + suf;
+   if(ObjectFind(0, name) < 0) ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
+   ObjectSetDouble (0, name, OBJPROP_PRICE, 0, price);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, style);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, width);
+   ObjectSetInteger(0, name, OBJPROP_BACK,  false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetString (0, name, OBJPROP_TEXT, text);
+}
+
+void IctRect(const string suf, datetime tL, datetime tR, double lo, double hi, color clr, bool fill)
+{
+   if(lo <= 0 || hi <= 0) return;
+   if(hi < lo) { double t = lo; lo = hi; hi = t; }
+   string name = ZONE_PREFIX + suf;
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_RECTANGLE, 0, tL, lo, tR, hi);
+      ObjectSetInteger(0, name, OBJPROP_BACK,       true);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   }
+   else
+   {
+      ObjectSetInteger(0, name, OBJPROP_TIME,  0, tL);
+      ObjectSetInteger(0, name, OBJPROP_TIME,  1, tR);
+      ObjectSetDouble (0, name, OBJPROP_PRICE, 0, lo);
+      ObjectSetDouble (0, name, OBJPROP_PRICE, 1, hi);
+   }
+   ObjectSetInteger(0, name, OBJPROP_COLOR,   clr);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_FILL,    fill);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH,   1);
+}
+
+//--- Draw the ict_fvg setup (the "why": fib premium zone, entry/HTF FVGs, entry/SL/TP,
+//    ChoCh break) from the rebased `ict` object in the /exec/zones payload.
+void DrawICT(const string js)
+{
+   double entry = JsonGetNumber(js, "entry");
+   if(entry <= 0) return;
+   double sl = JsonGetNumber(js, "sl");
+   double tp = JsonGetNumber(js, "tp");
+   double fl = JsonGetNumber(js, "fib_lo"),  fh = JsonGetNumber(js, "fib_hi");
+   double el = JsonGetNumber(js, "fvg_low"), eh = JsonGetNumber(js, "fvg_high");
+   double hl = JsonGetNumber(js, "htf_fvg_low"), hh = JsonGetNumber(js, "htf_fvg_high");
+   double ch = JsonGetNumber(js, "choch_level");
+   string side = JsonGetString(js, "side");
+   string status = JsonGetString(js, "status");
+   color  sideClr = (side == "short") ? clrTomato : clrLimeGreen;
+
+   int      secs = PeriodSeconds(PERIOD_CURRENT);
+   datetime tL = TimeCurrent() - 120 * secs, tR = TimeCurrent() + 20 * secs;
+
+   IctRect("ict_fib",  tL, tR, fl, fh, clrMediumPurple,   false);  // fib premium zone
+   IctRect("ict_fvg",  tL, tR, el, eh, clrSlateGray,      true);   // entry 1m FVG
+   IctRect("ict_hfvg", tL, tR, hl, hh, clrDarkSlateGray,  false);  // HTF 15m FVG
+   IctHLine("ict_entry", entry, sideClr,  STYLE_SOLID, 2, "ICT " + side + " entry (" + status + ")");
+   IctHLine("ict_sl",    sl,    clrRed,    STYLE_DASH,  1, "ICT SL");
+   IctHLine("ict_tp",    tp,    clrGreen,  STYLE_DASH,  1, "ICT TP");
+   IctHLine("ict_choch", ch,    clrGray,   STYLE_DOT,   1, "ChoCh");
+}
+
 void FetchAndDrawZones()
 {
    string body = StringFormat("{\"account\":\"%s\",\"symbol\":\"%s\",\"tf\":\"%s\"}",
@@ -540,6 +607,9 @@ void FetchAndDrawZones()
       ObjectSetString (0, fname, OBJPROP_TEXT, "fulcrum " + emitTF + " " + emitEdge);
    }
    else ObjectDelete(0, fname);
+
+   //--- ict_fvg overlay (the paper strategy's setup, rebased onto this venue)
+   DrawICT(resp);
 
    if(InpVerbose && (n > 0 || nl > 0))
       Print("🟦 Drew ", n, " zones + ", nl, " VP levels | fulcrum ",

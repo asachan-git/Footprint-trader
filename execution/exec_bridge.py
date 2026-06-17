@@ -94,6 +94,20 @@ class ExecBridge:
     _last_emit: dict[tuple, float] = {}     # (account, symbol, tf) → last emitted fulcrum
     _last_arm: dict[tuple, dict] = {}       # (account, broker_symbol) → last armed grid metadata
     _open: dict[tuple, dict] = {}           # (account, broker_symbol) → {positions, pendings, ts}
+    _ict_overlay: dict[str, dict] = {}      # analysis_symbol → ict_fvg setup (analysis frame)
+
+    # ── ict_fvg chart overlay (paper strategy publishes its active setup; the EA
+    #    draws it rebased onto the venue) ───────────────────────────────────────
+    @classmethod
+    def set_ict_overlay(cls, symbol: str, payload: dict) -> None:
+        with cls._lock:
+            cls._ict_overlay[str(symbol)] = dict(payload)
+
+    @classmethod
+    def get_ict_overlay(cls, symbol: str) -> dict | None:
+        with cls._lock:
+            p = cls._ict_overlay.get(str(symbol))
+            return dict(p) if p else None
 
     # ── live open-state (EA reports its position/order counts on each poll) ────
     @classmethod
@@ -390,3 +404,4 @@ class ExecBridge:
             cls._last_emit.clear()
             cls._last_arm.clear()
             cls._open.clear()
+            cls._ict_overlay.clear()
