@@ -547,3 +547,31 @@ strategies:
       min_hvn_dist: 1.0
       stop_mode: lvn
       min_sl_atr_mult: 0.5
+
+  # ict_fvg — ICT/SMC directional: HTF(15m) unmitigated-FVG rejection arms a bias;
+  # LTF(1m) ChoCh → Fib premium (0.5-0.786, focus 0.618) → a 1m FVG in the zone.
+  # Sell/buy-limit at the 1m FVG midpoint (armed in-strategy, fills on touch). Static
+  # SL outside the FVG wick +buffer; hard 4R TP (or next 15m-FVG mid); BE at +1R
+  # (≈ ChoCh swing low). decide_tf=1m. PAPER. v1: no candle-trail / R-partials.
+  - name: ict_fvg
+    enabled: true
+    config:
+      symbols: [BTCUSDT, XAUTUSDT]
+      decide_tf: 1m
+      htf_tf: 15m
+      htf_fvg_max_age: 100
+      htf_arm_bars: 4
+      swing_n: 2
+      choch_lookback: 200
+      arm_within: 10
+      ltf_fvg_max_age: 50
+      fib_lo: 0.5
+      fib_hi: 0.786
+      fib_focus: 0.618
+      entry_expiry_bars: 30
+      sl_buf_atr: 0.10
+      min_sl_atr_mult: 0.5
+      tp_mode: r          # r = hard tp_r·R | fvg = next unmitigated 15m FVG mid
+      tp_r: 4.0
+      min_rr: 1.5
+      be_at_r: 1.0

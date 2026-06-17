@@ -27,6 +27,7 @@ from .reversal_si import ReversalSI
 from .reversal_choch import ReversalChoch
 from .wave_fib import WaveFib
 from .continuation_hvn import ContinuationHVN
+from .ict_fvg import IctFvg
 
 LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
@@ -48,6 +49,7 @@ REGISTRY: dict[str, type[Strategy]] = {
     "reversal_choch": ReversalChoch,
     "wave_fib": WaveFib,
     "continuation_hvn": ContinuationHVN,
+    "ict_fvg": IctFvg,
 }
 
 

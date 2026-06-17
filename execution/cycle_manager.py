@@ -214,6 +214,34 @@ def _check_hard_sl(symbol: str, latest: Bar) -> list[dict]:
     return closed
 
 
+def _check_breakeven(symbol: str, latest: Bar, settings: dict | None = None) -> list[dict]:
+    """Move SL → entry once a cycle reaches +`be_at_r` (close-based). Opt-in
+    (settings.cycle.be_at_r > 0). One-shot: after the move SL sits at entry so the
+    condition can't re-fire. Used by `ict_fvg` to approximate its 'close beyond the
+    ChoCh swing low → break-even' rule (structurally ≈ +1R for these fib setups)."""
+    be_r = float((settings or {}).get("cycle", {}).get("be_at_r", 0.0) or 0.0)
+    if be_r <= 0:
+        return []
+    from execution.position_store import position_store
+    moved: list[dict] = []
+    ps = position_store()
+    c = latest.ohlc.c
+    for pos in ps.open_positions(symbol):
+        entry, sl = pos.avg_entry, pos.stop_loss
+        if not entry or not sl:
+            continue
+        risk = abs(entry - sl) or 1e-9
+        fav = (c - entry) if pos.side == "long" else (entry - c)
+        if fav / risk < be_r:
+            continue
+        if (pos.side == "long" and sl >= entry) or (pos.side == "short" and sl <= entry):
+            continue                              # already at/beyond break-even
+        ps.adjust_sl(pos.position_id, entry, reason="breakeven")
+        moved.append({"position_id": pos.position_id, "new_sl": round(entry, 4)})
+        LOG.info(f"[cycle] BREAK-EVEN {pos.position_id} {pos.side} SL→entry {entry:.2f} (+{be_r}R)")
+    return moved
+
+
 def _check_absorption_flip(symbol: str, latest: Bar) -> list[dict]:
     """Close any open cycle whose winner side gets absorbed at an extreme — the
     mirror of the entry trigger, now against us (the `coup` strategy's exit).
@@ -872,6 +900,15 @@ def on_bar_close(symbol: str, primary_tf: str, latest: Bar, settings: dict | Non
         LOG.exception(f"[cycle] check_tp failed: {e}")
         actions["tp_error"] = str(e)
 
+    # Break-even SL move — OPT-IN (settings.cycle.be_at_r > 0). Runs before the
+    # hard-SL check so a BE'd stop can close on the same bar it's reached.
+    if (settings or {}).get("cycle", {}).get("be_at_r"):
+        try:
+            actions["breakeven"] = _check_breakeven(symbol, latest, settings)
+        except Exception as e:
+            LOG.exception(f"[cycle] breakeven failed: {e}")
+            actions["be_error"] = str(e)
+
     # Hard-SL exit — OPT-IN (settings.cycle.hard_sl_exit). Default OFF preserves
     # the no-hard-SL / disaster-floor-only policy. When on (e.g. the `republic`
     # strategy), close a cycle the bar its low/high crosses pos.stop_loss.
@@ -922,6 +959,11 @@ def on_bar_close(symbol: str, primary_tf: str, latest: Bar, settings: dict | Non
             LOG.exception(f"[cycle] si_trail failed: {e}")
             actions["si_trail_error"] = str(e)
 
+    # TP-mutation gate: tp_participation + poc_trail rewrite a cycle's TP every bar.
+    # Strategies that need a HARD, static TP (e.g. ict_fvg's 4R) set this False; all
+    # others default True → unchanged behaviour.
+    _tp_mut = bool((settings or {}).get("cycle", {}).get("tp_mutation_enabled", True))
+
     # TP participation adjustment — extend/shrink TP based on live order-flow score
     try:
         from pipeline.features.tp_participation import adjust_tp as _tp_adjust
@@ -933,7 +975,7 @@ def on_bar_close(symbol: str, primary_tf: str, latest: Bar, settings: dict | Non
         _atr_val = _atr(_recent) if _recent else None
         from execution.position_store import position_store as _pos_store
         _pstore = _pos_store()
-        for _pos in _pstore.open_positions(symbol):
+        for _pos in (_pstore.open_positions(symbol) if _tp_mut else []):
             if _pos.tp is None or _atr_val is None:
                 continue
             _new_tp, _reason = _tp_adjust(
@@ -972,7 +1014,7 @@ def on_bar_close(symbol: str, primary_tf: str, latest: Bar, settings: dict | Non
             _max_ext_mult = float(
                 (settings.get("cycle") or {}).get("poc_trail_max_ext_atr_mult", 3.0)
             )
-            for _pos2 in _pstore2.open_positions(symbol):
+            for _pos2 in (_pstore2.open_positions(symbol) if _tp_mut else []):
                 if _pos2.tp is None:
                     continue
                 _min_dist = _poc_trail_mult * _atr2_val
