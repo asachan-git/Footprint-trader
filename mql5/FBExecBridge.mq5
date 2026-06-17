@@ -434,12 +434,34 @@ void PollAndExecute()
 //+------------------------------------------------------------------+
 void ClearZones()
 {
-   int total = ObjectsTotal(0, -1, OBJ_RECTANGLE);
+   // Clear ALL of our objects (rectangles, VP-level HLINEs, fulcrum) — they're all
+   // redrawn each refresh from the fresh /exec/zones payload.
+   int total = ObjectsTotal(0, -1, -1);
    for(int i = total - 1; i >= 0; i--)
    {
-      string name = ObjectName(0, i, -1, OBJ_RECTANGLE);
+      string name = ObjectName(0, i, -1, -1);
       if(StringFind(name, ZONE_PREFIX) == 0) ObjectDelete(0, name);
    }
+}
+
+//--- Draw a VP point-level (POC/VAH/VAL/naked-POC) the grid triggers on, as a labeled
+//    dotted HLINE. Colour by kind so they're distinct from the magenta-dashed fulcrum.
+void DrawLevel(const string kind, double price)
+{
+   string name = ZONE_PREFIX + "lvl_" + kind;
+   color  clr  = clrGray;
+   if(kind == "poc")            clr = clrGold;
+   else if(kind == "vah" || kind == "val") clr = clrDodgerBlue;
+   else if(kind == "naked_poc") clr = clrOrangeRed;
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
+   ObjectSetDouble (0, name, OBJPROP_PRICE, 0, price);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DOT);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, name, OBJPROP_BACK,  true);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetString (0, name, OBJPROP_TEXT, kind);
 }
 
 void DrawZone(int idx, const string kind, double lo, double hi)
@@ -490,6 +512,16 @@ void FetchAndDrawZones()
       if(lo > 0 && hi > 0) DrawZone(i, kind, lo, hi);
    }
 
+   //--- draw the VP point-levels the grid triggers on (POC/VAH/VAL/naked-POC)
+   string lv[];
+   int nl = JsonSplitArray(resp, "levels", lv);
+   for(int i = 0; i < nl; i++)
+   {
+      string lk = JsonGetString(lv[i], "kind");
+      double lp = JsonGetNumber(lv[i], "price");
+      if(lp > 0 && lk != "") DrawLevel(lk, lp);
+   }
+
    //--- draw the last-armed grid's fulcrum (the touched edge the straddle anchors on)
    double fulcrum  = JsonGetNumber(resp, "fulcrum");
    string emitTF   = JsonGetString(resp, "emit_tf");
@@ -509,8 +541,8 @@ void FetchAndDrawZones()
    }
    else ObjectDelete(0, fname);
 
-   if(InpVerbose && n > 0)
-      Print("🟦 Drew ", n, " ", InpZoneTF, " zones | fulcrum ",
+   if(InpVerbose && (n > 0 || nl > 0))
+      Print("🟦 Drew ", n, " zones + ", nl, " VP levels | fulcrum ",
             DoubleToString(fulcrum, _Digits), " (", emitTF, " ", emitEdge, ")");
 }
 

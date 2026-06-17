@@ -314,9 +314,20 @@ def exec_zones():
         zones.append({"kind": "lvn", "lo": round(float(z["low"]), 5),
                       "hi": round(float(z["high"]), 5)})
 
+    # VP point-levels the grid actually TRIGGERS on (vp_level_touch fulcrums), drawn as
+    # labeled lines — only the levels enabled in grid_levels.vp_fulcrum_levels. Same
+    # venue-shifted daily VP, so they line up with the zones above and the dashboard.
+    enabled = set((settings.get("grid_levels") or {}).get("vp_fulcrum_levels", []) or [])
+    levels = []
+    for k in ("poc", "vah", "val", "naked_poc"):
+        if k in enabled:
+            v = daily.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                levels.append({"kind": k, "price": round(float(v), 5)})
+
     quote = ExecBridge.get_quote(account, broker_symbol) or {}
     arm = ExecBridge.get_last_arm(account, broker_symbol) or {}
-    return jsonify({"ok": True, "zones": zones,
+    return jsonify({"ok": True, "zones": zones, "levels": levels,
                     "venue_mid": quote.get("mid", 0.0),
                     "symbol": symbol, "broker_symbol": broker_symbol,
                     "fulcrum": arm.get("fulcrum", 0.0), "emit_tf": arm.get("tf", ""),
