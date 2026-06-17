@@ -95,22 +95,40 @@ int JsonSplitArray(const string js, const string arrKey, string &out[])
    if(k < 0) return 0;
    int open = StringFind(js, "[", k);
    if(open < 0) return 0;
-   //--- find matching close bracket for the array (objects have no nested [])
-   int close = StringFind(js, "]", open);
-   if(close < 0) return 0;
-   string body = StringSubstr(js, open + 1, close - open - 1);
 
-   int pos = 0;
-   while(true)
+   //--- Depth-aware walk: find the matching ']' for THIS array by bracket depth,
+   //    split only its DIRECT child objects (depthArr==1), and skip any '[' ']'
+   //    '{' '}' that appear inside quoted strings. Robust to nested arrays/objects
+   //    and to brackets inside string values (the old first-']' scan was not).
+   int len = StringLen(js);
+   int depthArr = 0, depthObj = 0, objStart = -1;
+   bool inStr = false;
+   for(int i = open; i < len; i++)
    {
-      int objOpen = StringFind(body, "{", pos);
-      if(objOpen < 0) break;
-      int objClose = StringFind(body, "}", objOpen);
-      if(objClose < 0) break;
-      int n = ArraySize(out);
-      ArrayResize(out, n + 1);
-      out[n] = StringSubstr(body, objOpen, objClose - objOpen + 1);
-      pos = objClose + 1;
+      ushort ch = StringGetCharacter(js, i);
+      if(inStr)
+      {
+         if(ch == '\\') { i++; continue; }   // skip escaped char inside a string
+         if(ch == '"') inStr = false;
+         continue;
+      }
+      if(ch == '"') { inStr = true; continue; }
+      if(ch == '[') { depthArr++; continue; }
+      if(ch == ']') { depthArr--; if(depthArr == 0) break; continue; }
+      if(depthArr == 1)
+      {
+         if(ch == '{') { if(depthObj == 0) objStart = i; depthObj++; }
+         else if(ch == '}')
+         {
+            depthObj--;
+            if(depthObj == 0 && objStart >= 0)
+            {
+               int n = ArraySize(out); ArrayResize(out, n + 1);
+               out[n] = StringSubstr(js, objStart, i - objStart + 1);
+               objStart = -1;
+            }
+         }
+      }
    }
    return ArraySize(out);
 }

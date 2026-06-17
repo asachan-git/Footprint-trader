@@ -105,7 +105,9 @@ def exec_emit_grid():
     account = str(body.get("account") or "")
     req_symbol = body.get("symbol") or settings["instrument"]["symbol"]
     tf = body.get("tf") or settings["instrument"]["primary_tf"]
-    trigger_hint = str(body.get("trigger_hint") or "hvn_inside_touch")
+    # "structural" = {hvn_inside_touch, vp_level_touch} — arm the best of HVN-edge or
+    # VP-level (POC/VAH/VAL/naked-POC/LVN) touch. May also be one kind or a comma list.
+    trigger_hint = str(body.get("trigger_hint") or "structural")
     close_first = bool(body.get("close_first", True))
     if not account:
         return jsonify({"ok": False, "error": "missing account"}), 400
@@ -124,7 +126,7 @@ def exec_emit_grid():
                                        f"(EA must poll first)"}), 409
 
     from pipeline.state_store import store
-    from execution.grid_planner import plan_grid_levels
+    from execution.grid_planner import plan_grid_levels, _hint_set
     latest = store().latest(symbol, tf)
     if latest is None:
         return jsonify({"ok": False, "verdict": "skip",
@@ -142,9 +144,10 @@ def exec_emit_grid():
                         "symbol": symbol, "broker_symbol": broker_symbol})
 
     # Strict: plan_grid_levels falls back to ALL triggers when the hinted one is
-    # absent — but emit must fire ONLY the requested strategy, never a stray
-    # hvn_edge/va/etc. grid. Mismatch → treat as no-arm.
-    if trigger_hint and plan.trigger_kind != trigger_hint:
+    # absent — but emit must fire ONLY a requested-group strategy, never a stray
+    # hvn_edge/va/imbalance grid. Membership (not equality) so the group works.
+    hint_set = _hint_set(trigger_hint)
+    if hint_set and plan.trigger_kind not in hint_set:
         ExecBridge.clear_emit(account, symbol, tf)
         _emit_audit({"account": account, "symbol": symbol, "tf": tf, "verdict": "skip",
                      "skip_reason": f"trigger_mismatch:{plan.trigger_kind}"})
@@ -171,6 +174,18 @@ def exec_emit_grid():
                             "symbol": symbol, "broker_symbol": broker_symbol, "open": open_state})
         # same tf, flat → fall through and refresh the straddle at the new edge
 
+    # Fulcrum dedup: ONE grid per touched-level episode. Skip if the fulcrum hasn't
+    # moved beyond tol since the last arm (prevents re-placing the identical straddle
+    # every bar while price camps on a level). clear_emit (called on every skip above)
+    # resets it, so a moved fulcrum re-arms. mark_emit set after a successful arm.
+    dedup_pct = float((settings.get("grid_levels") or {}).get("emit_dedup_pct", 0.0007) or 0.0)
+    dedup_tol = float(quote["mid"]) * dedup_pct
+    if not force and not ExecBridge.should_emit(account, symbol, tf, plan.fulcrum, dedup_tol):
+        _emit_audit({"account": account, "symbol": symbol, "tf": tf, "verdict": "skip",
+                     "skip_reason": "dedup:same_fulcrum", "fulcrum": plan.fulcrum})
+        return jsonify({"ok": True, "verdict": "skip", "skip_reason": "dedup:same_fulcrum",
+                        "symbol": symbol, "broker_symbol": broker_symbol})
+
     # Re-arm clears stale pendings with CANCEL_PENDINGS (never CLOSE_ALL) so it can't
     # flatten a live position. The deliberate flatten is owned solely by monitor_cycle.
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
@@ -184,6 +199,7 @@ def exec_emit_grid():
                             n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
                             net_target_usd=net_target, max_pos_seen=0, pend_seen=0, flatten_ts=0.0)
+    ExecBridge.mark_emit(account, symbol, tf, plan.fulcrum)   # dedup: this fulcrum is now armed
     _emit_audit({"account": account, "symbol": symbol, "broker_symbol": broker_symbol,
                  "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind, "edge": edge,
                  "fulcrum": plan.fulcrum, "venue_mid": quote["mid"],
@@ -264,12 +280,15 @@ def exec_test_order():
 
 @bp.post("/exec/zones")
 def exec_zones():
-    """Current rolling-VP HVN/LVN zones for symbol/tf, rebased onto the account's
-    cached venue price, for the EA to draw on the chart.
+    """HVN/LVN zones for the EA to draw — the SAME source the dashboard renders:
+    the cached, session-anchored DAILY VP (vp_cache.get), already venue-shifted by
+    the configured additive offset. This deliberately matches the dashboard's
+    VolumeProfile panel, NOT the rolling-window VP the grid trigger uses (so the
+    drawn zones are for visual parity; the armed fulcrum may sit on a session-rolling
+    edge that differs slightly).
 
-    Body: {account, symbol(broker or analysis), tf}.
-    Returns {ok, zones:[{kind:"hvn"|"lvn", lo, hi}], venue_mid}. Empty if no quote
-    or no profile yet.
+    Body: {account, symbol(broker or analysis), [tf]}. `tf` is accepted but ignored —
+    daily VP is one period. Returns {ok, zones:[{kind, lo, hi}], venue_mid, fulcrum}.
     """
     if not _auth_ok():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
@@ -277,42 +296,28 @@ def exec_zones():
     body = request.get_json(silent=True) or {}
     account = str(body.get("account") or "")
     req_symbol = body.get("symbol") or settings["instrument"]["symbol"]
-    tf = body.get("tf") or "15m"
 
     symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
     broker_to_analysis = {v: k for k, v in symbol_map.items()}
     symbol = broker_to_analysis.get(req_symbol, req_symbol)
     broker_symbol = symbol_map.get(symbol, req_symbol)
 
-    quote = ExecBridge.get_quote(account, broker_symbol)
-    if not quote:
-        return jsonify({"ok": True, "zones": [], "reason": "no venue quote cached"})
-
-    from pipeline.state_store import store
-    from pipeline.features.volume_profile import compute as vp_compute, DEFAULT_BIN_SIZE
-    _VP_WIN = {"15m": 96, "5m": 288, "1m": 1440}
-    win = _VP_WIN.get(tf, 96)
-    bars = store().recent(symbol, tf, win)
-    if len(bars) < 20:
-        return jsonify({"ok": True, "zones": [], "reason": "not enough bars"})
-
-    analysis_anchor = float(bars[-1].ohlc.c)
-    ratio = float(quote["mid"]) / analysis_anchor if analysis_anchor > 0 else 1.0
-    try:
-        vp = vp_compute(bars, "daily", analysis_anchor, bin_size=DEFAULT_BIN_SIZE.get(symbol))
-    except Exception as e:
-        return jsonify({"ok": True, "zones": [], "reason": f"vp_error:{e}"})
-
+    # Same call as the dashboard (server/routes/dashboard.py): cached daily VP with
+    # the additive venue offset already applied → zones are in the venue frame.
+    from pipeline.features import vp_cache
+    daily = vp_cache.get(symbol, "daily") or {}
     zones = []
-    for z in (vp.hvn_zones or []):
-        zones.append({"kind": "hvn", "lo": round(float(z["low"]) * ratio, 5),
-                      "hi": round(float(z["high"]) * ratio, 5)})
-    for z in (vp.lvn_zones or []):
-        zones.append({"kind": "lvn", "lo": round(float(z["low"]) * ratio, 5),
-                      "hi": round(float(z["high"]) * ratio, 5)})
-    # surface the last-armed grid so the EA can draw the fulcrum (touched edge)
+    for z in (daily.get("hvn_zones") or []):
+        zones.append({"kind": "hvn", "lo": round(float(z["low"]), 5),
+                      "hi": round(float(z["high"]), 5)})
+    for z in (daily.get("lvn_zones") or []):
+        zones.append({"kind": "lvn", "lo": round(float(z["low"]), 5),
+                      "hi": round(float(z["high"]), 5)})
+
+    quote = ExecBridge.get_quote(account, broker_symbol) or {}
     arm = ExecBridge.get_last_arm(account, broker_symbol) or {}
-    return jsonify({"ok": True, "zones": zones, "venue_mid": quote["mid"],
+    return jsonify({"ok": True, "zones": zones,
+                    "venue_mid": quote.get("mid", 0.0),
                     "symbol": symbol, "broker_symbol": broker_symbol,
                     "fulcrum": arm.get("fulcrum", 0.0), "emit_tf": arm.get("tf", ""),
                     "emit_edge": arm.get("edge", "")})

@@ -300,6 +300,21 @@ class ExecBridge:
         Optionally prepend a clear command: clear_kind="flatten" → CLOSE_ALL (close
         positions + cancel pendings); "cancel" → CANCEL_PENDINGS (cancel stale pendings
         only, never touch a live position — the safe re-arm path)."""
+        # Per-order tag = the source level, so each grid's legs are identifiable in the
+        # MT5 comment: FB|poc|b1, FB|vah|s2, FB|hvn|b3 … (vp_level_touch → its level_type;
+        # hvn_inside_touch → "hvn"; else the trigger kind). All legs of one grid share
+        # the level; b/s + index distinguish legs. (MT5 comment cap ~31 chars — fits.)
+        ctx = getattr(plan, "trigger_context", {}) or {}
+        kind = getattr(plan, "trigger_kind", "") or ""
+        if kind == "vp_level_touch":
+            tag = str(ctx.get("level_type") or "vp")
+        elif kind == "hvn_inside_touch":
+            tag = "hvn"
+        elif kind == "squeeze":
+            tag = "sqz"
+        else:
+            tag = (kind[:8] or "grid")
+
         out: list[Command] = []
         if close_first:
             clear_cmd = CLOSE_ALL if clear_kind == "flatten" else CANCEL_PENDINGS
@@ -308,12 +323,12 @@ class ExecBridge:
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="buy_stop",
                 price=leg.price, lot=leg.lot, sl=0.0, tp=getattr(plan, "buy_tp", 0.0),
-                comment=f"FB|hvn|b{i + 1}"))
+                comment=f"FB|{tag}|b{i + 1}"))
         for i, leg in enumerate(getattr(plan, "sell_legs", []) or []):
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="sell_stop",
                 price=leg.price, lot=leg.lot, sl=0.0, tp=getattr(plan, "sell_tp", 0.0),
-                comment=f"FB|hvn|s{i + 1}"))
+                comment=f"FB|{tag}|s{i + 1}"))
         return out
 
     # ── poll (EA pulls) ──────────────────────────────────────────────────────
