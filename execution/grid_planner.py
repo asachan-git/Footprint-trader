@@ -70,6 +70,20 @@ class GridPlan:
     trigger_context: dict = field(default_factory=dict)   # detector metadata (edge side, session…)
 
 
+# trigger-hint groups: a hint may name one kind, a comma list, or a group keyword.
+_HINT_GROUPS = {"structural": {"hvn_inside_touch", "vp_level_touch", "squeeze"}}
+
+
+def _hint_set(hint: str) -> set[str]:
+    """Resolve a trigger_hint into the set of acceptable trigger kinds.
+    "" → empty (no filter); a group keyword → its members; else comma-split kinds."""
+    if not hint:
+        return set()
+    if hint in _HINT_GROUPS:
+        return set(_HINT_GROUPS[hint])
+    return {k.strip() for k in hint.split(",") if k.strip()}
+
+
 # ── confluence scoring (the edge) ───────────────────────────────────────────
 
 def _bb_stretch(bars, current_price: float, period: int = 20, mult: float = 2.0) -> float:
@@ -151,12 +165,17 @@ def _should_skip(trigger: Trigger | None, regime, fulcrum: float,
     """Don't arm a straddle where price will oscillate through both ladders."""
     if trigger is None:
         return True, "no_trigger"
-    # HVN-edge / inside-touch triggers ARE meant to sit at a node edge; only skip
-    # non-HVN fulcrums that fall *inside* a node body.
-    if trigger.kind not in ("hvn_edge", "hvn_inside_touch") and _price_inside_hvn(fulcrum, daily_vp):
+    # HVN-edge / inside-touch / VP-level triggers ARE meant to sit ON structure
+    # (an HVN edge or a POC/VA/LVN line, which usually lives inside a node); only skip
+    # other fulcrums that fall *inside* a node body.
+    if (trigger.kind not in ("hvn_edge", "hvn_inside_touch", "vp_level_touch", "squeeze")
+            and _price_inside_hvn(fulcrum, daily_vp)):
         return True, "chop:inside_hvn"
     if daily_vp and daily_vp.get("current_position") == "at_poc":
-        return True, "chop:at_poc"
+        # a POC / naked-POC fulcrum SHOULD arm at the POC — that's the setup, not chop.
+        if not (trigger.kind == "vp_level_touch"
+                and trigger.context.get("level_type") in ("poc", "naked_poc")):
+            return True, "chop:at_poc"
     # Genuine balance/chop = regime is uncertain AND there IS initial-balance data
     # showing little expansion. When regime is simply absent (no session data, e.g.
     # historical replay), don't hard-skip — the trigger itself carries the edge.
@@ -406,9 +425,10 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     plan_id = f"{symbol}-{tf}-{(bars[-1].close_ts if bars else 0)}"
 
     triggers = zone_triggers.detect_all(symbol, tf, current_price, regime,
-                                        atr=atr, daily_vp=daily_vp)
-    if trigger_hint:
-        hinted = [t for t in triggers if t.kind == trigger_hint]
+                                        atr=atr, daily_vp=daily_vp, cfg=grid_cfg)
+    hint_set = _hint_set(trigger_hint)
+    if hint_set:
+        hinted = [t for t in triggers if t.kind in hint_set]
         if hinted:
             triggers = hinted
 
@@ -439,16 +459,19 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
     buy_tp, sell_tp = _resolve_tps(symbol, fulcrum, buy_legs, sell_legs, atr, tp_mult)
 
-    # hvn_inside_touch: target HVN structure, not generic zones — buy_tp = next
-    # node-top above the tapped edge, sell_tp = next node-bottom below (same-node
-    # opposite edge, or next HVN's far edge across the LVN). Falls back to the
-    # _resolve_tps result if a structural target is missing or on the wrong side.
-    if fulcrum_t.kind == "hvn_inside_touch":
-        tp_up = float(fulcrum_t.context.get("tp_up", 0.0) or 0.0)
-        tp_down = float(fulcrum_t.context.get("tp_down", 0.0) or 0.0)
-        if tp_up > fulcrum:
+    # Structural TP override: any trigger that pre-computed tp_up/tp_down (HVN
+    # node edges for hvn_inside_touch; adjacent VP levels for vp_level_touch) targets
+    # that structure. Guard: the target must lie BEYOND the OUTER leg, else it would
+    # sit inside the ladder and the grid could never profit — in that case keep the
+    # _resolve_tps()/ATR fallback already computed above.
+    tp_up = float(fulcrum_t.context.get("tp_up", 0.0) or 0.0)
+    tp_down = float(fulcrum_t.context.get("tp_down", 0.0) or 0.0)
+    if tp_up or tp_down:
+        top_leg = max((l.price for l in buy_legs), default=fulcrum)
+        bot_leg = min((l.price for l in sell_legs), default=fulcrum)
+        if tp_up > top_leg:
             buy_tp = round(tp_up, 4)
-        if 0.0 < tp_down < fulcrum:
+        if 0.0 < tp_down < bot_leg:
             sell_tp = round(tp_down, 4)
 
     plan = GridPlan(

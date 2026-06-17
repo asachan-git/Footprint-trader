@@ -50,7 +50,22 @@ grid_levels:
   cycle_net_target_usd: 50.0      # base net floating-$ target; tune on demo (micro-lot swings are small)
   cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full
   cycle_min_target_usd: 0.20     # floor; must be >0 so a hedged cycle still has a positive net-$ exit
-  cycle_close_on_full_hedge: true  # cut a fully-hedged (delta-neutral) cycle to free margin — realizes a loss
+  cycle_close_on_full_hedge: true  # cut a fully-hedged (delta-neutral) cycle to free margin
+  # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
+  triggers: [hvn_inside_touch, vp_level_touch, squeeze]   # "structural" group the emitter arms
+  vp_fulcrum_levels: [poc, vah, val, naked_poc, lvn]   # which VP levels are fulcrums
+  vp_tol_atr_mult: 0.25      # tap "test" band = max(this·ATR, vp_tol_pct·price)
+  vp_tol_pct: 0.0005         # ATR-free floor for the tap band (replay safety)
+  vp_merge_atr_mult: 0.15    # merge coincident VP levels within this·ATR (stronger wins)
+  emit_dedup_pct: 0.0007     # skip re-arm if fulcrum moved < this·venue_mid (anti-churn) — realizes a loss
+  # Volatility squeeze→expansion (TTM Squeeze): BB(20,2) inside Keltner(20,1.5·meanTR),
+  # fire on RELEASE after a run. Neutral straddle positions before the displacement.
+  squeeze_enabled: true
+  squeeze_bb_period: 20
+  squeeze_bb_mult: 2.0
+  squeeze_kc_period: 20
+  squeeze_kc_mult: 1.5
+  squeeze_min_on_bars: 6     # require ≥this consecutive squeeze-ON bars before a release fires
 
 # Startup preflight — server REFUSES to start unless footprint + VP data are present.
 startup_check:

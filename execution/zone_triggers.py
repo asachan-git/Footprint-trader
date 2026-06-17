@@ -26,6 +26,7 @@ planner's scorer.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -345,6 +346,204 @@ def _t_va(symbol: str, current_price: float, regime, daily_vp: dict | None) -> T
     )
 
 
+_VP_LEVEL_BASE_CONF = {"naked_poc": 0.80, "poc": 0.75, "vah": 0.70, "val": 0.70, "lvn": 0.60}
+
+
+def _t_vp_level_touch(symbol: str, tf: str, current_price: float,
+                      daily_vp: dict | None, atr: float, cfg: dict | None = None) -> Trigger | None:
+    """Neutral straddle armed at a VP LEVEL (POC / VAH / VAL / naked-POC / LVN) when
+    the just-closed candle TAPS it and TESTS it — wick reaches the level, close stays
+    within `tol` of it (a test, not a decisive break). Companion to _t_hvn_inside_touch
+    for line-shaped levels; TPs target the next VP structure either side (LVN's vacuum
+    naturally targets its bounding HVN/value). Stateless / causal.
+
+    Anti-churn: fires only on a FRESH approach — the prior bar's close must NOT already
+    be parked within `tol` of the same level (else camping on POC fires every bar). The
+    route-level fulcrum dedup is the second guard.
+    """
+    if not daily_vp:
+        return None
+    cfg = cfg or {}
+    enabled = set(cfg.get("vp_fulcrum_levels", ["poc", "vah", "val", "naked_poc", "lvn"]))
+    tol_atr = float(cfg.get("vp_tol_atr_mult", 0.25))
+    tol_pct = float(cfg.get("vp_tol_pct", 0.0005))
+    merge_atr = float(cfg.get("vp_merge_atr_mult", 0.15))
+    if not enabled:
+        return None
+
+    from pipeline.state_store import store
+    bars = store().recent(symbol, tf, 3)
+    if len(bars) < 2:
+        return None
+    cur, prev = bars[-1], bars[-2]
+    c, h, lo_p, pc = cur.ohlc.c, cur.ohlc.h, cur.ohlc.l, prev.ohlc.c
+
+    def _tol(price: float) -> float:
+        return max(tol_atr * atr if atr > 0 else 0.0, tol_pct * price)
+
+    # candidate fulcrum levels (point levels + LVN mids), tagged with base confidence
+    cands: list[tuple[float, str, float]] = []
+    for key in ("naked_poc", "poc", "vah", "val"):
+        if key in enabled:
+            v = daily_vp.get(key)
+            if isinstance(v, (int, float)) and v > 0:
+                cands.append((float(v), key, _VP_LEVEL_BASE_CONF[key]))
+    if "lvn" in enabled:
+        for z in (daily_vp.get("lvn_zones") or []):
+            mid = (float(z["low"]) + float(z["high"])) / 2.0
+            if mid > 0:
+                cands.append((mid, "lvn", _VP_LEVEL_BASE_CONF["lvn"]))
+    if not cands:
+        return None
+
+    # collision merge: levels within merge_tol coincide → keep the higher-conf one
+    # (its exact price), strongest type wins (naked_poc > poc > va > lvn).
+    cands.sort(key=lambda x: x[0])
+    merged: list[tuple[float, str, float]] = []
+    for price, lt, bc in cands:
+        if merged and abs(price - merged[-1][0]) <= max(merge_atr * atr if atr > 0 else 0.0,
+                                                         tol_pct * price):
+            if bc > merged[-1][2]:
+                merged[-1] = (price, lt, bc)
+            continue
+        merged.append((price, lt, bc))
+
+    # tapped + tested + fresh-approach; pick the level nearest the close
+    best = None   # (dist, price, level_type, base_conf, tol)
+    for price, lt, bc in merged:
+        tol = _tol(price)
+        if tol <= 0 or not (lo_p <= price <= h):
+            continue
+        if abs(c - price) > tol:          # close is a break, not a test
+            continue
+        if abs(pc - price) <= tol:        # prior bar already parked here → not fresh
+            continue
+        dist = abs(price - c)
+        if best is None or dist < best[0]:
+            best = (dist, price, lt, bc, tol)
+    if best is None:
+        return None
+    _d, L, lt, bc, tol = best
+
+    # combined VP target set (point levels + HVN edges + LVN edges); nearest beyond
+    # the fulcrum, excluding anything within tol of it.
+    targets: list[float] = []
+    for key in ("poc", "vah", "val", "naked_poc"):
+        v = daily_vp.get(key)
+        if isinstance(v, (int, float)) and v > 0:
+            targets.append(float(v))
+    for z in (daily_vp.get("hvn_zones") or []):
+        targets += [float(z["low"]), float(z["high"])]
+    for z in (daily_vp.get("lvn_zones") or []):
+        targets += [float(z["low"]), float(z["high"])]
+    above = [t for t in targets if t > L + tol]
+    below = [t for t in targets if t < L - tol]
+    tp_up = min(above) if above else 0.0
+    tp_down = max(below) if below else 0.0
+
+    # sizing reach: gap to nearest other VP level (fallback va_width, ~3·ATR)
+    others = [p for p, _, _ in merged if abs(p - L) > tol]
+    raw_range = (min(abs(p - L) for p in others) if others
+                 else (float(daily_vp.get("va_width") or 0.0) or (3.0 * atr if atr > 0 else 0.0)))
+    if raw_range <= 0:
+        raw_range = max(L * 0.001, 1e-6)
+
+    conf = min(0.85, bc + (1.0 - abs(c - L) / tol) * 0.1) if tol > 0 else bc
+    return Trigger(
+        kind="vp_level_touch",
+        fulcrum_price=float(L),
+        raw_range=float(raw_range),
+        confidence=float(conf),
+        context={"bias": "none", "level_type": lt, "edge": lt,
+                 "tp_up": float(tp_up), "tp_down": float(tp_down)},
+    )
+
+
+def _t_squeeze(symbol: str, tf: str, current_price: float, atr: float,
+              cfg: dict | None = None) -> Trigger | None:
+    """Volatility squeeze → expansion (TTM Squeeze, John Carter). Squeeze is ON while
+    the Bollinger Bands (20, 2.0) sit ENTIRELY inside the Keltner Channels (20, 1.5·meanTR);
+    it FIRES on the RELEASE bar (BB expands back outside KC) after a run of ≥ min_on_bars.
+    A neutral straddle positions BEFORE the displacement — no direction needed, so the
+    momentum histogram is omitted. fulcrum = current price; raw_range = KC width (the
+    expanding band) sizes the legs. Stateless / causal.
+    """
+    cfg = cfg or {}
+    if not bool(cfg.get("squeeze_enabled", True)):
+        return None
+    period = int(cfg.get("squeeze_bb_period", 20))
+    bb_mult = float(cfg.get("squeeze_bb_mult", 2.0))
+    kc_period = int(cfg.get("squeeze_kc_period", period))
+    kc_mult = float(cfg.get("squeeze_kc_mult", 1.5))
+    min_on = int(cfg.get("squeeze_min_on_bars", 6))
+
+    from pipeline.state_store import store
+    win = max(period, kc_period)
+    bars = store().recent(symbol, tf, win + min_on + 6)
+    if len(bars) < win + min_on + 1:
+        return None
+    closes = [b.ohlc.c for b in bars]
+    highs = [b.ohlc.h for b in bars]
+    lows = [b.ohlc.l for b in bars]
+
+    def _stdev(vals: list[float]) -> float:
+        m = sum(vals) / len(vals)
+        return math.sqrt(sum((v - m) ** 2 for v in vals) / len(vals))
+
+    def _ema_at(e: int, p: int) -> float:
+        a = 2.0 / (p + 1)
+        s = max(0, e - p * 3)
+        val = closes[s]
+        for j in range(s + 1, e + 1):
+            val = a * closes[j] + (1.0 - a) * val
+        return val
+
+    def _tr(i: int) -> float:
+        if i == 0:
+            return highs[i] - lows[i]
+        return max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+
+    def _squeeze_at(e: int) -> tuple[bool, float, float]:
+        w = closes[e - period + 1:e + 1]
+        mid, sd = sum(w) / len(w), _stdev(w)
+        bb_u, bb_l = mid + bb_mult * sd, mid - bb_mult * sd
+        kmid = _ema_at(e, kc_period)
+        trs = [_tr(i) for i in range(e - kc_period + 1, e + 1)]
+        meantr = sum(trs) / len(trs)
+        kc_u, kc_l = kmid + kc_mult * meantr, kmid - kc_mult * meantr
+        return (bb_l > kc_l and bb_u < kc_u), (bb_u - bb_l), (kc_u - kc_l)
+
+    last = len(bars) - 1
+    on_now, bbw_now, kcw_now = _squeeze_at(last)
+    if on_now:
+        return None                       # still squeezed → wait for the release
+    on_prev, _, _ = _squeeze_at(last - 1)
+    if not on_prev:                        # released a while ago → not a fresh fire
+        return None
+    # count the consecutive ON run ending at last-1
+    run, e = 0, last - 1
+    while e >= period and run < min_on + 2:
+        o, _, _ = _squeeze_at(e)
+        if not o:
+            break
+        run += 1
+        e -= 1
+    if run < min_on:
+        return None
+
+    kc_width = kcw_now if kcw_now > 0 else (3.0 * atr if atr > 0 else max(current_price * 0.001, 1e-6))
+    bb_kc = (bbw_now / kcw_now) if kcw_now > 0 else 1.0
+    conf = min(0.8, 0.5 + 0.1 * min(run / max(min_on, 1), 2.0))   # longer squeeze → higher
+    return Trigger(
+        kind="squeeze",
+        fulcrum_price=float(current_price),
+        raw_range=float(kc_width),
+        confidence=float(conf),
+        context={"bias": "none", "interpretation": "volatility_release",
+                 "squeeze_bars": int(run), "bb_kc_ratio": round(bb_kc, 3)},
+    )
+
+
 def _t_cvd_div(symbol: str, tf: str, current_price: float, latest: Bar | None) -> Trigger | None:
     """CVD / delta divergence pivot. Exhaustion at the current bar's extreme is
     the fulcrum; bias points toward the divergence resolution."""
@@ -376,12 +575,14 @@ def _t_cvd_div(symbol: str, tf: str, current_price: float, latest: Bar | None) -
 # ── public entry ────────────────────────────────────────────────────────────
 
 def detect_all(symbol: str, tf: str, current_price: float, regime,
-               atr: float = 0.0, daily_vp: dict | None = None) -> list[Trigger]:
+               atr: float = 0.0, daily_vp: dict | None = None,
+               cfg: dict | None = None) -> list[Trigger]:
     """Run every detector; return the non-None triggers.
 
     `regime`   : DayType from day_type.get_regime (may be None).
     `atr`      : current ATR for anchor proximity / sizing (0 → anchor skipped).
     `daily_vp` : vp_cache.get(symbol, "daily") dict (fetched once by caller).
+    `cfg`      : grid_levels config (VP-level tolerances / enabled levels).
     """
     from pipeline.state_store import store
     latest = store().latest(symbol, tf)
@@ -393,6 +594,8 @@ def detect_all(symbol: str, tf: str, current_price: float, regime,
         _t_hvn_inside_touch(symbol, tf, current_price),
         _t_anchor(symbol, current_price, atr, latest),
         _t_va(symbol, current_price, regime, daily_vp),
+        _t_vp_level_touch(symbol, tf, current_price, daily_vp, atr, cfg),
+        _t_squeeze(symbol, tf, current_price, atr, cfg),
         _t_cvd_div(symbol, tf, current_price, latest),
     ):
         if t is not None:
