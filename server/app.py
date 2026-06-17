@@ -101,6 +101,11 @@ def create_app() -> Flask:
     settings = load_settings()
     app.config["FB_SETTINGS"] = settings
     _precompute_vp(settings)
+    # Preflight: footprint must cover ≥5d and VP/HVN/LVN must be present, else REFUSE
+    # to start (no trading on stale/short data). Runs after VP build so it checks the
+    # freshly-computed cache. Disable via startup_check.enabled=false (not for live).
+    from pipeline.startup_check import assert_ready
+    assert_ready(settings)
     _backfill_sweeps(settings)
     try:
         from pipeline.feed_monitor import start as _start_gap_monitor

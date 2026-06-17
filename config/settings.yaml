@@ -38,6 +38,30 @@ instrument:
   timeframes: [1m, 5m, 15m]
   primary_tf: 1m           # decision fires on close of this TF; higher TFs join as-of
 
+# Footprint-driven neutral-grid placement (/exec/emit_grid + FBExecBridge EA).
+# Planner reads these via .get() defaults — block is optional but canonical here.
+grid_levels:
+  base_lot: 0.01
+  lot_step: 0.01
+  tp_atr_mult: 1.5
+  hvn_max_legs: 8
+  max_fulcrum_dist_pct: 0.05
+  # Cycle exit (server-side cycle monitor). DEMO ONLY — strategy is -EV.
+  cycle_net_target_usd: 50.0      # base net floating-$ target; tune on demo (micro-lot swings are small)
+  cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full
+  cycle_min_target_usd: 0.20     # floor; must be >0 so a hedged cycle still has a positive net-$ exit
+  cycle_close_on_full_hedge: true  # cut a fully-hedged (delta-neutral) cycle to free margin — realizes a loss
+
+# Startup preflight — server REFUSES to start unless footprint + VP data are present.
+startup_check:
+  enabled: true
+  min_days: 5                # require ≥5d footprint span + ≥5 daily VP periods / symbol
+  max_period_age_days: 3     # latest VP daily period must be this fresh (3d allows weekend)
+  require_hvn: true          # latest VP period must carry HVN zones
+  stale_warn_hours: 6        # WARN (not block) if newest footprint bar older than this
+  min_density_pct: 0.5       # WARN if <50% of expected bars in the window (gaps)
+  # symbols / tfs default to vp_cache.symbols and instrument.timeframes
+
 claude:
   mode: restricted           # full | restricted | off
   model: claude-sonnet-4-6

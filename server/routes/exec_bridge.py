@@ -60,6 +60,18 @@ def exec_poll():
     if sym and ("positions" in body or "pendings" in body):
         ExecBridge.set_open(account, sym, int(body.get("positions", 0)),
                             int(body.get("pendings", 0)))
+    # Cycle monitor: decide exits on THIS poll's fresh quote/open-state so a flatten
+    # ships in the same response (saves a ~1s round-trip). Runs BEFORE poll(). Gated on
+    # field presence → an older EA binary (no pnl/buys/sells) just skips net-$/full-hedge.
+    if sym:
+        buys = int(body["buys"]) if "buys" in body else None
+        sells = int(body["sells"]) if "sells" in body else None
+        pnl = float(body["pnl"]) if "pnl" in body else None
+        try:
+            ExecBridge.monitor_cycle(account, sym, current_app.config.get("FB_SETTINGS"),
+                                     pnl=pnl, buys=buys, sells=sells)
+        except Exception:
+            LOG.exception("[exec] cycle monitor error")  # never break the poll
     commands = ExecBridge.poll(account)
     if commands:
         LOG.info(f"[exec] poll account={account} → {len(commands)} command(s)")
@@ -140,23 +152,38 @@ def exec_emit_grid():
                         "skip_reason": f"no_{trigger_hint}_trigger (got {plan.trigger_kind})",
                         "symbol": symbol, "broker_symbol": broker_symbol})
 
-    # Re-arm gate: keep placing on each touch WHILE FLAT, but never stack onto a live
-    # position. If a leg has filled (position open) → skip until it closes. With no
-    # position, each touch re-arms: close_first cancels stale pendings and places a
-    # fresh straddle at the new edge. (Gate on positions, not pendings — pendings are
-    # meant to be refreshed each touch.)
+    # Cycle-ownership gate: exactly ONE active cycle per (account, broker_symbol).
+    # There is a single position pool per (symbol, magic) — the EA can't attribute a
+    # fill to 5m vs 15m — so overlapping cycles are incoherent. Skip if a cycle is
+    # active and owned by a DIFFERENT tf. The owning tf may refresh ONLY while flat
+    # (re-place the straddle at the newest edge). This replaces the stale-open-state
+    # positions>0 gate that let a re-arm flatten freshly-filled positions.
+    arm = ExecBridge.get_last_arm(account, broker_symbol) or {}
     open_state = ExecBridge.get_open(account, broker_symbol)
-    if not bool(body.get("force", False)) and open_state.get("positions", 0) > 0:
-        return jsonify({"ok": True, "verdict": "skip", "skip_reason": "position_open",
-                        "symbol": symbol, "broker_symbol": broker_symbol,
-                        "open": open_state})
+    force = bool(body.get("force", False))
+    if not force and arm.get("active"):
+        owner_tf = arm.get("armed_tf", "")
+        if owner_tf and owner_tf != tf:
+            return jsonify({"ok": True, "verdict": "skip", "skip_reason": f"cycle_owned_by:{owner_tf}",
+                            "symbol": symbol, "broker_symbol": broker_symbol})
+        if open_state.get("positions", 0) > 0:
+            return jsonify({"ok": True, "verdict": "skip", "skip_reason": "position_open",
+                            "symbol": symbol, "broker_symbol": broker_symbol, "open": open_state})
+        # same tf, flat → fall through and refresh the straddle at the new edge
 
-    cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan, close_first=close_first)
+    # Re-arm clears stale pendings with CANCEL_PENDINGS (never CLOSE_ALL) so it can't
+    # flatten a live position. The deliberate flatten is owned solely by monitor_cycle.
+    cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
+                                        close_first=close_first, clear_kind="cancel")
     edge = plan.trigger_context.get("edge", "")
-    # ground truth: the touched edge (= fulcrum), TF, side, and full leg ladder
+    net_target = float(((settings.get("grid_levels") or {}).get("cycle_net_target_usd", 0.0)) or 0.0)
+    # ground truth + cycle state: touched edge (=fulcrum), TF owner, structural targets
+    # (tp_up=buy target, tp_down=sell target), and the exit-monitor bookkeeping fields.
     ExecBridge.set_last_arm(account, broker_symbol, fulcrum=plan.fulcrum, tf=tf, edge=edge,
                             trigger_kind=plan.trigger_kind, venue_mid=quote["mid"],
-                            n_per_side=plan.n_per_side, step=plan.step, ts=time.time())
+                            n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
+                            active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
+                            net_target_usd=net_target, max_pos_seen=0, pend_seen=0, flatten_ts=0.0)
     _emit_audit({"account": account, "symbol": symbol, "broker_symbol": broker_symbol,
                  "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind, "edge": edge,
                  "fulcrum": plan.fulcrum, "venue_mid": quote["mid"],

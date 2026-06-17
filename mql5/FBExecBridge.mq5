@@ -268,17 +268,79 @@ int CountMyPendings()
    return n;
 }
 
+//--- Per-side open counts + basket floating P&L (for the server cycle monitor).
+//    NOTE: POSITION_COMMISSION is often 0 on the open position (commission lands on
+//    the deal), so pnl may understate true cost — verify on the demo broker.
+int CountMyBuys()
+{
+   int n = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(posInfo.SelectByIndex(i))
+         if(posInfo.Magic() == InpMagic && posInfo.Symbol() == _Symbol
+            && posInfo.PositionType() == POSITION_TYPE_BUY) n++;
+   return n;
+}
+
+int CountMySells()
+{
+   int n = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(posInfo.SelectByIndex(i))
+         if(posInfo.Magic() == InpMagic && posInfo.Symbol() == _Symbol
+            && posInfo.PositionType() == POSITION_TYPE_SELL) n++;
+   return n;
+}
+
+double SumMyPnL()
+{
+   double total = 0.0;
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(posInfo.SelectByIndex(i))
+         if(posInfo.Magic() == InpMagic && posInfo.Symbol() == _Symbol)
+            total += posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+   return total;
+}
+
+//+------------------------------------------------------------------+
+//| Cancel this EA's pending orders ONLY (leave positions). The safe   |
+//| re-arm clear — can never flatten a live position.                  |
+//+------------------------------------------------------------------+
+bool ExecCancelPendings(const string cmd, int &cancelled, string &err)
+{
+   string sym = JsonGetString(cmd, "symbol");
+   cancelled = 0; err = "";
+   bool allOk = true;
+
+   ulong pend[];
+   for(int i = 0; i < OrdersTotal(); i++)
+      if(orderInfo.SelectByIndex(i))
+         if(orderInfo.Magic() == InpMagic && (sym == "" || orderInfo.Symbol() == sym))
+         {
+            int n = ArraySize(pend); ArrayResize(pend, n + 1); pend[n] = orderInfo.Ticket();
+         }
+   for(int i = 0; i < ArraySize(pend); i++)
+   {
+      if(trade.OrderDelete(pend[i])) cancelled++;
+      else { allOk = false; err = "cancel fail #" + IntegerToString((long)pend[i]); }
+   }
+   return allOk;
+}
+
 //+------------------------------------------------------------------+
 //| Poll the queue, execute commands, build + POST the ack array.    |
 //+------------------------------------------------------------------+
 void PollAndExecute()
 {
-   //--- report live quote (for venue rebasing) + open-state (for the re-arm gate)
+   //--- report live quote (rebasing) + open-state (cycle monitor): per-side counts
+   //    and basket floating P&L drive the server-side exit triggers.
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   int    buys  = CountMyBuys();
+   int    sells = CountMySells();
    string pollBody = StringFormat(
-      "{\"account\":\"%s\",\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f,\"positions\":%d,\"pendings\":%d}",
-      gAccount, _Symbol, bid, ask, CountMyPositions(), CountMyPendings());
+      "{\"account\":\"%s\",\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f,"
+      "\"positions\":%d,\"pendings\":%d,\"buys\":%d,\"sells\":%d,\"pnl\":%.2f}",
+      gAccount, _Symbol, bid, ask, buys + sells, CountMyPendings(), buys, sells, SumMyPnL());
    string resp;
    int code = HttpPost(InpBridgeURL + "/exec/poll", pollBody, resp);
    if(code != 200) return;
@@ -318,6 +380,15 @@ void PollAndExecute()
             Print(ok ? "✅ " : "⚠️ ", "CLOSE_ALL ", JsonGetString(cmds[i], "symbol"),
                   " → closed ", closed, " cancelled ", cancelled,
                   (err == "" ? "" : " | " + err));
+      }
+      else if(type == "CANCEL_PENDINGS")
+      {
+         int cancelled = 0;
+         ok = ExecCancelPendings(cmds[i], cancelled, err);
+         extra = StringFormat(",\"cancelled\":%d", cancelled);
+         if(InpVerbose)
+            Print(ok ? "✅ " : "⚠️ ", "CANCEL_PENDINGS ", JsonGetString(cmds[i], "symbol"),
+                  " → cancelled ", cancelled, (err == "" ? "" : " | " + err));
       }
       else
       {

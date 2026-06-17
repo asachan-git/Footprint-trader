@@ -28,6 +28,17 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _AUDIT_LOG = _ROOT / "data" / "exec_bridge.jsonl"
+_EMIT_LOG = _ROOT / "data" / "exec_emit.jsonl"   # ground-truth arm/exit decisions
+
+
+def _emit_exit_audit(row: dict) -> None:
+    """Append one cycle-exit decision — same log the emit route uses for arms."""
+    try:
+        _EMIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _EMIT_LOG.open("a") as fh:
+            fh.write(json.dumps({"ts": time.time(), "verdict": "exit", **row}) + "\n")
+    except Exception:
+        pass  # audit must never break execution
 
 # command lifecycle
 PENDING = "pending"
@@ -37,9 +48,14 @@ FAILED = "failed"
 
 # command types
 PLACE_PENDING = "PLACE_PENDING"
-CLOSE_ALL = "CLOSE_ALL"
+CLOSE_ALL = "CLOSE_ALL"          # close positions + cancel pendings (deliberate flatten)
+CANCEL_PENDINGS = "CANCEL_PENDINGS"  # cancel pendings ONLY, leave positions (safe re-arm)
 
 _RECLAIM_AFTER_S = 10.0   # IN_FLIGHT with no ack this long → back to PENDING
+# Cycle-flatten idempotency: once a CLOSE_ALL is enqueued, suppress further exit
+# evaluation until it confirms (positions→0) or this grace lapses, then re-issue.
+# Must exceed _RECLAIM_AFTER_S so the queue's own re-send isn't double-stacked.
+_FLATTEN_GRACE_S = 12.0
 
 
 @dataclass
@@ -106,6 +122,113 @@ class ExecBridge:
             m = cls._last_arm.get((str(account), broker_symbol))
             return dict(m) if m else None
 
+    # ── cycle monitor (server-side exit brain) ─────────────────────────────────
+    @classmethod
+    def monitor_cycle(cls, account: str, symbol: str, settings: dict | None, *,
+                      pnl: float | None = None, buys: int | None = None,
+                      sells: int | None = None, now: float | None = None) -> str | None:
+        """Evaluate the active grid cycle on `(account, symbol)` and, if any exit
+        trigger fires, enqueue ONE CLOSE_ALL (flatten the whole cycle). Returns the
+        exit reason, or None. LOCK-FREE: composes the locked classmethods only —
+        never holds cls._lock while enqueuing (cls._lock is non-reentrant).
+
+        Called once per EA poll (the only ~1s cadence). Exit order, first wins:
+          1. flatten-rest — a leg closed mid-cycle while the opposite ladder rests
+          2. net-$ target — basket floating ≥ effective (hedge-decayed) target
+          3. full-hedge   — delta-neutral basket cut to free margin (realizes loss)
+        """
+        t = now if now is not None else time.time()
+        cyc = cls.get_last_arm(account, symbol)
+        if not cyc or not cyc.get("active"):
+            return None
+
+        open_state = cls.get_open(account, symbol)
+        pendings = int(open_state.get("pendings", 0) or 0)
+        # Prefer the per-side sum the new EA sends; fall back to the legacy count.
+        if buys is not None and sells is not None:
+            positions = int(buys) + int(sells)
+        else:
+            positions = int(open_state.get("positions", 0) or 0)
+
+        # 0) flatten-pending guard — checked FIRST so we never stack CLOSE_ALLs.
+        fts = float(cyc.get("flatten_ts") or 0.0)
+        if fts > 0:
+            if positions == 0:
+                cls.set_last_arm(account, symbol, **{**cyc, "active": False, "flatten_ts": 0.0})
+            elif (t - fts) > _FLATTEN_GRACE_S:
+                # close demonstrably didn't land (past the queue's reclaim window) → re-issue once
+                cls.enqueue(account, CLOSE_ALL, symbol, comment="FB|flatten|retry", now=t)
+                cls.set_last_arm(account, symbol, **{**cyc, "flatten_ts": t})
+            return None
+
+        # track high-water of open positions (basis for flatten-rest) + resting pendings
+        # (so a never-filled cycle can be retired); both reset per arm.
+        max_seen = int(cyc.get("max_pos_seen") or 0)
+        pend_seen = int(cyc.get("pend_seen") or 0)
+        if positions > max_seen or pendings > pend_seen:
+            max_seen = max(max_seen, positions)
+            pend_seen = max(pend_seen, pendings)
+            cyc["max_pos_seen"] = max_seen
+            cyc["pend_seen"] = pend_seen
+            cls.set_last_arm(account, symbol, **cyc)
+
+        if positions <= 0:
+            # flat. Retire the cycle once it had something live (positions filled OR
+            # pendings rested) and now has nothing open AND nothing resting — frees the
+            # symbol for a new arm by either tf. The (max/pend)_seen high-water avoids
+            # the placement-window race (active set before the EA reports pendings).
+            if (max_seen > 0 or pend_seen > 0) and pendings == 0:
+                cls.set_last_arm(account, symbol, **{**cyc, "active": False})
+            return None
+
+        n = int(cyc.get("n_per_side") or 0)
+        tp_up = float(cyc.get("tp_up") or 0.0)
+        tp_down = float(cyc.get("tp_down") or 0.0)
+        q = cls.get_quote(account, symbol) or {}
+        mid = float(q.get("mid") or 0.0)
+
+        grid_cfg = (settings.get("grid_levels") or {}) if isinstance(settings, dict) else {}
+        base_target = float(grid_cfg.get("cycle_net_target_usd", 0.0) or 0.0)
+        decay_pct = float(grid_cfg.get("cycle_hedge_decay_pct", 33.0) or 0.0)
+        min_target = float(grid_cfg.get("cycle_min_target_usd", 0.20) or 0.0)
+        close_on_full_hedge = bool(grid_cfg.get("cycle_close_on_full_hedge", True))
+
+        reason: str | None = None
+        detail: dict = {}
+
+        # 1) flatten-rest — a filled leg closed while the opposite ladder still rests.
+        if 0 < positions < max_seen and pendings > 0:
+            tol = max(mid * 1e-4, 1e-6) if mid > 0 else 1e-6
+            confirms = (tp_up > 0 and mid >= tp_up - tol) or (tp_down > 0 and 0 < mid <= tp_down + tol)
+            reason = "leg_tp" if confirms else "leg_closed_other"
+
+        # 2) net-$ target (hedge-decayed)
+        if reason is None and base_target > 0 and pnl is not None and n > 0:
+            hedged = min(int(buys or 0), int(sells or 0))
+            decay = min(1.0, max(0.0, (hedged / n) * (decay_pct / 100.0)))
+            eff = max(min_target, base_target * (1.0 - decay))
+            if float(pnl) >= eff:
+                reason = "net_target"
+                detail = {"effective_target": round(eff, 2), "decay": round(decay, 3)}
+
+        # 3) full-hedge backstop (delta-neutral → cut to free margin; realizes a loss)
+        if reason is None and close_on_full_hedge and n > 0 \
+                and buys is not None and sells is not None:
+            if min(int(buys), int(sells)) >= n and (int(buys) + int(sells)) >= 2 * n:
+                reason = "full_hedge"
+
+        if reason is None:
+            return None
+
+        cls.enqueue(account, CLOSE_ALL, symbol, comment=f"FB|flatten|{reason}", now=t)
+        cls.set_last_arm(account, symbol, **{**cyc, "flatten_ts": t})
+        _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
+                          "exit_reason": reason, "armed_tf": cyc.get("armed_tf", ""),
+                          "positions": positions, "pendings": pendings,
+                          "buys": buys, "sells": sells, "pnl": pnl, "venue_mid": mid,
+                          "tp_up": tp_up, "tp_down": tp_down, **detail})
+        return reason
+
     # ── emit dedup (one grid per HVN-touch episode, not per bar) ───────────────
     @classmethod
     def should_emit(cls, account: str, symbol: str, tf: str, fulcrum: float, tol: float) -> bool:
@@ -171,13 +294,16 @@ class ExecBridge:
 
     @classmethod
     def enqueue_grid_plan(cls, account: str, broker_symbol: str, plan, *,
-                          close_first: bool = True) -> list[Command]:
+                          close_first: bool = True, clear_kind: str = "flatten") -> list[Command]:
         """Translate a rebased neutral GridPlan into PLACE_PENDING commands.
         buy_legs → buy_stop, sell_legs → sell_stop, shared per-side TP, no SL (v1).
-        Optionally prepend a CLOSE_ALL to clear any prior cycle on the symbol."""
+        Optionally prepend a clear command: clear_kind="flatten" → CLOSE_ALL (close
+        positions + cancel pendings); "cancel" → CANCEL_PENDINGS (cancel stale pendings
+        only, never touch a live position — the safe re-arm path)."""
         out: list[Command] = []
         if close_first:
-            out.append(cls.enqueue(account, CLOSE_ALL, broker_symbol))
+            clear_cmd = CLOSE_ALL if clear_kind == "flatten" else CANCEL_PENDINGS
+            out.append(cls.enqueue(account, clear_cmd, broker_symbol))
         for i, leg in enumerate(getattr(plan, "buy_legs", []) or []):
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="buy_stop",
