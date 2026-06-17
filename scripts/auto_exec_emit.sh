@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# auto_exec_emit.sh — fire the HVN-grid emitter on each 5m + 15m candle close.
+# auto_exec_emit.sh — fire the structural-grid emitter on each 5m + 15m candle close.
 #
-# On every bar boundary it POSTs /exec/emit_grid {account, symbol, tf}; the server
-# builds the neutral grid (trigger_hint hvn_inside_touch), rebases it onto the EA's
-# reported venue quote, and enqueues PLACE_PENDING/CLOSE_ALL commands the EA drains.
-# Server-side dedup means at most one grid per touched-edge episode (not every bar).
+# On every bar boundary it POSTs /exec/emit_grid {account, symbol, tf, trigger_hint};
+# the server builds the neutral grid for the best "structural" trigger (HVN-edge touch
+# OR VP-level touch: POC/VAH/VAL/naked-POC/LVN), rebases onto the EA's reported venue
+# quote, and enqueues CANCEL_PENDINGS/PLACE_PENDING commands the EA drains.
+# Server-side fulcrum dedup → at most one grid per touched-level episode (not every bar).
 #
-# DEMO ONLY: hvn_inside_touch is sim-NEGATIVE. This is for watching the live
+# DEMO ONLY: the grid family is sim-NEGATIVE. This is for watching the live
 # placement/lifecycle on a demo account, not for edge.
 #
 # Usage:
@@ -31,7 +32,7 @@ emit_loop() {
     ts=$(date '+%Y-%m-%d %H:%M:%S')
     resp=$(curl -s -X POST "${FLASK}/exec/emit_grid" \
       -H "Content-Type: application/json" \
-      -d "{\"account\":\"${ACCOUNT}\",\"symbol\":\"${SYMBOL}\",\"tf\":\"${tf}\"}")
+      -d "{\"account\":\"${ACCOUNT}\",\"symbol\":\"${SYMBOL}\",\"tf\":\"${tf}\",\"trigger_hint\":\"structural\"}")
     local note
     note=$(echo "$resp" | python3 -c "
 import sys, json
