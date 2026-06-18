@@ -48,13 +48,18 @@ else:
   done
 }
 
-# 15m fires on the :00/:15/:30/:45 boundary; 5m a few seconds later when they coincide,
-# so a 15m grid wins the dedup at a shared close. Offsets keep them off the same instant.
-emit_loop 15m 900 8 &
+# Each TF runs an INDEPENDENT parallel cycle (server keys cycles by TF, isolates by
+# strategy×TF magic) — they no longer contend for the symbol. Offsets keep coincident
+# closes off the same instant (avoids a thundering-herd at :00).
+emit_loop 1h  3600 20 &
+P1H=$!
+emit_loop 15m 900  8 &
 P15=$!
-emit_loop 5m 300 12 &
+emit_loop 5m  300  12 &
 P5=$!
+emit_loop 1m  60   3 &
+P1=$!
 
-echo "[auto_exec_emit] running — 15m(pid $P15) + 5m(pid $P5). Ctrl-C to stop."
-trap 'kill $P15 $P5 2>/dev/null; echo "[auto_exec_emit] stopped."; exit 0' INT TERM
+echo "[auto_exec_emit] running — 1H($P1H) 15m($P15) 5m($P5) 1m($P1). Ctrl-C to stop."
+trap 'kill $P1H $P15 $P5 $P1 2>/dev/null; echo "[auto_exec_emit] stopped."; exit 0' INT TERM
 wait

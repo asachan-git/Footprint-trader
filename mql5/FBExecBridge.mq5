@@ -28,8 +28,8 @@ input string InpBridgeURL   = "http://127.0.0.1:5000"; // Python bridge base URL
 input int    InpPollMs      = 1000;                    // Poll interval (ms)
 input int    InpTimeoutMs   = 4000;                    // WebRequest timeout (ms)
 input string InpToken       = "";                      // X-FB-Token (must match server FB_EXEC_TOKEN; blank = none)
-input int    InpMagic       = 770001;                  // Default magic for bridge orders
-input int    InpMagicSqueeze= 770002;                  // Magic for squeeze grids (server sends it; must match settings.squeeze_magic)
+input int    InpMagic       = 770000;                  // Magic BASE; server sends base+strat*10+tf (1m/5m/15m/1H × strategy)
+input int    InpMagicRange   = 100;                    // EA owns magics [InpMagic, InpMagic+InpMagicRange)
 input int    InpSlippage    = 20;                      // Deviation (points)
 input bool   InpVerbose     = true;                    // Log every command
 
@@ -250,6 +250,7 @@ bool ExecPlacePending(const string cmd, ulong &ticket, int &retcode, string &err
 bool ExecCloseAll(const string cmd, int &closed, int &cancelled, string &err)
 {
    string sym = JsonGetString(cmd, "symbol");
+   long   cmdMagic = (long)JsonGetNumber(cmd, "magic");   // >0 → scope to this cycle only
    closed = 0; cancelled = 0; err = "";
    bool allOk = true;
 
@@ -257,7 +258,7 @@ bool ExecCloseAll(const string cmd, int &closed, int &cancelled, string &err)
    ulong pend[];
    for(int i = 0; i < OrdersTotal(); i++)
       if(orderInfo.SelectByIndex(i))
-         if(IsMine(orderInfo.Magic()) && (sym == "" || orderInfo.Symbol() == sym))
+         if(MagicMatch(orderInfo.Magic(), cmdMagic) && (sym == "" || orderInfo.Symbol() == sym))
          {
             int n = ArraySize(pend); ArrayResize(pend, n + 1); pend[n] = orderInfo.Ticket();
          }
@@ -271,7 +272,7 @@ bool ExecCloseAll(const string cmd, int &closed, int &cancelled, string &err)
    ulong pos[];
    for(int i = 0; i < PositionsTotal(); i++)
       if(posInfo.SelectByIndex(i))
-         if(IsMine(posInfo.Magic()) && (sym == "" || posInfo.Symbol() == sym))
+         if(MagicMatch(posInfo.Magic(), cmdMagic) && (sym == "" || posInfo.Symbol() == sym))
          {
             int n = ArraySize(pos); ArrayResize(pos, n + 1); pos[n] = posInfo.Ticket();
          }
@@ -289,7 +290,13 @@ bool ExecCloseAll(const string cmd, int &closed, int &cancelled, string &err)
 //+------------------------------------------------------------------+
 bool IsMine(long magic)
 {
-   return (magic == InpMagic || magic == InpMagicSqueeze);
+   return (magic >= InpMagic && magic < InpMagic + InpMagicRange);
+}
+
+//--- scope a sweep: an explicit cmdMagic (>0) targets ONE cycle's pool; 0 = any of ours.
+bool MagicMatch(long magic, long cmdMagic)
+{
+   return (cmdMagic > 0) ? (magic == cmdMagic) : IsMine(magic);
 }
 
 //+------------------------------------------------------------------+
@@ -347,19 +354,77 @@ double SumMyPnL()
 }
 
 //+------------------------------------------------------------------+
+//| Per-magic open-state breakdown → JSON array for the poll body.    |
+//| One object per (strategy×TF) magic that has any position/pending  |
+//| so the server can monitor each TF cycle independently.            |
+//+------------------------------------------------------------------+
+int FindMagic(long &mg[], long m)
+{
+   for(int k = 0; k < ArraySize(mg); k++) if(mg[k] == m) return k;
+   return -1;
+}
+
+string BuildMagicsJson()
+{
+   long   mg[];
+   int    buys[], sells[], pend[];
+   double pnl[];
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Symbol() != _Symbol || !IsMine(posInfo.Magic())) continue;
+      long m = posInfo.Magic();
+      int k = FindMagic(mg, m);
+      if(k < 0)
+      {
+         k = ArraySize(mg);
+         ArrayResize(mg, k + 1); ArrayResize(buys, k + 1); ArrayResize(sells, k + 1);
+         ArrayResize(pend, k + 1); ArrayResize(pnl, k + 1);
+         mg[k] = m; buys[k] = 0; sells[k] = 0; pend[k] = 0; pnl[k] = 0.0;
+      }
+      if(posInfo.PositionType() == POSITION_TYPE_BUY) buys[k]++; else sells[k]++;
+      pnl[k] += posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+   }
+   for(int i = 0; i < OrdersTotal(); i++)
+   {
+      if(!orderInfo.SelectByIndex(i)) continue;
+      if(orderInfo.Symbol() != _Symbol || !IsMine(orderInfo.Magic())) continue;
+      long m = orderInfo.Magic();
+      int k = FindMagic(mg, m);
+      if(k < 0)
+      {
+         k = ArraySize(mg);
+         ArrayResize(mg, k + 1); ArrayResize(buys, k + 1); ArrayResize(sells, k + 1);
+         ArrayResize(pend, k + 1); ArrayResize(pnl, k + 1);
+         mg[k] = m; buys[k] = 0; sells[k] = 0; pend[k] = 0; pnl[k] = 0.0;
+      }
+      pend[k]++;
+   }
+
+   string js = "";
+   for(int k = 0; k < ArraySize(mg); k++)
+      js += (k == 0 ? "" : ",") +
+            StringFormat("{\"magic\":%I64d,\"buys\":%d,\"sells\":%d,\"pendings\":%d,\"pnl\":%.2f}",
+                         mg[k], buys[k], sells[k], pend[k], pnl[k]);
+   return js;
+}
+
+//+------------------------------------------------------------------+
 //| Cancel this EA's pending orders ONLY (leave positions). The safe   |
 //| re-arm clear — can never flatten a live position.                  |
 //+------------------------------------------------------------------+
 bool ExecCancelPendings(const string cmd, int &cancelled, string &err)
 {
    string sym = JsonGetString(cmd, "symbol");
+   long   cmdMagic = (long)JsonGetNumber(cmd, "magic");   // >0 → scope to this cycle only
    cancelled = 0; err = "";
    bool allOk = true;
 
    ulong pend[];
    for(int i = 0; i < OrdersTotal(); i++)
       if(orderInfo.SelectByIndex(i))
-         if(IsMine(orderInfo.Magic()) && (sym == "" || orderInfo.Symbol() == sym))
+         if(MagicMatch(orderInfo.Magic(), cmdMagic) && (sym == "" || orderInfo.Symbol() == sym))
          {
             int n = ArraySize(pend); ArrayResize(pend, n + 1); pend[n] = orderInfo.Ticket();
          }
@@ -382,10 +447,12 @@ void PollAndExecute()
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    int    buys  = CountMyBuys();
    int    sells = CountMySells();
+   string magicsJson = BuildMagicsJson();   // per-(strategy×TF) breakdown for per-TF cycles
+   // Aggregate fields kept for back-compat/diagnostics; `magics` drives the per-TF monitor.
    string pollBody = StringFormat(
       "{\"account\":\"%s\",\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f,"
-      "\"positions\":%d,\"pendings\":%d,\"buys\":%d,\"sells\":%d,\"pnl\":%.2f}",
-      gAccount, _Symbol, bid, ask, buys + sells, CountMyPendings(), buys, sells, SumMyPnL());
+      "\"positions\":%d,\"pendings\":%d,\"buys\":%d,\"sells\":%d,\"pnl\":%.2f,\"magics\":[%s]}",
+      gAccount, _Symbol, bid, ask, buys + sells, CountMyPendings(), buys, sells, SumMyPnL(), magicsJson);
    string resp;
    int code = HttpPost(InpBridgeURL + "/exec/poll", pollBody, resp);
    if(code != 200) return;
@@ -753,7 +820,7 @@ int OnInit()
    Print("✅ FBExecBridge v1.00 — thin Python-driven executor");
    Print("    Account:   ", gAccount);
    Print("    Bridge:    ", InpBridgeURL, "  (poll ", InpPollMs, "ms)");
-   Print("    Magic:     ", InpMagic);
+   Print("    Magic:     ", InpMagic, "..", InpMagic + InpMagicRange - 1, " (strategy×TF range)");
    Print("    AutoTrade: ", tradeAllowed ? "✅ ENABLED" : "❌ DISABLED (Ctrl+E)");
    Print("    Token:     ", (InpToken == "" ? "none" : "set"));
 

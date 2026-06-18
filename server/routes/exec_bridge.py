@@ -18,7 +18,7 @@ from pathlib import Path
 
 from flask import Blueprint, current_app, jsonify, request
 
-from execution.exec_bridge import ExecBridge
+from execution.exec_bridge import ExecBridge, magic_for, tf_from_magic
 
 bp = Blueprint("exec_bridge", __name__)
 _EMIT_LOG = Path(__file__).resolve().parent.parent.parent / "data" / "exec_emit.jsonl"
@@ -57,19 +57,35 @@ def exec_poll():
     ExecBridge.last_poll_body = dict(body)   # DEBUG: surface the EA's raw poll body
     if sym and bid and ask:
         ExecBridge.set_quote(account, sym, float(bid), float(ask))
-    if sym and ("positions" in body or "pendings" in body):
+    # Per-magic open-state + cycle monitor. The EA sends a `magics` array — one entry
+    # per (strategy×TF) pool it holds — so each TF cycle is tracked and exited in
+    # isolation. tf is recovered from the magic. A flatten ships in the same response
+    # (saves a ~1s round-trip). Falls back to the legacy aggregate fields for an older
+    # EA binary (single pool, no per-magic breakdown).
+    settings_cfg = current_app.config.get("FB_SETTINGS")
+    magics = body.get("magics")
+    if sym and isinstance(magics, list) and magics:
+        for m in magics:
+            try:
+                mg = int(m.get("magic", 0))
+                tf_m = tf_from_magic(mg)
+                if not tf_m:
+                    continue
+                b = int(m.get("buys", 0)); s = int(m.get("sells", 0))
+                ExecBridge.set_open(account, sym, b + s, int(m.get("pendings", 0)), tf=tf_m)
+                ExecBridge.monitor_cycle(account, sym, settings_cfg, tf=tf_m, magic=mg,
+                                         pnl=float(m.get("pnl", 0.0)), buys=b, sells=s)
+            except Exception:
+                LOG.exception("[exec] per-magic cycle monitor error")  # never break the poll
+    elif sym and ("positions" in body or "pendings" in body):
+        # legacy single-pool path (no magics array)
         ExecBridge.set_open(account, sym, int(body.get("positions", 0)),
                             int(body.get("pendings", 0)))
-    # Cycle monitor: decide exits on THIS poll's fresh quote/open-state so a flatten
-    # ships in the same response (saves a ~1s round-trip). Runs BEFORE poll(). Gated on
-    # field presence → an older EA binary (no pnl/buys/sells) just skips net-$/full-hedge.
-    if sym:
         buys = int(body["buys"]) if "buys" in body else None
         sells = int(body["sells"]) if "sells" in body else None
         pnl = float(body["pnl"]) if "pnl" in body else None
         try:
-            ExecBridge.monitor_cycle(account, sym, current_app.config.get("FB_SETTINGS"),
-                                     pnl=pnl, buys=buys, sells=sells)
+            ExecBridge.monitor_cycle(account, sym, settings_cfg, pnl=pnl, buys=buys, sells=sells)
         except Exception:
             LOG.exception("[exec] cycle monitor error")  # never break the poll
     commands = ExecBridge.poll(account)
@@ -155,24 +171,20 @@ def exec_emit_grid():
                         "skip_reason": f"no_{trigger_hint}_trigger (got {plan.trigger_kind})",
                         "symbol": symbol, "broker_symbol": broker_symbol})
 
-    # Cycle-ownership gate: exactly ONE active cycle per (account, broker_symbol).
-    # There is a single position pool per (symbol, magic) — the EA can't attribute a
-    # fill to 5m vs 15m — so overlapping cycles are incoherent. Skip if a cycle is
-    # active and owned by a DIFFERENT tf. The owning tf may refresh ONLY while flat
-    # (re-place the straddle at the newest edge). This replaces the stale-open-state
-    # positions>0 gate that let a re-arm flatten freshly-filled positions.
-    arm = ExecBridge.get_last_arm(account, broker_symbol) or {}
-    open_state = ExecBridge.get_open(account, broker_symbol)
+    # Cycle-ownership gate: now ONE active cycle PER (account, broker_symbol, tf) —
+    # each TF runs an independent parallel cycle, isolated by its own magic
+    # (magic_for(kind, tf)), so the EA can attribute every fill to the right TF pool.
+    # This TF's cycle, while it holds a live position, can't be re-armed (would
+    # flatten its own fills); it may refresh only while flat. Sibling TFs are not
+    # consulted here — they own separate pools.
+    arm = ExecBridge.get_last_arm(account, broker_symbol, tf) or {}
+    open_state = ExecBridge.get_open(account, broker_symbol, tf)
     force = bool(body.get("force", False))
-    if not force and arm.get("active"):
-        owner_tf = arm.get("armed_tf", "")
-        if owner_tf and owner_tf != tf:
-            return jsonify({"ok": True, "verdict": "skip", "skip_reason": f"cycle_owned_by:{owner_tf}",
-                            "symbol": symbol, "broker_symbol": broker_symbol})
-        if open_state.get("positions", 0) > 0:
-            return jsonify({"ok": True, "verdict": "skip", "skip_reason": "position_open",
-                            "symbol": symbol, "broker_symbol": broker_symbol, "open": open_state})
-        # same tf, flat → fall through and refresh the straddle at the new edge
+    if not force and arm.get("active") and open_state.get("positions", 0) > 0:
+        return jsonify({"ok": True, "verdict": "skip", "skip_reason": "position_open",
+                        "symbol": symbol, "broker_symbol": broker_symbol, "tf": tf,
+                        "open": open_state})
+        # active+flat, or inactive → fall through and (re)arm this TF's straddle
 
     # Fulcrum dedup: ONE grid per touched-level episode. Skip if the fulcrum hasn't
     # moved beyond tol since the last arm (prevents re-placing the identical straddle
@@ -188,11 +200,9 @@ def exec_emit_grid():
 
     # Re-arm clears stale pendings with CANCEL_PENDINGS (never CLOSE_ALL) so it can't
     # flatten a live position. The deliberate flatten is owned solely by monitor_cycle.
-    # Per-strategy magic so squeeze legs are identifiable in MT5 history. 0 → EA uses
-    # its default InpMagic. The EA must list this magic among the ones it OWNS (its
-    # IsMine set) or the cycle monitor goes blind to squeeze positions.
-    grid_cfg = (settings.get("grid_levels") or {})
-    leg_magic = int(grid_cfg.get("squeeze_magic", 0) or 0) if plan.trigger_kind == "squeeze" else 0
+    # Composite magic = strategy × TF (e.g. hvn·15m, squeeze·1h). Identifies every leg
+    # in MT5 history AND keys the per-TF cycle so the EA can run all TFs in parallel.
+    leg_magic = magic_for(plan.trigger_kind, tf)
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
                                         close_first=close_first, clear_kind="cancel",
                                         magic=leg_magic)
@@ -205,8 +215,8 @@ def exec_emit_grid():
     _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
     node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
     node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
-    ExecBridge.set_last_arm(account, broker_symbol, fulcrum=plan.fulcrum, tf=tf, edge=edge,
-                            trigger_kind=plan.trigger_kind, venue_mid=quote["mid"],
+    ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum, edge=edge,
+                            trigger_kind=plan.trigger_kind, venue_mid=quote["mid"], magic=leg_magic,
                             n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
                             node_low=round(node_low, 5), node_high=round(node_high, 5),
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
@@ -338,7 +348,10 @@ def exec_zones():
                 levels.append({"kind": k, "price": round(float(v), 5)})
 
     quote = ExecBridge.get_quote(account, broker_symbol) or {}
-    arm = ExecBridge.get_last_arm(account, broker_symbol) or {}
+    # dashboard shows the cycle for the EA's drawn TF (body.tf). Cycles are now per-TF,
+    # so without a tf we'd find nothing — default to the zone TF the EA reports.
+    zone_tf = str(body.get("tf") or "")
+    arm = ExecBridge.get_last_arm(account, broker_symbol, zone_tf) or {}
 
     # ict_fvg paper-strategy overlay (entry/SL/TP, fib zone, FVGs, ChoCh) — published in
     # the ANALYSIS frame; rebase onto the venue (ratio = venue_mid / analysis_anchor) so

@@ -35,7 +35,7 @@ decide_on_bar_close:
 
 instrument:
   symbol: XAUTUSDT
-  timeframes: [1m, 5m, 15m]
+  timeframes: [1m, 5m, 15m, 1h]   # 1h added for the per-TF grid fleet (needs backfill on first run)
   primary_tf: 1m           # decision fires on close of this TF; higher TFs join as-of
 
 # Footprint-driven neutral-grid placement (/exec/emit_grid + FBExecBridge EA).

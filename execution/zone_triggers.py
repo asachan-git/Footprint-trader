@@ -33,7 +33,7 @@ from typing import Any
 from pipeline.types import Bar
 
 # ~24h trailing VP window per TF (matches reversal_hvn / continuation_hvn).
-_VP_WIN = {"15m": 96, "5m": 288, "1m": 1440}
+_VP_WIN = {"15m": 96, "5m": 288, "1m": 1440, "1h": 24}
 
 # Which HVN source(s) feed the inside-touch trigger, per session. London/Overlap
 # (deep, two-sided liquidity) use BOTH the price-tracking rolling profile and the

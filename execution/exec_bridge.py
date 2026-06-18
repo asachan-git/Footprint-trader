@@ -51,6 +51,32 @@ PLACE_PENDING = "PLACE_PENDING"
 CLOSE_ALL = "CLOSE_ALL"          # close positions + cancel pendings (deliberate flatten)
 CANCEL_PENDINGS = "CANCEL_PENDINGS"  # cancel pendings ONLY, leave positions (safe re-arm)
 
+# ── per-strategy × per-TF magic scheme ───────────────────────────────────────
+# magic = MAGIC_BASE + strat_code·10 + tf_code  →  e.g. hvn·15m = 770013,
+# squeeze·1h = 770024. The EA owns the whole [MAGIC_BASE, MAGIC_BASE+99] range; the
+# tf is recoverable as magic % 10, so the server can attribute each EA-reported
+# position pool to the TF cycle that owns it (enables parallel per-TF cycles).
+MAGIC_BASE = 770000
+_STRAT_CODE = {
+    "hvn_inside_touch": 1, "squeeze": 2, "vp_level_touch": 3, "imbalance": 4,
+    "hvn_edge": 5, "anchor": 6, "va": 7, "cvd_div": 8,
+}
+_TF_CODE = {"1m": 1, "5m": 2, "15m": 3, "1h": 4}
+_CODE_TF = {v: k for k, v in _TF_CODE.items()}
+
+
+def magic_for(trigger_kind: str, tf: str) -> int:
+    """Composite magic identifying (strategy, TF). Unknown kind→0, unknown tf→0."""
+    return MAGIC_BASE + _STRAT_CODE.get(trigger_kind, 0) * 10 + _TF_CODE.get(tf, 0)
+
+
+def tf_from_magic(magic: int) -> str:
+    """Recover the TF a magic belongs to (magic % 10). '' if not one of ours."""
+    if magic < MAGIC_BASE or magic >= MAGIC_BASE + 100:
+        return ""
+    return _CODE_TF.get(int(magic) % 10, "")
+
+
 _RECLAIM_AFTER_S = 10.0   # IN_FLIGHT with no ack this long → back to PENDING
 # Cycle-flatten idempotency: once a CLOSE_ALL is enqueued, suppress further exit
 # evaluation until it confirms (positions→0) or this grace lapses, then re-issue.
@@ -78,10 +104,10 @@ class Command:
 
     def to_wire(self) -> dict:
         """Flat dict the EA's JSON parser consumes (only execution fields)."""
-        d = {"id": self.id, "type": self.type, "symbol": self.symbol}
+        d = {"id": self.id, "type": self.type, "symbol": self.symbol, "magic": self.magic}
         if self.type == PLACE_PENDING:
             d.update(order_type=self.order_type, price=self.price, lot=self.lot,
-                     sl=self.sl, tp=self.tp, comment=self.comment, magic=self.magic)
+                     sl=self.sl, tp=self.tp, comment=self.comment)
         return d
 
 
@@ -113,37 +139,39 @@ class ExecBridge:
     # ── live open-state (EA reports its position/order counts on each poll) ────
     @classmethod
     def set_open(cls, account: str, symbol: str, positions: int, pendings: int,
-                 now: float | None = None) -> None:
+                 tf: str = "", now: float | None = None) -> None:
         with cls._lock:
-            cls._open[(str(account), symbol)] = {
+            cls._open[(str(account), symbol, tf)] = {
                 "positions": int(positions), "pendings": int(pendings),
                 "ts": now if now is not None else time.time(),
             }
 
     @classmethod
-    def get_open(cls, account: str, symbol: str) -> dict:
+    def get_open(cls, account: str, symbol: str, tf: str = "") -> dict:
         with cls._lock:
-            return dict(cls._open.get((str(account), symbol), {"positions": 0, "pendings": 0}))
+            return dict(cls._open.get((str(account), symbol, tf), {"positions": 0, "pendings": 0}))
 
     # ── last-armed grid (ground truth for chart drawing + diagnostics) ─────────
     @classmethod
-    def set_last_arm(cls, account: str, broker_symbol: str, **meta) -> None:
+    def set_last_arm(cls, account: str, broker_symbol: str, tf: str = "", **meta) -> None:
         with cls._lock:
-            cls._last_arm[(str(account), broker_symbol)] = dict(meta)
+            cls._last_arm[(str(account), broker_symbol, tf)] = dict(meta, tf=tf)
 
     @classmethod
-    def get_last_arm(cls, account: str, broker_symbol: str) -> dict | None:
+    def get_last_arm(cls, account: str, broker_symbol: str, tf: str = "") -> dict | None:
         with cls._lock:
-            m = cls._last_arm.get((str(account), broker_symbol))
+            m = cls._last_arm.get((str(account), broker_symbol, tf))
             return dict(m) if m else None
 
     # ── cycle monitor (server-side exit brain) ─────────────────────────────────
     @classmethod
     def monitor_cycle(cls, account: str, symbol: str, settings: dict | None, *,
                       pnl: float | None = None, buys: int | None = None,
-                      sells: int | None = None, now: float | None = None) -> str | None:
-        """Evaluate the active grid cycle on `(account, symbol)` and, if any exit
-        trigger fires, enqueue ONE CLOSE_ALL (flatten the whole cycle). Returns the
+                      sells: int | None = None, now: float | None = None,
+                      tf: str = "", magic: int = 0) -> str | None:
+        """Evaluate the active grid cycle on `(account, symbol, tf)` and, if any exit
+        trigger fires, enqueue ONE CLOSE_ALL scoped to `magic` (flatten ONLY this TF's
+        position pool — sibling TF cycles on the same symbol are untouched). Returns the
         exit reason, or None. LOCK-FREE: composes the locked classmethods only —
         never holds cls._lock while enqueuing (cls._lock is non-reentrant).
 
@@ -153,11 +181,13 @@ class ExecBridge:
           3. full-hedge   — delta-neutral basket cut to free margin (realizes loss)
         """
         t = now if now is not None else time.time()
-        cyc = cls.get_last_arm(account, symbol)
+        cyc = cls.get_last_arm(account, symbol, tf)
         if not cyc or not cyc.get("active"):
             return None
+        if not magic:
+            magic = int(cyc.get("magic") or 0)
 
-        open_state = cls.get_open(account, symbol)
+        open_state = cls.get_open(account, symbol, tf)
         pendings = int(open_state.get("pendings", 0) or 0)
         # Prefer the per-side sum the new EA sends; fall back to the legacy count.
         if buys is not None and sells is not None:
@@ -172,7 +202,7 @@ class ExecBridge:
                 cls.set_last_arm(account, symbol, **{**cyc, "active": False, "flatten_ts": 0.0})
             elif (t - fts) > _FLATTEN_GRACE_S:
                 # close demonstrably didn't land (past the queue's reclaim window) → re-issue once
-                cls.enqueue(account, CLOSE_ALL, symbol, comment="FB|flatten|retry", now=t)
+                cls.enqueue(account, CLOSE_ALL, symbol, comment="FB|flatten|retry", magic=magic, now=t)
                 cls.set_last_arm(account, symbol, **{**cyc, "flatten_ts": t})
             return None
 
@@ -235,9 +265,9 @@ class ExecBridge:
         if reason is None:
             return None
 
-        cls.enqueue(account, CLOSE_ALL, symbol, comment=f"FB|flatten|{reason}", now=t)
+        cls.enqueue(account, CLOSE_ALL, symbol, comment=f"FB|flatten|{reason}", magic=magic, now=t)
         cls.set_last_arm(account, symbol, **{**cyc, "flatten_ts": t})
-        _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
+        _emit_exit_audit({"account": str(account), "broker_symbol": symbol, "tf": tf, "magic": magic,
                           "exit_reason": reason, "armed_tf": cyc.get("armed_tf", ""),
                           "positions": positions, "pendings": pendings,
                           "buys": buys, "sells": sells, "pnl": pnl, "venue_mid": mid,
@@ -335,7 +365,9 @@ class ExecBridge:
         out: list[Command] = []
         if close_first:
             clear_cmd = CLOSE_ALL if clear_kind == "flatten" else CANCEL_PENDINGS
-            out.append(cls.enqueue(account, clear_cmd, broker_symbol))
+            # scope the clear to THIS cycle's magic so a re-arm only cancels its own
+            # TF/strategy pendings, never a sibling TF cycle's live orders.
+            out.append(cls.enqueue(account, clear_cmd, broker_symbol, magic=magic))
         for i, leg in enumerate(getattr(plan, "buy_legs", []) or []):
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="buy_stop",
