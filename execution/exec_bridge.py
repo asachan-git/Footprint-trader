@@ -70,6 +70,7 @@ class Command:
     sl: float = 0.0
     tp: float = 0.0
     comment: str = ""
+    magic: int = 0            # per-strategy magic (0 → EA uses its default InpMagic)
     status: str = PENDING
     ts_created: float = 0.0
     ts_sent: float = 0.0
@@ -80,7 +81,7 @@ class Command:
         d = {"id": self.id, "type": self.type, "symbol": self.symbol}
         if self.type == PLACE_PENDING:
             d.update(order_type=self.order_type, price=self.price, lot=self.lot,
-                     sl=self.sl, tp=self.tp, comment=self.comment)
+                     sl=self.sl, tp=self.tp, comment=self.comment, magic=self.magic)
         return d
 
 
@@ -293,11 +294,12 @@ class ExecBridge:
     @classmethod
     def enqueue(cls, account: str, type: str, symbol: str, *, order_type: str = "",
                 price: float = 0.0, lot: float = 0.0, sl: float = 0.0, tp: float = 0.0,
-                comment: str = "", now: float | None = None) -> Command:
+                comment: str = "", magic: int = 0, now: float | None = None) -> Command:
         cmd = Command(
             id=uuid.uuid4().hex[:12], account=str(account), type=type, symbol=symbol,
             order_type=order_type, price=round(float(price), 5), lot=round(float(lot), 2),
             sl=round(float(sl), 5), tp=round(float(tp), 5), comment=comment,
+            magic=int(magic),
             ts_created=now if now is not None else time.time(),
         )
         with cls._lock:
@@ -308,7 +310,8 @@ class ExecBridge:
 
     @classmethod
     def enqueue_grid_plan(cls, account: str, broker_symbol: str, plan, *,
-                          close_first: bool = True, clear_kind: str = "flatten") -> list[Command]:
+                          close_first: bool = True, clear_kind: str = "flatten",
+                          magic: int = 0) -> list[Command]:
         """Translate a rebased neutral GridPlan into PLACE_PENDING commands.
         buy_legs → buy_stop, sell_legs → sell_stop, shared per-side TP, no SL (v1).
         Optionally prepend a clear command: clear_kind="flatten" → CLOSE_ALL (close
@@ -337,12 +340,12 @@ class ExecBridge:
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="buy_stop",
                 price=leg.price, lot=leg.lot, sl=0.0, tp=getattr(plan, "buy_tp", 0.0),
-                comment=f"FB|{tag}|b{i + 1}"))
+                comment=f"FB|{tag}|b{i + 1}", magic=magic))
         for i, leg in enumerate(getattr(plan, "sell_legs", []) or []):
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="sell_stop",
                 price=leg.price, lot=leg.lot, sl=0.0, tp=getattr(plan, "sell_tp", 0.0),
-                comment=f"FB|{tag}|s{i + 1}"))
+                comment=f"FB|{tag}|s{i + 1}", magic=magic))
         return out
 
     # ── poll (EA pulls) ──────────────────────────────────────────────────────

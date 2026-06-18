@@ -71,7 +71,17 @@ class GridPlan:
 
 
 # trigger-hint groups: a hint may name one kind, a comma list, or a group keyword.
-_HINT_GROUPS = {"structural": {"hvn_inside_touch", "vp_level_touch", "squeeze"}}
+# vp_level_touch intentionally EXCLUDED — disabled per user (HVN-inside-touch + squeeze
+# only). The detector still runs but can never win the structural hint, so no VP-level
+# straddles arm. Re-add "vp_level_touch" here to revive it.
+_HINT_GROUPS = {
+    "structural": {"hvn_inside_touch", "squeeze"},
+    # LVN displacement: vp_level_touch is the only detector that arms on an LVN.
+    # The planner narrows it to level_type=="lvn" (see plan_grid_levels) so only the
+    # vacuum fires. Neutral straddle-in-vacuum: price sits in the LVN, leaves fast one
+    # side, that leg fills + runs to the bounding HVN; the opposite leg never triggers.
+    "lvn_displacement": {"vp_level_touch"},
+}
 
 
 def _hint_set(hint: str) -> set[str]:
@@ -231,12 +241,27 @@ def _candle_conviction(symbol: str, tf: str) -> float:
 
 
 def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
-               conviction: float, hvn_max_legs: int = 8) -> tuple[int, float]:
+               conviction: float, hvn_max_legs: int = 8,
+               lvn_legs_per_side: int = 1) -> tuple[int, float]:
     """N (capped by regime.max_legs) and step ($) from ATR + swing range +
     candle conviction. HVN node width floors the step so legs span the node."""
     rtype = getattr(regime, "type", "uncertain")
     step_mult = TREND_STEP_MULT if rtype in ("trend_up", "trend_down") else MEAN_REV_STEP_MULT
     max_legs = int(getattr(regime, "max_legs", 5) or 5)
+
+    # LVN displacement (straddle-in-vacuum): step = node_width/2 puts the inner buy/
+    # sell legs EXACTLY on the LVN edges. Price exiting the vacuum trips the edge leg
+    # immediately and rides to the bounding HVN (the trigger's tp_up/tp_down). FEW
+    # legs — displacement is a fast one-way thrust, not an oscillation to scale into.
+    # Independent of regime.max_legs / ATR: the vacuum width is the whole geometry.
+    if trigger.kind == "vp_level_touch" and trigger.context.get("level_type") == "lvn":
+        node_width = float(trigger.context.get("node_width", 0.0) or 0.0)
+        if node_width <= 0:
+            node_width = float(trigger.raw_range or 0.0)
+        n = max(1, int(lvn_legs_per_side))
+        step = (node_width / 2.0) if node_width > 0 else max(
+            (step_mult * atr) if atr > 0 else swing_range / 5.0, 1e-6)
+        return n, round(step, 4)
 
     # hvn_inside_touch: spacing is pure ATR-mult; leg count = node_width / step so a
     # WIDER node gets MORE legs (the user's rule). No width-floor on the step (that
@@ -396,6 +421,7 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     lot_step = float(grid_cfg.get("lot_step", 0.01))
     tp_mult = float(grid_cfg.get("tp_atr_mult", 1.5))
     hvn_max_legs = int(grid_cfg.get("hvn_max_legs", 8))
+    lvn_legs_per_side = int(grid_cfg.get("lvn_legs_per_side", 1))
     max_fulcrum_dist_pct = float(grid_cfg.get("max_fulcrum_dist_pct", 0.05))
 
     from pipeline.state_store import store
@@ -431,6 +457,11 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         hinted = [t for t in triggers if t.kind in hint_set]
         if hinted:
             triggers = hinted
+    # lvn_displacement narrows vp_level_touch to the VACUUM only (LVN), excluding
+    # POC/VA/naked-POC taps — those are mean-revert lines, not displacement vacuums.
+    if trigger_hint == "lvn_displacement":
+        lvn_only = [t for t in triggers if t.context.get("level_type") == "lvn"]
+        triggers = lvn_only
 
     fulcrum_t = _score_and_pick(triggers, regime, current_price, daily_vp, bars)
 
@@ -455,7 +486,8 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     swing_range = _opposing_swing_range(symbol, fulcrum, skew, daily_vp, atr)
     conviction = _candle_conviction(symbol, tf)
     n, step = _size_grid(fulcrum_t, regime, atr, swing_range, conviction,
-                         hvn_max_legs=hvn_max_legs)
+                         hvn_max_legs=hvn_max_legs,
+                         lvn_legs_per_side=lvn_legs_per_side)
     buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
     buy_tp, sell_tp = _resolve_tps(symbol, fulcrum, buy_legs, sell_legs, atr, tp_mult)
 

@@ -52,20 +52,24 @@ grid_levels:
   cycle_min_target_usd: 0.20     # floor; must be >0 so a hedged cycle still has a positive net-$ exit
   cycle_close_on_full_hedge: true  # cut a fully-hedged (delta-neutral) cycle to free margin
   # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
-  triggers: [hvn_inside_touch, vp_level_touch, squeeze]   # "structural" group the emitter arms
+  triggers: [hvn_inside_touch, squeeze]   # "structural" group the emitter arms (vp_level_touch disabled)
   vp_fulcrum_levels: [poc, vah, val, naked_poc, lvn]   # which VP levels are fulcrums
   vp_tol_atr_mult: 0.25      # tap "test" band = max(this·ATR, vp_tol_pct·price)
   vp_tol_pct: 0.0005         # ATR-free floor for the tap band (replay safety)
   vp_merge_atr_mult: 0.15    # merge coincident VP levels within this·ATR (stronger wins)
   emit_dedup_pct: 0.0007     # skip re-arm if fulcrum moved < this·venue_mid (anti-churn) — realizes a loss
-  # Volatility squeeze→expansion (TTM Squeeze): BB(20,2) inside Keltner(20,1.5·meanTR),
-  # fire on RELEASE after a run. Neutral straddle positions before the displacement.
+  # Volatility compression→expansion via Bollinger BANDWIDTH PERCENTILE (vol-regime
+  # gate): compression = BBW in the bottom squeeze_bbw_pct of its trailing window; fire
+  # on RELEASE after a run. Neutral straddle positions before the displacement.
   squeeze_enabled: true
   squeeze_bb_period: 20
-  squeeze_bb_mult: 2.0
-  squeeze_kc_period: 20
-  squeeze_kc_mult: 1.5
-  squeeze_min_on_bars: 6     # require ≥this consecutive squeeze-ON bars before a release fires
+  squeeze_bb_mult: 3.0        # Bollinger band = 3·stdev
+  squeeze_bbw_pct: 0.15       # compression = BBW in bottom 15% of the trailing window
+  squeeze_bbw_window: 100     # trailing window (bars) for the BBW percentile rank
+  squeeze_magic: 770002      # distinct MT5 magic for squeeze grid legs (MUST match EA InpMagicSqueeze); 0 = default magic
+  squeeze_min_on_bars: 6     # require ≥this consecutive compressed bars before a release fires
+  squeeze_max_bars_since_release: 0   # bars allowed between coil-release and arm; 0 = NO limit
+  squeeze_release_lookback: 120       # how far back to scan for the coil (bounded by history, not freshness)
 
 # Startup preflight — server REFUSES to start unless footprint + VP data are present.
 startup_check:
@@ -139,6 +143,11 @@ execution:
     "BTCUSD+": 0.001
   metaapi_timeout_s: 30
   order_comment_prefix: "FB"
+  # Direct-MT5 adapter (wine rpyc shim) — used when broker: vantage_mt5_direct.
+  # Distinct magic from the EA grid (770001) so reconcile/close-all never cross.
+  direct_magic: 770010
+  direct_port: 18812            # localhost rpyc port (scripts/mt5_server.sh)
+  direct_deviation: 20
   # Paper-mode simulation: matches live risk math without a broker connection
   paper_balance: 100000
   contract_size:                # used by paper lot simulation

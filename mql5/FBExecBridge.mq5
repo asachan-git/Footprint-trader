@@ -28,7 +28,8 @@ input string InpBridgeURL   = "http://127.0.0.1:5000"; // Python bridge base URL
 input int    InpPollMs      = 1000;                    // Poll interval (ms)
 input int    InpTimeoutMs   = 4000;                    // WebRequest timeout (ms)
 input string InpToken       = "";                      // X-FB-Token (must match server FB_EXEC_TOKEN; blank = none)
-input int    InpMagic       = 770001;                  // Magic number for bridge orders
+input int    InpMagic       = 770001;                  // Default magic for bridge orders
+input int    InpMagicSqueeze= 770002;                  // Magic for squeeze grids (server sends it; must match settings.squeeze_magic)
 input int    InpSlippage    = 20;                      // Deviation (points)
 input bool   InpVerbose     = true;                    // Log every command
 
@@ -39,6 +40,11 @@ input int    InpZoneRefreshSec = 30;            // Zone redraw interval (s)
 input color  InpHVNColor       = clrSteelBlue;  // HVN zone fill
 input color  InpLVNColor       = clrSandyBrown; // LVN zone fill
 
+input group "=== Corner dashboard ==="
+input bool   InpShowDash        = true;          // Show trigger/HVN/hedged-loss panel (top-right)
+input int    InpDashFontSize    = 9;             // Dashboard font size
+input color  InpDashColor       = clrWhite;      // Dashboard text colour
+
 CTrade        trade;
 COrderInfo    orderInfo;
 CPositionInfo posInfo;
@@ -46,7 +52,15 @@ CPositionInfo posInfo;
 string   gAccount       = "";
 datetime gLastZoneFetch = 0;
 
+//--- last-armed grid metadata (cached from /exec/zones) for the corner dashboard
+double   gFulcrum       = 0.0;
+double   gNodeLo        = 0.0;
+double   gNodeHi        = 0.0;
+string   gTriggerKind   = "";
+string   gEmitEdge      = "";
+
 #define ZONE_PREFIX "FBZone_"
+#define DASH_PREFIX "FBDash_"   // separate prefix → ClearZones() won't sweep the dashboard
 
 //+------------------------------------------------------------------+
 //| Minimal flat-JSON scalar extractors (contract is flat per object)|
@@ -172,6 +186,7 @@ bool ExecPlacePending(const string cmd, ulong &ticket, int &retcode, string &err
    string sym       = JsonGetString(cmd, "symbol");
    string orderType = JsonGetString(cmd, "order_type");
    string comment   = JsonGetString(cmd, "comment");
+   long   magic     = (long)JsonGetNumber(cmd, "magic");   // 0 → use the default InpMagic
    int    digits    = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
    double price     = NormalizeDouble(JsonGetNumber(cmd, "price"), digits);
    double lot       = NormalizeDouble(JsonGetNumber(cmd, "lot"), 2);
@@ -189,6 +204,9 @@ bool ExecPlacePending(const string cmd, ulong &ticket, int &retcode, string &err
    double point        = SymbolInfoDouble(sym, SYMBOL_POINT);
    long   stopsLevelPts = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
    double minStop      = stopsLevelPts * point;
+
+   //--- stamp the per-order magic (squeeze legs carry their own); restored after place
+   trade.SetExpertMagicNumber(magic > 0 ? magic : InpMagic);
 
    bool ok = false;
    if(orderType == "buy_stop")
@@ -239,7 +257,7 @@ bool ExecCloseAll(const string cmd, int &closed, int &cancelled, string &err)
    ulong pend[];
    for(int i = 0; i < OrdersTotal(); i++)
       if(orderInfo.SelectByIndex(i))
-         if(orderInfo.Magic() == InpMagic && (sym == "" || orderInfo.Symbol() == sym))
+         if(IsMine(orderInfo.Magic()) && (sym == "" || orderInfo.Symbol() == sym))
          {
             int n = ArraySize(pend); ArrayResize(pend, n + 1); pend[n] = orderInfo.Ticket();
          }
@@ -253,7 +271,7 @@ bool ExecCloseAll(const string cmd, int &closed, int &cancelled, string &err)
    ulong pos[];
    for(int i = 0; i < PositionsTotal(); i++)
       if(posInfo.SelectByIndex(i))
-         if(posInfo.Magic() == InpMagic && (sym == "" || posInfo.Symbol() == sym))
+         if(IsMine(posInfo.Magic()) && (sym == "" || posInfo.Symbol() == sym))
          {
             int n = ArraySize(pos); ArrayResize(pos, n + 1); pos[n] = posInfo.Ticket();
          }
@@ -266,6 +284,15 @@ bool ExecCloseAll(const string cmd, int &closed, int &cancelled, string &err)
 }
 
 //+------------------------------------------------------------------+
+//| Ownership: an order/position is ours if its magic is any we manage |
+//| (default grid OR squeeze). Keeps counts/PnL/close blind to nothing.|
+//+------------------------------------------------------------------+
+bool IsMine(long magic)
+{
+   return (magic == InpMagic || magic == InpMagicSqueeze);
+}
+
+//+------------------------------------------------------------------+
 //| Count this EA's open positions / pending orders (magic + symbol). |
 //+------------------------------------------------------------------+
 int CountMyPositions()
@@ -273,7 +300,7 @@ int CountMyPositions()
    int n = 0;
    for(int i = 0; i < PositionsTotal(); i++)
       if(posInfo.SelectByIndex(i))
-         if(posInfo.Magic() == InpMagic && posInfo.Symbol() == _Symbol) n++;
+         if(IsMine(posInfo.Magic()) && posInfo.Symbol() == _Symbol) n++;
    return n;
 }
 
@@ -282,7 +309,7 @@ int CountMyPendings()
    int n = 0;
    for(int i = 0; i < OrdersTotal(); i++)
       if(orderInfo.SelectByIndex(i))
-         if(orderInfo.Magic() == InpMagic && orderInfo.Symbol() == _Symbol) n++;
+         if(IsMine(orderInfo.Magic()) && orderInfo.Symbol() == _Symbol) n++;
    return n;
 }
 
@@ -294,7 +321,7 @@ int CountMyBuys()
    int n = 0;
    for(int i = 0; i < PositionsTotal(); i++)
       if(posInfo.SelectByIndex(i))
-         if(posInfo.Magic() == InpMagic && posInfo.Symbol() == _Symbol
+         if(IsMine(posInfo.Magic()) && posInfo.Symbol() == _Symbol
             && posInfo.PositionType() == POSITION_TYPE_BUY) n++;
    return n;
 }
@@ -304,7 +331,7 @@ int CountMySells()
    int n = 0;
    for(int i = 0; i < PositionsTotal(); i++)
       if(posInfo.SelectByIndex(i))
-         if(posInfo.Magic() == InpMagic && posInfo.Symbol() == _Symbol
+         if(IsMine(posInfo.Magic()) && posInfo.Symbol() == _Symbol
             && posInfo.PositionType() == POSITION_TYPE_SELL) n++;
    return n;
 }
@@ -314,7 +341,7 @@ double SumMyPnL()
    double total = 0.0;
    for(int i = 0; i < PositionsTotal(); i++)
       if(posInfo.SelectByIndex(i))
-         if(posInfo.Magic() == InpMagic && posInfo.Symbol() == _Symbol)
+         if(IsMine(posInfo.Magic()) && posInfo.Symbol() == _Symbol)
             total += posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
    return total;
 }
@@ -332,7 +359,7 @@ bool ExecCancelPendings(const string cmd, int &cancelled, string &err)
    ulong pend[];
    for(int i = 0; i < OrdersTotal(); i++)
       if(orderInfo.SelectByIndex(i))
-         if(orderInfo.Magic() == InpMagic && (sym == "" || orderInfo.Symbol() == sym))
+         if(IsMine(orderInfo.Magic()) && (sym == "" || orderInfo.Symbol() == sym))
          {
             int n = ArraySize(pend); ArrayResize(pend, n + 1); pend[n] = orderInfo.Ticket();
          }
@@ -594,6 +621,13 @@ void FetchAndDrawZones()
    string emitTF   = JsonGetString(resp, "emit_tf");
    string emitEdge = JsonGetString(resp, "emit_edge");
    string fname    = ZONE_PREFIX + "fulcrum";
+
+   //--- cache arm metadata for the corner dashboard (rendered every tick in OnTimer)
+   gFulcrum     = fulcrum;
+   gNodeLo      = JsonGetNumber(resp, "node_low");
+   gNodeHi      = JsonGetNumber(resp, "node_high");
+   gTriggerKind = JsonGetString(resp, "trigger_kind");
+   gEmitEdge    = emitEdge;
    if(fulcrum > 0)
    {
       if(ObjectFind(0, fname) < 0)
@@ -614,6 +648,94 @@ void FetchAndDrawZones()
    if(InpVerbose && (n > 0 || nl > 0))
       Print("🟦 Drew ", n, " zones + ", nl, " VP levels | fulcrum ",
             DoubleToString(fulcrum, _Digits), " (", emitTF, " ", emitEdge, ")");
+}
+
+//+------------------------------------------------------------------+
+//| Corner dashboard: trigger, which HVN, max loss if fully hedged    |
+//+------------------------------------------------------------------+
+
+//--- Worst-case loss if EVERY grid leg fills (pendings assumed filled) and price
+//    returns to the fulcrum: the straddle locks buys-above + sells-below, so the
+//    realized loss when whipsawed back to mid = Σ lot·|entry − fulcrum|·money/point.
+//    Open positions + this-magic pendings are both counted (= "all hedged").
+double HedgedLossAtFulcrum(int &nOpen, int &nPend)
+{
+   nOpen = 0; nPend = 0;
+   if(gFulcrum <= 0) return 0.0;
+   double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize <= 0) return 0.0;
+   double perPoint = tickVal / tickSize;   // account currency per 1.0 price unit per lot
+
+   double loss = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Symbol() != _Symbol || !IsMine(posInfo.Magic())) continue;
+      loss += posInfo.Volume() * MathAbs(posInfo.PriceOpen() - gFulcrum) * perPoint;
+      nOpen++;
+   }
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(!orderInfo.SelectByIndex(i)) continue;
+      if(orderInfo.Symbol() != _Symbol || !IsMine(orderInfo.Magic())) continue;
+      loss += orderInfo.VolumeInitial() * MathAbs(orderInfo.PriceOpen() - gFulcrum) * perPoint;
+      nPend++;
+   }
+   return loss;
+}
+
+void DashRow(int row, const string text, color clr)
+{
+   string name = DASH_PREFIX + IntegerToString(row);
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_CORNER,     CORNER_RIGHT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_ANCHOR,     ANCHOR_RIGHT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE,  10);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+      ObjectSetString (0, name, OBJPROP_FONT,       "Consolas");
+   }
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, 18 + row * (InpDashFontSize + 8));
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,  InpDashFontSize);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,     clr);
+   ObjectSetString (0, name, OBJPROP_TEXT,      text);
+}
+
+void UpdateDashboard()
+{
+   if(!InpShowDash) return;
+   int dg = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   if(gFulcrum <= 0)   // nothing armed → single idle row
+   {
+      DashRow(0, "▌ FB GRID — idle", clrSilver);
+      for(int r = 1; r <= 5; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
+      return;
+   }
+
+   int nOpen = 0, nPend = 0;
+   double loss = HedgedLossAtFulcrum(nOpen, nPend);
+   string ccy = AccountInfoString(ACCOUNT_CURRENCY);
+   string kind = (gTriggerKind == "" ? "—" : gTriggerKind);
+   string nodeStr = (gNodeLo > 0 && gNodeHi > 0)
+                    ? DoubleToString(gNodeLo, dg) + "–" + DoubleToString(gNodeHi, dg)
+                    : "—";
+
+   DashRow(0, "▌ FB GRID", InpDashColor);
+   DashRow(1, "Trigger:  " + kind + (gEmitEdge == "" ? "" : " " + gEmitEdge), InpDashColor);
+   DashRow(2, "Trig px:  " + DoubleToString(gFulcrum, dg), clrAqua);
+   DashRow(3, "HVN:      " + nodeStr, clrSteelBlue);
+   DashRow(4, "Legs:     " + IntegerToString(nOpen) + " open / " + IntegerToString(nPend) + " pend", InpDashColor);
+   DashRow(5, "Hedged loss: -" + DoubleToString(loss, 2) + " " + ccy,
+           loss > 0 ? clrTomato : clrLimeGreen);
+}
+
+void ClearDashboard()
+{
+   for(int r = 0; r <= 5; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
 }
 
 //+------------------------------------------------------------------+
@@ -662,12 +784,17 @@ void OnTimer()
       FetchAndDrawZones();
       gLastZoneFetch = TimeCurrent();
    }
+
+   //--- dashboard refreshes every poll: hedged loss tracks fills in near-real-time,
+   //    while trigger/HVN come from the cached arm metadata (updated on zone fetch).
+   UpdateDashboard();
 }
 
 void OnDeinit(const int reason)
 {
    EventKillTimer();
    ClearZones();
+   ClearDashboard();
    Print("🛑 FBExecBridge stopped. Reason: ", reason);
 }
 

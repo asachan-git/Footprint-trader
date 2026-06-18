@@ -188,15 +188,27 @@ def exec_emit_grid():
 
     # Re-arm clears stale pendings with CANCEL_PENDINGS (never CLOSE_ALL) so it can't
     # flatten a live position. The deliberate flatten is owned solely by monitor_cycle.
+    # Per-strategy magic so squeeze legs are identifiable in MT5 history. 0 → EA uses
+    # its default InpMagic. The EA must list this magic among the ones it OWNS (its
+    # IsMine set) or the cycle monitor goes blind to squeeze positions.
+    grid_cfg = (settings.get("grid_levels") or {})
+    leg_magic = int(grid_cfg.get("squeeze_magic", 0) or 0) if plan.trigger_kind == "squeeze" else 0
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
-                                        close_first=close_first, clear_kind="cancel")
+                                        close_first=close_first, clear_kind="cancel",
+                                        magic=leg_magic)
     edge = plan.trigger_context.get("edge", "")
     net_target = float(((settings.get("grid_levels") or {}).get("cycle_net_target_usd", 0.0)) or 0.0)
     # ground truth + cycle state: touched edge (=fulcrum), TF owner, structural targets
     # (tp_up=buy target, tp_down=sell target), and the exit-monitor bookkeeping fields.
+    # node bounds (the HVN/LVN the fulcrum sits on) — rebased to the venue frame like
+    # the legs, so the EA dashboard reports the price band the broker actually quotes.
+    _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
+    node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
+    node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
     ExecBridge.set_last_arm(account, broker_symbol, fulcrum=plan.fulcrum, tf=tf, edge=edge,
                             trigger_kind=plan.trigger_kind, venue_mid=quote["mid"],
                             n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
+                            node_low=round(node_low, 5), node_high=round(node_high, 5),
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
                             net_target_usd=net_target, max_pos_seen=0, pend_seen=0, flatten_ts=0.0)
     ExecBridge.mark_emit(account, symbol, tf, plan.fulcrum)   # dedup: this fulcrum is now armed
@@ -348,7 +360,10 @@ def exec_zones():
                     "venue_mid": quote.get("mid", 0.0),
                     "symbol": symbol, "broker_symbol": broker_symbol,
                     "fulcrum": arm.get("fulcrum", 0.0), "emit_tf": arm.get("tf", ""),
-                    "emit_edge": arm.get("edge", "")})
+                    "emit_edge": arm.get("edge", ""),
+                    "trigger_kind": arm.get("trigger_kind", ""),
+                    "node_low": arm.get("node_low", 0.0),
+                    "node_high": arm.get("node_high", 0.0)})
 
 
 @bp.get("/exec/queue")

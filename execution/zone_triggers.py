@@ -172,6 +172,54 @@ def _cached_hvn(symbol: str) -> list[tuple[float, float]]:
         return []
 
 
+def _merge_zone_tuples(zones: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Merge overlapping/touching (lo,hi) HVN spans. Rolling + cached sources are
+    concatenated, so the same node can appear twice at slightly offset prices —
+    collapse them so the grid straddles ONE fulcrum, not two near-duplicate edges."""
+    if not zones:
+        return zones
+    out: list[list[float]] = [list(zones[0])]
+    for lo, hi in sorted(zones):
+        if lo <= out[-1][1]:                       # overlap or touch
+            out[-1][1] = max(out[-1][1], hi)
+        else:
+            out.append([lo, hi])
+    return [(lo, hi) for lo, hi in out]
+
+
+def _outside_daily_va(symbol: str, price: float) -> bool:
+    """True when price sits beyond today's cached value area (above VAH / below VAL)."""
+    try:
+        from pipeline.features.vp_cache import get as vp_get
+        vp = vp_get(symbol, "daily") or {}
+    except Exception:
+        return False
+    val, vah = vp.get("val"), vp.get("vah")
+    if val is None or vah is None:
+        return False
+    return price > float(vah) or price < float(val)
+
+
+def _prior_day_hvn(symbol: str, price: float) -> list[tuple[float, float]]:
+    """Borrow HVN structure from the most recent PRIOR-DAY profile whose value area
+    still brackets `price`. When price has run into a thin tail outside today's value,
+    today's profile offers no node to straddle — but a previous session that traded
+    AROUND this price did build one. Venue-offset is already applied by get_history."""
+    try:
+        from pipeline.features.vp_cache import get_history
+        hist = get_history(symbol, "daily", n=5)
+    except Exception:
+        return []
+    for e in reversed(hist):   # newest prior day first
+        val, vah = e.get("val"), e.get("vah")
+        if val is None or vah is None:
+            continue
+        if float(val) <= price <= float(vah):
+            return [(float(z["low"]), float(z["high"]))
+                    for z in (e.get("hvn_zones") or [])]
+    return []
+
+
 def _session_hvn_zones(symbol: str, tf: str, bars: list[Bar]) -> tuple[list[tuple[float, float]], str]:
     """HVN zones for the current session per `_SESSION_HVN_SRC`. Returns (zones, session)."""
     from pipeline.features.session import current_session
@@ -183,6 +231,15 @@ def _session_hvn_zones(symbol: str, tf: str, bars: list[Bar]) -> tuple[list[tupl
         zones += _rolling_hvn(symbol, tf, bars)
     if "cached" in srcs:
         zones += _cached_hvn(symbol)
+    zones = _merge_zone_tuples(zones)   # collapse rolling/cached near-duplicate nodes
+
+    # Vacuum fallback: price ran outside today's value AND no current node holds it →
+    # borrow the most recent prior-day node whose value area still brackets price.
+    price = bars[-1].ohlc.c if bars else 0.0
+    if price > 0 and not any(lo <= price <= hi for lo, hi in zones) \
+       and _outside_daily_va(symbol, price):
+        zones = _merge_zone_tuples(zones + _prior_day_hvn(symbol, price))
+
     return zones, sess
 
 
@@ -245,6 +302,10 @@ def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger |
     tp_up = min(tops_above) if tops_above else 0.0
     tp_down = max(bots_below) if bots_below else 0.0
 
+    # the node whose edge was tapped (the "which HVN" the dashboard reports): the
+    # fulcrum is one edge, the body spans `width` on the inside of that edge.
+    node_low  = (edge - width) if side == "top" else edge
+    node_high = edge if side == "top" else (edge + width)
     return Trigger(
         kind="hvn_inside_touch",
         fulcrum_price=float(edge),
@@ -252,6 +313,7 @@ def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger |
         confidence=float(conf),
         context={"bias": "none", "edge": side, "session": sess,
                  "reject_frac": round(reject_frac, 4),
+                 "node_low": float(node_low), "node_high": float(node_high),
                  "tp_up": float(tp_up), "tp_down": float(tp_down)},
     )
 
@@ -388,11 +450,17 @@ def _t_vp_level_touch(symbol: str, tf: str, current_price: float,
             v = daily_vp.get(key)
             if isinstance(v, (int, float)) and v > 0:
                 cands.append((float(v), key, _VP_LEVEL_BASE_CONF[key]))
+    # LVN mids carry their zone bounds too: the displacement grid straddles the
+    # VACUUM (step = node_width/2 puts the inner legs on the LVN edges), so the
+    # planner needs the node width, not the gap-to-next-level raw_range below.
+    lvn_bounds: dict[float, tuple[float, float]] = {}
     if "lvn" in enabled:
         for z in (daily_vp.get("lvn_zones") or []):
-            mid = (float(z["low"]) + float(z["high"])) / 2.0
+            lo_z, hi_z = float(z["low"]), float(z["high"])
+            mid = (lo_z + hi_z) / 2.0
             if mid > 0:
                 cands.append((mid, "lvn", _VP_LEVEL_BASE_CONF["lvn"]))
+                lvn_bounds[mid] = (lo_z, hi_z)
     if not cands:
         return None
 
@@ -449,98 +517,131 @@ def _t_vp_level_touch(symbol: str, tf: str, current_price: float,
         raw_range = max(L * 0.001, 1e-6)
 
     conf = min(0.85, bc + (1.0 - abs(c - L) / tol) * 0.1) if tol > 0 else bc
+    ctx = {"bias": "none", "level_type": lt, "edge": lt,
+           "tp_up": float(tp_up), "tp_down": float(tp_down)}
+    if lt == "lvn" and L in lvn_bounds:
+        lo_z, hi_z = lvn_bounds[L]
+        ctx["node_low"], ctx["node_high"] = lo_z, hi_z
+        ctx["node_width"] = round(hi_z - lo_z, 6)
     return Trigger(
         kind="vp_level_touch",
         fulcrum_price=float(L),
         raw_range=float(raw_range),
         confidence=float(conf),
-        context={"bias": "none", "level_type": lt, "edge": lt,
-                 "tp_up": float(tp_up), "tp_down": float(tp_down)},
+        context=ctx,
     )
 
 
 def _t_squeeze(symbol: str, tf: str, current_price: float, atr: float,
               cfg: dict | None = None) -> Trigger | None:
-    """Volatility squeeze → expansion (TTM Squeeze, John Carter). Squeeze is ON while
-    the Bollinger Bands (20, 2.0) sit ENTIRELY inside the Keltner Channels (20, 1.5·meanTR);
-    it FIRES on the RELEASE bar (BB expands back outside KC) after a run of ≥ min_on_bars.
-    A neutral straddle positions BEFORE the displacement — no direction needed, so the
-    momentum histogram is omitted. fulcrum = current price; raw_range = KC width (the
-    expanding band) sizes the legs. Stateless / causal.
+    """Volatility compression → expansion via BOLLINGER BANDWIDTH PERCENTILE — a
+    vol-regime gate (how desks frame compression: vol relative to its OWN recent
+    history), replacing the binary TTM Squeeze (BB-inside-Keltner).
+
+    BandWidth  BBW(e) = (BB_upper − BB_lower) / mid  with BB(period, bb_mult·stdev).
+    Compression is ON when BBW(e) sits in the bottom `bbw_pct` of its trailing
+    `bbw_window` distribution — self-calibrating per instrument and regime. It FIRES on
+    the RELEASE: BBW climbs back out of that low-percentile band after a coil run of
+    ≥ min_on bars. The coil DEPTH (how deep into the low percentile) drives a continuous
+    confidence, not a flat on/off. Stateless / causal — identical live and in sim.
     """
     cfg = cfg or {}
     if not bool(cfg.get("squeeze_enabled", True)):
         return None
     period = int(cfg.get("squeeze_bb_period", 20))
-    bb_mult = float(cfg.get("squeeze_bb_mult", 2.0))
-    kc_period = int(cfg.get("squeeze_kc_period", period))
-    kc_mult = float(cfg.get("squeeze_kc_mult", 1.5))
+    bb_mult = float(cfg.get("squeeze_bb_mult", 3.0))        # 3σ Bollinger band
+    bbw_pct = float(cfg.get("squeeze_bbw_pct", 0.15))       # compression = bottom 15% of trailing BBW
+    bbw_window = int(cfg.get("squeeze_bbw_window", 100))    # trailing window for the percentile rank
     min_on = int(cfg.get("squeeze_min_on_bars", 6))
+    # Release window: once compression is detected the expansion may arrive any number
+    # of bars later — 0 = unlimited (no bar cap). `lookback` only bounds how far back we
+    # SCAN for the coil (available history is finite); it is not a freshness limit.
+    max_since = int(cfg.get("squeeze_max_bars_since_release", 0))
+    lookback = int(cfg.get("squeeze_release_lookback", 120))
 
     from pipeline.state_store import store
-    win = max(period, kc_period)
-    bars = store().recent(symbol, tf, win + min_on + 6)
-    if len(bars) < win + min_on + 1:
+    need = period + bbw_window + lookback + min_on + 6
+    bars = store().recent(symbol, tf, need)
+    n = len(bars)
+    if n < period + bbw_window + 1:
         return None
     closes = [b.ohlc.c for b in bars]
-    highs = [b.ohlc.h for b in bars]
-    lows = [b.ohlc.l for b in bars]
 
     def _stdev(vals: list[float]) -> float:
         m = sum(vals) / len(vals)
         return math.sqrt(sum((v - m) ** 2 for v in vals) / len(vals))
 
-    def _ema_at(e: int, p: int) -> float:
-        a = 2.0 / (p + 1)
-        s = max(0, e - p * 3)
-        val = closes[s]
-        for j in range(s + 1, e + 1):
-            val = a * closes[j] + (1.0 - a) * val
-        return val
-
-    def _tr(i: int) -> float:
-        if i == 0:
-            return highs[i] - lows[i]
-        return max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
-
-    def _squeeze_at(e: int) -> tuple[bool, float, float]:
+    # Precompute BBW for every bar once (avoids O(window²) recompute in the scans).
+    bbw = [0.0] * n
+    for e in range(period - 1, n):
         w = closes[e - period + 1:e + 1]
         mid, sd = sum(w) / len(w), _stdev(w)
-        bb_u, bb_l = mid + bb_mult * sd, mid - bb_mult * sd
-        kmid = _ema_at(e, kc_period)
-        trs = [_tr(i) for i in range(e - kc_period + 1, e + 1)]
-        meantr = sum(trs) / len(trs)
-        kc_u, kc_l = kmid + kc_mult * meantr, kmid - kc_mult * meantr
-        return (bb_l > kc_l and bb_u < kc_u), (bb_u - bb_l), (kc_u - kc_l)
+        bbw[e] = (2.0 * bb_mult * sd) / mid if mid > 0 else 0.0   # (upper−lower)/mid
 
-    last = len(bars) - 1
-    on_now, bbw_now, kcw_now = _squeeze_at(last)
+    def _on_at(e: int) -> tuple[bool, float]:
+        """(compressed?, percentile-rank of BBW[e] within its trailing window)."""
+        lo = e - bbw_window + 1
+        if lo < period - 1:
+            return False, 1.0                # not enough history for the window
+        cur = bbw[e]
+        hist = bbw[lo:e + 1]
+        rank = sum(1 for v in hist if v <= cur) / len(hist)
+        return (rank <= bbw_pct), rank
+
+    last = n - 1
+    on_now, _ = _on_at(last)
     if on_now:
-        return None                       # still squeezed → wait for the release
-    on_prev, _, _ = _squeeze_at(last - 1)
-    if not on_prev:                        # released a while ago → not a fresh fire
-        return None
-    # count the consecutive ON run ending at last-1
-    run, e = 0, last - 1
-    while e >= period and run < min_on + 2:
-        o, _, _ = _squeeze_at(e)
+        return None                          # still compressed → wait for the release
+
+    # Walk back through the post-release (OFF) bars to the END of the coil — the most
+    # recent compressed bar. No 1-bar edge: the release may be several bars old and we
+    # still arm. All bars between rel_end and `last` are OFF by construction.
+    rel_end, scanned, e = -1, 0, last - 1
+    while e >= period - 1 and scanned < lookback:
+        o, _ = _on_at(e)
+        if o:
+            rel_end = e
+            break
+        e -= 1
+        scanned += 1
+    if rel_end < 0:
+        return None                          # no compression within lookback → nothing released
+    bars_since_release = last - rel_end
+    if max_since > 0 and bars_since_release > max_since:
+        return None                          # only enforced when a cap is configured
+
+    # coil length: consecutive compressed bars ending at rel_end, + track the deepest rank
+    run, e, min_rank = 0, rel_end, 1.0
+    while e >= period - 1 and run < min_on + 2:
+        o, r = _on_at(e)
         if not o:
             break
+        min_rank = min(min_rank, r)
         run += 1
         e -= 1
     if run < min_on:
         return None
 
-    kc_width = kcw_now if kcw_now > 0 else (3.0 * atr if atr > 0 else max(current_price * 0.001, 1e-6))
-    bb_kc = (bbw_now / kcw_now) if kcw_now > 0 else 1.0
-    conf = min(0.8, 0.5 + 0.1 * min(run / max(min_on, 1), 2.0))   # longer squeeze → higher
+    # Anchor the straddle to the RELEASE bar's close (the coil-exit reference), NOT the
+    # drifting current price. Stable across the whole post-release window → the emitter's
+    # fulcrum dedup arms ONCE per episode instead of re-arming every flat bar (churn).
+    # The proximity gate (max_fulcrum_dist_pct) is then the natural staleness guard.
+    release_px = closes[rel_end]
+    band_w = bbw[rel_end] * release_px       # BB(3σ) width in price at the coil → leg sizing
+    raw_range = band_w if band_w > 0 else (3.0 * atr if atr > 0 else max(release_px * 0.001, 1e-6))
+    # Continuous confidence from coil DEPTH: tighter than the threshold → higher. A coil
+    # at rank 0 (tightest in window) → 0.9; one barely under bbw_pct → 0.55. Now able to
+    # top hvn_inside_touch (~0.85) in the planner's confluence pick when genuinely tight.
+    depth = max(0.0, (bbw_pct - min_rank) / bbw_pct) if bbw_pct > 0 else 0.0
+    conf = min(0.9, 0.55 + 0.35 * depth)
     return Trigger(
         kind="squeeze",
-        fulcrum_price=float(current_price),
-        raw_range=float(kc_width),
+        fulcrum_price=float(release_px),
+        raw_range=float(raw_range),
         confidence=float(conf),
         context={"bias": "none", "interpretation": "volatility_release",
-                 "squeeze_bars": int(run), "bb_kc_ratio": round(bb_kc, 3)},
+                 "squeeze_bars": int(run), "bbw_rank": round(min_rank, 3),
+                 "bars_since_release": int(bars_since_release)},
     )
 
 
