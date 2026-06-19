@@ -56,7 +56,10 @@ def exec_poll():
     bid, ask = body.get("bid"), body.get("ask")
     ExecBridge.last_poll_body = dict(body)   # DEBUG: surface the EA's raw poll body
     if sym and bid and ask:
-        ExecBridge.set_quote(account, sym, float(bid), float(ask))
+        # broker min-stop distance ($) = stops_level(points)·point — floors the grid step
+        # so the innermost leg clears the freeze band (no more silently-rejected legs).
+        stops_dist = float(body.get("stops_pts", 0) or 0) * float(body.get("point", 0.0) or 0.0)
+        ExecBridge.set_quote(account, sym, float(bid), float(ask), stops_dist=stops_dist)
     # Per-magic open-state + cycle monitor. The EA sends a `magics` array — one entry
     # per (strategy×TF) pool it holds — so each TF cycle is tracked and exited in
     # isolation. tf is recovered from the magic. A flatten ships in the same response
@@ -148,9 +151,12 @@ def exec_emit_grid():
         return jsonify({"ok": False, "verdict": "skip",
                         "skip_reason": f"no bars stored for {symbol} {tf}"}), 404
 
+    # Freeze-aware step floor: clear the broker's min-stop distance (×1.5 margin) so the
+    # innermost leg can't land inside the freeze band and get silently rejected.
+    min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
     plan = plan_grid_levels(symbol, tf, float(latest.ohlc.c),
                             trigger_hint=trigger_hint, settings=settings,
-                            venue_price=float(quote["mid"]))
+                            venue_price=float(quote["mid"]), min_step_venue=min_step_venue)
     if plan.verdict != "arm":
         # episode ended → next arm on this symbol/tf is a fresh touch
         ExecBridge.clear_emit(account, symbol, tf)

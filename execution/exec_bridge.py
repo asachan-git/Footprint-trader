@@ -295,12 +295,13 @@ class ExecBridge:
     # ── venue quote cache (EA reports its live price on each poll) ─────────────
     @classmethod
     def set_quote(cls, account: str, symbol: str, bid: float, ask: float,
-                  now: float | None = None) -> None:
+                  stops_dist: float = 0.0, now: float | None = None) -> None:
         if bid <= 0 or ask <= 0:
             return
         with cls._lock:
             cls._quotes[(str(account), symbol)] = {
                 "bid": float(bid), "ask": float(ask), "mid": (bid + ask) / 2.0,
+                "stops_dist": float(stops_dist),   # broker min stop distance ($) for step floor
                 "ts": now if now is not None else time.time(),
             }
 

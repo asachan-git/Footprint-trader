@@ -448,11 +448,16 @@ void PollAndExecute()
    int    buys  = CountMyBuys();
    int    sells = CountMySells();
    string magicsJson = BuildMagicsJson();   // per-(strategy×TF) breakdown for per-TF cycles
+   long   stopsPts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);  // broker freeze (points)
+   double point    = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    // Aggregate fields kept for back-compat/diagnostics; `magics` drives the per-TF monitor.
+   // stops_pts/point let the server floor the grid step so no leg lands inside the freeze.
    string pollBody = StringFormat(
       "{\"account\":\"%s\",\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f,"
-      "\"positions\":%d,\"pendings\":%d,\"buys\":%d,\"sells\":%d,\"pnl\":%.2f,\"magics\":[%s]}",
-      gAccount, _Symbol, bid, ask, buys + sells, CountMyPendings(), buys, sells, SumMyPnL(), magicsJson);
+      "\"positions\":%d,\"pendings\":%d,\"buys\":%d,\"sells\":%d,\"pnl\":%.2f,"
+      "\"stops_pts\":%d,\"point\":%.5f,\"magics\":[%s]}",
+      gAccount, _Symbol, bid, ask, buys + sells, CountMyPendings(), buys, sells, SumMyPnL(),
+      (int)stopsPts, point, magicsJson);
    string resp;
    int code = HttpPost(InpBridgeURL + "/exec/poll", pollBody, resp);
    if(code != 200) return;

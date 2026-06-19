@@ -407,7 +407,8 @@ def _rebase_to_venue(plan: GridPlan, analysis_anchor: float, venue_price: float)
 
 def plan_grid_levels(symbol: str, tf: str, current_price: float,
                      trigger_hint: str = "", settings: dict | None = None,
-                     venue_price: float | None = None) -> GridPlan:
+                     venue_price: float | None = None,
+                     min_step_venue: float = 0.0) -> GridPlan:
     """Compute a neutral-grid plan for `symbol`/`tf`.
 
     `current_price` is the ANALYSIS-frame price (Binance/Bybit) used for structure.
@@ -488,6 +489,13 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     n, step = _size_grid(fulcrum_t, regime, atr, swing_range, conviction,
                          hvn_max_legs=hvn_max_legs,
                          lvn_legs_per_side=lvn_legs_per_side)
+    # Freeze-aware floor: ensure the innermost leg (fulcrum ± step) clears the broker's
+    # min-stop distance. min_step_venue is in the VENUE frame; convert to the analysis
+    # frame here (× current/venue) since the step is rebased back by venue/current later.
+    if min_step_venue > 0 and venue_price and venue_price > 0:
+        min_step_analysis = min_step_venue * (current_price / venue_price)
+        if step < min_step_analysis:
+            step = round(min_step_analysis, 4)
     buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
     buy_tp, sell_tp = _resolve_tps(symbol, fulcrum, buy_legs, sell_legs, atr, tp_mult)
 
