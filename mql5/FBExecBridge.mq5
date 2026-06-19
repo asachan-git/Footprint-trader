@@ -368,7 +368,7 @@ string BuildMagicsJson()
 {
    long   mg[];
    int    buys[], sells[], pend[];
-   double pnl[];
+   double buyPnl[], sellPnl[];
 
    for(int i = 0; i < PositionsTotal(); i++)
    {
@@ -380,11 +380,12 @@ string BuildMagicsJson()
       {
          k = ArraySize(mg);
          ArrayResize(mg, k + 1); ArrayResize(buys, k + 1); ArrayResize(sells, k + 1);
-         ArrayResize(pend, k + 1); ArrayResize(pnl, k + 1);
-         mg[k] = m; buys[k] = 0; sells[k] = 0; pend[k] = 0; pnl[k] = 0.0;
+         ArrayResize(pend, k + 1); ArrayResize(buyPnl, k + 1); ArrayResize(sellPnl, k + 1);
+         mg[k] = m; buys[k] = 0; sells[k] = 0; pend[k] = 0; buyPnl[k] = 0.0; sellPnl[k] = 0.0;
       }
-      if(posInfo.PositionType() == POSITION_TYPE_BUY) buys[k]++; else sells[k]++;
-      pnl[k] += posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+      double p = posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+      if(posInfo.PositionType() == POSITION_TYPE_BUY) { buys[k]++;  buyPnl[k]  += p; }
+      else                                            { sells[k]++; sellPnl[k] += p; }
    }
    for(int i = 0; i < OrdersTotal(); i++)
    {
@@ -396,8 +397,8 @@ string BuildMagicsJson()
       {
          k = ArraySize(mg);
          ArrayResize(mg, k + 1); ArrayResize(buys, k + 1); ArrayResize(sells, k + 1);
-         ArrayResize(pend, k + 1); ArrayResize(pnl, k + 1);
-         mg[k] = m; buys[k] = 0; sells[k] = 0; pend[k] = 0; pnl[k] = 0.0;
+         ArrayResize(pend, k + 1); ArrayResize(buyPnl, k + 1); ArrayResize(sellPnl, k + 1);
+         mg[k] = m; buys[k] = 0; sells[k] = 0; pend[k] = 0; buyPnl[k] = 0.0; sellPnl[k] = 0.0;
       }
       pend[k]++;
    }
@@ -405,8 +406,10 @@ string BuildMagicsJson()
    string js = "";
    for(int k = 0; k < ArraySize(mg); k++)
       js += (k == 0 ? "" : ",") +
-            StringFormat("{\"magic\":%I64d,\"buys\":%d,\"sells\":%d,\"pendings\":%d,\"pnl\":%.2f}",
-                         mg[k], buys[k], sells[k], pend[k], pnl[k]);
+            StringFormat("{\"magic\":%I64d,\"buys\":%d,\"sells\":%d,\"pendings\":%d,"
+                         "\"pnl\":%.2f,\"buy_pnl\":%.2f,\"sell_pnl\":%.2f}",
+                         mg[k], buys[k], sells[k], pend[k],
+                         buyPnl[k] + sellPnl[k], buyPnl[k], sellPnl[k]);
    return js;
 }
 
@@ -432,6 +435,66 @@ bool ExecCancelPendings(const string cmd, int &cancelled, string &err)
    {
       if(trade.OrderDelete(pend[i])) cancelled++;
       else { allOk = false; err = "cancel fail #" + IntegerToString((long)pend[i]); }
+   }
+   return allOk;
+}
+
+//+------------------------------------------------------------------+
+//| Close a FRACTION of one side's positions (bias-side profit book). |
+//| Scoped to the command's magic + side; closes ceil(count·frac).    |
+//+------------------------------------------------------------------+
+bool ExecCloseSide(const string cmd, int &closed, string &err)
+{
+   string sym   = JsonGetString(cmd, "symbol");
+   long   magic = (long)JsonGetNumber(cmd, "magic");
+   string side  = JsonGetString(cmd, "side");
+   double frac  = JsonGetNumber(cmd, "frac"); if(frac <= 0.0) frac = 0.5;
+   ENUM_POSITION_TYPE want = (side == "buy") ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+   closed = 0; err = ""; bool allOk = true;
+
+   ulong tk[];
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(posInfo.SelectByIndex(i))
+         if(posInfo.Magic() == magic && posInfo.Symbol() == sym
+            && posInfo.PositionType() == want)
+         {
+            int n = ArraySize(tk); ArrayResize(tk, n + 1); tk[n] = posInfo.Ticket();
+         }
+   int total   = ArraySize(tk);
+   int toClose = (int)MathCeil(total * frac);
+   for(int i = 0; i < toClose && i < total; i++)
+   {
+      if(trade.PositionClose(tk[i], InpSlippage)) closed++;
+      else { allOk = false; err = "close fail #" + IntegerToString((long)tk[i]); }
+   }
+   return allOk;
+}
+
+//+------------------------------------------------------------------+
+//| Move one side's positions' SL to breakeven (risk-free runner).    |
+//+------------------------------------------------------------------+
+bool ExecMoveBE(const string cmd, int &moved, string &err)
+{
+   string sym   = JsonGetString(cmd, "symbol");
+   long   magic = (long)JsonGetNumber(cmd, "magic");
+   string side  = JsonGetString(cmd, "side");
+   ENUM_POSITION_TYPE want = (side == "buy") ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+   moved = 0; err = ""; bool allOk = true;
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Magic() != magic || posInfo.Symbol() != sym
+         || posInfo.PositionType() != want) continue;
+      double be = posInfo.PriceOpen();
+      double tp = posInfo.TakeProfit();
+      // only tighten toward breakeven (never loosen an existing protective stop)
+      double curSL = posInfo.StopLoss();
+      bool improve = (want == POSITION_TYPE_BUY) ? (curSL <= 0 || be > curSL)
+                                                 : (curSL <= 0 || be < curSL);
+      if(!improve) continue;
+      if(trade.PositionModify(posInfo.Ticket(), be, tp)) moved++;
+      else { allOk = false; err = "modify fail #" + IntegerToString((long)posInfo.Ticket()); }
    }
    return allOk;
 }
@@ -506,6 +569,24 @@ void PollAndExecute()
          if(InpVerbose)
             Print(ok ? "✅ " : "⚠️ ", "CANCEL_PENDINGS ", JsonGetString(cmds[i], "symbol"),
                   " → cancelled ", cancelled, (err == "" ? "" : " | " + err));
+      }
+      else if(type == "CLOSE_SIDE")
+      {
+         int closedN = 0;
+         ok = ExecCloseSide(cmds[i], closedN, err);
+         extra = StringFormat(",\"closed\":%d", closedN);
+         if(InpVerbose)
+            Print(ok ? "✅ " : "⚠️ ", "CLOSE_SIDE ", JsonGetString(cmds[i], "side"),
+                  " → booked ", closedN, (err == "" ? "" : " | " + err));
+      }
+      else if(type == "MOVE_BE")
+      {
+         int movedN = 0;
+         ok = ExecMoveBE(cmds[i], movedN, err);
+         extra = StringFormat(",\"moved\":%d", movedN);
+         if(InpVerbose)
+            Print(ok ? "✅ " : "⚠️ ", "MOVE_BE ", JsonGetString(cmds[i], "side"),
+                  " → moved ", movedN, (err == "" ? "" : " | " + err));
       }
       else
       {

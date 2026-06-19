@@ -77,7 +77,9 @@ def exec_poll():
                 b = int(m.get("buys", 0)); s = int(m.get("sells", 0))
                 ExecBridge.set_open(account, sym, b + s, int(m.get("pendings", 0)), tf=tf_m)
                 ExecBridge.monitor_cycle(account, sym, settings_cfg, tf=tf_m, magic=mg,
-                                         pnl=float(m.get("pnl", 0.0)), buys=b, sells=s)
+                                         pnl=float(m.get("pnl", 0.0)), buys=b, sells=s,
+                                         buy_pnl=float(m.get("buy_pnl", 0.0)),
+                                         sell_pnl=float(m.get("sell_pnl", 0.0)))
             except Exception:
                 LOG.exception("[exec] per-magic cycle monitor error")  # never break the poll
     elif sym and ("positions" in body or "pendings" in body):
@@ -224,6 +226,8 @@ def exec_emit_grid():
     ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum, edge=edge,
                             trigger_kind=plan.trigger_kind, venue_mid=quote["mid"], magic=leg_magic,
                             n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
+                            buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
+                            bias_peak=0.0, bias_booked=False,
                             node_low=round(node_low, 5), node_high=round(node_high, 5),
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
                             net_target_usd=net_target, max_pos_seen=0, pend_seen=0, flatten_ts=0.0)

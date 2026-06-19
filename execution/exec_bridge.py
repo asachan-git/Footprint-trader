@@ -50,6 +50,8 @@ FAILED = "failed"
 PLACE_PENDING = "PLACE_PENDING"
 CLOSE_ALL = "CLOSE_ALL"          # close positions + cancel pendings (deliberate flatten)
 CANCEL_PENDINGS = "CANCEL_PENDINGS"  # cancel pendings ONLY, leave positions (safe re-arm)
+CLOSE_SIDE = "CLOSE_SIDE"        # close a fraction of ONE side's positions (bias-side booking)
+MOVE_BE = "MOVE_BE"              # move one side's positions' SL to breakeven (risk-free runner)
 
 # ── per-strategy × per-TF magic scheme ───────────────────────────────────────
 # magic = MAGIC_BASE + strat_code·10 + tf_code  →  e.g. hvn·15m = 770013,
@@ -97,6 +99,8 @@ class Command:
     tp: float = 0.0
     comment: str = ""
     magic: int = 0            # per-strategy magic (0 → EA uses its default InpMagic)
+    side: str = ""            # "buy"|"sell" for CLOSE_SIDE / MOVE_BE
+    frac: float = 0.0         # fraction of that side's positions to close (CLOSE_SIDE)
     status: str = PENDING
     ts_created: float = 0.0
     ts_sent: float = 0.0
@@ -108,6 +112,8 @@ class Command:
         if self.type == PLACE_PENDING:
             d.update(order_type=self.order_type, price=self.price, lot=self.lot,
                      sl=self.sl, tp=self.tp, comment=self.comment)
+        elif self.type in (CLOSE_SIDE, MOVE_BE):
+            d.update(side=self.side, frac=self.frac, comment=self.comment)
         return d
 
 
@@ -168,7 +174,8 @@ class ExecBridge:
     def monitor_cycle(cls, account: str, symbol: str, settings: dict | None, *,
                       pnl: float | None = None, buys: int | None = None,
                       sells: int | None = None, now: float | None = None,
-                      tf: str = "", magic: int = 0) -> str | None:
+                      tf: str = "", magic: int = 0,
+                      buy_pnl: float | None = None, sell_pnl: float | None = None) -> str | None:
         """Evaluate the active grid cycle on `(account, symbol, tf)` and, if any exit
         trigger fires, enqueue ONE CLOSE_ALL scoped to `magic` (flatten ONLY this TF's
         position pool — sibling TF cycles on the same symbol are untouched). Returns the
@@ -237,6 +244,43 @@ class ExecBridge:
         decay_pct = float(grid_cfg.get("cycle_hedge_decay_pct", 33.0) or 0.0)
         min_target = float(grid_cfg.get("cycle_min_target_usd", 0.20) or 0.0)
         close_on_full_hedge = bool(grid_cfg.get("cycle_close_on_full_hedge", True))
+
+        # 0.5) bias-side trailing book — directional profit capture, independent of the
+        # net-basket exit (which a hedge leg can mask). Gate: a side has ALL its legs
+        # filled (the move committed your way). Track that side's peak floating P&L; when
+        # it gives back ≥ giveback% from the peak, BOOK half that side and move the rest
+        # to breakeven (risk-free runner). Fires once per cycle (bias_booked guard).
+        if (bool(grid_cfg.get("bias_trail_enabled", True))
+                and not cyc.get("bias_booked")
+                and buy_pnl is not None and sell_pnl is not None):
+            buy_n = int(cyc.get("buy_n") or 0)
+            sell_n = int(cyc.get("sell_n") or 0)
+            bias = ""
+            if buy_n > 0 and int(buys or 0) >= buy_n:
+                bias = "buy"
+            elif sell_n > 0 and int(sells or 0) >= sell_n:
+                bias = "sell"
+            if bias:
+                side_pnl = float(buy_pnl if bias == "buy" else sell_pnl)
+                peak = max(float(cyc.get("bias_peak") or 0.0), side_pnl)
+                if peak != float(cyc.get("bias_peak") or 0.0):
+                    cyc["bias_peak"] = peak
+                    cls.set_last_arm(account, symbol, **cyc)
+                activate = float(grid_cfg.get("bias_trail_activate_usd", 5.0) or 0.0)
+                giveback = float(grid_cfg.get("bias_trail_giveback_pct", 40.0) or 0.0)
+                book_frac = float(grid_cfg.get("bias_book_frac", 0.5) or 0.5)
+                if (activate > 0 and peak >= activate
+                        and side_pnl <= peak * (1.0 - giveback / 100.0)):
+                    cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic, side=bias,
+                                frac=book_frac, comment=f"FB|book|{bias}", now=t)
+                    cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=bias,
+                                comment=f"FB|be|{bias}", now=t)
+                    cls.set_last_arm(account, symbol, **{**cyc, "bias_booked": True})
+                    _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
+                                      "tf": tf, "magic": magic, "exit_reason": "bias_book_trail",
+                                      "bias": bias, "peak": round(peak, 2),
+                                      "side_pnl": round(side_pnl, 2), "book_frac": book_frac})
+                    return "bias_book_trail"   # cycle continues (runner + hedge); no flatten
 
         reason: str | None = None
         detail: dict = {}
@@ -325,12 +369,13 @@ class ExecBridge:
     @classmethod
     def enqueue(cls, account: str, type: str, symbol: str, *, order_type: str = "",
                 price: float = 0.0, lot: float = 0.0, sl: float = 0.0, tp: float = 0.0,
-                comment: str = "", magic: int = 0, now: float | None = None) -> Command:
+                comment: str = "", magic: int = 0, side: str = "", frac: float = 0.0,
+                now: float | None = None) -> Command:
         cmd = Command(
             id=uuid.uuid4().hex[:12], account=str(account), type=type, symbol=symbol,
             order_type=order_type, price=round(float(price), 5), lot=round(float(lot), 2),
             sl=round(float(sl), 5), tp=round(float(tp), 5), comment=comment,
-            magic=int(magic),
+            magic=int(magic), side=side, frac=float(frac),
             ts_created=now if now is not None else time.time(),
         )
         with cls._lock:
