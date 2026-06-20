@@ -357,6 +357,12 @@ def exec_zones():
             if isinstance(v, (int, float)) and v > 0:
                 levels.append({"kind": k, "price": round(float(v), 5)})
 
+    # Computed volume-at-price histogram (venue-shifted) for the EA to draw as a sideways
+    # profile. Rebuilt from bars (cache keeps only aggregates). Same daily window as zones.
+    prof = vp_cache.period_profile(symbol, "daily") or {}
+    profile = prof.get("profile", [])
+    vp_bin = prof.get("bin", 0.0)
+
     quote = ExecBridge.get_quote(account, broker_symbol) or {}
     # dashboard shows the cycle for the EA's drawn TF (body.tf). Cycles are now per-TF,
     # so without a tf we'd find nothing — default to the zone TF the EA reports.
@@ -380,6 +386,7 @@ def exec_zones():
             ict_out["status"] = ov.get("status", "")
 
     return jsonify({"ok": True, "zones": zones, "levels": levels, "ict": ict_out,
+                    "profile": profile, "vp_bin": vp_bin,
                     "venue_mid": quote.get("mid", 0.0),
                     "symbol": symbol, "broker_symbol": broker_symbol,
                     "fulcrum": arm.get("fulcrum", 0.0), "emit_tf": arm.get("tf", ""),

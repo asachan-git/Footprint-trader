@@ -17,7 +17,7 @@
 //|    POST {InpBridgeURL}/exec/ack   {account, results:[...]}        |
 //+------------------------------------------------------------------+
 #property copyright "Aniket"
-#property version   "1.00"
+#property version   "1.02"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -39,6 +39,11 @@ input string InpZoneTF         = "15m";         // TF whose VP zones to draw (5m
 input int    InpZoneRefreshSec = 30;            // Zone redraw interval (s)
 input color  InpHVNColor       = clrSteelBlue;  // HVN zone fill
 input color  InpLVNColor       = clrSandyBrown; // LVN zone fill
+input bool   InpShowZoneLabels = true;          // Label zones/levels with name + value
+input bool   InpDrawVP         = true;          // Draw computed volume profile (right margin)
+input int    InpVPMaxBars      = 50;            // VP histogram max width (bars)
+input color  InpVPColor        = clrDimGray;    // VP histogram bar colour
+input color  InpVPPocColor     = clrGoldenrod;  // VP histogram POC (max) bar colour
 
 input group "=== Corner dashboard ==="
 input bool   InpShowDash        = true;          // Show trigger/HVN/hedged-loss panel (top-right)
@@ -208,25 +213,42 @@ bool ExecPlacePending(const string cmd, ulong &ticket, int &retcode, string &err
    //--- stamp the per-order magic (squeeze legs carry their own); restored after place
    trade.SetExpertMagicNumber(magic > 0 ? magic : InpMagic);
 
+   //--- place with one bounded retry on TRANSIENT broker rejects (off-quotes / price-off
+   //    / requote / price-changed / dropped trade-link). The live quote is re-read each
+   //    attempt so the freeze guard checks fresh price. Geometry rejects (invalid stops)
+   //    and market-closed are NOT retried — they won't self-heal in 200ms, and retrying
+   //    a whole grid episode on those just wastes the poll timer.
    bool ok = false;
-   if(orderType == "buy_stop")
+   for(int attempt = 0; attempt < 2; attempt++)
    {
-      double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
-      if(price < ask + minStop + point) { err = "buy_stop inside freeze"; return false; }
-      ok = trade.BuyStop(lot, price, sym, sl, tp, ORDER_TIME_GTC, 0, comment);
-   }
-   else if(orderType == "sell_stop")
-   {
-      double bid = SymbolInfoDouble(sym, SYMBOL_BID);
-      if(price > bid - minStop - point) { err = "sell_stop inside freeze"; return false; }
-      ok = trade.SellStop(lot, price, sym, sl, tp, ORDER_TIME_GTC, 0, comment);
-   }
-   else
-   {
-      err = "unknown order_type " + orderType; return false;
+      if(orderType == "buy_stop")
+      {
+         double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+         if(price < ask + minStop + point) { err = "buy_stop inside freeze"; retcode = 0; ticket = 0; return false; }
+         ok = trade.BuyStop(lot, price, sym, sl, tp, ORDER_TIME_GTC, 0, comment);
+      }
+      else if(orderType == "sell_stop")
+      {
+         double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+         if(price > bid - minStop - point) { err = "sell_stop inside freeze"; retcode = 0; ticket = 0; return false; }
+         ok = trade.SellStop(lot, price, sym, sl, tp, ORDER_TIME_GTC, 0, comment);
+      }
+      else
+      {
+         err = "unknown order_type " + orderType; retcode = 0; ticket = 0; return false;
+      }
+
+      retcode = (int)trade.ResultRetcode();
+      if(ok) break;
+      bool transientRej = (retcode == TRADE_RETCODE_PRICE_OFF    ||  // 10021 "Off quotes" — no firm quote
+                           retcode == TRADE_RETCODE_REQUOTE      ||  // 10004
+                           retcode == TRADE_RETCODE_PRICE_CHANGED||  // 10020
+                           retcode == TRADE_RETCODE_TIMEOUT      ||  // 10012 request timed out
+                           retcode == TRADE_RETCODE_CONNECTION);     // 10031 trade link dropped
+      if(!transientRej || attempt == 1) break;   // permanent reject, or retry already spent
+      Sleep(200);   // brief pause; next loop re-reads quote + freeze guard
    }
 
-   retcode = (int)trade.ResultRetcode();
    if(!ok)
    {
       err = trade.ResultRetcodeDescription();
@@ -642,6 +664,13 @@ void DrawLevel(const string kind, double price)
    ObjectSetInteger(0, name, OBJPROP_BACK,  true);
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
    ObjectSetString (0, name, OBJPROP_TEXT, kind);
+
+   if(InpShowZoneLabels)
+   {
+      string lbl = kind; StringToUpper(lbl);
+      ZoneText("lvltxt_" + kind, TimeCurrent() + 20 * PeriodSeconds(PERIOD_CURRENT),
+               price, lbl + " " + DoubleToString(price, _Digits), clr);
+   }
 }
 
 void DrawZone(int idx, const string kind, double lo, double hi)
@@ -671,6 +700,11 @@ void DrawZone(int idx, const string kind, double lo, double hi)
    ObjectSetInteger(0, name, OBJPROP_COLOR,   clr);
    ObjectSetInteger(0, name, OBJPROP_BGCOLOR, clr);
    ObjectSetInteger(0, name, OBJPROP_WIDTH,   1);
+
+   if(InpShowZoneLabels)
+      ZoneText("ztxt_" + IntegerToString(idx), tR, hi,
+               (kind == "hvn" ? "HVN " : "LVN ") +
+               DoubleToString(lo, _Digits) + "–" + DoubleToString(hi, _Digits), clr);
 }
 
 //--- ICT overlay primitives (named with ZONE_PREFIX so ClearZones sweeps them) -----
@@ -740,6 +774,75 @@ void DrawICT(const string js)
    IctHLine("ict_choch", ch,    clrGray,   STYLE_DOT,   1, "ChoCh");
 }
 
+//--- Labelled text tag (ZONE_PREFIX so ClearZones sweeps it). Anchored left at (t,price)
+//    so the text sits in the right margin beside the zone/level it names.
+void ZoneText(const string suf, datetime t, double price, const string text, color clr)
+{
+   if(price <= 0) return;
+   string name = ZONE_PREFIX + suf;
+   if(ObjectFind(0, name) < 0) ObjectCreate(0, name, OBJ_TEXT, 0, t, price);
+   ObjectSetInteger(0, name, OBJPROP_TIME,  0, t);
+   ObjectSetDouble (0, name, OBJPROP_PRICE, 0, price);
+   ObjectSetString (0, name, OBJPROP_TEXT,  " " + text);
+   ObjectSetString (0, name, OBJPROP_FONT,  "Consolas");
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 8);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT);
+   ObjectSetInteger(0, name, OBJPROP_BACK,  false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+}
+
+//--- Computed volume profile: one horizontal bar per price bin, length ∝ volume, drawn
+//    into the EMPTY future margin (right of the last candle) so it never overlays price.
+//    Parses {profile:[{price,vol}], vp_bin} from /exec/zones. POC (max-vol) bar highlighted.
+void DrawProfile(const string js)
+{
+   double vpbin = JsonGetNumber(js, "vp_bin");
+   if(vpbin <= 0) return;
+   string ps[];
+   int n = JsonSplitArray(js, "profile", ps);
+   if(n <= 0) return;
+
+   double price[], vol[];
+   ArrayResize(price, n); ArrayResize(vol, n);
+   double maxv = 0.0;
+   for(int i = 0; i < n; i++)
+   {
+      price[i] = JsonGetNumber(ps[i], "price");
+      vol[i]   = JsonGetNumber(ps[i], "vol");
+      if(vol[i] > maxv) maxv = vol[i];
+   }
+   if(maxv <= 0.0) return;
+
+   int      secs = PeriodSeconds(PERIOD_CURRENT);
+   datetime t0   = TimeCurrent();
+   double   half = vpbin / 2.0;
+   for(int i = 0; i < n; i++)
+   {
+      double   frac = vol[i] / maxv;
+      datetime t1   = t0 + (int)(frac * InpVPMaxBars * secs) + secs;  // +secs so tiny bins still show
+      bool     isPoc = (vol[i] >= maxv);
+      color    c     = isPoc ? InpVPPocColor : InpVPColor;
+      string   name  = ZONE_PREFIX + "vp_" + IntegerToString(i);
+      if(ObjectFind(0, name) < 0)
+      {
+         ObjectCreate(0, name, OBJ_RECTANGLE, 0, t0, price[i] - half, t1, price[i] + half);
+         ObjectSetInteger(0, name, OBJPROP_BACK,       true);
+         ObjectSetInteger(0, name, OBJPROP_FILL,       true);
+         ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      }
+      else
+      {
+         ObjectSetInteger(0, name, OBJPROP_TIME,  0, t0);
+         ObjectSetInteger(0, name, OBJPROP_TIME,  1, t1);
+         ObjectSetDouble (0, name, OBJPROP_PRICE, 0, price[i] - half);
+         ObjectSetDouble (0, name, OBJPROP_PRICE, 1, price[i] + half);
+      }
+      ObjectSetInteger(0, name, OBJPROP_COLOR,   c);
+      ObjectSetInteger(0, name, OBJPROP_BGCOLOR, c);
+   }
+}
+
 void FetchAndDrawZones()
 {
    string body = StringFormat("{\"account\":\"%s\",\"symbol\":\"%s\",\"tf\":\"%s\"}",
@@ -797,6 +900,9 @@ void FetchAndDrawZones()
 
    //--- ict_fvg overlay (the paper strategy's setup, rebased onto this venue)
    DrawICT(resp);
+
+   //--- computed volume profile (right-margin histogram)
+   if(InpDrawVP) DrawProfile(resp);
 
    if(InpVerbose && (n > 0 || nl > 0))
       Print("🟦 Drew ", n, " zones + ", nl, " VP levels | fulcrum ",
@@ -903,7 +1009,7 @@ int OnInit()
    bool tradeAllowed = TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) &&
                        MQLInfoInteger(MQL_TRADE_ALLOWED);
    Print("─────────────────────────────────────────────");
-   Print("✅ FBExecBridge v1.00 — thin Python-driven executor");
+   Print("✅ FBExecBridge v1.02 — executor + zone/level labels + VP histogram");
    Print("    Account:   ", gAccount);
    Print("    Bridge:    ", InpBridgeURL, "  (poll ", InpPollMs, "ms)");
    Print("    Magic:     ", InpMagic, "..", InpMagic + InpMagicRange - 1, " (strategy×TF range)");

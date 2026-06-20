@@ -532,6 +532,73 @@ def _t_vp_level_touch(symbol: str, tf: str, current_price: float,
     )
 
 
+def squeeze_gate(symbol: str, tf: str, cfg: dict | None = None) -> tuple[bool, float]:
+    """Vol-compression GATE for grid arming (NOT a release trigger). A neutral straddle
+    should only be placed when volatility has COILED — it profits on the expansion either
+    way, and bleeds in trending/uncoiled regimes (the whipsaw-fills-both-sides trap).
+
+    Returns (ok, rank). ok = BBW is compressed NOW, or a compression run of ≥ `min_on`
+    bars ended within `squeeze_gate_max_bars` (so the breakout is still ahead). Same
+    BBW = (BB_upper − BB_lower)/mid with BB(period, bb_mult·σ), compression = bottom
+    `bbw_pct` of the trailing `bbw_window` — identical math to _t_squeeze, reused as a
+    regime filter. Stateless / causal — identical live and in sim.
+    """
+    cfg = cfg or {}
+    period = int(cfg.get("squeeze_bb_period", 20))
+    bb_mult = float(cfg.get("squeeze_bb_mult", 3.0))        # 3σ Bollinger band
+    bbw_pct = float(cfg.get("squeeze_bbw_pct", 0.15))       # compression = bottom 15% of trailing BBW
+    bbw_window = int(cfg.get("squeeze_bbw_window", 100))
+    min_on = int(cfg.get("squeeze_min_on_bars", 6))
+    gate_max = int(cfg.get("squeeze_gate_max_bars", 10))    # how stale a just-ended coil may be
+
+    from pipeline.state_store import store
+    bars = store().recent(symbol, tf, period + bbw_window + gate_max + min_on + 6)
+    n = len(bars)
+    if n < period + bbw_window + 1:
+        return False, 1.0
+    closes = [b.ohlc.c for b in bars]
+
+    def _stdev(vals: list[float]) -> float:
+        m = sum(vals) / len(vals)
+        return math.sqrt(sum((v - m) ** 2 for v in vals) / len(vals))
+
+    bbw = [0.0] * n
+    for e in range(period - 1, n):
+        w = closes[e - period + 1:e + 1]
+        mid, sd = sum(w) / len(w), _stdev(w)
+        bbw[e] = (2.0 * bb_mult * sd) / mid if mid > 0 else 0.0
+
+    def _on_at(e: int) -> tuple[bool, float]:
+        lo = e - bbw_window + 1
+        if lo < period - 1:
+            return False, 1.0
+        hist = bbw[lo:e + 1]
+        rank = sum(1 for v in hist if v <= bbw[e]) / len(hist)
+        return (rank <= bbw_pct), rank
+
+    last = n - 1
+    on_now, rank_now = _on_at(last)
+    if on_now:
+        return True, rank_now                # still coiled — best time to straddle
+
+    # recently released: find a coil END within gate_max bars, then verify the run length
+    e, scanned = last - 1, 0
+    while e >= period - 1 and scanned < gate_max:
+        o, rank = _on_at(e)
+        if o:
+            run, ee = 0, e
+            while ee >= period - 1 and run < min_on:
+                oo, _ = _on_at(ee)
+                if not oo:
+                    break
+                run += 1
+                ee -= 1
+            return (run >= min_on), rank
+        e -= 1
+        scanned += 1
+    return False, 1.0
+
+
 def _t_squeeze(symbol: str, tf: str, current_price: float, atr: float,
               cfg: dict | None = None) -> Trigger | None:
     """Volatility compression → expansion via BOLLINGER BANDWIDTH PERCENTILE — a

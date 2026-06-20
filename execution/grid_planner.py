@@ -477,6 +477,13 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         dist_pct = abs(fulcrum_t.fulcrum_price - current_price) / current_price
         if dist_pct > max_fulcrum_dist_pct:
             skip, reason = True, f"fulcrum_too_far:{dist_pct:.3f}>{max_fulcrum_dist_pct}"
+    # Vol-compression gate: a neutral straddle only pays on expansion FROM a coil. When
+    # enabled, arm ANY trigger (hvn_inside_touch/squeeze/…) only if vol is compressed now
+    # or just released — filters out the trending regimes that whipsaw-fill both sides.
+    if not skip and fulcrum_t is not None and bool(grid_cfg.get("require_squeeze_gate", False)):
+        ok, rank = zone_triggers.squeeze_gate(symbol, tf, grid_cfg)
+        if not ok:
+            skip, reason = True, f"no_squeeze_gate:rank={rank:.2f}"
     if skip:
         return GridPlan(verdict="skip", skip_reason=reason,
                         regime=getattr(regime, "type", "unknown"),
@@ -496,6 +503,22 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         min_step_analysis = min_step_venue * (current_price / venue_price)
         if step < min_step_analysis:
             step = round(min_step_analysis, 4)
+
+    # Ladder-span gate: a neutral straddle only works if price sits INSIDE the ladder
+    # [fulcrum − n·step, fulcrum + n·step]. If the fulcrum is a level price has already
+    # run away from, the near-side stops land on the wrong side of market and the broker
+    # (EA freeze guard) rejects them → a one-sided grid. The %-gate above is span-agnostic
+    # (max_fulcrum_dist_pct 5% ≈ 3200pts at BTC vs a ~190pt ladder) so it can't catch this;
+    # gate here on the ACTUAL span now that n·step is final. Analysis frame throughout.
+    if current_price > 0 and n > 0 and step > 0:
+        ladder_half = n * step
+        off = abs(current_price - fulcrum)
+        if off > ladder_half:
+            return GridPlan(verdict="skip",
+                            skip_reason=f"price_outside_ladder:{off:.4f}>{ladder_half:.4f}",
+                            regime=getattr(regime, "type", "unknown"),
+                            atr=round(atr, 4), plan_id=plan_id)
+
     buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
     buy_tp, sell_tp = _resolve_tps(symbol, fulcrum, buy_legs, sell_legs, atr, tp_mult)
 

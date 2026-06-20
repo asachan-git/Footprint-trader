@@ -78,6 +78,12 @@ grid_levels:
   squeeze_min_on_bars: 6     # require ≥this consecutive compressed bars before a release fires
   squeeze_max_bars_since_release: 0   # bars allowed between coil-release and arm; 0 = NO limit
   squeeze_release_lookback: 120       # how far back to scan for the coil (bounded by history, not freshness)
+  # Vol-compression GATE (applies to ALL triggers, not just squeeze): only arm a grid when
+  # vol has coiled (BB 3σ compression now, or a ≥squeeze_min_on_bars coil that ended within
+  # squeeze_gate_max_bars). A straddle pays on expansion FROM a coil → this filters the
+  # trending regimes that whipsaw-fill both sides. Cuts arm frequency for quality.
+  require_squeeze_gate: true
+  squeeze_gate_max_bars: 10  # how stale a just-ended coil may be and still pass the gate
 
 # Startup preflight — server REFUSES to start unless footprint + VP data are present.
 startup_check:
@@ -88,6 +94,8 @@ startup_check:
   stale_warn_hours: 6        # WARN (not block) if newest footprint bar older than this
   min_density_pct: 0.5       # WARN if <50% of expected bars in the window (gaps)
   # symbols / tfs default to vp_cache.symbols and instrument.timeframes
+  symbols: [BTCUSDT]         # WEEKEND: BTC-only (gold closed → XAU VP thin, no HVN → blocks boot).
+                             # REVERT to [BTCUSDT, XAUTUSDT] (or remove this line) when gold reopens.
 
 claude:
   mode: restricted           # full | restricted | off
@@ -141,14 +149,14 @@ execution:
   tradable_symbols: [XAUTUSDT, BTCUSDT]
   symbol_map:
     XAUTUSDT: "XAUUSD+"
-    BTCUSDT:  "BTCUSD+"
+    BTCUSDT:  "BTCUSD"
   # Risk-adjusted sizing: lots = (balance × risk_per_trade_pct) / (SL_distance × contract_size)
   # Set risk_per_trade_pct = 0 to disable; falls back to default_lots.
   risk_per_trade_pct: 0.0025    # 0.25% of equity per trade
   max_lots: 1.0                 # hard cap regardless of risk math
   default_lots:                 # fallback when risk math fails (no SL, etc.)
     "XAUUSD+": 0.01
-    "BTCUSD+": 0.001
+    "BTCUSD": 0.001
   metaapi_timeout_s: 30
   order_comment_prefix: "FB"
   # Direct-MT5 adapter (wine rpyc shim) — used when broker: vantage_mt5_direct.
@@ -161,11 +169,11 @@ execution:
   contract_size:                # used by paper lot simulation
     XAUTUSDT: 100
     BTCUSDT: 1
-    "BTCUSD+": 1
+    "BTCUSD": 1
   # Pre-trade execution gates (live only — checked in MT5Adapter.submit_order)
   max_spread:                   # reject order if (ask-bid) exceeds, per broker symbol
     "XAUUSD+": 0.50
-    "BTCUSD+": 50.0
+    "BTCUSD": 50.0
   news_blackout_utc: []         # e.g. ["12:25-12:35", "18:00-18:05"] — no orders in these UTC windows
 
 # Risk controls (used by ingest DD halt + hedge_manager circuit breaker)

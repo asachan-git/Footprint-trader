@@ -344,6 +344,40 @@ def poc_sequence(symbol: str, period: str, n: int = 5) -> list[float | None]:
     return [e.get("poc") for e in get_history(symbol, period, n)]
 
 
+def period_profile(symbol: str, period: str) -> dict | None:
+    """Per-price volume histogram for the symbol's CURRENT period, venue-offset applied.
+
+    The cache stores only aggregates (POC/zones/etc), so the bins are rebuilt here from
+    stored 1m bars over the same session window get() uses — for the EA's VP overlay.
+    Returns {"bin": <width>, "profile": [{price, vol}, ...]} (vol>0 bins, venue-shifted),
+    or None if <30 bars (matches _compute_period_vp's floor)."""
+    from pipeline.state_store import store as _store
+    from .volume_profile import _build_bins
+    cache = _load()
+    sym = cache.get(symbol, {})
+    anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
+    offset = _get_offset(sym)
+    bin_cfg = sym.get("bin_size")
+    now_ts = int(time.time())
+    if period == "daily":
+        st, en = _day_bounds(_session_day_key(now_ts, anchor), anchor)
+    elif period == "weekly":
+        st, en = _week_bounds(_week_key(now_ts), anchor)
+    else:
+        return None
+    end = min(en, now_ts)
+    bars = [b for b in _store().recent(symbol, "1m", 100_000) if st <= b.close_ts < end]
+    if len(bars) < 30:
+        return None
+    res = _build_bins(bars, bin_size=float(bin_cfg) if bin_cfg else None)
+    if not res:
+        return None
+    bins, centers, bin_size, _pmin, _pmax = res
+    profile = [{"price": round(float(centers[i]) + offset, 5), "vol": round(float(bins[i]), 2)}
+               for i in range(len(bins)) if bins[i] > 0]
+    return {"bin": round(float(bin_size), 5), "profile": profile}
+
+
 def get_va_regime(
     symbol: str,
     period: str = "daily",
