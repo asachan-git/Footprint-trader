@@ -17,7 +17,7 @@
 //|    POST {InpBridgeURL}/exec/ack   {account, results:[...]}        |
 //+------------------------------------------------------------------+
 #property copyright "Aniket"
-#property version   "1.02"
+#property version   "1.03"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -45,6 +45,15 @@ input int    InpVPMaxBars      = 50;            // VP histogram max width (bars)
 input color  InpVPColor        = clrDimGray;    // VP histogram bar colour
 input color  InpVPPocColor     = clrGoldenrod;  // VP histogram POC (max) bar colour
 
+input group "=== Bollinger / squeeze pane ==="
+input bool   InpShowBB          = true;   // Draw 3σ Bollinger Bands on the price chart
+input bool   InpShowSqueezePane = true;   // Attach the FBSqueeze BBW-percentile subwindow
+input int    InpBBPeriod        = 20;     // BB period (MATCH server squeeze_bb_period)
+input double InpBBMult          = 3.0;    // BB σ multiple (MATCH squeeze_bb_mult)
+input double InpBBWPctThr        = 0.15;  // compression pct (MATCH squeeze_bbw_pct)
+input int    InpBBWWindow       = 100;    // BBW window (MATCH squeeze_bbw_window)
+input int    InpSqMinOn         = 6;      // min coil bars (MATCH squeeze_min_on_bars)
+
 input group "=== Corner dashboard ==="
 input bool   InpShowDash        = true;          // Show trigger/HVN/hedged-loss panel (top-right)
 input int    InpDashFontSize    = 9;             // Dashboard font size
@@ -63,6 +72,11 @@ double   gNodeLo        = 0.0;
 double   gNodeHi        = 0.0;
 string   gTriggerKind   = "";
 string   gEmitEdge      = "";
+
+//--- chart-overlay indicator handles (3σ Bollinger Bands + FBSqueeze BBW% subwindow)
+int      gBBHandle      = INVALID_HANDLE;
+int      gSqHandle      = INVALID_HANDLE;
+int      gSqSubwin      = -1;
 
 #define ZONE_PREFIX "FBZone_"
 #define DASH_PREFIX "FBDash_"   // separate prefix → ClearZones() won't sweep the dashboard
@@ -1009,7 +1023,7 @@ int OnInit()
    bool tradeAllowed = TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) &&
                        MQLInfoInteger(MQL_TRADE_ALLOWED);
    Print("─────────────────────────────────────────────");
-   Print("✅ FBExecBridge v1.02 — executor + zone/level labels + VP histogram");
+   Print("✅ FBExecBridge v1.03 — executor + labels + VP histogram + BB/squeeze pane");
    Print("    Account:   ", gAccount);
    Print("    Bridge:    ", InpBridgeURL, "  (poll ", InpPollMs, "ms)");
    Print("    Magic:     ", InpMagic, "..", InpMagic + InpMagicRange - 1, " (strategy×TF range)");
@@ -1027,6 +1041,32 @@ int OnInit()
    if(code == 200) Print("    Bridge health: ✅ reachable");
    else            Print("⚠️  Bridge UNREACHABLE (code ", code,
                          "). Whitelist the URL and start the Python server.");
+
+   //--- chart overlays: native 3σ Bollinger Bands on the price chart + the FBSqueeze
+   //    BBW-percentile subwindow (visual twin of the server squeeze gate). OnDeinit
+   //    removes them, so a reload re-adds cleanly (no duplicates).
+   if(InpShowBB)
+   {
+      gBBHandle = iBands(_Symbol, PERIOD_CURRENT, InpBBPeriod, 0, InpBBMult, PRICE_CLOSE);
+      if(gBBHandle != INVALID_HANDLE && ChartIndicatorAdd(0, 0, gBBHandle))
+         Print("    Bollinger Bands: ✅ ", InpBBPeriod, "/", DoubleToString(InpBBMult, 1), "σ on price");
+   }
+   if(InpShowSqueezePane)
+   {
+      gSqHandle = iCustom(_Symbol, PERIOD_CURRENT, "FBSqueeze",
+                          InpBBPeriod, InpBBMult, InpBBWPctThr, InpBBWWindow, InpSqMinOn);
+      if(gSqHandle == INVALID_HANDLE)
+         Print("⚠️  FBSqueeze handle failed — compile mql5/FBSqueeze.mq5 first (iCustom needs FBSqueeze.ex5)");
+      else
+      {
+         gSqSubwin = (int)ChartGetInteger(0, CHART_WINDOWS_TOTAL);   // next free subwindow index
+         if(ChartIndicatorAdd(0, gSqSubwin, gSqHandle))
+            Print("    Squeeze pane: ✅ subwindow ", gSqSubwin, " (BBW% vs ",
+                  DoubleToString(InpBBWPctThr * 100, 0), "% threshold)");
+         else
+            Print("⚠️  FBSqueeze attach failed (err ", GetLastError(), ")");
+      }
+   }
    Print("─────────────────────────────────────────────");
 
    EventSetMillisecondTimer(InpPollMs);
@@ -1049,11 +1089,33 @@ void OnTimer()
    UpdateDashboard();
 }
 
+//--- remove chart indicators we added whose short-name starts with `prefix` (so a
+//    reload/recompile re-adds cleanly instead of stacking duplicates).
+void DeleteIndicatorsByPrefix(int subwin, const string prefix)
+{
+   int tot = ChartIndicatorsTotal(0, subwin);
+   for(int i = tot - 1; i >= 0; i--)
+   {
+      string nm = ChartIndicatorName(0, subwin, i);
+      if(StringFind(nm, prefix) == 0) ChartIndicatorDelete(0, subwin, nm);
+   }
+}
+
 void OnDeinit(const int reason)
 {
    EventKillTimer();
    ClearZones();
    ClearDashboard();
+
+   //--- tear down the BB / squeeze overlays we attached (guarded so we never touch a
+   //    user's own manually-added indicators when our toggles were off).
+   if(gSqHandle != INVALID_HANDLE && gSqSubwin >= 0)
+      DeleteIndicatorsByPrefix(gSqSubwin, "FB Squeeze");
+   if(gBBHandle != INVALID_HANDLE)
+      DeleteIndicatorsByPrefix(0, "Bands");
+   if(gBBHandle != INVALID_HANDLE) IndicatorRelease(gBBHandle);
+   if(gSqHandle != INVALID_HANDLE) IndicatorRelease(gSqHandle);
+
    Print("🛑 FBExecBridge stopped. Reason: ", reason);
 }
 
