@@ -19,6 +19,11 @@ FLASK="${1:-http://127.0.0.1:5000}"
 ACCOUNT="${2:?account login required (e.g. 25230425)}"
 SYMBOL="${3:-XAUUSD+}"
 
+# Three parallel grid setups — each posts its OWN trigger_hint and (post-P1 magic re-key)
+# arms an INDEPENDENT cycle on the same symbol+TF, so they coexist and can be reviewed
+# separately by magic: hvn_inside_touch (strat 1), squeeze (2), vp_levels = va+vp (7/3).
+SETUPS=(hvn_inside_touch squeeze vp_levels)
+
 emit_loop() {
   local tf="$1" interval="$2" offset="$3"
   echo "[emit:$tf] started — every ${interval}s (offset ${offset}s) → $SYMBOL acct $ACCOUNT"
@@ -28,23 +33,26 @@ emit_loop() {
     next=$(( (now / interval + 1) * interval + offset ))
     sleep_s=$((next - now))
     sleep "$sleep_s"
-    local ts resp
+    local ts resp note hint
     ts=$(date '+%Y-%m-%d %H:%M:%S')
-    resp=$(curl -s -X POST "${FLASK}/exec/emit_grid" \
-      -H "Content-Type: application/json" \
-      -d "{\"account\":\"${ACCOUNT}\",\"symbol\":\"${SYMBOL}\",\"tf\":\"${tf}\",\"trigger_hint\":\"structural\"}")
-    local note
-    note=$(echo "$resp" | python3 -c "
+    # Fire each setup independently — each arms its own magic cycle (P1), so all three
+    # can be live at once on this symbol+TF.
+    for hint in "${SETUPS[@]}"; do
+      resp=$(curl -s -X POST "${FLASK}/exec/emit_grid" \
+        -H "Content-Type: application/json" \
+        -d "{\"account\":\"${ACCOUNT}\",\"symbol\":\"${SYMBOL}\",\"tf\":\"${tf}\",\"trigger_hint\":\"${hint}\"}")
+      note=$(echo "$resp" | python3 -c "
 import sys, json
 try: r = json.load(sys.stdin)
 except Exception: print('parse-err'); sys.exit()
 v = r.get('verdict','?')
 if v == 'arm':
-    print(f\"ARM n/side={r.get('n_per_side')} fulcrum={r.get('fulcrum')} venue_mid={r.get('venue_mid')} cmds={r.get('commands_enqueued')}\")
+    print(f\"ARM {r.get('trigger_kind','')} n/side={r.get('n_per_side')} fulcrum={r.get('fulcrum')} cmds={r.get('commands_enqueued')}\")
 else:
     print(f\"skip ({r.get('skip_reason','')})\")
 " 2>/dev/null || echo "err: $(echo "$resp" | head -c 120)")
-    echo "$ts [$tf] $note"
+      echo "$ts [$tf/$hint] $note"
+    done
   done
 }
 

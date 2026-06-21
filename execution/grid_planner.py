@@ -86,6 +86,10 @@ _HINT_GROUPS = {
     # vacuum fires. Neutral straddle-in-vacuum: price sits in the LVN, leaves fast one
     # side, that leg fills + runs to the bounding HVN; the opposite leg never triggers.
     "lvn_displacement": {"vp_level_touch"},
+    # VP-level setup (parallel setup #3): VAL/VAH reclaim-or-break-sustain (va) + POC /
+    # VAH / VAL support-resistance touches (vp_level_touch). Each arms its own magic
+    # (va=strat 7, vp=strat 3) so it runs parallel to hvn (1) and squeeze (2).
+    "vp_levels": {"va", "vp_level_touch"},
 }
 
 
