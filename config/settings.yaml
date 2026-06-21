@@ -58,6 +58,17 @@ grid_levels:
   # far next-HVN target). Directional inventory → a net-profit exit price exists. false =
   # symmetric HVN→HVN straddle.
   hvn_reversion_bias: true
+  # Directional skew votes (skew-only — both sides still placed, favoured side heavier):
+  # HTF Bollinger bias reads the NEXT TF up's 20-SMA (5m→15m, 15m→1h…) — price above a
+  # rising 20MA = bull vote, below a falling one = bear. 2.5σ "edge" votes mean-reversion
+  # when price is stretched ≥ bb_edge_sigma from the basis on the grid TF. (3.0σ stays the
+  # squeeze.) Net vote sign skews the ladder → directional inventory → net-profit exit exists.
+  htf_bias_enabled: true
+  htf_bias_period: 20
+  htf_bias_slope_bars: 3
+  htf_bias_map: {1m: "15m", 5m: "15m", 15m: "1h", 1h: "4h"}
+  bb_edge_enabled: true
+  bb_edge_sigma: 2.5
   cycle_net_target_usd: 50.0      # base net floating-$ target; tune on demo (micro-lot swings are small)
   cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full
   cycle_min_target_usd: 0.20     # floor; must be >0 so a hedged cycle still has a positive net-$ exit

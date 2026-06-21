@@ -296,33 +296,48 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
 
 # ── skew ────────────────────────────────────────────────────────────────────
 
-def _resolve_skew(trigger: Trigger, regime, cfg: dict | None = None) -> tuple[str, str]:
-    """Which side to load (scale into the winner). Neutral straddle remains;
-    skew only weights one side."""
+def _resolve_skew(trigger: Trigger, regime, cfg: dict | None = None,
+                  symbol: str = "", tf: str = "") -> tuple[str, str]:
+    """Which side to load (scale into the winner) — a VOTE SUM across signals. Net sign
+    picks the side; net zero stays symmetric. Directional inventory (skew) also makes a
+    net-profit exit price exist (L_buy ≠ L_sell). Votes (buy +, sell −):
+      • HVN inside-touch reversion (weight 2 — the core thesis): tapped top → fade down
+        (sell), bottom → fade up (buy). Strong enough that one counter-vote can't flip it.
+      • detector context bias / regime trend / HTF-20MA bias / 2.5σ edge (weight 1 each).
+    """
     cfg = cfg or {}
-    bias = trigger.context.get("bias", "none")
-    interp = trigger.context.get("interpretation", "")
-    rtype = getattr(regime, "type", "uncertain")
+    votes = 0
+    why: list[str] = []
 
-    # HVN inside-touch is a rejection AT an edge → the move that pays is the fade INTO
-    # the node (the edge held). Load the into-node side: tapped TOP → sell into node;
-    # tapped BOTTOM → buy into node. Directional inventory also makes a net-profit exit
-    # price exist (L_buy ≠ L_sell). Opt out with hvn_reversion_bias: false.
     if trigger.kind == "hvn_inside_touch" and bool(cfg.get("hvn_reversion_bias", True)):
         edge = trigger.context.get("edge", "")
         if edge == "top":
-            return "sell", "hvn inside-touch: rejected at top → fade into node (load sell)"
-        if edge == "bottom":
-            return "buy", "hvn inside-touch: rejected at bottom → fade into node (load buy)"
+            votes -= 2; why.append("hvn reject-top→fade down")
+        elif edge == "bottom":
+            votes += 2; why.append("hvn reject-bottom→fade up")
 
-    if bias in ("buy", "sell"):
-        why = f"{trigger.kind}:{interp or 'bias'} → load {bias}"
-        return bias, why
+    bias = trigger.context.get("bias", "none")
+    if bias == "buy":
+        votes += 1; why.append(f"{trigger.kind} bias buy")
+    elif bias == "sell":
+        votes -= 1; why.append(f"{trigger.kind} bias sell")
+
+    rtype = getattr(regime, "type", "uncertain")
     if rtype == "trend_up":
-        return "buy", "trend_up regime → load buy"
-    if rtype == "trend_down":
-        return "sell", "trend_down regime → load sell"
-    return "none", "no directional lean → symmetric"
+        votes += 1; why.append("regime up")
+    elif rtype == "trend_down":
+        votes -= 1; why.append("regime down")
+
+    if symbol and tf:
+        hv, hw = zone_triggers.bb_htf_bias(symbol, tf, cfg)
+        if hv:
+            votes += hv; why.append(hw)
+        ev, ew = zone_triggers.bb_edge_vote(symbol, tf, cfg)
+        if ev:
+            votes += ev; why.append(ew)
+
+    side = "buy" if votes > 0 else "sell" if votes < 0 else "none"
+    return side, (f"skew={side}(Σ{votes:+d}): " + "; ".join(why) if why else "symmetric")
 
 
 # ── legs ────────────────────────────────────────────────────────────────────
@@ -509,7 +524,7 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
                         atr=round(atr, 4), plan_id=plan_id)
 
     fulcrum = fulcrum_t.fulcrum_price
-    skew, skew_reason = _resolve_skew(fulcrum_t, regime, grid_cfg)
+    skew, skew_reason = _resolve_skew(fulcrum_t, regime, grid_cfg, symbol=symbol, tf=tf)
     swing_range = _opposing_swing_range(symbol, fulcrum, skew, daily_vp, atr)
     conviction = _candle_conviction(symbol, tf)
     n, step = _size_grid(fulcrum_t, regime, atr, swing_range, conviction,

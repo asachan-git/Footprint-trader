@@ -532,6 +532,69 @@ def _t_vp_level_touch(symbol: str, tf: str, current_price: float,
     )
 
 
+_HTF_MAP = {"1m": "15m", "5m": "15m", "15m": "1h", "1h": "4h"}
+
+
+def bb_htf_bias(symbol: str, grid_tf: str, cfg: dict | None = None) -> tuple[int, str]:
+    """Higher-timeframe Bollinger directional bias as a skew VOTE (+1 buy / −1 sell / 0).
+
+    Reads the NEXT TF up (grid_tf → htf via _HTF_MAP, e.g. 5m→15m, 15m→1h): where is
+    price vs the HTF 20-SMA basis AND is the basis sloping the same way. Above a rising
+    20MA → bull (+1); below a falling 20MA → bear (−1); mixed/chop → 0. Stateless/causal.
+    Returns 0 gracefully when the HTF has no bars (e.g. 4h not ingested)."""
+    cfg = cfg or {}
+    if not bool(cfg.get("htf_bias_enabled", True)):
+        return 0, "htf_bias off"
+    htf = (cfg.get("htf_bias_map") or _HTF_MAP).get(grid_tf)
+    if not htf:
+        return 0, f"no htf for {grid_tf}"
+    period = int(cfg.get("htf_bias_period", 20))
+    slope_bars = int(cfg.get("htf_bias_slope_bars", 3))
+    from pipeline.state_store import store
+    bars = store().recent(symbol, htf, period + slope_bars + 2)
+    if len(bars) < period + slope_bars:
+        return 0, f"{htf} insufficient bars"
+    closes = [b.ohlc.c for b in bars]
+    sma_now = sum(closes[-period:]) / period
+    sma_prev = sum(closes[-period - slope_bars:-slope_bars]) / period
+    slope = sma_now - sma_prev
+    px = closes[-1]
+    if px > sma_now and slope > 0:
+        return 1, f"{htf} bull (px>20MA, rising)"
+    if px < sma_now and slope < 0:
+        return -1, f"{htf} bear (px<20MA, falling)"
+    return 0, f"{htf} mixed"
+
+
+def bb_edge_vote(symbol: str, tf: str, cfg: dict | None = None) -> tuple[int, str]:
+    """2.5σ Bollinger 'edge' as a mean-reversion skew VOTE (+1 buy / −1 sell / 0).
+
+    Where is price vs the 20-SMA basis on THIS tf, in σ? Beyond the `bb_edge_sigma`
+    (2.5σ default — the 'edge', distinct from the 3.0σ squeeze) price is stretched →
+    fade back toward the mean: ≥ +2.5σ → vote sell (−1); ≤ −2.5σ → vote buy (+1)."""
+    cfg = cfg or {}
+    if not bool(cfg.get("bb_edge_enabled", True)):
+        return 0, "bb_edge off"
+    period = int(cfg.get("squeeze_bb_period", 20))
+    edge_sigma = float(cfg.get("bb_edge_sigma", 2.5))
+    from pipeline.state_store import store
+    bars = store().recent(symbol, tf, period + 2)
+    if len(bars) < period:
+        return 0, "insufficient bars"
+    closes = [b.ohlc.c for b in bars]
+    sma = sum(closes[-period:]) / period
+    var = sum((c - sma) ** 2 for c in closes[-period:]) / period
+    sd = math.sqrt(var)
+    if sd <= 0:
+        return 0, "flat"
+    z = (closes[-1] - sma) / sd
+    if z >= edge_sigma:
+        return -1, f"px +{z:.1f}σ (≥{edge_sigma}) → fade sell"
+    if z <= -edge_sigma:
+        return 1, f"px {z:.1f}σ (≤−{edge_sigma}) → fade buy"
+    return 0, f"px {z:.1f}σ (inside edge)"
+
+
 def squeeze_gate(symbol: str, tf: str, cfg: dict | None = None) -> tuple[bool, float]:
     """Vol-compression GATE for grid arming (NOT a release trigger). A neutral straddle
     should only be placed when volatility has COILED — it profits on the expansion either
