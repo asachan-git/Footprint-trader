@@ -62,6 +62,10 @@ MAGIC_BASE = 770000
 _STRAT_CODE = {
     "hvn_inside_touch": 1, "squeeze": 2, "vp_level_touch": 3, "imbalance": 4,
     "hvn_edge": 5, "anchor": 6, "va": 7, "cvd_div": 8,
+    # Setup-level pseudo-kind: the "vp_levels" parallel setup (va OR vp_level_touch) arms
+    # under ONE dedicated magic so the trade report reads it as a single setup. The audit
+    # still records the real detector (trigger_kind) that fired.
+    "vp_levels": 9,
 }
 _TF_CODE = {"1m": 1, "5m": 2, "15m": 3, "1h": 4}
 _CODE_TF = {v: k for k, v in _TF_CODE.items()}

@@ -161,8 +161,12 @@ def exec_emit_grid():
                             venue_price=float(quote["mid"]), min_step_venue=min_step_venue)
     # Cycle state is keyed by MAGIC (strategy×TF) so independent setups (hvn / squeeze /
     # vp …) run as parallel cycles on the SAME symbol+TF. Compute it once from the plan's
-    # trigger; "" trigger (skip) → 0 (the legacy single pool).
-    leg_magic = magic_for(plan.trigger_kind, tf) if plan.trigger_kind else 0
+    # trigger; "" trigger (skip) → 0 (the legacy single pool). The vp_levels SETUP (va OR
+    # vp_level_touch) arms under one dedicated setup magic so the report reads it as one.
+    if trigger_hint == "vp_levels" and plan.trigger_kind:
+        leg_magic = magic_for("vp_levels", tf)
+    else:
+        leg_magic = magic_for(plan.trigger_kind, tf) if plan.trigger_kind else 0
     if plan.verdict != "arm":
         # episode ended → next arm on this magic is a fresh touch
         ExecBridge.clear_emit(account, symbol, magic=leg_magic)
