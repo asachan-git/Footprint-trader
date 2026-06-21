@@ -391,12 +391,17 @@ class ExecBridge:
     @classmethod
     def enqueue_grid_plan(cls, account: str, broker_symbol: str, plan, *,
                           close_first: bool = True, clear_kind: str = "flatten",
-                          magic: int = 0) -> list[Command]:
+                          magic: int = 0, leg_tp: bool = True) -> list[Command]:
         """Translate a rebased neutral GridPlan into PLACE_PENDING commands.
         buy_legs → buy_stop, sell_legs → sell_stop, shared per-side TP, no SL (v1).
         Optionally prepend a clear command: clear_kind="flatten" → CLOSE_ALL (close
         positions + cancel pendings); "cancel" → CANCEL_PENDINGS (cancel stale pendings
-        only, never touch a live position — the safe re-arm path)."""
+        only, never touch a live position — the safe re-arm path).
+
+        leg_tp=False places legs WITHOUT a per-order TP — they never self-close, so the
+        winning side can't book while the losing side dangles (a per-leg TP hit ≠ a
+        net-positive cycle). The basket net-target exit (monitor_cycle) then owns ALL
+        profit-taking and only closes when the whole cycle is net ≥ target."""
         # Per-order tag = the source level, so each grid's legs are identifiable in the
         # MT5 comment: FB|poc|b1, FB|vah|s2, FB|hvn|b3 … (vp_level_touch → its level_type;
         # hvn_inside_touch → "hvn"; else the trigger kind). All legs of one grid share
@@ -418,15 +423,17 @@ class ExecBridge:
             # scope the clear to THIS cycle's magic so a re-arm only cancels its own
             # TF/strategy pendings, never a sibling TF cycle's live orders.
             out.append(cls.enqueue(account, clear_cmd, broker_symbol, magic=magic))
+        buy_tp = getattr(plan, "buy_tp", 0.0) if leg_tp else 0.0
+        sell_tp = getattr(plan, "sell_tp", 0.0) if leg_tp else 0.0
         for i, leg in enumerate(getattr(plan, "buy_legs", []) or []):
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="buy_stop",
-                price=leg.price, lot=leg.lot, sl=0.0, tp=getattr(plan, "buy_tp", 0.0),
+                price=leg.price, lot=leg.lot, sl=0.0, tp=buy_tp,
                 comment=f"FB|{tag}|b{i + 1}", magic=magic))
         for i, leg in enumerate(getattr(plan, "sell_legs", []) or []):
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="sell_stop",
-                price=leg.price, lot=leg.lot, sl=0.0, tp=getattr(plan, "sell_tp", 0.0),
+                price=leg.price, lot=leg.lot, sl=0.0, tp=sell_tp,
                 comment=f"FB|{tag}|s{i + 1}", magic=magic))
         return out
 

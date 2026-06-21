@@ -47,6 +47,12 @@ grid_levels:
   hvn_max_legs: 8
   max_fulcrum_dist_pct: 0.05
   # Cycle exit (server-side cycle monitor). DEMO ONLY — strategy is -EV.
+  # Net-profit-exit-only: place legs with NO per-order TP so the winning side can't book
+  # while the losing side dangles (a per-leg TP hit ≠ a net-positive cycle). The basket
+  # net-target below then owns ALL profit-taking → a cycle only closes green when the
+  # WHOLE basket is net ≥ target; bias_trail still rides clean winners; full_hedge cuts
+  # the symmetric whipsaw (which is mathematically un-profitable at any single exit).
+  net_profit_exit_only: true
   cycle_net_target_usd: 50.0      # base net floating-$ target; tune on demo (micro-lot swings are small)
   cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full
   cycle_min_target_usd: 0.20     # floor; must be >0 so a hedged cycle still has a positive net-$ exit

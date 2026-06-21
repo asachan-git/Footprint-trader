@@ -211,9 +211,14 @@ def exec_emit_grid():
     # Composite magic = strategy × TF (e.g. hvn·15m, squeeze·1h). Identifies every leg
     # in MT5 history AND keys the per-TF cycle so the EA can run all TFs in parallel.
     leg_magic = magic_for(plan.trigger_kind, tf)
+    # net-profit-exit-only: place legs WITHOUT per-order TP so no single side self-closes
+    # while the other dangles — the basket net-target (monitor_cycle) becomes the sole
+    # profit exit and only flattens when the whole cycle is net ≥ target.
+    grid_cfg_ep = (settings.get("grid_levels") or {})
+    leg_tp = not bool(grid_cfg_ep.get("net_profit_exit_only", False))
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
                                         close_first=close_first, clear_kind="cancel",
-                                        magic=leg_magic)
+                                        magic=leg_magic, leg_tp=leg_tp)
     edge = plan.trigger_context.get("edge", "")
     net_target = float(((settings.get("grid_levels") or {}).get("cycle_net_target_usd", 0.0)) or 0.0)
     # ground truth + cycle state: touched edge (=fulcrum), TF owner, structural targets
