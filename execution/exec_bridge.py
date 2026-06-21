@@ -145,29 +145,52 @@ class ExecBridge:
     # ── live open-state (EA reports its position/order counts on each poll) ────
     @classmethod
     def set_open(cls, account: str, symbol: str, positions: int, pendings: int,
-                 tf: str = "", now: float | None = None) -> None:
+                 tf: str = "", now: float | None = None, magic: int = 0) -> None:
+        # Cycle state is keyed by MAGIC (strategy×TF), not TF alone — so multiple setups
+        # (hvn / squeeze / vp …) run as INDEPENDENT parallel cycles on the same symbol+TF.
         with cls._lock:
-            cls._open[(str(account), symbol, tf)] = {
-                "positions": int(positions), "pendings": int(pendings),
+            cls._open[(str(account), symbol, int(magic))] = {
+                "positions": int(positions), "pendings": int(pendings), "tf": tf,
                 "ts": now if now is not None else time.time(),
             }
 
     @classmethod
-    def get_open(cls, account: str, symbol: str, tf: str = "") -> dict:
+    def get_open(cls, account: str, symbol: str, tf: str = "", magic: int = 0) -> dict:
         with cls._lock:
-            return dict(cls._open.get((str(account), symbol, tf), {"positions": 0, "pendings": 0}))
+            return dict(cls._open.get((str(account), symbol, int(magic)), {"positions": 0, "pendings": 0}))
 
     # ── last-armed grid (ground truth for chart drawing + diagnostics) ─────────
     @classmethod
-    def set_last_arm(cls, account: str, broker_symbol: str, tf: str = "", **meta) -> None:
+    def set_last_arm(cls, account: str, broker_symbol: str, tf: str = "", magic: int = 0,
+                     **meta) -> None:
+        # Keyed by magic. The internal monitor calls re-pass the stored cyc via **cyc, so
+        # `magic` arrives either as the named arg or inside meta — accept both.
+        key_magic = int(magic or meta.get("magic", 0) or 0)
         with cls._lock:
-            cls._last_arm[(str(account), broker_symbol, tf)] = dict(meta, tf=tf)
+            cls._last_arm[(str(account), broker_symbol, key_magic)] = dict(meta, tf=tf, magic=key_magic)
 
     @classmethod
-    def get_last_arm(cls, account: str, broker_symbol: str, tf: str = "") -> dict | None:
+    def get_last_arm(cls, account: str, broker_symbol: str, tf: str = "", magic: int = 0) -> dict | None:
         with cls._lock:
-            m = cls._last_arm.get((str(account), broker_symbol, tf))
+            m = cls._last_arm.get((str(account), broker_symbol, int(magic)))
             return dict(m) if m else None
+
+    @classmethod
+    def get_active_arm_for_tf(cls, account: str, broker_symbol: str, tf: str) -> dict | None:
+        """Dashboard helper: with cycles keyed by magic, several setups may be armed on
+        one TF. Return the most-recently-armed ACTIVE cycle whose stored tf matches — what
+        the EA's zone overlay draws (the fulcrum/trigger currently in play on that TF)."""
+        with cls._lock:
+            best, best_ts = None, -1.0
+            for (acc, sym, _mg), m in cls._last_arm.items():
+                if acc != str(account) or sym != broker_symbol:
+                    continue
+                if m.get("tf") != tf or not m.get("active"):
+                    continue
+                ts = float(m.get("ts", 0.0) or 0.0)
+                if ts >= best_ts:
+                    best, best_ts = m, ts
+            return dict(best) if best else None
 
     # ── cycle monitor (server-side exit brain) ─────────────────────────────────
     @classmethod
@@ -188,13 +211,13 @@ class ExecBridge:
           3. full-hedge   — delta-neutral basket cut to free margin (realizes loss)
         """
         t = now if now is not None else time.time()
-        cyc = cls.get_last_arm(account, symbol, tf)
+        cyc = cls.get_last_arm(account, symbol, magic=magic)
         if not cyc or not cyc.get("active"):
             return None
         if not magic:
             magic = int(cyc.get("magic") or 0)
 
-        open_state = cls.get_open(account, symbol, tf)
+        open_state = cls.get_open(account, symbol, magic=magic)
         pendings = int(open_state.get("pendings", 0) or 0)
         # Prefer the per-side sum the new EA sends; fall back to the legacy count.
         if buys is not None and sells is not None:
@@ -324,21 +347,22 @@ class ExecBridge:
 
     # ── emit dedup (one grid per HVN-touch episode, not per bar) ───────────────
     @classmethod
-    def should_emit(cls, account: str, symbol: str, tf: str, fulcrum: float, tol: float) -> bool:
+    def should_emit(cls, account: str, symbol: str, fulcrum: float, tol: float,
+                    magic: int = 0) -> bool:
         """True if this fulcrum is a NEW touched-edge episode (no prior, or moved
-        more than `tol` from the last emitted edge). Prevents re-arming the same
-        node every bar while price sits in it."""
-        last = cls._last_emit.get((str(account), symbol, tf))
+        more than `tol` from the last emitted edge). Per-magic so each setup dedups
+        independently. Prevents re-arming the same node every bar while price sits in it."""
+        last = cls._last_emit.get((str(account), symbol, int(magic)))
         return last is None or abs(fulcrum - last) > tol
 
     @classmethod
-    def mark_emit(cls, account: str, symbol: str, tf: str, fulcrum: float) -> None:
-        cls._last_emit[(str(account), symbol, tf)] = fulcrum
+    def mark_emit(cls, account: str, symbol: str, fulcrum: float, magic: int = 0) -> None:
+        cls._last_emit[(str(account), symbol, int(magic))] = fulcrum
 
     @classmethod
-    def clear_emit(cls, account: str, symbol: str, tf: str) -> None:
+    def clear_emit(cls, account: str, symbol: str, magic: int = 0) -> None:
         """Episode ended (no arm this bar) → next arm is a fresh touch."""
-        cls._last_emit.pop((str(account), symbol, tf), None)
+        cls._last_emit.pop((str(account), symbol, int(magic)), None)
 
     # ── venue quote cache (EA reports its live price on each poll) ─────────────
     @classmethod

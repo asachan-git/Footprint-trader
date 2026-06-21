@@ -75,7 +75,7 @@ def exec_poll():
                 if not tf_m:
                     continue
                 b = int(m.get("buys", 0)); s = int(m.get("sells", 0))
-                ExecBridge.set_open(account, sym, b + s, int(m.get("pendings", 0)), tf=tf_m)
+                ExecBridge.set_open(account, sym, b + s, int(m.get("pendings", 0)), tf=tf_m, magic=mg)
                 ExecBridge.monitor_cycle(account, sym, settings_cfg, tf=tf_m, magic=mg,
                                          pnl=float(m.get("pnl", 0.0)), buys=b, sells=s,
                                          buy_pnl=float(m.get("buy_pnl", 0.0)),
@@ -159,9 +159,13 @@ def exec_emit_grid():
     plan = plan_grid_levels(symbol, tf, float(latest.ohlc.c),
                             trigger_hint=trigger_hint, settings=settings,
                             venue_price=float(quote["mid"]), min_step_venue=min_step_venue)
+    # Cycle state is keyed by MAGIC (strategy×TF) so independent setups (hvn / squeeze /
+    # vp …) run as parallel cycles on the SAME symbol+TF. Compute it once from the plan's
+    # trigger; "" trigger (skip) → 0 (the legacy single pool).
+    leg_magic = magic_for(plan.trigger_kind, tf) if plan.trigger_kind else 0
     if plan.verdict != "arm":
-        # episode ended → next arm on this symbol/tf is a fresh touch
-        ExecBridge.clear_emit(account, symbol, tf)
+        # episode ended → next arm on this magic is a fresh touch
+        ExecBridge.clear_emit(account, symbol, magic=leg_magic)
         _emit_audit({"account": account, "symbol": symbol, "tf": tf, "verdict": "skip",
                      "skip_reason": plan.skip_reason})
         return jsonify({"ok": True, "verdict": "skip", "skip_reason": plan.skip_reason,
@@ -172,7 +176,7 @@ def exec_emit_grid():
     # hvn_edge/va/imbalance grid. Membership (not equality) so the group works.
     hint_set = _hint_set(trigger_hint)
     if hint_set and plan.trigger_kind not in hint_set:
-        ExecBridge.clear_emit(account, symbol, tf)
+        ExecBridge.clear_emit(account, symbol, magic=leg_magic)
         _emit_audit({"account": account, "symbol": symbol, "tf": tf, "verdict": "skip",
                      "skip_reason": f"trigger_mismatch:{plan.trigger_kind}"})
         return jsonify({"ok": True, "verdict": "skip",
@@ -185,8 +189,8 @@ def exec_emit_grid():
     # This TF's cycle, while it holds a live position, can't be re-armed (would
     # flatten its own fills); it may refresh only while flat. Sibling TFs are not
     # consulted here — they own separate pools.
-    arm = ExecBridge.get_last_arm(account, broker_symbol, tf) or {}
-    open_state = ExecBridge.get_open(account, broker_symbol, tf)
+    arm = ExecBridge.get_last_arm(account, broker_symbol, magic=leg_magic) or {}
+    open_state = ExecBridge.get_open(account, broker_symbol, magic=leg_magic)
     force = bool(body.get("force", False))
     if not force and arm.get("active") and open_state.get("positions", 0) > 0:
         return jsonify({"ok": True, "verdict": "skip", "skip_reason": "position_open",
@@ -200,7 +204,7 @@ def exec_emit_grid():
     # resets it, so a moved fulcrum re-arms. mark_emit set after a successful arm.
     dedup_pct = float((settings.get("grid_levels") or {}).get("emit_dedup_pct", 0.0007) or 0.0)
     dedup_tol = float(quote["mid"]) * dedup_pct
-    if not force and not ExecBridge.should_emit(account, symbol, tf, plan.fulcrum, dedup_tol):
+    if not force and not ExecBridge.should_emit(account, symbol, plan.fulcrum, dedup_tol, magic=leg_magic):
         _emit_audit({"account": account, "symbol": symbol, "tf": tf, "verdict": "skip",
                      "skip_reason": "dedup:same_fulcrum", "fulcrum": plan.fulcrum})
         return jsonify({"ok": True, "verdict": "skip", "skip_reason": "dedup:same_fulcrum",
@@ -208,9 +212,8 @@ def exec_emit_grid():
 
     # Re-arm clears stale pendings with CANCEL_PENDINGS (never CLOSE_ALL) so it can't
     # flatten a live position. The deliberate flatten is owned solely by monitor_cycle.
-    # Composite magic = strategy × TF (e.g. hvn·15m, squeeze·1h). Identifies every leg
-    # in MT5 history AND keys the per-TF cycle so the EA can run all TFs in parallel.
-    leg_magic = magic_for(plan.trigger_kind, tf)
+    # leg_magic (strategy × TF, computed above) identifies every leg in MT5 history AND
+    # keys the per-(strategy×TF) cycle so independent setups run in parallel on one symbol.
     # net-profit-exit-only: place legs WITHOUT per-order TP so no single side self-closes
     # while the other dangles — the basket net-target (monitor_cycle) becomes the sole
     # profit exit and only flattens when the whole cycle is net ≥ target.
@@ -237,7 +240,7 @@ def exec_emit_grid():
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
                             net_target_usd=net_target, max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
                             squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank)
-    ExecBridge.mark_emit(account, symbol, tf, plan.fulcrum)   # dedup: this fulcrum is now armed
+    ExecBridge.mark_emit(account, symbol, plan.fulcrum, magic=leg_magic)   # dedup: this fulcrum is now armed
     _emit_audit({"account": account, "symbol": symbol, "broker_symbol": broker_symbol,
                  "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind, "edge": edge,
                  "fulcrum": plan.fulcrum, "venue_mid": quote["mid"],
@@ -374,7 +377,7 @@ def exec_zones():
     # dashboard shows the cycle for the EA's drawn TF (body.tf). Cycles are now per-TF,
     # so without a tf we'd find nothing — default to the zone TF the EA reports.
     zone_tf = str(body.get("tf") or "")
-    arm = ExecBridge.get_last_arm(account, broker_symbol, zone_tf) or {}
+    arm = ExecBridge.get_active_arm_for_tf(account, broker_symbol, zone_tf) or {}
 
     # ict_fvg paper-strategy overlay (entry/SL/TP, fib zone, FVGs, ChoCh) — published in
     # the ANALYSIS frame; rebase onto the venue (ratio = venue_mid / analysis_anchor) so
