@@ -218,11 +218,13 @@ def exec_emit_grid():
     # flatten a live position. The deliberate flatten is owned solely by monitor_cycle.
     # leg_magic (strategy × TF, computed above) identifies every leg in MT5 history AND
     # keys the per-(strategy×TF) cycle so independent setups run in parallel on one symbol.
-    # net-profit-exit-only: place legs WITHOUT per-order TP so no single side self-closes
-    # while the other dangles — the basket net-target (monitor_cycle) becomes the sole
-    # profit exit and only flattens when the whole cycle is net ≥ target.
+    # Leg-TP policy: net_profit_exit_only places legs WITHOUT a per-order TP so no single
+    # side self-closes while the other dangles (basket net_target owns the exit). BUT
+    # leg_tp_ceiling re-adds the computed structural TP as a FAR ceiling (visible target +
+    # runaway-move backstop); the basket exit stays primary since it's closer.
     grid_cfg_ep = (settings.get("grid_levels") or {})
-    leg_tp = not bool(grid_cfg_ep.get("net_profit_exit_only", False))
+    leg_tp = (not bool(grid_cfg_ep.get("net_profit_exit_only", False))
+              or bool(grid_cfg_ep.get("leg_tp_ceiling", False)))
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
                                         close_first=close_first, clear_kind="cancel",
                                         magic=leg_magic, leg_tp=leg_tp)

@@ -53,6 +53,12 @@ grid_levels:
   # WHOLE basket is net ≥ target; bias_trail still rides clean winners; full_hedge cuts
   # the symmetric whipsaw (which is mathematically un-profitable at any single exit).
   net_profit_exit_only: true
+  # Structural-TP-as-ceiling: even in net_profit_exit_only, place each leg's COMPUTED
+  # structural TP (HVN reversion→POC, breakout→next-HVN, VP target) on the broker order
+  # as a FAR ceiling — so the targets show on the chart/orders and a runaway move books at
+  # structure. The basket net_target stays primary (it's closer → fires first in the
+  # common case); the leg TP is the backstop. false = truly TP-less legs.
+  leg_tp_ceiling: true
   # HVN inside-touch reversion bias: a rejection at an edge is a fade INTO the node, so
   # skew lots to the into-node side + target POC on that side (breakout side stays light,
   # far next-HVN target). Directional inventory → a net-profit exit price exists. false =
