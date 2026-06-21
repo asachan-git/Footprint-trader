@@ -230,7 +230,8 @@ def exec_emit_grid():
                             bias_peak=0.0, bias_booked=False,
                             node_low=round(node_low, 5), node_high=round(node_high, 5),
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
-                            net_target_usd=net_target, max_pos_seen=0, pend_seen=0, flatten_ts=0.0)
+                            net_target_usd=net_target, max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
+                            squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank)
     ExecBridge.mark_emit(account, symbol, tf, plan.fulcrum)   # dedup: this fulcrum is now armed
     _emit_audit({"account": account, "symbol": symbol, "broker_symbol": broker_symbol,
                  "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind, "edge": edge,
@@ -239,7 +240,8 @@ def exec_emit_grid():
                  "step": plan.step,
                  "buy_legs": [l.price for l in plan.buy_legs],
                  "sell_legs": [l.price for l in plan.sell_legs],
-                 "buy_tp": plan.buy_tp, "sell_tp": plan.sell_tp})
+                 "buy_tp": plan.buy_tp, "sell_tp": plan.sell_tp,
+                 "squeeze_ok": plan.squeeze_ok, "squeeze_rank": plan.squeeze_rank})
     LOG.info(f"[exec] emit_grid {account} {broker_symbol} {tf} → armed [{plan.trigger_kind} "
              f"edge={edge} fulcrum={plan.fulcrum}], {len(cmds)} command(s)")
     return jsonify({

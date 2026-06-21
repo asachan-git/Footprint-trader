@@ -279,7 +279,9 @@ class ExecBridge:
                     _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
                                       "tf": tf, "magic": magic, "exit_reason": "bias_book_trail",
                                       "bias": bias, "peak": round(peak, 2),
-                                      "side_pnl": round(side_pnl, 2), "book_frac": book_frac})
+                                      "side_pnl": round(side_pnl, 2), "book_frac": book_frac,
+                                      "squeeze_ok": cyc.get("squeeze_ok"),
+                                      "squeeze_rank": cyc.get("squeeze_rank")})
                     return "bias_book_trail"   # cycle continues (runner + hedge); no flatten
 
         reason: str | None = None
@@ -315,7 +317,9 @@ class ExecBridge:
                           "exit_reason": reason, "armed_tf": cyc.get("armed_tf", ""),
                           "positions": positions, "pendings": pendings,
                           "buys": buys, "sells": sells, "pnl": pnl, "venue_mid": mid,
-                          "tp_up": tp_up, "tp_down": tp_down, **detail})
+                          "tp_up": tp_up, "tp_down": tp_down,
+                          "squeeze_ok": cyc.get("squeeze_ok"), "squeeze_rank": cyc.get("squeeze_rank"),
+                          **detail})
         return reason
 
     # ── emit dedup (one grid per HVN-touch episode, not per bar) ───────────────

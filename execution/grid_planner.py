@@ -68,6 +68,11 @@ class GridPlan:
     venue_anchor: float = 0.0
     rebased: bool = False
     trigger_context: dict = field(default_factory=dict)   # detector metadata (edge side, session…)
+    # Squeeze A/B label — ALWAYS computed (vol compressed/coiled at arm?), independent of
+    # whether require_squeeze_gate enforces it. Carried through the cycle so the exit audit
+    # can bucket outcomes squeeze-pass vs squeeze-fail.
+    squeeze_ok: bool = False
+    squeeze_rank: float = 1.0
 
 
 # trigger-hint groups: a hint may name one kind, a comma list, or a group keyword.
@@ -477,13 +482,15 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         dist_pct = abs(fulcrum_t.fulcrum_price - current_price) / current_price
         if dist_pct > max_fulcrum_dist_pct:
             skip, reason = True, f"fulcrum_too_far:{dist_pct:.3f}>{max_fulcrum_dist_pct}"
-    # Vol-compression gate: a neutral straddle only pays on expansion FROM a coil. When
-    # enabled, arm ANY trigger (hvn_inside_touch/squeeze/…) only if vol is compressed now
-    # or just released — filters out the trending regimes that whipsaw-fill both sides.
-    if not skip and fulcrum_t is not None and bool(grid_cfg.get("require_squeeze_gate", False)):
-        ok, rank = zone_triggers.squeeze_gate(symbol, tf, grid_cfg)
-        if not ok:
-            skip, reason = True, f"no_squeeze_gate:rank={rank:.2f}"
+    # Vol-compression gate/label: a neutral straddle only pays on expansion FROM a coil.
+    # ALWAYS compute the label (squeeze_ok/rank) when there's a fulcrum — so an ungated run
+    # still tags every arm for the squeeze A/B. ENFORCE (skip uncoiled) only when
+    # require_squeeze_gate is set — else arm both and let the outcome audit compare.
+    sq_ok, sq_rank = False, 1.0
+    if not skip and fulcrum_t is not None:
+        sq_ok, sq_rank = zone_triggers.squeeze_gate(symbol, tf, grid_cfg)
+        if bool(grid_cfg.get("require_squeeze_gate", False)) and not sq_ok:
+            skip, reason = True, f"no_squeeze_gate:rank={sq_rank:.2f}"
     if skip:
         return GridPlan(verdict="skip", skip_reason=reason,
                         regime=getattr(regime, "type", "unknown"),
@@ -544,6 +551,8 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         regime_confidence=round(float(getattr(regime, "confidence", 0.0) or 0.0), 3),
         trigger_kind=fulcrum_t.kind,
         trigger_confidence=round(fulcrum_t.confidence, 3),
+        squeeze_ok=bool(sq_ok),
+        squeeze_rank=round(float(sq_rank), 3),
         n_per_side=n,
         step=step,
         skew=skew,

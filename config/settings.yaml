@@ -82,7 +82,11 @@ grid_levels:
   # vol has coiled (BB 3σ compression now, or a ≥squeeze_min_on_bars coil that ended within
   # squeeze_gate_max_bars). A straddle pays on expansion FROM a coil → this filters the
   # trending regimes that whipsaw-fill both sides. Cuts arm frequency for quality.
-  require_squeeze_gate: true
+  # OBSERVE/LABEL mode for the squeeze A/B: false = arm BOTH coiled & uncoiled grids,
+  # each tagged squeeze_ok in the arm + exit audits (data/exec_emit.jsonl) so outcomes can
+  # be bucketed squeeze-pass vs squeeze-fail. Flip to true to ENFORCE (skip uncoiled) once
+  # the data favours the gate. The label is stamped either way.
+  require_squeeze_gate: false
   squeeze_gate_max_bars: 10  # how stale a just-ended coil may be and still pass the gate
 
 # Startup preflight — server REFUSES to start unless footprint + VP data are present.
