@@ -296,12 +296,24 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
 
 # ── skew ────────────────────────────────────────────────────────────────────
 
-def _resolve_skew(trigger: Trigger, regime) -> tuple[str, str]:
+def _resolve_skew(trigger: Trigger, regime, cfg: dict | None = None) -> tuple[str, str]:
     """Which side to load (scale into the winner). Neutral straddle remains;
     skew only weights one side."""
+    cfg = cfg or {}
     bias = trigger.context.get("bias", "none")
     interp = trigger.context.get("interpretation", "")
     rtype = getattr(regime, "type", "uncertain")
+
+    # HVN inside-touch is a rejection AT an edge → the move that pays is the fade INTO
+    # the node (the edge held). Load the into-node side: tapped TOP → sell into node;
+    # tapped BOTTOM → buy into node. Directional inventory also makes a net-profit exit
+    # price exist (L_buy ≠ L_sell). Opt out with hvn_reversion_bias: false.
+    if trigger.kind == "hvn_inside_touch" and bool(cfg.get("hvn_reversion_bias", True)):
+        edge = trigger.context.get("edge", "")
+        if edge == "top":
+            return "sell", "hvn inside-touch: rejected at top → fade into node (load sell)"
+        if edge == "bottom":
+            return "buy", "hvn inside-touch: rejected at bottom → fade into node (load buy)"
 
     if bias in ("buy", "sell"):
         why = f"{trigger.kind}:{interp or 'bias'} → load {bias}"
@@ -497,7 +509,7 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
                         atr=round(atr, 4), plan_id=plan_id)
 
     fulcrum = fulcrum_t.fulcrum_price
-    skew, skew_reason = _resolve_skew(fulcrum_t, regime)
+    skew, skew_reason = _resolve_skew(fulcrum_t, regime, grid_cfg)
     swing_range = _opposing_swing_range(symbol, fulcrum, skew, daily_vp, atr)
     conviction = _candle_conviction(symbol, tf)
     n, step = _size_grid(fulcrum_t, regime, atr, swing_range, conviction,
@@ -543,6 +555,23 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
             buy_tp = round(tp_up, 4)
         if 0.0 < tp_down < bot_leg:
             sell_tp = round(tp_down, 4)
+
+    # HVN inside-touch reversion TP: the fade INTO the node targets the POC (the node's
+    # acceptance magnet), not the far next-HVN. Tapped TOP → sells fade DOWN to POC;
+    # tapped BOTTOM → buys revert UP to POC. Breakout side keeps its far next-HVN target
+    # (tp_up/tp_down above). Only when POC sits beyond the inner leg on the fade side
+    # (else it'd sit inside the ladder → keep the structural/ATR target).
+    if (fulcrum_t.kind == "hvn_inside_touch"
+            and bool(grid_cfg.get("hvn_reversion_bias", True))):
+        poc = float((daily_vp or {}).get("poc", 0.0) or 0.0)
+        edge = fulcrum_t.context.get("edge", "")
+        bot_leg = min((l.price for l in sell_legs), default=fulcrum)
+        top_leg = max((l.price for l in buy_legs), default=fulcrum)
+        if poc > 0:
+            if edge == "top" and poc < bot_leg:        # fade down to POC (sell side)
+                sell_tp = round(poc, 4)
+            elif edge == "bottom" and poc > top_leg:   # revert up to POC (buy side)
+                buy_tp = round(poc, 4)
 
     plan = GridPlan(
         verdict="arm",

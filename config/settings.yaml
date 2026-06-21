@@ -53,6 +53,11 @@ grid_levels:
   # WHOLE basket is net ≥ target; bias_trail still rides clean winners; full_hedge cuts
   # the symmetric whipsaw (which is mathematically un-profitable at any single exit).
   net_profit_exit_only: true
+  # HVN inside-touch reversion bias: a rejection at an edge is a fade INTO the node, so
+  # skew lots to the into-node side + target POC on that side (breakout side stays light,
+  # far next-HVN target). Directional inventory → a net-profit exit price exists. false =
+  # symmetric HVN→HVN straddle.
+  hvn_reversion_bias: true
   cycle_net_target_usd: 50.0      # base net floating-$ target; tune on demo (micro-lot swings are small)
   cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full
   cycle_min_target_usd: 0.20     # floor; must be >0 so a hedged cycle still has a positive net-$ exit
