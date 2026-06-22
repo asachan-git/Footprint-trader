@@ -19,10 +19,11 @@ FLASK="${1:-http://127.0.0.1:5000}"
 ACCOUNT="${2:?account login required (e.g. 25230425)}"
 SYMBOL="${3:-XAUUSD+}"
 
-# Three parallel grid setups — each posts its OWN trigger_hint and (post-P1 magic re-key)
-# arms an INDEPENDENT cycle on the same symbol+TF, so they coexist and can be reviewed
-# separately by magic: hvn_inside_touch (strat 1), squeeze (2), vp_levels = va+vp (7/3).
-SETUPS=(hvn_inside_touch squeeze vp_levels)
+# Parallel grid setups — each posts its OWN trigger_hint and (post-P1 magic re-key) arms
+# an INDEPENDENT cycle on the same symbol+TF. Override the list per instance with the
+# FB_SETUPS env var (space-separated) — e.g. live deploys a vetted subset while demo keeps
+# all three for data:  FB_SETUPS="hvn_inside_touch" scripts/auto_exec_emit.sh ...
+SETUPS=(${FB_SETUPS:-hvn_inside_touch squeeze vp_levels})
 
 emit_loop() {
   local tf="$1" interval="$2" offset="$3"
