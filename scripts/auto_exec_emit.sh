@@ -51,7 +51,7 @@ if v == 'arm':
 else:
     print(f\"skip ({r.get('skip_reason','')})\")
 " 2>/dev/null || echo "err: $(echo "$resp" | head -c 120)")
-      echo "$ts [$tf/$hint] $note"
+      echo "$ts [$SYMBOL $tf/$hint] $note"
     done
   done
 }

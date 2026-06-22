@@ -126,8 +126,8 @@ startup_check:
   stale_warn_hours: 6        # WARN (not block) if newest footprint bar older than this
   min_density_pct: 0.5       # WARN if <50% of expected bars in the window (gaps)
   # symbols / tfs default to vp_cache.symbols and instrument.timeframes
-  symbols: [BTCUSDT]         # WEEKEND: BTC-only (gold closed → XAU VP thin, no HVN → blocks boot).
-                             # REVERT to [BTCUSDT, XAUTUSDT] (or remove this line) when gold reopens.
+  symbols: [BTCUSDT, XAUTUSDT]   # both live (gold reopened 2026-06-22). Weekend BTC-only
+                                 # was for the gold-closed XAU-thin-VP boot block.
 
 claude:
   mode: restricted           # full | restricted | off
