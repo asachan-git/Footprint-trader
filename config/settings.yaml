@@ -41,10 +41,14 @@ instrument:
 # Footprint-driven neutral-grid placement (/exec/emit_grid + FBExecBridge EA).
 # Planner reads these via .get() defaults — block is optional but canonical here.
 grid_levels:
-  base_lot: 0.01
-  lot_step: 0.01
+  base_lot: 0.25
+  lot_step: 0.25
   tp_atr_mult: 1.5
-  hvn_max_legs: 8
+  hvn_max_legs: 6
+  # Minimum TP distance ($) beyond the outermost leg — a structural level closer than
+  # this is skipped (keep walking out to the next). Stops the tiny-TP-into-own-node bug
+  # (a fulcrum on an HVN edge had its into-node TP land ~2pt away). 0 = no floor.
+  min_tp_dist: 8.0
   max_fulcrum_dist_pct: 0.05
   # Cycle exit (server-side cycle monitor). DEMO ONLY — strategy is -EV.
   # Net-profit-exit-only: place legs with NO per-order TP so the winning side can't book
@@ -64,6 +68,10 @@ grid_levels:
   # far next-HVN target). Directional inventory → a net-profit exit price exists. false =
   # symmetric HVN→HVN straddle.
   hvn_reversion_bias: true
+  # Wick proximity buffer for hvn_inside_touch: fire if wick came within this many price
+  # units of the edge even without crossing it (e.g. 0.5pt catches near-misses on gold).
+  # 0.0 = exact touch only (original behaviour). Edge is still the fulcrum price.
+  hvn_touch_buffer: 0.5
   # Directional skew votes (skew-only — both sides still placed, favoured side heavier):
   # HTF Bollinger bias reads the NEXT TF up's 20-SMA (5m→15m, 15m→1h…) — price above a
   # rising 20MA = bull vote, below a falling one = bear. 2.5σ "edge" votes mean-reversion
@@ -75,18 +83,42 @@ grid_levels:
   htf_bias_map: {1m: "15m", 5m: "15m", 15m: "1h", 1h: "4h"}
   bb_edge_enabled: true
   bb_edge_sigma: 2.5
-  cycle_net_target_usd: 50.0      # base net floating-$ target; tune on demo (micro-lot swings are small)
+  cycle_net_target_usd: 500.0      # base net floating-$ target; tune on demo (micro-lot swings are small)
+  # Per-TF override of the base net-$ target. The cycle's TF is recovered from its magic
+  # (magic % 10), so each parallel TF pool can carry its own profit target — fast TFs book
+  # small swings, slow TFs hold for larger moves. Any TF absent here falls back to
+  # cycle_net_target_usd above. Keys are TF strings ("1m","5m","15m","1h").
+  cycle_net_target_by_tf: {1m: 1000.0, 5m: 2000.0, 15m: 4000.0, 1h: 8000.0}
   cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full
   cycle_min_target_usd: 0.20     # floor; must be >0 so a hedged cycle still has a positive net-$ exit
   cycle_close_on_full_hedge: true  # cut a fully-hedged (delta-neutral) cycle to free margin
+  # Orphan-pending sweep: a never-filled pending leg anchored on a fulcrum HVN that has
+  # since DISAPPEARED from the live VP gets cancelled — but ONLY once the cycle's other
+  # positions have all closed (no open legs left). Frees a stale dangling order whose
+  # structural reason to exist is gone. Opt-in; the cycle must have filled at least once
+  # (max_pos_seen>0) so a freshly armed straddle is never cancelled early.
+  cancel_orphan_on_hvn_gone: true
+  hvn_gone_tol_usd: 0.0   # venue-$ tolerance band around HVN edges when testing "gone" (0 = exact zone)
+  # Full-fill breakeven: the moment ONE side fills ALL its legs the move has committed that
+  # way, so the opposite resting ladder becomes a stop that would lock the full ladder span.
+  # Cap that immediately — move the committed side to BE (SL=avg entry); filled side can no
+  # longer lose, opposite ladder stays armed to catch a reversal. Reduces hedge loss risk.
+  fullfill_be_enabled: true
   # Bias-side trailing book: when ONE side has ALL its legs filled (the move committed
   # that way), track its peak floating P&L; on a give-back from peak, BOOK a fraction of
   # that side and move the rest to breakeven (risk-free runner). Captures directional
   # profit the net-basket exit masks (a hedge leg drags net down → target never hits).
   bias_trail_enabled: true
   bias_trail_activate_usd: 5.0   # bias-side floating must PEAK ≥ this ($) to arm the trail
-  bias_trail_giveback_pct: 40    # fire when floating retraces this % off the peak
+  bias_trail_giveback_pct: 50    # fire when floating retraces this % off the peak
   bias_book_frac: 0.5            # fraction of the bias side's positions to book at the trigger
+  # Intrabar touch-arm: arm the straddle the moment LIVE price taps an HVN edge and ticks
+  # back inside (mini-rejection), without waiting for the candle to close. Checked every EA
+  # poll (~1s). Filters breakouts via the tick-reversal confirm. Close-driven emit still
+  # runs in parallel — touch-arm just gets in earlier when price reverses off an edge.
+  touch_arm_enabled: true
+  touch_arm_tfs: [5m, 15m]       # which TFs arm on touch (1m left close-only = too noisy)
+  touch_arm_confirm_ticks: 0.2   # price must revert this many $ back inside the edge to confirm
   # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
   triggers: [hvn_inside_touch, squeeze]   # "structural" group the emitter arms (vp_level_touch disabled)
   vp_fulcrum_levels: [poc, vah, val, naked_poc, lvn]   # which VP levels are fulcrums
@@ -114,7 +146,7 @@ grid_levels:
   # each tagged squeeze_ok in the arm + exit audits (data/exec_emit.jsonl) so outcomes can
   # be bucketed squeeze-pass vs squeeze-fail. Flip to true to ENFORCE (skip uncoiled) once
   # the data favours the gate. The label is stamped either way.
-  require_squeeze_gate: false
+  require_squeeze_gate: true
   squeeze_gate_max_bars: 10  # how stale a just-ended coil may be and still pass the gate
 
 # Startup preflight — server REFUSES to start unless footprint + VP data are present.
@@ -180,14 +212,15 @@ execution:
   broker: vantage_mt5
   tradable_symbols: [XAUTUSDT, BTCUSDT]
   symbol_map:
-    XAUTUSDT: "XAUUSD+"
+    XAUTUSDT: "XAUUSD.pc"        # VantageMarkets-Live USC cent account
     BTCUSDT:  "BTCUSD"
   # Risk-adjusted sizing: lots = (balance × risk_per_trade_pct) / (SL_distance × contract_size)
   # Set risk_per_trade_pct = 0 to disable; falls back to default_lots.
   risk_per_trade_pct: 0.0025    # 0.25% of equity per trade
   max_lots: 1.0                 # hard cap regardless of risk math
   default_lots:                 # fallback when risk math fails (no SL, etc.)
-    "XAUUSD+": 0.01
+    "XAUUSD.pc": 0.25            # live USC cent acct base lot
+    "XAUUSD+": 0.01              # demo fallback
     "BTCUSD": 0.001
   metaapi_timeout_s: 30
   order_comment_prefix: "FB"
@@ -202,8 +235,10 @@ execution:
     XAUTUSDT: 100
     BTCUSDT: 1
     "BTCUSD": 1
+    "XAUUSD.pc": 100
   # Pre-trade execution gates (live only — checked in MT5Adapter.submit_order)
   max_spread:                   # reject order if (ask-bid) exceeds, per broker symbol
+    "XAUUSD.pc": 0.50
     "XAUUSD+": 0.50
     "BTCUSD": 50.0
   news_blackout_utc: []         # e.g. ["12:25-12:35", "18:00-18:05"] — no orders in these UTC windows
@@ -216,6 +251,11 @@ risk:
   max_legs_per_cycle: 6        # max legs per cycle (total exposure cap = max_cycles × this)
   daily:
     max_dd_r: 4.0              # halt + close all + block re-entry when daily realized R ≤ -this
+
+# Daily floating P&L target — close all grid positions and block new arms for the day
+# once equity rises by this % above the session-open balance.
+# 0 = disabled. Example: 1.5 = close everything once up 1.5% on the day.
+daily_target_pct: 3000.0
 
 # Dhan options trading configuration
 dhan:
