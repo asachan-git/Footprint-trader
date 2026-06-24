@@ -169,12 +169,20 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
     # Unified TP rule (matches arm-time): next HVN far edge + VP refinements (Case 1: VP
     # within 1×step of HVN edge → VP; Case 2: HVN < 2×step from leg → next VP/HVN beyond).
     # Refreshed each poll; HVN rebuilds every 15m so the target re-targets on that cadence.
+    # hvn_inside_touch: target the NEXT node's far edge — exclude the node the fulcrum
+    # sits in (arm-time bounds stored venue-frame → un-rebase to analysis/raw via /ratio).
+    _skip_node = None
+    if arm.get("trigger_kind") == "hvn_inside_touch" and ratio:
+        _nlo_v = float(arm.get("node_low") or 0.0)
+        _nhi_v = float(arm.get("node_high") or 0.0)
+        if _nlo_v > 0 and _nhi_v > _nlo_v:
+            _skip_node = (_nlo_v / ratio, _nhi_v / ratio)
     from execution.zone_triggers import hvn_or_vp_tp as _hvn_or_vp_tp
     raw_tp_up, raw_tp_down = _hvn_or_vp_tp(analysis_symbol, _raw_zones, _top_leg, _bot_leg,
-                                           _stp_raw, min_tp_dist=_min_tp_raw)
+                                           _stp_raw, min_tp_dist=_min_tp_raw, skip_node=_skip_node)
     # Cascade fallback ONLY when nothing structural sits beyond the leg (LVN→fib).
     if raw_tp_up == 0.0 or raw_tp_down == 0.0:
-        _c_up, _c_dn = compute_hvn_tps(analysis_symbol, best_edge, _raw_zones,
+        _c_up, _c_dn = compute_hvn_tps(analysis_symbol, best_edge, _raw_zones, skip_node=_skip_node,
                                        min_dist=_min_tp_raw, top_leg=_top_leg, bot_leg=_bot_leg)
         if raw_tp_up   == 0.0: raw_tp_up   = _c_up
         if raw_tp_down == 0.0: raw_tp_down = _c_dn
@@ -330,6 +338,13 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict) -> 
     open_state = ExecBridge.get_open(account, broker_symbol, magic=leg_magic) or {}
     if int(open_state.get("positions", 0) or 0) > 0 or int(open_state.get("pendings", 0) or 0) > 0:
         return   # cycle already live on this magic
+    # One concurrent cycle per TF: an ACTIVE arm occupies this magic even when MT5 momentarily
+    # reports flat (legs placed but not yet reported back, or pendings mid-reanchor). Without
+    # this, a subsequent touch could stack a second straddle on the same node before the first
+    # cycle's legs surface. Re-arm is freed only when the cycle retires (active→False on
+    # completion / reap / fade). Subsequent touches → only ONE grid per TF.
+    if (ExecBridge.get_last_arm(account, broker_symbol, magic=leg_magic) or {}).get("active"):
+        return
     dedup_pct = float(grid_cfg.get("emit_dedup_pct", 0.0007) or 0.0)
     dedup_tol = venue_mid * dedup_pct
     fulcrum_venue = round(edge * ratio, 4)
@@ -625,6 +640,16 @@ def exec_emit_grid():
     open_state = ExecBridge.get_open(account, broker_symbol, magic=leg_magic)
     force = bool(body.get("force", False))
     _live = int(open_state.get("positions", 0) or 0) > 0 or int(open_state.get("pendings", 0) or 0) > 0
+    # One concurrent cycle per TF for hvn_inside_touch: an ACTIVE arm occupies the magic even
+    # when MT5 momentarily reports flat (legs placed-but-unreported, or pendings mid-reanchor),
+    # so a subsequent touch can't stack/replace a second straddle on the same node. Re-anchoring
+    # while flat is owned by the poll-path _refresh_cycle_tps (MODIFY_PENDING) — no full re-arm
+    # needed. Re-arm frees only once the cycle retires (active→False). Other setups keep the
+    # active+flat re-arm fall-through below.
+    if not force and arm.get("active") and not _live and plan.trigger_kind == "hvn_inside_touch":
+        return jsonify({"ok": True, "verdict": "skip",
+                        "skip_reason": "cycle_active(once_per_tf)",
+                        "symbol": symbol, "broker_symbol": broker_symbol, "tf": tf})
     if not force and arm.get("active") and _live:
         # Refresh TP + pending order prices from latest HVN edges while cycle is live
         # (positions OR resting pendings) — ON CANDLE CLOSE (this route fires per bar),
@@ -687,12 +712,20 @@ def exec_emit_grid():
                 _stp_r = (float(arm.get("step") or 0.0) / _ratio) if _ratio else float(arm.get("step") or 0.0)
                 _top_leg_r = _best_edge + _buy_n_r  * _stp_r if (_buy_n_r  > 0 and _stp_r > 0) else _best_edge
                 _bot_leg_r = _best_edge - _sell_n_r * _stp_r if (_sell_n_r > 0 and _stp_r > 0) else _best_edge
+                # hvn_inside_touch: target the NEXT node's far edge — exclude the node the
+                # fulcrum sits in (arm-time bounds stored venue-frame → un-rebase via /_ratio).
+                _skip_node = None
+                if arm.get("trigger_kind") == "hvn_inside_touch" and _ratio:
+                    _nlo_v = float(arm.get("node_low") or 0.0)
+                    _nhi_v = float(arm.get("node_high") or 0.0)
+                    if _nlo_v > 0 and _nhi_v > _nlo_v:
+                        _skip_node = (_nlo_v / _ratio, _nhi_v / _ratio)
                 # Unified TP rule (matches arm-time): next HVN far edge + VP refinements.
                 from execution.zone_triggers import hvn_or_vp_tp as _hvn_or_vp_tp
                 raw_tp_up, raw_tp_down = _hvn_or_vp_tp(symbol, _raw_zones, _top_leg_r, _bot_leg_r,
-                                                       _stp_r, min_tp_dist=_min_tp_raw)
+                                                       _stp_r, min_tp_dist=_min_tp_raw, skip_node=_skip_node)
                 if raw_tp_up == 0.0 or raw_tp_down == 0.0:   # cascade only if nothing beyond
-                    _cu, _cd = compute_hvn_tps(symbol, _best_edge, _raw_zones,
+                    _cu, _cd = compute_hvn_tps(symbol, _best_edge, _raw_zones, skip_node=_skip_node,
                                                min_dist=_min_tp_raw, top_leg=_top_leg_r, bot_leg=_bot_leg_r)
                     if raw_tp_up   == 0.0: raw_tp_up   = _cu
                     if raw_tp_down == 0.0: raw_tp_down = _cd
@@ -1076,10 +1109,18 @@ def exec_zones():
     except Exception:
         pass
 
+    # Armed-node overlay: the EXACT node each active cycle triggered on (node_low..node_high
+    # + fulcrum), across ALL TFs — already venue-frame (rebased at emit). The drawn HVN/LVN
+    # zones are the DAILY VP, but a grid arms on its per-TF ROLLING VP, whose edges can differ
+    # (esp. 1m). Drawing the armed node makes the touched edge visible regardless of InpZoneTF.
+    armed_nodes = [c for c in _active_cycles
+                   if float(c.get("node_low") or 0.0) > 0 and float(c.get("node_high") or 0.0) > 0]
+
     return jsonify({"ok": True, "zones": zones, "levels": levels, "ict": ict_out,
                     "profile": profile, "vp_bin": vp_bin,
                     "touch_lines": touch_lines,
                     "hvn_cycle_map": hvn_cycle_map,
+                    "armed_nodes": armed_nodes,
                     "cvd_signals": cvd_signals,
                     "venue_mid": quote.get("mid", 0.0),
                     "symbol": symbol, "broker_symbol": broker_symbol,
@@ -1202,9 +1243,26 @@ def exec_fix_tps():
             arm["symbol"] = _broker_to.get(broker_sym, broker_sym)
         analysis_sym = arm.get("symbol", broker_sym)
 
-        dvp = vp_get(analysis_sym, "daily") or {}
-        hvn_zones = [(float(z["low"]), float(z["high"]))
-                     for z in (dvp.get("hvn_zones") or [])]
+        # hvn_inside_touch: use the SAME session zones the trigger armed on (not daily) and
+        # target the NEXT node beyond the touched node, so this repair can't re-clobber the
+        # TP back to the node price already sits in. Every other setup keeps daily zones.
+        _is_inside = arm.get("trigger_kind") == "hvn_inside_touch"
+        hvn_zones = []
+        if _is_inside:
+            try:
+                from execution.zone_triggers import _session_hvn_zones
+                from pipeline.state_store import store as _store
+                _tf = str(arm.get("armed_tf") or arm.get("tf") or "")
+                if _tf:
+                    _sb = _store().recent(analysis_sym, _tf, 120)
+                    _sz, _ = _session_hvn_zones(analysis_sym, _tf, _sb)
+                    hvn_zones = [(float(lo), float(hi)) for lo, hi in (_sz or [])]
+            except Exception:
+                hvn_zones = []
+        if not hvn_zones:
+            dvp = vp_get(analysis_sym, "daily") or {}
+            hvn_zones = [(float(z["low"]), float(z["high"]))
+                         for z in (dvp.get("hvn_zones") or [])]
 
         if not hvn_zones:
             skipped += 1
@@ -1216,7 +1274,15 @@ def exec_fix_tps():
         ratio = (bybit_mid / venue_mid) if venue_mid > 0 and bybit_mid > 0 else 1.0
         analysis_price = price * ratio
 
-        tp_up, tp_down = compute_hvn_tps(analysis_sym, analysis_price, hvn_zones)
+        # skip_node = touched node bounds (stored venue-frame → analysis via *ratio here,
+        # since analysis = venue * ratio in this endpoint's frame convention).
+        _skip_node = None
+        if _is_inside:
+            _nlo_v = float(arm.get("node_low") or 0.0)
+            _nhi_v = float(arm.get("node_high") or 0.0)
+            if _nlo_v > 0 and _nhi_v > _nlo_v:
+                _skip_node = (_nlo_v * ratio, _nhi_v * ratio)
+        tp_up, tp_down = compute_hvn_tps(analysis_sym, analysis_price, hvn_zones, skip_node=_skip_node)
 
         # pick which TP applies to this order side
         is_buy = "buy" in order_type.lower()

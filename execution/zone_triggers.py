@@ -145,7 +145,8 @@ def compute_hvn_tps(symbol: str, edge: float,
                     zones: list[tuple[float, float]],
                     min_dist: float = 0.0,
                     top_leg: float = 0.0,
-                    bot_leg: float = 0.0) -> tuple[float, float]:
+                    bot_leg: float = 0.0,
+                    skip_node: tuple[float, float] | None = None) -> tuple[float, float]:
     """Recompute (tp_up, tp_down) from current HVN zones for a given edge price.
 
     `top_leg`/`bot_leg`: outermost buy/sell leg prices — the TP must clear the WHOLE
@@ -153,6 +154,10 @@ def compute_hvn_tps(symbol: str, edge: float,
     Defaults to `edge` when 0. `min_dist`: a structural level closer than this to the
     reference leg is skipped (keep walking out) so a TP can never land trivially close
     (the small-TP-into-own-node bug). Falls back to fib 1.618× ext if nothing clears it.
+
+    `skip_node`: (node_low, node_high) of the HVN the fulcrum sits INSIDE
+    (hvn_inside_touch). When given, that bracketing node's own edges are excluded so the
+    HVN candidate is the NEXT node's far edge beyond it — never the node price is already in.
 
     Priority per direction (each candidate must clear ref leg + min_dist):
       1. Far edge (hi/lo) of nearest qualifying HVN beyond the leg
@@ -164,9 +169,15 @@ def compute_hvn_tps(symbol: str, edge: float,
     up_ref  = top_leg if top_leg > 0 else edge
     dn_ref  = bot_leg if bot_leg > 0 else edge
 
-    # candidate HVN far-edges that clear the outer leg + min_dist
-    up_cands = sorted(hi for lo, hi in zones if hi > up_ref + min_dist)
-    dn_cands = sorted((lo for lo, hi in zones if lo < dn_ref - min_dist), reverse=True)
+    # candidate HVN far-edges that clear the outer leg + min_dist. When skip_node is set,
+    # restrict to nodes BEYOND the bracketing node (next node up / next node down).
+    if skip_node:
+        _nlo, _nhi = float(skip_node[0]), float(skip_node[1])
+        up_cands = sorted(hi for lo, hi in zones if hi > up_ref + min_dist and lo >= _nhi - 1e-6)
+        dn_cands = sorted((lo for lo, hi in zones if lo < dn_ref - min_dist and hi <= _nlo + 1e-6), reverse=True)
+    else:
+        up_cands = sorted(hi for lo, hi in zones if hi > up_ref + min_dist)
+        dn_cands = sorted((lo for lo, hi in zones if lo < dn_ref - min_dist), reverse=True)
     tp_up   = up_cands[0] if up_cands else 0.0
     tp_down = dn_cands[0] if dn_cands else 0.0
 
@@ -208,7 +219,8 @@ def compute_hvn_tps(symbol: str, edge: float,
 
 def hvn_or_vp_tp(symbol: str, zones: list[tuple[float, float]],
                  top_leg: float, bot_leg: float, step: float,
-                 min_tp_dist: float = 0.0) -> tuple[float, float]:
+                 min_tp_dist: float = 0.0,
+                 skip_node: tuple[float, float] | None = None) -> tuple[float, float]:
     """Unified grid TP: next HVN far edge beyond each outer leg, with two VP-level
     refinements (per user rule):
 
@@ -218,6 +230,11 @@ def hvn_or_vp_tp(symbol: str, zones: list[tuple[float, float]],
       Case 2 — next HVN too close: if the nearest HVN far edge is < 2× step beyond the
         outer leg, skip it and target the next VP level beyond the leg; if no VP qualifies,
         walk to the next HVN beyond.
+
+    `skip_node`: (node_low, node_high) of the HVN the fulcrum sits INSIDE
+    (hvn_inside_touch). When given, the bracketing node's own edges are excluded so TP
+    targets the NEXT node's far edge beyond it, and Case 2 (too-close overshoot) is
+    bypassed — jumping past a whole node already guarantees the TP clears the ladder.
 
     All candidates must clear the outer leg + min_tp_dist. Returns (tp_up, tp_down);
     a side is 0.0 when nothing structural sits beyond it. Pure-structural — no ATR/fib here.
@@ -230,6 +247,7 @@ def hvn_or_vp_tp(symbol: str, zones: list[tuple[float, float]],
 
     near = max(step, 1e-9)         # Case-1 proximity window
     too_close = 2.0 * max(step, 1e-9)   # Case-2 minimum HVN distance from the outer leg
+    _skip_case2 = skip_node is not None   # already targeting the next node → no overshoot
 
     def _pick(edges_sorted: list[float], leg: float, sign: int) -> float:
         # sign +1 → upward (buy TP above leg); sign -1 → downward (sell TP below leg).
@@ -242,7 +260,8 @@ def hvn_or_vp_tp(symbol: str, zones: list[tuple[float, float]],
         hvn = edges_sorted[0]
         dist = sign * (hvn - leg)
         # Case 2: HVN too close → prefer next VP level beyond the leg, else next HVN beyond.
-        if dist < too_close:
+        # Skipped when skip_node is set (the candidate is already the next node beyond).
+        if not _skip_case2 and dist < too_close:
             vp_beyond = sorted((v for v in _vps if sign * (v - leg) >= too_close),
                                key=lambda v: sign * (v - leg))
             if vp_beyond:
@@ -255,8 +274,13 @@ def hvn_or_vp_tp(symbol: str, zones: list[tuple[float, float]],
             return min(vp_near, key=lambda v: abs(v - hvn))
         return hvn
 
-    up_edges = sorted((hi for lo, hi in zones if hi > top_leg + min_tp_dist))
-    dn_edges = sorted((lo for lo, hi in zones if lo < bot_leg - min_tp_dist), reverse=True)
+    if skip_node:
+        _nlo, _nhi = float(skip_node[0]), float(skip_node[1])
+        up_edges = sorted((hi for lo, hi in zones if hi > top_leg + min_tp_dist and lo >= _nhi - 1e-6))
+        dn_edges = sorted((lo for lo, hi in zones if lo < bot_leg - min_tp_dist and hi <= _nlo + 1e-6), reverse=True)
+    else:
+        up_edges = sorted((hi for lo, hi in zones if hi > top_leg + min_tp_dist))
+        dn_edges = sorted((lo for lo, hi in zones if lo < bot_leg - min_tp_dist), reverse=True)
     tp_up   = round(_pick(up_edges, top_leg, +1), 4)
     tp_down = round(_pick(dn_edges, bot_leg, -1), 4)
     # final leg-clear guard
@@ -537,22 +561,21 @@ def touch_arm_trigger(symbol: str, tf: str, live_price: float) -> Trigger | None
     if not zones:
         return None
 
-    # which edge is live price tapping: within buffer of an edge (from EITHER side —
-    # outside approach OR inside). Original strict interior check missed the most
-    # common case: price approaching the edge from outside the node and tapping it.
+    # Tap must come FROM INSIDE the HVN body: live price sits within the node [lo,hi] AND
+    # within hvn_touch_buffer of an edge — an edge-rejection from within value. An OUTSIDE
+    # approach (price below the node tapping the bottom from below, or above tapping the top
+    # from above) is NOT an inside-touch and is excluded (matches the close-driven path,
+    # which requires the candle to CLOSE inside the node).
     best = None   # (dist_to_edge, edge, width, side)
     for lo, hi in zones:
         width = hi - lo
         if width <= 0:
             continue
-        # price must be within buffer of at least one edge (inside OR outside the node)
-        touch_top = live_price >= hi - _buf   # approaching/tapping top edge from below or outside
-        touch_bot = live_price <= lo + _buf   # approaching/tapping bottom edge from above or outside
-        # exclude price that's far away from both edges
-        if not (touch_top or touch_bot):
+        if not (lo <= live_price <= hi):       # live price must be INSIDE the node body
             continue
-        # for outside-approach: price must not be more than _buf beyond the edge
-        if live_price > hi + _buf or live_price < lo - _buf:
+        touch_top = live_price >= hi - _buf    # inside, within buffer of the top edge
+        touch_bot = live_price <= lo + _buf    # inside, within buffer of the bottom edge
+        if not (touch_top or touch_bot):       # inside but not near an edge → no tap
             continue
         if touch_top and touch_bot:   # degenerate thin node — take nearer edge
             edge, side = (hi, "top") if abs(hi - live_price) <= abs(lo - live_price) else (lo, "bottom")

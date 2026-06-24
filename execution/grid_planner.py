@@ -640,14 +640,33 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     min_tp_dist = float(grid_cfg.get("min_tp_dist", 0.0) or 0.0)
     _dz = [(float(z["low"]), float(z["high"]))
            for z in ((_vp_get(symbol, "daily") or {}).get("hvn_zones") or [])]
+    # hvn_inside_touch arms INSIDE a node, so its TP must target the NEXT node's far edge,
+    # not the node price is already in. Use the SAME session zones the trigger armed on
+    # (rolling today + cached prev-D) and pass skip_node = the touched node's bounds so the
+    # bracketing node is excluded (Case 2 overshoot is bypassed too). Every other setup keeps
+    # the daily-zone next-far-edge-beyond-leg rule unchanged.
+    _skip_node = None
+    if fulcrum_t.kind == "hvn_inside_touch":
+        try:
+            _sz, _ = zone_triggers._session_hvn_zones(symbol, tf, bars)
+            if _sz:
+                _dz = [(float(lo), float(hi)) for lo, hi in _sz]
+        except Exception:
+            pass
+        _nlo = float((fulcrum_t.context or {}).get("node_low") or 0.0)
+        _nhi = float((fulcrum_t.context or {}).get("node_high") or 0.0)
+        if _nlo > 0 and _nhi > _nlo:
+            _skip_node = (_nlo, _nhi)
     # Next HVN far edge, with VP-level refinements (Case 1: VP within 1×step of the HVN edge
     # → use VP; Case 2: HVN < 2×step from the leg → next VP beyond, else next HVN beyond).
-    buy_tp, sell_tp = _hvn_or_vp_tp(symbol, _dz, top_leg, bot_leg, step, min_tp_dist=min_tp_dist)
+    buy_tp, sell_tp = _hvn_or_vp_tp(symbol, _dz, top_leg, bot_leg, step,
+                                    min_tp_dist=min_tp_dist, skip_node=_skip_node)
     # Fallback ONLY when nothing structural sits beyond a leg: LVN/fib-ext cascade so the
     # side still has a target rather than 0.
     if buy_tp == 0.0 or sell_tp == 0.0:
         _ctp_up, _ctp_dn = _compute_hvn_tps(symbol, fulcrum, _dz,
-                                            min_dist=min_tp_dist, top_leg=top_leg, bot_leg=bot_leg)
+                                            min_dist=min_tp_dist, top_leg=top_leg, bot_leg=bot_leg,
+                                            skip_node=_skip_node)
         if buy_tp  == 0.0 and _ctp_up > top_leg:        buy_tp  = round(_ctp_up, 4)
         if sell_tp == 0.0 and 0 < _ctp_dn < bot_leg:    sell_tp = round(_ctp_dn, 4)
 
