@@ -345,6 +345,10 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict) -> 
     # completion / reap / fade). Subsequent touches → only ONE grid per TF.
     if (ExecBridge.get_last_arm(account, broker_symbol, magic=leg_magic) or {}).get("active"):
         return
+    # Completed-cycle release: we got here flat AND with no active arm → any cycle that armed
+    # at this fulcrum is fully closed. Its stale dedup mark would otherwise block re-arm at the
+    # same edge forever while price camps there. Drop it so a fresh touch can take orders again.
+    ExecBridge.clear_emit(account, broker_symbol, magic=leg_magic)
     dedup_pct = float(grid_cfg.get("emit_dedup_pct", 0.0007) or 0.0)
     dedup_tol = venue_mid * dedup_pct
     fulcrum_venue = round(edge * ratio, 4)
@@ -776,6 +780,15 @@ def exec_emit_grid():
                         "symbol": symbol, "broker_symbol": broker_symbol, "tf": tf,
                         "open": open_state})
         # active+flat, or inactive → fall through and (re)arm this TF's straddle
+
+    # Completed-cycle release: a cycle that has retired (inactive) AND is flat (orders closed)
+    # still carries its arm-time dedup mark. Price camping on the same HVN edge keeps the
+    # trigger firing at the same fulcrum every bar, so the mark never clears via the no-arm
+    # path and re-arm stays stuck on dedup:same_fulcrum forever. Once the orders are closed
+    # the next touch is a NEW episode → drop the stale mark so we can take orders again. The
+    # active-cycle guards above still prevent stacking (at most one fresh cycle per close).
+    if not arm.get("active") and not _live:
+        ExecBridge.clear_emit(account, symbol, magic=leg_magic)
 
     # Fulcrum dedup: ONE grid per touched-level episode. Skip if the fulcrum hasn't
     # moved beyond tol since the last arm (prevents re-placing the identical straddle
