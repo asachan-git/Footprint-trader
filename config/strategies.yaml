@@ -575,3 +575,8 @@ strategies:
       tp_r: 4.0
       min_rr: 1.5
       be_at_r: 1.0
+      # LIVE execution on the direct wine-rpyc MT5 adapter (real SL-modify/BE/partials —
+      # the reason this strategy can't run on the stop-only EA bridge). Default OFF →
+      # stays paper. Flip true + set ALLOW_LIVE=1 + run scripts/mt5_server.sh to go live.
+      # Routes ONLY ict_fvg to the direct adapter (magic 770010); fleet stays paper.
+      live_direct: false

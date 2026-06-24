@@ -19,15 +19,24 @@ FLASK="${1:-http://127.0.0.1:5000}"
 ACCOUNT="${2:?account login required (e.g. 25230425)}"
 SYMBOL="${3:-XAUUSD+}"
 
-# Parallel grid setups — each posts its OWN trigger_hint and (post-P1 magic re-key) arms
-# an INDEPENDENT cycle on the same symbol+TF. Override the list per instance with the
-# FB_SETUPS env var (space-separated) — e.g. live deploys a vetted subset while demo keeps
-# all three for data:  FB_SETUPS="hvn_inside_touch" scripts/auto_exec_emit.sh ...
-SETUPS=(${FB_SETUPS:-hvn_inside_touch squeeze vp_levels})
+# Per-TF setup lists:
+#   1m  — hvn_inside_touch only
+#   5m  — hvn_inside_touch + squeeze + hvn_displacement + hvn_edge
+#   15m — hvn_inside_touch + squeeze + hvn_displacement + hvn_edge
+# hvn_edge reads the SAME daily/weekly VP the chart draws (vp_cache.get), so it arms
+# on the HVN edge-touch you see on the chart — unlike hvn_inside_touch, which measures
+# the rolling-window VP and a stricter close-inside+wick-reject geometry.
+# Override per-TF with FB_SETUPS_1M / FB_SETUPS_5M / FB_SETUPS_15M env vars.
+SETUPS_1M=(${FB_SETUPS_1M:-hvn_inside_touch})
+SETUPS_5M=(${FB_SETUPS_5M:-hvn_inside_touch squeeze hvn_displacement hvn_edge})
+SETUPS_15M=(${FB_SETUPS_15M:-hvn_inside_touch squeeze hvn_displacement hvn_edge})
+SETUPS_1H=(${FB_SETUPS_1H:-hvn_displacement})
 
 emit_loop() {
   local tf="$1" interval="$2" offset="$3"
-  echo "[emit:$tf] started — every ${interval}s (offset ${offset}s) → $SYMBOL acct $ACCOUNT"
+  shift 3
+  local setups=("$@")
+  echo "[emit:$tf] started — every ${interval}s (offset ${offset}s) → $SYMBOL acct $ACCOUNT setups=[${setups[*]}]"
   while true; do
     local now next sleep_s
     now=$(date +%s)
@@ -36,9 +45,7 @@ emit_loop() {
     sleep "$sleep_s"
     local ts resp note hint
     ts=$(date '+%Y-%m-%d %H:%M:%S')
-    # Fire each setup independently — each arms its own magic cycle (P1), so all three
-    # can be live at once on this symbol+TF.
-    for hint in "${SETUPS[@]}"; do
+    for hint in "${setups[@]}"; do
       resp=$(curl -s -X POST "${FLASK}/exec/emit_grid" \
         -H "Content-Type: application/json" \
         -d "{\"account\":\"${ACCOUNT}\",\"symbol\":\"${SYMBOL}\",\"tf\":\"${tf}\",\"trigger_hint\":\"${hint}\"}")
@@ -57,18 +64,42 @@ else:
   done
 }
 
-# Each TF runs an INDEPENDENT parallel cycle (server keys cycles by TF, isolates by
-# strategy×TF magic) — they no longer contend for the symbol. Offsets keep coincident
-# closes off the same instant (avoids a thundering-herd at :00).
-emit_loop 1h  3600 20 &
-P1H=$!
-emit_loop 15m 900  8 &
-P15=$!
-emit_loop 5m  300  12 &
-P5=$!
-emit_loop 1m  60   3 &
-P1=$!
+# Uniform 1m TP/order refresh: every 1m bar close, re-target EVERY active cycle (any TF)
+# against the live HVN — so all orders track structure at a steady 1m cadence regardless
+# of which TF armed them. Independent of the emit setups (refresh ≠ arm).
+refresh_loop() {
+  local interval=60 offset=5
+  echo "[refresh] started — every ${interval}s → re-target all active cycles"
+  while true; do
+    local now next sleep_s ts resp n
+    now=$(date +%s)
+    next=$(( (now / interval + 1) * interval + offset ))
+    sleep_s=$((next - now)); sleep "$sleep_s"
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    resp=$(curl -s -X POST "${FLASK}/exec/refresh_tps" \
+      -H "Content-Type: application/json" \
+      -d "{\"account\":\"${ACCOUNT}\",\"symbol\":\"${SYMBOL}\"}")
+    n=$(echo "$resp" | python3 -c "
+import sys,json
+try: r=json.load(sys.stdin); print(len(r.get('refreshed_magics',[])))
+except Exception: print('?')" 2>/dev/null || echo '?')
+    echo "$ts [$SYMBOL refresh] re-targeted $n active cycle(s)"
+  done
+}
 
-echo "[auto_exec_emit] running — 1H($P1H) 15m($P15) 5m($P5) 1m($P1). Ctrl-C to stop."
-trap 'kill $P1H $P15 $P5 $P1 2>/dev/null; echo "[auto_exec_emit] stopped."; exit 0' INT TERM
+# Each TF runs an INDEPENDENT parallel cycle, isolated by strategy×TF magic.
+# Offsets keep coincident closes off the same instant (avoids thundering-herd at :00).
+emit_loop 15m 900   8  "${SETUPS_15M[@]}" &
+P15=$!
+emit_loop 5m  300  12  "${SETUPS_5M[@]}" &
+P5=$!
+emit_loop 1m  60    3  "${SETUPS_1M[@]}" &
+P1=$!
+emit_loop 1h  3600 15  "${SETUPS_1H[@]}" &
+P1H=$!
+refresh_loop &
+PR=$!
+
+echo "[auto_exec_emit] running — 15m($P15) 5m($P5) 1m($P1) 1h($P1H) refresh($PR). Ctrl-C to stop."
+trap 'kill $P15 $P5 $P1 $P1H $PR 2>/dev/null; echo "[auto_exec_emit] stopped."; exit 0' INT TERM
 wait

@@ -126,6 +126,11 @@ def _live(broker: str = "vantage_mt5") -> Executor:
     if broker == "dhan":
         from .live.dhan_adapter import DhanAdapter
         return LiveExecutor(DhanAdapter())
+    if broker == "vantage_mt5_direct":
+        # Local wine rpyc adapter — supports SL-modify / partial / pending-modify
+        # (used by ict_fvg; rest of fleet stays on MetaApi / paper).
+        from .live.mt5_direct_adapter import MT5DirectAdapter
+        return LiveExecutor(MT5DirectAdapter())
     from .live.mt5_adapter import MT5Adapter
     return LiveExecutor(MT5Adapter())
 

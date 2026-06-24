@@ -58,6 +58,8 @@ class GridPlan:
     sell_legs: list[Leg] = field(default_factory=list)
     buy_tp: float = 0.0
     sell_tp: float = 0.0
+    buy_sl: float = 0.0   # 0 = no SL (default); set for displacement trigger
+    sell_sl: float = 0.0
     atr: float = 0.0
     swing_range: float = 0.0
     plan_id: str = ""
@@ -80,7 +82,7 @@ class GridPlan:
 # only). The detector still runs but can never win the structural hint, so no VP-level
 # straddles arm. Re-add "vp_level_touch" here to revive it.
 _HINT_GROUPS = {
-    "structural": {"hvn_inside_touch", "squeeze"},
+    "structural": {"hvn_inside_touch", "squeeze", "hvn_displacement"},
     # LVN displacement: vp_level_touch is the only detector that arms on an LVN.
     # The planner narrows it to level_type=="lvn" (see plan_grid_levels) so only the
     # vacuum fires. Neutral straddle-in-vacuum: price sits in the LVN, leaves fast one
@@ -187,20 +189,26 @@ def _should_skip(trigger: Trigger | None, regime, fulcrum: float,
     # HVN-edge / inside-touch / VP-level triggers ARE meant to sit ON structure
     # (an HVN edge or a POC/VA/LVN line, which usually lives inside a node); only skip
     # other fulcrums that fall *inside* a node body.
-    if (trigger.kind not in ("hvn_edge", "hvn_inside_touch", "vp_level_touch", "squeeze")
+    if (trigger.kind not in ("hvn_edge", "hvn_inside_touch", "hvn_displacement",
+                             "vp_level_touch", "squeeze")
             and _price_inside_hvn(fulcrum, daily_vp)):
         return True, "chop:inside_hvn"
     if daily_vp and daily_vp.get("current_position") == "at_poc":
         # a POC / naked-POC fulcrum SHOULD arm at the POC — that's the setup, not chop.
-        if not (trigger.kind == "vp_level_touch"
-                and trigger.context.get("level_type") in ("poc", "naked_poc")):
+        # hvn_inside_touch is ALSO exempt: an edge-rejection tap is a directional signal
+        # (price rejected the HVN boundary), not POC balance — straddle the tapped edge.
+        _poc_ok = (trigger.kind == "vp_level_touch"
+                   and trigger.context.get("level_type") in ("poc", "naked_poc"))
+        _structural = trigger.kind in ("hvn_inside_touch", "hvn_displacement")
+        if not (_poc_ok or _structural):
             return True, "chop:at_poc"
     # Genuine balance/chop = regime is uncertain AND there IS initial-balance data
-    # showing little expansion. When regime is simply absent (no session data, e.g.
-    # historical replay), don't hard-skip — the trigger itself carries the edge.
+    # showing little expansion. Structural HVN moves (displacement/touch) are exempt —
+    # they represent committed directional flow between zones, not oscillation.
     rtype = getattr(regime, "type", "uncertain")
     ib_range = getattr(regime, "ib_range", 0.0) or 0.0
-    if (rtype == "uncertain" and ib_range > 0
+    _is_structural = trigger.kind in ("hvn_inside_touch", "hvn_displacement")
+    if (not _is_structural and rtype == "uncertain" and ib_range > 0
             and getattr(regime, "ib_expansion_pct", 0.0) < 0.5):
         return True, "chop:uncertain_no_expansion"
     return False, ""
@@ -433,6 +441,8 @@ def _rebase_to_venue(plan: GridPlan, analysis_anchor: float, venue_price: float)
         sell_legs=[Leg(price=round(l.price * ratio, 4), lot=l.lot) for l in plan.sell_legs],
         buy_tp=round(plan.buy_tp * ratio, 4),
         sell_tp=round(plan.sell_tp * ratio, 4),
+        buy_sl=round(plan.buy_sl * ratio, 4) if plan.buy_sl else 0.0,
+        sell_sl=round(plan.sell_sl * ratio, 4) if plan.sell_sl else 0.0,
         analysis_anchor=round(analysis_anchor, 4),
         venue_anchor=round(venue_price, 4),
         rebased=True,
@@ -444,7 +454,8 @@ def _rebase_to_venue(plan: GridPlan, analysis_anchor: float, venue_price: float)
 def plan_grid_levels(symbol: str, tf: str, current_price: float,
                      trigger_hint: str = "", settings: dict | None = None,
                      venue_price: float | None = None,
-                     min_step_venue: float = 0.0) -> GridPlan:
+                     min_step_venue: float = 0.0,
+                     force_trigger: "Trigger | None" = None) -> GridPlan:
     """Compute a neutral-grid plan for `symbol`/`tf`.
 
     `current_price` is the ANALYSIS-frame price (Binance/Bybit) used for structure.
@@ -457,7 +468,13 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     base_lot = float(grid_cfg.get("base_lot", 0.01))
     lot_step = float(grid_cfg.get("lot_step", 0.01))
     tp_mult = float(grid_cfg.get("tp_atr_mult", 1.5))
+    # Per-TF leg cap: a fast TF should run a tighter ladder than a slow one. The cycle's
+    # TF is known here, so hvn_max_legs_by_tf (keyed "1m"/"5m"/"15m"/"1h") overrides the
+    # global hvn_max_legs. Any TF absent falls back to the global.
     hvn_max_legs = int(grid_cfg.get("hvn_max_legs", 8))
+    _legs_by_tf = grid_cfg.get("hvn_max_legs_by_tf") or {}
+    if isinstance(_legs_by_tf, dict) and tf and tf in _legs_by_tf:
+        hvn_max_legs = int(_legs_by_tf.get(tf) or hvn_max_legs)
     lvn_legs_per_side = int(grid_cfg.get("lvn_legs_per_side", 1))
     max_fulcrum_dist_pct = float(grid_cfg.get("max_fulcrum_dist_pct", 0.05))
 
@@ -465,11 +482,27 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     from pipeline.features.atr import atr_from_store
     from pipeline.features import day_type
     try:
-        from pipeline.features.vp_cache import get as vp_get
-        daily_vp = vp_get(symbol, "daily")
-        if daily_vp is not None:
-            daily_vp = dict(daily_vp)
-            daily_vp["_symbol"] = symbol  # let downstream helpers recover symbol
+        from pipeline.features.vp_cache import get_prev_and_today
+        _prev_vp, _today_vp = get_prev_and_today(symbol)
+        # Merge prev-D and today's zones so both are trigger candidates at all times.
+        # POC/VAH/VAL: prefer today's if available (forming session reference), else prev-D.
+        # HVN/LVN zone lists: union of both periods (deduped by proximity handled downstream).
+        if _prev_vp or _today_vp:
+            _base = dict(_prev_vp or _today_vp)
+            if _today_vp and _prev_vp:
+                _merged_hvn = list(_prev_vp.get("hvn_zones") or []) + list(_today_vp.get("hvn_zones") or [])
+                _merged_lvn = list(_prev_vp.get("lvn_zones") or []) + list(_today_vp.get("lvn_zones") or [])
+                _base["hvn_zones"] = _merged_hvn
+                _base["lvn_zones"] = _merged_lvn
+                # today's POC/VAH/VAL only if session has enough data (poc > 0)
+                if _today_vp.get("poc"):
+                    _base["poc"] = _today_vp["poc"]
+                    _base["vah"] = _today_vp.get("vah") or _base.get("vah")
+                    _base["val"] = _today_vp.get("val") or _base.get("val")
+            daily_vp = _base
+            daily_vp["_symbol"] = symbol
+        else:
+            daily_vp = None
     except Exception:
         daily_vp = None
 
@@ -487,24 +520,52 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
 
     plan_id = f"{symbol}-{tf}-{(bars[-1].close_ts if bars else 0)}"
 
-    triggers = zone_triggers.detect_all(symbol, tf, current_price, regime,
-                                        atr=atr, daily_vp=daily_vp, cfg=grid_cfg)
-    hint_set = _hint_set(trigger_hint)
-    if hint_set:
-        hinted = [t for t in triggers if t.kind in hint_set]
-        if hinted:
-            triggers = hinted
-    # lvn_displacement narrows vp_level_touch to the VACUUM only (LVN), excluding
-    # POC/VA/naked-POC taps — those are mean-revert lines, not displacement vacuums.
-    if trigger_hint == "lvn_displacement":
-        lvn_only = [t for t in triggers if t.context.get("level_type") == "lvn"]
-        triggers = lvn_only
+    _no_trig_reason = ""
+    if force_trigger is not None:
+        # Intrabar touch-arm: caller already resolved the tapped edge as the Trigger —
+        # skip detection/scoring, use it verbatim (still subject to the skip gates below).
+        fulcrum_t = force_trigger
+    else:
+        all_triggers = zone_triggers.detect_all(symbol, tf, current_price, regime,
+                                               atr=atr, daily_vp=daily_vp, cfg=grid_cfg)
+        hint_set = _hint_set(trigger_hint)
+        if hint_set:
+            hinted = [t for t in all_triggers if t.kind in hint_set]
+            triggers = hinted  # empty → no trigger → fulcrum_t=None → clean skip, not wrong-kind win
+        else:
+            triggers = all_triggers
+        # lvn_displacement narrows vp_level_touch to the VACUUM only (LVN), excluding
+        # POC/VA/naked-POC taps — those are mean-revert lines, not displacement vacuums.
+        if trigger_hint == "lvn_displacement":
+            lvn_only = [t for t in triggers if t.context.get("level_type") == "lvn"]
+            triggers = lvn_only
 
-    fulcrum_t = _score_and_pick(triggers, regime, current_price, daily_vp, bars)
+        fulcrum_t = _score_and_pick(triggers, regime, current_price, daily_vp, bars)
+
+        # Build a descriptive no-trigger reason for the emit log.
+        # kept_kinds = detectors that matched the hint (relevant); other_kinds = rest (context only).
+        if fulcrum_t is None:
+            kept_kinds  = [t.kind for t in triggers]
+            other_kinds = [t.kind for t in all_triggers if t.kind not in {t2.kind for t2 in triggers}]
+            if not all_triggers:
+                _no_trig_reason = f"no_{trigger_hint}"
+            elif not kept_kinds:
+                # hint-specific detectors didn't fire; show other fires as context
+                others_str = f",others={','.join(other_kinds)}" if other_kinds else ""
+                _no_trig_reason = f"no_{trigger_hint}{others_str}"
+            else:
+                # hint detectors fired but got gated downstream (chop/poc/squeeze/etc.)
+                _no_trig_reason = f"no_{trigger_hint}:gated({','.join(kept_kinds)})"
+        else:
+            _no_trig_reason = ""
 
     skip, reason = _should_skip(fulcrum_t, regime,
                                 fulcrum_t.fulcrum_price if fulcrum_t else current_price,
                                 daily_vp)
+    # Upgrade the opaque "no_trigger" with the descriptive reason built above (only set
+    # when force_trigger was not used and fulcrum_t is None).
+    if reason == "no_trigger" and force_trigger is None and _no_trig_reason:
+        reason = _no_trig_reason
     # Proximity gate: reject a fulcrum sitting too far from current price (a stale /
     # far cached-HVN edge). Measured in the ANALYSIS frame, before any rebase. Such a
     # fulcrum both rebases to a garbage offset and places stops far off the venue's
@@ -520,7 +581,13 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     sq_ok, sq_rank = False, 1.0
     if not skip and fulcrum_t is not None:
         sq_ok, sq_rank = zone_triggers.squeeze_gate(symbol, tf, grid_cfg)
-        if bool(grid_cfg.get("require_squeeze_gate", False)) and not sq_ok:
+        # Structural HVN setups arm on a node edge/touch, not on a vol coil — exempt
+        # them from the squeeze gate. hvn_edge reads the same daily/weekly VP the chart
+        # draws, so it should arm on the visible edge-touch regardless of squeeze.
+        _structural_kinds = ("hvn_inside_touch", "hvn_displacement", "hvn_edge")
+        is_structural = ((fulcrum_t is not None and fulcrum_t.kind in _structural_kinds)
+                         or any(k in trigger_hint for k in _structural_kinds))
+        if bool(grid_cfg.get("require_squeeze_gate", False)) and not sq_ok and not is_structural:
             skip, reason = True, f"no_squeeze_gate:rank={sq_rank:.2f}"
     if skip:
         return GridPlan(verdict="skip", skip_reason=reason,
@@ -558,39 +625,46 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
                             atr=round(atr, 4), plan_id=plan_id)
 
     buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
-    buy_tp, sell_tp = _resolve_tps(symbol, fulcrum, buy_legs, sell_legs, atr, tp_mult)
 
-    # Structural TP override: any trigger that pre-computed tp_up/tp_down (HVN
-    # node edges for hvn_inside_touch; adjacent VP levels for vp_level_touch) targets
-    # that structure. Guard: the target must lie BEYOND the OUTER leg, else it would
-    # sit inside the ladder and the grid could never profit — in that case keep the
-    # _resolve_tps()/ATR fallback already computed above.
-    tp_up = float(fulcrum_t.context.get("tp_up", 0.0) or 0.0)
-    tp_down = float(fulcrum_t.context.get("tp_down", 0.0) or 0.0)
-    if tp_up or tp_down:
-        top_leg = max((l.price for l in buy_legs), default=fulcrum)
-        bot_leg = min((l.price for l in sell_legs), default=fulcrum)
-        if tp_up > top_leg:
-            buy_tp = round(tp_up, 4)
-        if 0.0 < tp_down < bot_leg:
-            sell_tp = round(tp_down, 4)
+    # TP = next HVN FAR EDGE beyond the outermost leg — for EVERY setup, both sides.
+    # buy side  → lowest HVN high  that clears the top leg + min_tp_dist (the next node up)
+    # sell side → highest HVN low  that clears the bot leg − min_tp_dist (the next node down)
+    # No POC-fade, no displacement dest/origin override: one rule everywhere. If no HVN sits
+    # beyond a leg, that side's TP stays 0 (compute_hvn_tps cascade is the only fallback, and
+    # only when there is literally no HVN out there). Refreshed every 15m as the HVN rebuilds.
+    from execution.zone_triggers import hvn_or_vp_tp as _hvn_or_vp_tp
+    from execution.zone_triggers import compute_hvn_tps as _compute_hvn_tps
+    from pipeline.features.vp_cache import get as _vp_get
+    top_leg = max((l.price for l in buy_legs),  default=fulcrum)
+    bot_leg = min((l.price for l in sell_legs), default=fulcrum)
+    min_tp_dist = float(grid_cfg.get("min_tp_dist", 0.0) or 0.0)
+    _dz = [(float(z["low"]), float(z["high"]))
+           for z in ((_vp_get(symbol, "daily") or {}).get("hvn_zones") or [])]
+    # Next HVN far edge, with VP-level refinements (Case 1: VP within 1×step of the HVN edge
+    # → use VP; Case 2: HVN < 2×step from the leg → next VP beyond, else next HVN beyond).
+    buy_tp, sell_tp = _hvn_or_vp_tp(symbol, _dz, top_leg, bot_leg, step, min_tp_dist=min_tp_dist)
+    # Fallback ONLY when nothing structural sits beyond a leg: LVN/fib-ext cascade so the
+    # side still has a target rather than 0.
+    if buy_tp == 0.0 or sell_tp == 0.0:
+        _ctp_up, _ctp_dn = _compute_hvn_tps(symbol, fulcrum, _dz,
+                                            min_dist=min_tp_dist, top_leg=top_leg, bot_leg=bot_leg)
+        if buy_tp  == 0.0 and _ctp_up > top_leg:        buy_tp  = round(_ctp_up, 4)
+        if sell_tp == 0.0 and 0 < _ctp_dn < bot_leg:    sell_tp = round(_ctp_dn, 4)
 
-    # HVN inside-touch reversion TP: the fade INTO the node targets the POC (the node's
-    # acceptance magnet), not the far next-HVN. Tapped TOP → sells fade DOWN to POC;
-    # tapped BOTTOM → buys revert UP to POC. Breakout side keeps its far next-HVN target
-    # (tp_up/tp_down above). Only when POC sits beyond the inner leg on the fade side
-    # (else it'd sit inside the ladder → keep the structural/ATR target).
-    if (fulcrum_t.kind == "hvn_inside_touch"
-            and bool(grid_cfg.get("hvn_reversion_bias", True))):
-        poc = float((daily_vp or {}).get("poc", 0.0) or 0.0)
-        edge = fulcrum_t.context.get("edge", "")
-        bot_leg = min((l.price for l in sell_legs), default=fulcrum)
-        top_leg = max((l.price for l in buy_legs), default=fulcrum)
-        if poc > 0:
-            if edge == "top" and poc < bot_leg:        # fade down to POC (sell side)
-                sell_tp = round(poc, 4)
-            elif edge == "bottom" and poc > top_leg:   # revert up to POC (buy side)
-                buy_tp = round(poc, 4)
+    # HVN displacement keeps ONLY its SL override (counter-side = displacement candle
+    # extreme); its TP now follows the unified next-HVN-far-edge rule above.
+    buy_sl = sell_sl = 0.0
+    if fulcrum_t.kind == "hvn_displacement":
+        ctx = fulcrum_t.context
+        direction = ctx.get("direction", "")
+        extreme = float(ctx.get("candle_extreme") or 0.0)
+        if extreme > 0:
+            if direction == "buy":
+                buy_sl  = 0.0                 # bias side (buys): no hard SL — BE logic owns it
+                sell_sl = round(extreme, 4)   # counter side (sells): SL = candle high
+            elif direction == "sell":
+                sell_sl = 0.0
+                buy_sl  = round(extreme, 4)   # counter side (buys): SL = candle low
 
     plan = GridPlan(
         verdict="arm",
@@ -609,6 +683,8 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         sell_legs=sell_legs,
         buy_tp=buy_tp,
         sell_tp=sell_tp,
+        buy_sl=buy_sl,
+        sell_sl=sell_sl,
         atr=round(atr, 4),
         swing_range=round(swing_range, 4),
         plan_id=plan_id,

@@ -65,46 +65,123 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
     latest = store().latest(analysis_symbol, tf)
     if latest is None or not latest.ohlc.c:
         return
-    _dvp = vp_get(analysis_symbol, "daily") or {}
-    _raw_zones = [(float(z["low"]), float(z["high"])) for z in (_dvp.get("hvn_zones") or [])]
-    if not _raw_zones:
-        return
-
     ratio = venue_mid / float(latest.ohlc.c) if latest.ohlc.c else 1.0
     old_fulcrum_venue = float(arm.get("fulcrum") or 0.0)
     edge_raw = old_fulcrum_venue / ratio if ratio else old_fulcrum_venue
-
-    # nearest current HVN edge to the original fulcrum → the edge may have drifted
-    best_dist, best_edge = float("inf"), edge_raw
-    for lo, hi in _raw_zones:
-        for cand in (lo, hi):
-            d = abs(cand - edge_raw)
-            if d < best_dist:
-                best_dist, best_edge = d, cand
-    raw_delta = best_edge - edge_raw
-    venue_delta = round(raw_delta * ratio, 4)
 
     open_state = ExecBridge.get_open(account, broker_symbol, magic=magic) or {}
     _open_buys = int((open_state.get("buys") or 0))
     _open_sells = int((open_state.get("sells") or 0))
 
-    # edge drift beyond noise (0.1) and below sanity cap (5) → shift PENDING entry prices
-    if 0.1 < abs(venue_delta) < (5.0 * ratio):
-        new_fulcrum_venue = round(old_fulcrum_venue + venue_delta, 4)
-        arm = {**arm, "fulcrum": new_fulcrum_venue}
-        ExecBridge.set_last_arm(account, broker_symbol, **arm)
-        ExecBridge.enqueue_modify_pending(account, broker_symbol, magic, price_delta=venue_delta)
-        _emit_audit({"account": account, "symbol": analysis_symbol, "tf": tf,
-                     "verdict": "fulcrum_shift", "magic": magic, "poll": True,
-                     "old_fulcrum": old_fulcrum_venue, "new_fulcrum": new_fulcrum_venue,
-                     "delta": venue_delta})
+    # FROZEN cycle: once a leg filled, the VP/HVN structure was snapshotted (monitor_cycle).
+    # We manage against THAT frozen structure — fulcrum is LOCKED (no shift/re-anchor), no
+    # fade-flatten (morphing live VP is irrelevant; the entry's structure is fixed). TP is
+    # recomputed from the frozen zones (stable, since they don't change). Exits come from
+    # BE / bias-trail / net-target / price-hits-TP, never structure morph.
+    _frozen = arm.get("vp_frozen") and arm.get("frozen_zones")
+    if _frozen:
+        _raw_zones = [(float(lo), float(hi)) for lo, hi in arm.get("frozen_zones") or []]
+        best_edge = edge_raw          # fulcrum locked — no shift
+        # fall straight through to the TP recompute below (no drift/fade branch)
+    else:
+        # Live (pending-only, pre-fill) cycle: zone source MUST match what the trigger armed
+        # against — session HVNs (rolling today + cached prev-D), NOT daily-only (which omits
+        # the forming hvn_today node and false-faded). Re-anchor pendings cheaply while flat.
+        try:
+            from execution.zone_triggers import _session_hvn_zones
+            _sbars = store().recent(analysis_symbol, tf, 120)
+            _raw_zones, _ = _session_hvn_zones(analysis_symbol, tf, _sbars)
+        except Exception:
+            _raw_zones = []
+        if not _raw_zones:
+            _dvp = vp_get(analysis_symbol, "daily") or {}
+            _raw_zones = [(float(z["low"]), float(z["high"])) for z in (_dvp.get("hvn_zones") or [])]
+        if not _raw_zones:
+            return
+
+    # ── Anchor-HVN structural-integrity check (LIVE/pre-fill cycles ONLY) ────────────
+    # Skipped entirely for a FROZEN cycle: once a leg fills, the fulcrum is locked to the
+    # snapshot structure — no drift, no re-anchor, no fade-flatten. Pending-only cycles
+    # (not yet frozen) still classify the anchor node each poll:
+    #   DRIFT  — nearest edge moved ≤ 2×step          → shift pendings to track it
+    #   RE-ANCHOR — edge moved > 2×step BUT a node still brackets the fulcrum (merge/split)
+    #   FADED  — no node brackets AND nearest edge > 2×step → premise gone → flatten+retire
+    if not _frozen:
+        _step_venue = float(arm.get("step") or 0.0)
+        _step_raw = _step_venue / ratio if ratio else _step_venue
+        _drift_cap = 2.0 * _step_raw if _step_raw > 0 else (5.0)   # raw frame
+
+        best_dist, best_edge = float("inf"), edge_raw
+        for lo, hi in _raw_zones:
+            for cand in (lo, hi):
+                d = abs(cand - edge_raw)
+                if d < best_dist:
+                    best_dist, best_edge = d, cand
+        _bracketed = any(lo <= edge_raw <= hi for lo, hi in _raw_zones)
+        raw_delta = best_edge - edge_raw
+        venue_delta = round(raw_delta * ratio, 4)
+
+        # Placement-window grace: don't fade-flatten a cycle armed in the last 30s — its
+        # legs may not be placed/reported yet, and a mid-rebuild HVN read could be noise.
+        import time as _t
+        _arm_age = _t.time() - float(arm.get("ts", 0.0) or 0.0)
+        if (not _bracketed) and best_dist > _drift_cap and _arm_age > 30.0:
+            # FADED — anchor HVN dissolved before any fill. Premise invalidated → flatten.
+            ExecBridge.enqueue(account, "CLOSE_ALL", broker_symbol, magic=magic,
+                               comment="FB|hvn_faded")
+            _cyc = ExecBridge.get_last_arm(account, broker_symbol, magic=magic) or {}
+            _cyc.pop("magic", None)
+            ExecBridge.set_last_arm(account, broker_symbol, magic=magic,
+                                    **{**_cyc, "active": False, "flatten_ts": __import__("time").time()})
+            ExecBridge.clear_emit(account, broker_symbol, magic=magic)
+            _emit_audit({"account": account, "symbol": analysis_symbol, "tf": tf,
+                         "verdict": "hvn_faded_flatten", "magic": magic, "poll": True,
+                         "exit_reason": "hvn_faded",
+                         "old_fulcrum": old_fulcrum_venue, "nearest_edge_dist": round(best_dist, 4)})
+            return   # cycle retired — nothing more to refresh
+
+        # DRIFT or RE-ANCHOR: shift fulcrum + pendings to best_edge (still on real structure).
+        if abs(venue_delta) > 0.1:
+            _kind = "fulcrum_shift" if best_dist <= _drift_cap else "fulcrum_reanchor"
+            new_fulcrum_venue = round(old_fulcrum_venue + venue_delta, 4)
+            arm = {**arm, "fulcrum": new_fulcrum_venue}
+            ExecBridge.set_last_arm(account, broker_symbol, **arm)
+            ExecBridge.enqueue_modify_pending(account, broker_symbol, magic, price_delta=venue_delta)
+            _emit_audit({"account": account, "symbol": analysis_symbol, "tf": tf,
+                         "verdict": _kind, "magic": magic, "poll": True,
+                         "old_fulcrum": old_fulcrum_venue, "new_fulcrum": new_fulcrum_venue,
+                         "delta": venue_delta, "bracketed": _bracketed})
 
     # recompute TPs from the (possibly shifted) edge, with the min-distance floor
     # (analysis frame: min_tp_dist is venue-$, un-rebase by /ratio)
     _min_tp = float(settings.get("grid_levels", {}).get("min_tp_dist", 0.0) or 0.0)
     _min_tp_raw = _min_tp / ratio if ratio else _min_tp
-    raw_tp_up, raw_tp_down = compute_hvn_tps(analysis_symbol, best_edge, _raw_zones,
-                                             min_dist=_min_tp_raw)
+    # Reconstruct the outermost ladder legs (analysis frame) from the arm's geometry so the
+    # refreshed TP clears the WHOLE ladder — matching the arm-time computation. Without this
+    # the TP is measured from the edge only and can regress INSIDE the ladder (un-profitable).
+    # per-side leg counts (skew-aware): buy_n legs above the edge, sell_n below.
+    _buy_n  = int(arm.get("buy_n")  or arm.get("n_per_side") or 0)
+    _sell_n = int(arm.get("sell_n") or arm.get("n_per_side") or 0)
+    _stp_venue = float(arm.get("step") or 0.0)
+    _stp_raw   = _stp_venue / ratio if ratio else _stp_venue
+    _top_leg = best_edge + _buy_n  * _stp_raw if (_buy_n  > 0 and _stp_raw > 0) else best_edge
+    _bot_leg = best_edge - _sell_n * _stp_raw if (_sell_n > 0 and _stp_raw > 0) else best_edge
+    # Unified TP rule (matches arm-time): next HVN far edge + VP refinements (Case 1: VP
+    # within 1×step of HVN edge → VP; Case 2: HVN < 2×step from leg → next VP/HVN beyond).
+    # Refreshed each poll; HVN rebuilds every 15m so the target re-targets on that cadence.
+    from execution.zone_triggers import hvn_or_vp_tp as _hvn_or_vp_tp
+    raw_tp_up, raw_tp_down = _hvn_or_vp_tp(analysis_symbol, _raw_zones, _top_leg, _bot_leg,
+                                           _stp_raw, min_tp_dist=_min_tp_raw)
+    # Cascade fallback ONLY when nothing structural sits beyond the leg (LVN→fib).
+    if raw_tp_up == 0.0 or raw_tp_down == 0.0:
+        _c_up, _c_dn = compute_hvn_tps(analysis_symbol, best_edge, _raw_zones,
+                                       min_dist=_min_tp_raw, top_leg=_top_leg, bot_leg=_bot_leg)
+        if raw_tp_up   == 0.0: raw_tp_up   = _c_up
+        if raw_tp_down == 0.0: raw_tp_down = _c_dn
+    # Guard: TP must lie strictly beyond the outermost leg or the grid can't profit on that
+    # side — drop it to 0 (leave the existing TP untouched) rather than set an inside-ladder TP.
+    if not (raw_tp_up   and raw_tp_up   > _top_leg):       raw_tp_up   = 0.0
+    if not (raw_tp_down and 0 < raw_tp_down < _bot_leg):   raw_tp_down = 0.0
     new_tp_up = round(raw_tp_up * ratio, 4) if raw_tp_up else 0.0
     new_tp_down = round(raw_tp_down * ratio, 4) if raw_tp_down else 0.0
     old_up = float(arm.get("tp_up") or 0.0)
@@ -358,14 +435,15 @@ def exec_poll():
                 if not tf_m:
                     continue
                 b = int(m.get("buys", 0)); s = int(m.get("sells", 0))
-                ExecBridge.set_open(account, sym, b + s, int(m.get("pendings", 0)), tf=tf_m, magic=mg)
+                ExecBridge.set_open(account, sym, b + s, int(m.get("pendings", 0)),
+                                    tf=tf_m, magic=mg, buys=b, sells=s)
                 ExecBridge.monitor_cycle(account, sym, settings_cfg, tf=tf_m, magic=mg,
                                          pnl=float(m.get("pnl", 0.0)), buys=b, sells=s,
                                          buy_pnl=float(m.get("buy_pnl", 0.0)),
                                          sell_pnl=float(m.get("sell_pnl", 0.0)))
-                # Track the moving HVN: refresh entry prices + TPs (pending AND filled)
-                # every poll, not just on bar-close emit. Covers pending-only cycles.
-                _refresh_cycle_tps(account, sym, analysis_sym, tf_m, mg, settings_cfg or {})
+                # NOTE: HVN-driven TP/entry refresh runs on CANDLE CLOSE only (in the
+                # /exec/emit_grid position_open path), NOT here on the 1s poll — by design,
+                # so orders re-target structure once per bar, not every tick.
                 # Orphan-pending sweep: if this cycle's positions all closed and a never-
                 # filled pending still rests on a fulcrum HVN that has since disappeared,
                 # cancel that dangling pending (opt-in via grid_levels.cancel_orphan_on_hvn_gone).
@@ -384,6 +462,46 @@ def exec_poll():
             ExecBridge.monitor_cycle(account, sym, settings_cfg, pnl=pnl, buys=buys, sells=sells)
         except Exception:
             LOG.exception("[exec] cycle monitor error")  # never break the poll
+
+    # Reap absent magics: any cycle the server still holds ACTIVE but the EA did NOT
+    # report THIS poll has zero live positions AND pendings in MT5 — BuildMagicsJson emits
+    # a magic only when it iterates a live order/position, so absence == flat. Retire it so
+    # phantom cycles (manually flattened in the terminal) can't block re-arm or linger in
+    # the dashboard. Runs whenever the EA sends a magics array (even empty []); never on the
+    # legacy single-pool path (no per-magic truth there). clear_emit frees the fulcrum dedup.
+    if sym and isinstance(magics, list):
+        try:
+            import time as _t
+            _now = _t.time()
+            _reap_grace = 30.0   # s — let a freshly-armed cycle place + report its legs first
+            # Whole-account-flat signal: EA reports zero buys/sells/pendings at the top level
+            # AND an empty magics array → MT5 holds nothing for us. Unambiguous; reap WITHOUT
+            # the placement grace (no fresh arm can have legs if the EA sees zero everything).
+            _flat_all = (int(body.get("buys", 0) or 0) == 0
+                         and int(body.get("sells", 0) or 0) == 0
+                         and int(body.get("pendings", 0) or 0) == 0
+                         and not magics)
+            _reported = {int(m.get("magic", 0)) for m in magics}
+            for _mg in list(ExecBridge.active_fulcrums(account, sym).keys()):
+                if _mg in _reported:
+                    continue
+                _cyc = ExecBridge.get_last_arm(account, sym, magic=_mg) or {}
+                # Placement-window guard: skip a just-armed cycle whose EA legs haven't
+                # been reported yet (else we'd retire a fresh arm before it places).
+                # Skipped entirely when the EA reports the whole account flat.
+                if not _flat_all and (_now - float(_cyc.get("ts", 0.0) or 0.0)) < _reap_grace:
+                    continue
+                if _cyc:
+                    # explicit magic=_mg: persisted arms may lack a `magic` key, which would
+                    # otherwise default set_last_arm's key to 0 and leave the real entry active.
+                    _cyc.pop("magic", None)
+                    ExecBridge.set_last_arm(account, sym, magic=_mg, **{**_cyc, "active": False})
+                ExecBridge.clear_emit(account, sym, magic=_mg)
+                ExecBridge.set_open(account, sym, 0, 0, magic=_mg)
+                LOG.info(f"[exec] reaped absent magic {_mg} (flat in MT5) for {account}/{sym}")
+        except Exception:
+            LOG.exception("[exec] absent-magic reap error")  # never break the poll
+
     # Intrabar touch-arm — check each touch-enabled TF against live price (this is the
     # only 1s-cadence hook). Gated off unless touch_arm_enabled; never breaks the poll.
     if sym and not ExecBridge.daily_target_hit(account):
@@ -506,15 +624,22 @@ def exec_emit_grid():
     arm = ExecBridge.get_last_arm(account, broker_symbol, magic=leg_magic) or {}
     open_state = ExecBridge.get_open(account, broker_symbol, magic=leg_magic)
     force = bool(body.get("force", False))
-    if not force and arm.get("active") and open_state.get("positions", 0) > 0:
-        # Refresh TP + pending order prices from latest HVN edges while cycle is live.
-        # HVNs shift intra-day as volume accumulates; stale TPs and pending prices mis-target.
+    _live = int(open_state.get("positions", 0) or 0) > 0 or int(open_state.get("pendings", 0) or 0) > 0
+    if not force and arm.get("active") and _live:
+        # Refresh TP + pending order prices from latest HVN edges while cycle is live
+        # (positions OR resting pendings) — ON CANDLE CLOSE (this route fires per bar),
+        # not on the 1s poll. HVNs shift intra-day; stale TPs/pending prices mis-target.
         try:
-            from execution.zone_triggers import compute_hvn_tps
+            from execution.zone_triggers import compute_hvn_tps, _session_hvn_zones
             from pipeline.features.vp_cache import get as vp_get
-            _dvp = vp_get(symbol, "daily") or {}
-            _raw_zones = [(float(z["low"]), float(z["high"]))
-                          for z in (_dvp.get("hvn_zones") or [])]
+            # session HVNs (rolling today + cached prev-D) — same set the trigger armed on,
+            # NOT daily-only (which omits the forming hvn_today node the entry sat on).
+            _sbars = store().recent(symbol, tf, 120)
+            _raw_zones, _ = _session_hvn_zones(symbol, tf, _sbars)
+            if not _raw_zones:
+                _dvp = vp_get(symbol, "daily") or {}
+                _raw_zones = [(float(z["low"]), float(z["high"]))
+                              for z in (_dvp.get("hvn_zones") or [])]
             if _raw_zones:
                 # Work in raw Bybit frame; rebase only final results.
                 # arm.fulcrum is venue-rebased → un-rebase for zone lookup.
@@ -552,11 +677,27 @@ def exec_emit_grid():
                                  "new_fulcrum": _new_fulcrum_venue,
                                  "delta": _venue_delta})
 
-                # Recompute TPs from updated edge, with the min-distance floor
+                # Recompute TPs from updated edge, with the min-distance floor. Pass the
+                # reconstructed outermost legs so the TP clears the WHOLE ladder (matching
+                # arm-time) — never regresses to an inside-ladder, un-profitable level.
                 _min_tp = float((settings.get("grid_levels") or {}).get("min_tp_dist", 0.0) or 0.0)
                 _min_tp_raw = _min_tp / _ratio if _ratio else _min_tp
-                raw_tp_up, raw_tp_down = compute_hvn_tps(symbol, _best_edge, _raw_zones,
-                                                         min_dist=_min_tp_raw)
+                _buy_n_r  = int(arm.get("buy_n")  or arm.get("n_per_side") or 0)
+                _sell_n_r = int(arm.get("sell_n") or arm.get("n_per_side") or 0)
+                _stp_r = (float(arm.get("step") or 0.0) / _ratio) if _ratio else float(arm.get("step") or 0.0)
+                _top_leg_r = _best_edge + _buy_n_r  * _stp_r if (_buy_n_r  > 0 and _stp_r > 0) else _best_edge
+                _bot_leg_r = _best_edge - _sell_n_r * _stp_r if (_sell_n_r > 0 and _stp_r > 0) else _best_edge
+                # Unified TP rule (matches arm-time): next HVN far edge + VP refinements.
+                from execution.zone_triggers import hvn_or_vp_tp as _hvn_or_vp_tp
+                raw_tp_up, raw_tp_down = _hvn_or_vp_tp(symbol, _raw_zones, _top_leg_r, _bot_leg_r,
+                                                       _stp_r, min_tp_dist=_min_tp_raw)
+                if raw_tp_up == 0.0 or raw_tp_down == 0.0:   # cascade only if nothing beyond
+                    _cu, _cd = compute_hvn_tps(symbol, _best_edge, _raw_zones,
+                                               min_dist=_min_tp_raw, top_leg=_top_leg_r, bot_leg=_bot_leg_r)
+                    if raw_tp_up   == 0.0: raw_tp_up   = _cu
+                    if raw_tp_down == 0.0: raw_tp_down = _cd
+                if not (raw_tp_up   and raw_tp_up   > _top_leg_r):     raw_tp_up   = 0.0
+                if not (raw_tp_down and 0 < raw_tp_down < _bot_leg_r): raw_tp_down = 0.0
                 new_tp_up   = round(raw_tp_up   * _ratio, 4) if raw_tp_up   else 0.0
                 new_tp_down = round(raw_tp_down * _ratio, 4) if raw_tp_down else 0.0
                 old_up   = float(arm.get("tp_up")   or 0.0)
@@ -589,7 +730,16 @@ def exec_emit_grid():
                                  "tp_up": new_tp_up, "tp_down": new_tp_down})
         except Exception:
             pass
-        return jsonify({"ok": True, "verdict": "skip", "skip_reason": "position_open",
+        _os_buys  = int(open_state.get("buys",     0) or 0)
+        _os_sells = int(open_state.get("sells",    0) or 0)
+        _os_pend  = int(open_state.get("pendings", 0) or 0)
+        _live_parts = []
+        if _os_buys  > 0: _live_parts.append(f"{_os_buys}B")
+        if _os_sells > 0: _live_parts.append(f"{_os_sells}S")
+        if _os_pend  > 0: _live_parts.append(f"{_os_pend}pend")
+        _live_str = ",".join(_live_parts) if _live_parts else "live"
+        return jsonify({"ok": True, "verdict": "skip",
+                        "skip_reason": f"cycle_live({_live_str})",
                         "symbol": symbol, "broker_symbol": broker_symbol, "tf": tf,
                         "open": open_state})
         # active+flat, or inactive → fall through and (re)arm this TF's straddle
@@ -649,6 +799,43 @@ def exec_emit_grid():
         "sell_legs": [{"price": l.price, "lot": l.lot} for l in plan.sell_legs],
         "buy_tp": plan.buy_tp, "sell_tp": plan.sell_tp, "commands_enqueued": len(cmds),
     })
+
+
+@bp.post("/exec/refresh_tps")
+def exec_refresh_tps():
+    """Refresh entry prices + TPs for EVERY active cycle (any TF) against the live HVN.
+    Called once per 1m bar close (by the emitter) so all orders re-target structure at a
+    uniform 1m cadence regardless of which TF armed them. Per-cycle no-op if nothing moved.
+
+    Body: {account, symbol(broker or analysis)}."""
+    if not _auth_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    settings = current_app.config["FB_SETTINGS"]
+    body = request.get_json(silent=True) or {}
+    account = str(body.get("account") or "")
+    req_symbol = body.get("symbol") or settings["instrument"]["symbol"]
+    if not account:
+        return jsonify({"ok": False, "error": "missing account"}), 400
+
+    symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
+    b2a = {v: k for k, v in symbol_map.items()}
+    broker_symbol = symbol_map.get(req_symbol, req_symbol)  # accept analysis OR broker
+    if req_symbol in b2a:                                   # was already broker
+        broker_symbol = req_symbol
+    analysis_sym = b2a.get(broker_symbol, broker_symbol)
+
+    refreshed = []
+    for mg in ExecBridge.active_fulcrums(account, broker_symbol).keys():
+        tf_m = tf_from_magic(mg)
+        if not tf_m:
+            continue
+        try:
+            _refresh_cycle_tps(account, broker_symbol, analysis_sym, tf_m, mg, settings)
+            refreshed.append(mg)
+        except Exception:
+            LOG.exception(f"[refresh_tps] magic={mg} error")
+    return jsonify({"ok": True, "account": account, "broker_symbol": broker_symbol,
+                    "refreshed_magics": refreshed})
 
 
 @bp.post("/exec/test_order")
@@ -740,7 +927,12 @@ def exec_zones():
 
     from pipeline.features import vp_cache
     from pipeline.state_store import store as _store
-    daily = vp_cache.get(symbol, "daily") or {}
+    # Fetch prev-D and today separately so we can overlay both on the chart.
+    # /exec/zones always returns both: prev-D zones as "hvn"/"lvn", today's as
+    # "hvn_today"/"lvn_today" so the EA can color them differently.
+    _prev_daily, _today_daily = vp_cache.get_prev_and_today(symbol)
+    # Fallback: if neither exists use the standard get() (weekly or legacy path).
+    daily = _prev_daily or _today_daily or vp_cache.get(symbol, "daily") or {}
 
     # Zone rebase: when MetaAPI offset is 0 (403 plan) derive the ratio from the live
     # EA quote vs Bybit last close so EA-drawn zones align with the rebased fulcrum.
@@ -756,11 +948,19 @@ def exec_zones():
         return round(p * _zone_ratio, 5) if _zone_ratio != 1.0 else round(p, 5)
 
     zones = []
-    for z in (daily.get("hvn_zones") or []):
+    # Prev-D zones (completed session reference) — drawn with standard HVN/LVN colors.
+    for z in (_prev_daily.get("hvn_zones") or [] if _prev_daily else []):
         zones.append({"kind": "hvn", "lo": _rebase_price(float(z["low"])),
                       "hi": _rebase_price(float(z["high"]))})
-    for z in (daily.get("lvn_zones") or []):
+    for z in (_prev_daily.get("lvn_zones") or [] if _prev_daily else []):
         zones.append({"kind": "lvn", "lo": _rebase_price(float(z["low"])),
+                      "hi": _rebase_price(float(z["high"]))})
+    # Today's forming zones — drawn with "_today" kinds so the EA colors them distinctly.
+    for z in (_today_daily.get("hvn_zones") or [] if _today_daily else []):
+        zones.append({"kind": "hvn_today", "lo": _rebase_price(float(z["low"])),
+                      "hi": _rebase_price(float(z["high"]))})
+    for z in (_today_daily.get("lvn_zones") or [] if _today_daily else []):
+        zones.append({"kind": "lvn_today", "lo": _rebase_price(float(z["low"])),
                       "hi": _rebase_price(float(z["high"]))})
 
     # VP point-levels the grid actually TRIGGERS on (vp_level_touch fulcrums), drawn as
@@ -773,6 +973,13 @@ def exec_zones():
             v = daily.get(k)
             if isinstance(v, (int, float)) and v > 0:
                 levels.append({"kind": k, "price": _rebase_price(float(v))})
+    # Today's forming session POC + value area (VAH/VAL) as distinct levels so the user
+    # can see the developing session value, separate from the prev-D vah/val above.
+    if _today_daily:
+        for _src_k, _out_k in (("poc", "poc_today"), ("vah", "vah_today"), ("val", "val_today")):
+            _v = _today_daily.get(_src_k)
+            if isinstance(_v, (int, float)) and _v > 0:
+                levels.append({"kind": _out_k, "price": _rebase_price(float(_v))})
 
     # Computed volume-at-price histogram (venue-shifted) for the EA to draw as a sideways
     # profile. Rebuilt from bars (cache keeps only aggregates). Same daily window as zones.
@@ -817,9 +1024,63 @@ def exec_zones():
             touch_lines.append({"price": round(z["hi"] - _buf, 5), "side": "top"})
             touch_lines.append({"price": round(z["lo"] + _buf, 5), "side": "bottom"})
 
+    # HVN → cycle map: for each HVN zone, list which active cycles are anchored inside it.
+    # A cycle belongs to an HVN if its venue-frame fulcrum sits within [lo, hi] (with a
+    # ±tol band equal to hvn_touch_buffer so edge-touching cycles are included).
+    _touch_buf = float((settings.get("grid_levels") or {}).get("hvn_touch_buffer", 0.0) or 0.0) * _zone_ratio
+    _active_cycles = ExecBridge.active_cycles_detail(account, broker_symbol)
+    hvn_cycle_map = []
+    for z in zones:
+        if z["kind"] != "hvn":
+            continue
+        lo, hi = z["lo"], z["hi"]
+        tol = _touch_buf or (hi - lo) * 0.1  # fallback: 10% of zone width
+        matched = [
+            c for c in _active_cycles
+            if lo - tol <= c["fulcrum"] <= hi + tol
+        ]
+        hvn_cycle_map.append({
+            "lo": lo, "hi": hi,
+            "cycles": matched,
+        })
+
+    # CVD divergence signals — scan recent bars on the zone TF so the EA can mark
+    # divergence candles with arrows. Looks back `cvd_lookback` bars (default 50) for
+    # any bar where price broke the prior-window extreme but delta lagged.
+    cvd_signals = []
+    try:
+        from pipeline.features.delta_divergence import detect as _cvd_detect
+        from pipeline.state_store import store as _cvd_store
+        _cvd_tf = zone_tf or "15m"
+        _cvd_window = 5
+        _cvd_lookback = 50
+        # TF → seconds so we can compute bar OPEN time (MT5 bars are keyed by open time).
+        _tf_secs = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400,
+                    "1d": 86400}.get(_cvd_tf, 900)
+        _cvd_bars = _cvd_store().recent(symbol, _cvd_tf, _cvd_lookback + _cvd_window + 2)
+        for _i in range(_cvd_window, len(_cvd_bars)):
+            _bar = _cvd_bars[_i]
+            _hist = _cvd_bars[max(0, _i - _cvd_window):_i]
+            _dd = _cvd_detect(_bar, _hist, window=_cvd_window)
+            if _dd.fired:
+                # price anchor: bearish → candle high (price made new high, delta failed)
+                #               bullish → candle low (price made new low, delta failed)
+                _px = _bar.ohlc.h if _dd.direction == "bearish" else _bar.ohlc.l
+                # MT5 places objects by bar OPEN time; close_ts - tf_secs = open_ts.
+                _open_ts = int(_bar.close_ts) - _tf_secs
+                cvd_signals.append({
+                    "bar_time": _open_ts,
+                    "price": _rebase_price(float(_px)),
+                    "direction": _dd.direction,
+                })
+    except Exception:
+        pass
+
     return jsonify({"ok": True, "zones": zones, "levels": levels, "ict": ict_out,
                     "profile": profile, "vp_bin": vp_bin,
                     "touch_lines": touch_lines,
+                    "hvn_cycle_map": hvn_cycle_map,
+                    "cvd_signals": cvd_signals,
                     "venue_mid": quote.get("mid", 0.0),
                     "symbol": symbol, "broker_symbol": broker_symbol,
                     "fulcrum": arm.get("fulcrum", 0.0), "emit_tf": arm.get("tf", ""),
@@ -836,6 +1097,65 @@ def exec_queue():
     account = request.args.get("account")
     return jsonify({"ok": True, "commands": ExecBridge.snapshot(account),
                     "last_poll_body": getattr(ExecBridge, "last_poll_body", None)})
+
+
+@bp.post("/exec/close_magic")
+def exec_close_magic():
+    """Enqueue CLOSE_ALL for specific magics — closes positions + cancels pendings on the EA.
+    Body: {account, symbol, magics: [int, ...]}"""
+    if not _auth_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    account = str(body.get("account") or "")
+    symbol = str(body.get("symbol") or "")
+    magics = body.get("magics") or []
+    if not account or not symbol or not magics:
+        return jsonify({"ok": False, "error": "need account, symbol, magics"}), 400
+    for mg in magics:
+        ExecBridge.enqueue(account, "CLOSE_ALL", symbol, magic=int(mg),
+                           comment="FB|force_close")
+    LOG.info(f"[exec] close_magic queued CLOSE_ALL for {magics} on {account}/{symbol}")
+    return jsonify({"ok": True, "queued": [int(m) for m in magics]})
+
+
+@bp.post("/exec/retire_cycle")
+def exec_retire_cycle():
+    """Force-retire one or more stale cycles that the EA already flattened manually.
+    Body: {account, symbol, magics: [int, ...]}  — marks each magic active=False."""
+    if not _auth_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    account = str(body.get("account") or "")
+    symbol = str(body.get("symbol") or "")
+    magics = body.get("magics") or []
+    if not account or not symbol or not magics:
+        return jsonify({"ok": False, "error": "need account, symbol, magics"}), 400
+    retired = []
+    for mg in magics:
+        cyc = ExecBridge.get_last_arm(account, symbol, magic=int(mg))
+        if cyc:
+            # explicit magic: persisted arms may lack a `magic` key (would default the
+            # set_last_arm key to 0 and leave the real entry active=True).
+            cyc.pop("magic", None)
+            ExecBridge.set_last_arm(account, symbol, magic=int(mg), **{**cyc, "active": False})
+        else:
+            ExecBridge.set_last_arm(account, symbol, magic=int(mg), active=False,
+                                    tf="", fulcrum=0.0, edge="", trigger_kind="",
+                                    venue_mid=0.0, n_per_side=0, step=0.0,
+                                    buy_n=0, sell_n=0, bias_peak=0.0, bias_booked=False,
+                                    be_done_buy=False, be_done_sell=False,
+                                    node_low=0.0, node_high=0.0,
+                                    max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
+                                    squeeze_ok=False, squeeze_rank=0.0, armed_tf="",
+                                    tp_up=0.0, tp_down=0.0)
+        # Sweep any residual resting pendings on this magic — else the EA keeps
+        # reporting them in magics[], which re-activates the cycle every poll.
+        ExecBridge.enqueue(account, "CANCEL_PENDINGS", symbol, magic=int(mg),
+                           comment="FB|retire")
+        retired.append(int(mg))
+        ExecBridge.clear_emit(account, symbol, magic=int(mg))
+    LOG.info(f"[exec] retire_cycle account={account} symbol={symbol} magics={retired}")
+    return jsonify({"ok": True, "retired": retired})
 
 
 @bp.post("/exec/fix_tps")

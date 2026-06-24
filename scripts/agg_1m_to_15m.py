@@ -40,8 +40,11 @@ def load_jsonl(path: Path) -> list[dict]:
     return out
 
 
+_TF_SEC = {"5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400}
+
+
 def bucket_ts(close_ts: int, tf_sec: int = 900) -> int:
-    """15m bucket a 1m bar belongs to: ceil(close_ts / tf_sec) * tf_sec."""
+    """Target-TF bucket a 1m bar belongs to: ceil(close_ts / tf_sec) * tf_sec."""
     return math.ceil(close_ts / tf_sec) * tf_sec
 
 
@@ -62,14 +65,15 @@ def merge_ladders(bars: list[dict]) -> tuple[list[dict], list[dict], float | Non
     return bid_ladder, ask_ladder, poc
 
 
-def aggregate(symbol: str, input_path: Path) -> list[dict]:
+def aggregate(symbol: str, input_path: Path, target_tf: str = "15m") -> list[dict]:
+    tf_sec = _TF_SEC[target_tf]
     bars_1m = [b for b in load_jsonl(input_path) if b.get("symbol") == symbol and b.get("tf") == "1m"]
     bars_1m.sort(key=lambda b: b["close_ts"])
 
-    # Group into 15m buckets
+    # Group into target-TF buckets
     buckets: dict[int, list[dict]] = defaultdict(list)
     for b in bars_1m:
-        buckets[bucket_ts(b["close_ts"])].append(b)
+        buckets[bucket_ts(b["close_ts"], tf_sec)].append(b)
 
     out: list[dict] = []
     for bts in sorted(buckets):
@@ -81,9 +85,9 @@ def aggregate(symbol: str, input_path: Path) -> list[dict]:
         highs = [b["ohlc"]["h"] for b in group]
         lows  = [b["ohlc"]["l"] for b in group]
         bar = {
-            "bar_id":     f"{symbol}|15m|{bts}",
+            "bar_id":     f"{symbol}|{target_tf}|{bts}",
             "symbol":     symbol,
-            "tf":         "15m",
+            "tf":         target_tf,
             "close_ts":   bts,
             "source":     "agg_1m",
             "ohlc": {
@@ -104,18 +108,27 @@ def aggregate(symbol: str, input_path: Path) -> list[dict]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", "-s", required=True)
+    parser.add_argument("--tf", default="15m", choices=sorted(_TF_SEC),
+                        help="Target timeframe to aggregate 1m bars into")
     parser.add_argument("--data-dir", default=str(FP_DIR))
-    parser.add_argument("--out", default=None, help="Output path (default: FP_DIR/SYMBOL_15m_agg.jsonl)")
+    parser.add_argument("--out", default=None,
+                        help="Output path (default: FP_DIR/SYMBOL_15m_agg.jsonl for 15m, "
+                             "else canonical FP_DIR/SYMBOL_TF.jsonl)")
     parser.add_argument("--print-stats", action="store_true")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
     input_path = data_dir / f"{args.symbol}_1m.jsonl"
-    out_path = Path(args.out) if args.out else data_dir / f"{args.symbol}_15m_agg.jsonl"
+    if args.out:
+        out_path = Path(args.out)
+    elif args.tf == "15m":
+        out_path = data_dir / f"{args.symbol}_15m_agg.jsonl"   # back-compat default
+    else:
+        out_path = data_dir / f"{args.symbol}_{args.tf}.jsonl"  # canonical (state_store reads this)
 
     print(f"[agg] reading {input_path} ...")
-    bars = aggregate(args.symbol, input_path)
-    print(f"[agg] aggregated → {len(bars)} 15m bars")
+    bars = aggregate(args.symbol, input_path, args.tf)
+    print(f"[agg] aggregated → {len(bars)} {args.tf} bars")
 
     if bars and args.print_stats:
         from datetime import datetime, timezone

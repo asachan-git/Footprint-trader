@@ -29,7 +29,7 @@ input int    InpPollMs      = 1000;                    // Poll interval (ms)
 input int    InpTimeoutMs   = 4000;                    // WebRequest timeout (ms)
 input string InpToken       = "";                      // X-FB-Token (must match server FB_EXEC_TOKEN; blank = none)
 input int    InpMagic       = 770000;                  // Magic BASE; server sends base+strat*10+tf (1m/5m/15m/1H × strategy)
-input int    InpMagicRange   = 100;                    // EA owns magics [InpMagic, InpMagic+InpMagicRange)
+input int    InpMagicRange   = 110;                    // EA owns magics [InpMagic, InpMagic+InpMagicRange)
 input int    InpSlippage    = 20;                      // Deviation (points)
 input bool   InpVerbose     = true;                    // Log every command
 
@@ -40,8 +40,9 @@ input int    InpZoneRefreshSec = 30;            // Zone redraw interval (s)
 input color  InpHVNColor       = clrSteelBlue;  // HVN zone fill
 input color  InpLVNColor       = clrSandyBrown; // LVN zone fill
 input bool   InpShowZoneLabels = true;          // Label zones/levels with name + value
-input bool   InpDrawVP         = true;          // Draw computed volume profile (right margin)
+input bool   InpDrawVP         = true;          // Draw computed volume profile
 input int    InpVPMaxBars      = 50;            // VP histogram max width (bars)
+input bool   InpVPLeft         = true;          // Anchor VP to left of visible range (VPFR style); false = right margin
 input color  InpVPColor        = clrDimGray;    // VP histogram bar colour
 input color  InpVPPocColor     = clrGoldenrod;  // VP histogram POC (max) bar colour
 
@@ -72,6 +73,16 @@ double   gNodeLo        = 0.0;
 double   gNodeHi        = 0.0;
 string   gTriggerKind   = "";
 string   gEmitEdge      = "";
+
+//--- per-magic fulcrums (from each poll response) — hedged loss measures each cycle's
+//    legs against ITS OWN fulcrum, so parallel cycles aren't conflated.
+long     gFulcMagic[];
+double   gFulcPrice[];
+
+//--- HVN → cycle map (from /exec/zones hvn_cycle_map): each entry = one HVN zone
+//    with zero or more active cycles anchored inside it.
+struct HvnCycleEntry { double lo; double hi; long magic; string tf; string edge; };
+HvnCycleEntry gHvnCycles[];   // flat: one row per (HVN, cycle) pair
 
 //--- chart-overlay indicator handles (3σ Bollinger Bands + FBSqueeze BBW% subwindow)
 int      gBBHandle      = INVALID_HANDLE;
@@ -507,6 +518,59 @@ bool ExecCloseSide(const string cmd, int &closed, string &err)
 }
 
 //+------------------------------------------------------------------+
+//| Modify pending stop orders for a magic: update price + TP.       |
+//| Legs are identified by side ("buy"/"sell"/""=both) and comment   |
+//| prefix. price_delta shifts each leg by the given amount; tp       |
+//| replaces the per-order TP when > 0. Skips orders already inside  |
+//| the broker freeze band at the new price.                          |
+//+------------------------------------------------------------------+
+bool ExecModifyPending(const string cmd, int &modified, string &err)
+{
+   string sym        = JsonGetString(cmd, "symbol");
+   long   cmdMagic   = (long)JsonGetNumber(cmd, "magic");
+   double priceDelta = JsonGetNumber(cmd, "price_delta");  // shift all legs by this amount
+   double newTp      = JsonGetNumber(cmd, "tp");           // 0 = leave TP unchanged
+   string side       = JsonGetString(cmd, "side");         // "buy","sell","" = both
+   modified = 0; err = ""; bool allOk = true;
+
+   int    digits    = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   double point     = SymbolInfoDouble(sym, SYMBOL_POINT);
+   long   stopsPts  = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStop   = stopsPts * point;
+
+   ulong tickets[];
+   double prices[], tps[];
+   for(int i = 0; i < OrdersTotal(); i++)
+   {
+      if(!orderInfo.SelectByIndex(i)) continue;
+      if(!MagicMatch(orderInfo.Magic(), cmdMagic)) continue;
+      if(sym != "" && orderInfo.Symbol() != sym) continue;
+      ENUM_ORDER_TYPE ot = orderInfo.OrderType();
+      bool isBuy  = (ot == ORDER_TYPE_BUY_STOP  || ot == ORDER_TYPE_BUY_LIMIT);
+      bool isSell = (ot == ORDER_TYPE_SELL_STOP || ot == ORDER_TYPE_SELL_LIMIT);
+      if(side == "buy"  && !isBuy)  continue;
+      if(side == "sell" && !isSell) continue;
+      double newPrice = NormalizeDouble(orderInfo.PriceOpen() + priceDelta, digits);
+      double useTp    = (newTp > 0) ? NormalizeDouble(newTp, digits)
+                                    : NormalizeDouble(orderInfo.TakeProfit(), digits);
+      // freeze guard: buy_stop must be above ask+minStop; sell_stop below bid-minStop
+      double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+      if(isBuy  && newPrice < ask + minStop + point) continue;
+      if(isSell && newPrice > bid - minStop - point) continue;
+      int n = ArraySize(tickets);
+      ArrayResize(tickets, n+1); ArrayResize(prices, n+1); ArrayResize(tps, n+1);
+      tickets[n] = orderInfo.Ticket(); prices[n] = newPrice; tps[n] = useTp;
+   }
+   for(int i = 0; i < ArraySize(tickets); i++)
+   {
+      if(trade.OrderModify(tickets[i], prices[i], 0.0, tps[i], ORDER_TIME_GTC, 0)) modified++;
+      else { allOk = false; err = "modify fail #" + IntegerToString((long)tickets[i]); }
+   }
+   return allOk;
+}
+
+//+------------------------------------------------------------------+
 //| Move one side's positions' SL to breakeven (risk-free runner).    |
 //+------------------------------------------------------------------+
 bool ExecMoveBE(const string cmd, int &moved, string &err)
@@ -516,6 +580,12 @@ bool ExecMoveBE(const string cmd, int &moved, string &err)
    string side  = JsonGetString(cmd, "side");
    ENUM_POSITION_TYPE want = (side == "buy") ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
    moved = 0; err = ""; bool allOk = true;
+
+   double point    = SymbolInfoDouble(sym, SYMBOL_POINT);
+   long   stopsPts = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStop  = stopsPts * point;     // SL must clear this from market or broker rejects
+   double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+   double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
 
    for(int i = 0; i < PositionsTotal(); i++)
    {
@@ -529,7 +599,46 @@ bool ExecMoveBE(const string cmd, int &moved, string &err)
       bool improve = (want == POSITION_TYPE_BUY) ? (curSL <= 0 || be > curSL)
                                                  : (curSL <= 0 || be < curSL);
       if(!improve) continue;
+      // Freeze guard: BE-SL must clear the broker stops-level from the CURRENT market, or
+      // PositionModify is rejected. When price is still within minStop of entry (BE inside
+      // the freeze band) we CAN'T set it yet — skip quietly (ok, moved=0) so the server
+      // doesn't spam-retry the same un-settable BE every poll (was 100s of "modify fail").
+      // A BUY's SL sits below price (must be ≤ bid-minStop); a SELL's above (≥ ask+minStop).
+      bool blocked = (want == POSITION_TYPE_BUY) ? (be > bid - minStop)
+                                                 : (be < ask + minStop);
+      if(blocked) continue;   // can't place BE here yet — not a failure, just not now
       if(trade.PositionModify(posInfo.Ticket(), be, tp)) moved++;
+      else { allOk = false; err = "modify fail #" + IntegerToString((long)posInfo.Ticket()); }
+   }
+   return allOk;
+}
+
+//+------------------------------------------------------------------+
+//| Refresh TP on one side's FILLED positions (SL left unchanged).    |
+//| Pending legs track the HVN via MODIFY_PENDING; this keeps filled   |
+//| legs on the same moving structural target. side ""=both.           |
+//+------------------------------------------------------------------+
+bool ExecModifyPosition(const string cmd, int &modified, string &err)
+{
+   string sym   = JsonGetString(cmd, "symbol");
+   long   magic = (long)JsonGetNumber(cmd, "magic");
+   string side  = JsonGetString(cmd, "side");
+   int    digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   double newTp = NormalizeDouble(JsonGetNumber(cmd, "tp"), digits);
+   modified = 0; err = ""; bool allOk = true;
+   if(newTp <= 0) { err = "no tp"; return false; }
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Magic() != magic || posInfo.Symbol() != sym) continue;
+      bool isBuy = (posInfo.PositionType() == POSITION_TYPE_BUY);
+      if(side == "buy"  && !isBuy) continue;
+      if(side == "sell" &&  isBuy) continue;
+      double curTp = NormalizeDouble(posInfo.TakeProfit(), digits);
+      if(MathAbs(curTp - newTp) < SymbolInfoDouble(sym, SYMBOL_POINT)) continue;  // no-op
+      double sl = posInfo.StopLoss();   // keep existing SL
+      if(trade.PositionModify(posInfo.Ticket(), sl, newTp)) modified++;
       else { allOk = false; err = "modify fail #" + IntegerToString((long)posInfo.Ticket()); }
    }
    return allOk;
@@ -551,15 +660,28 @@ void PollAndExecute()
    double point    = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    // Aggregate fields kept for back-compat/diagnostics; `magics` drives the per-TF monitor.
    // stops_pts/point let the server floor the grid step so no leg lands inside the freeze.
+   double acctBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double acctEquity  = AccountInfoDouble(ACCOUNT_EQUITY);
    string pollBody = StringFormat(
       "{\"account\":\"%s\",\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f,"
       "\"positions\":%d,\"pendings\":%d,\"buys\":%d,\"sells\":%d,\"pnl\":%.2f,"
-      "\"stops_pts\":%d,\"point\":%.5f,\"magics\":[%s]}",
+      "\"stops_pts\":%d,\"point\":%.5f,\"balance\":%.2f,\"equity\":%.2f,\"magics\":[%s]}",
       gAccount, _Symbol, bid, ask, buys + sells, CountMyPendings(), buys, sells, SumMyPnL(),
-      (int)stopsPts, point, magicsJson);
+      (int)stopsPts, point, acctBalance, acctEquity, magicsJson);
    string resp;
    int code = HttpPost(InpBridgeURL + "/exec/poll", pollBody, resp);
    if(code != 200) return;
+
+   //--- cache per-magic fulcrums (every poll, even with no commands) for the
+   //    hedged-loss dashboard: each cycle measured against ITS OWN fulcrum.
+   string fz[];
+   int nf = JsonSplitArray(resp, "fulcrums", fz);
+   ArrayResize(gFulcMagic, nf); ArrayResize(gFulcPrice, nf);
+   for(int i = 0; i < nf; i++)
+   {
+      gFulcMagic[i] = (long)JsonGetNumber(fz[i], "magic");
+      gFulcPrice[i] = JsonGetNumber(fz[i], "fulcrum");
+   }
 
    string cmds[];
    int n = JsonSplitCommands(resp, cmds);
@@ -624,6 +746,26 @@ void PollAndExecute()
             Print(ok ? "✅ " : "⚠️ ", "MOVE_BE ", JsonGetString(cmds[i], "side"),
                   " → moved ", movedN, (err == "" ? "" : " | " + err));
       }
+      else if(type == "MODIFY_PENDING")
+      {
+         int modN = 0;
+         ok = ExecModifyPending(cmds[i], modN, err);
+         extra = StringFormat(",\"modified\":%d", modN);
+         if(InpVerbose)
+            Print(ok ? "✅ " : "⚠️ ", "MODIFY_PENDING magic=", (long)JsonGetNumber(cmds[i],"magic"),
+                  " delta=", DoubleToString(JsonGetNumber(cmds[i],"price_delta"),_Digits),
+                  " → modified ", modN, (err == "" ? "" : " | " + err));
+      }
+      else if(type == "MODIFY_POSITION")
+      {
+         int modN = 0;
+         ok = ExecModifyPosition(cmds[i], modN, err);
+         extra = StringFormat(",\"modified\":%d", modN);
+         if(InpVerbose)
+            Print(ok ? "✅ " : "⚠️ ", "MODIFY_POSITION ", JsonGetString(cmds[i],"side"),
+                  " tp=", DoubleToString(JsonGetNumber(cmds[i],"tp"),_Digits),
+                  " → modified ", modN, (err == "" ? "" : " | " + err));
+      }
       else
       {
          err = "unknown type " + type;
@@ -669,6 +811,8 @@ void DrawLevel(const string kind, double price)
    if(kind == "poc")            clr = clrGold;
    else if(kind == "vah" || kind == "val") clr = clrDodgerBlue;
    else if(kind == "naked_poc") clr = clrOrangeRed;
+   else if(kind == "poc_today") clr = clrYellow;
+   else if(kind == "vah_today" || kind == "val_today") clr = clrDeepSkyBlue;
    if(ObjectFind(0, name) < 0)
       ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
    ObjectSetDouble (0, name, OBJPROP_PRICE, 0, price);
@@ -681,10 +825,28 @@ void DrawLevel(const string kind, double price)
 
    if(InpShowZoneLabels)
    {
-      string lbl = kind; StringToUpper(lbl);
+      string lbl = (kind == "poc_today") ? "POC·D"
+                 : (kind == "vah_today") ? "VAH·D"
+                 : (kind == "val_today") ? "VAL·D" : kind; StringToUpper(lbl);
       ZoneText("lvltxt_" + kind, TimeCurrent() + 20 * PeriodSeconds(PERIOD_CURRENT),
                price, lbl + " " + DoubleToString(price, _Digits), clr);
    }
+}
+
+//--- Touch-trigger line: green dotted HLINE at a price where a LIVE tap arms an entry
+//    (an HVN edge ± hvn_touch_buffer). Named with ZONE_PREFIX so ClearZones sweeps it.
+void DrawTouchLine(int idx, const string side, double price)
+{
+   if(price <= 0) return;
+   string name = ZONE_PREFIX + "touch_" + IntegerToString(idx);
+   if(ObjectFind(0, name) < 0) ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
+   ObjectSetDouble (0, name, OBJPROP_PRICE, 0, price);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clrLime);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DOT);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, name, OBJPROP_BACK,  false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetString (0, name, OBJPROP_TEXT, "tap-arm " + side);
 }
 
 void DrawZone(int idx, const string kind, double lo, double hi)
@@ -693,8 +855,14 @@ void DrawZone(int idx, const string kind, double lo, double hi)
    int    secs  = PeriodSeconds(PERIOD_CURRENT);
    datetime tL  = TimeCurrent() - 120 * secs;
    datetime tR  = TimeCurrent() + 20 * secs;
-   color  clr   = (kind == "hvn") ? InpHVNColor : InpLVNColor;
-   bool   fill  = (kind == "hvn");   // HVN filled, LVN outline → visually distinct
+   // _today variants: lighter/distinct colors for the forming current session zones.
+   color  clr;
+   bool   fill;
+   if(kind == "hvn")        { clr = InpHVNColor;      fill = true;  }
+   else if(kind == "lvn")   { clr = InpLVNColor;      fill = false; }
+   else if(kind == "hvn_today") { clr = clrCornflowerBlue; fill = true;  }
+   else if(kind == "lvn_today") { clr = clrPeachPuff;      fill = false; }
+   else                     { clr = InpHVNColor;      fill = false; }
 
    if(ObjectFind(0, name) < 0)
    {
@@ -716,9 +884,16 @@ void DrawZone(int idx, const string kind, double lo, double hi)
    ObjectSetInteger(0, name, OBJPROP_WIDTH,   1);
 
    if(InpShowZoneLabels)
+   {
+      string lbl_prefix = "";
+      if(kind == "hvn")         lbl_prefix = "HVN ";
+      else if(kind == "lvn")    lbl_prefix = "LVN ";
+      else if(kind == "hvn_today") lbl_prefix = "HVN·D ";
+      else if(kind == "lvn_today") lbl_prefix = "LVN·D ";
+      else                      lbl_prefix = "ZONE ";
       ZoneText("ztxt_" + IntegerToString(idx), tR, hi,
-               (kind == "hvn" ? "HVN " : "LVN ") +
-               DoubleToString(lo, _Digits) + "–" + DoubleToString(hi, _Digits), clr);
+               lbl_prefix + DoubleToString(lo, _Digits) + "–" + DoubleToString(hi, _Digits), clr);
+   }
 }
 
 //--- ICT overlay primitives (named with ZONE_PREFIX so ClearZones sweeps them) -----
@@ -806,8 +981,9 @@ void ZoneText(const string suf, datetime t, double price, const string text, col
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
 }
 
-//--- Computed volume profile: one horizontal bar per price bin, length ∝ volume, drawn
-//    into the EMPTY future margin (right of the last candle) so it never overlays price.
+//--- Computed volume profile: one horizontal bar per price bin, length ∝ volume.
+//    InpVPLeft=true  → VPFR style: anchor at leftmost visible bar, bars extend right into chart.
+//    InpVPLeft=false → right-margin style: anchor at last candle, bars extend into future.
 //    Parses {profile:[{price,vol}], vp_bin} from /exec/zones. POC (max-vol) bar highlighted.
 void DrawProfile(const string js)
 {
@@ -829,12 +1005,25 @@ void DrawProfile(const string js)
    if(maxv <= 0.0) return;
 
    int      secs = PeriodSeconds(PERIOD_CURRENT);
-   datetime t0   = TimeCurrent();
    double   half = vpbin / 2.0;
+
+   datetime t0;
+   if(InpVPLeft)
+   {
+      // Leftmost visible bar: ChartGetInteger(CHART_FIRST_VISIBLE_BAR) = bar index,
+      // iTime converts to datetime. The VP spans rightward from there.
+      int firstBar = (int)ChartGetInteger(0, CHART_FIRST_VISIBLE_BAR);
+      t0 = iTime(_Symbol, PERIOD_CURRENT, firstBar);
+   }
+   else
+   {
+      t0 = TimeCurrent();  // right of last candle
+   }
+
    for(int i = 0; i < n; i++)
    {
-      double   frac = vol[i] / maxv;
-      datetime t1   = t0 + (int)(frac * InpVPMaxBars * secs) + secs;  // +secs so tiny bins still show
+      double   frac  = vol[i] / maxv;
+      datetime t1    = t0 + (int)(frac * InpVPMaxBars * secs) + secs;
       bool     isPoc = (vol[i] >= maxv);
       color    c     = isPoc ? InpVPPocColor : InpVPColor;
       string   name  = ZONE_PREFIX + "vp_" + IntegerToString(i);
@@ -854,6 +1043,44 @@ void DrawProfile(const string js)
       }
       ObjectSetInteger(0, name, OBJPROP_COLOR,   c);
       ObjectSetInteger(0, name, OBJPROP_BGCOLOR, c);
+   }
+}
+
+//--- Draw CVD divergence arrows on the chart. Bearish div (price up, delta failed) →
+//    red arrow-down above the candle high. Bullish div (price down, delta failed) →
+//    lime arrow-up below the candle low. bar_time is the bar's close_ts (unix seconds)
+//    from the server; iBarShift maps it to a chart bar index for OBJ_ARROW placement.
+//    Objects named ZONE_PREFIX+"cvd_"+idx so ClearZones() sweeps them each refresh.
+void DrawCvdArrows(const string js)
+{
+   string sigs[];
+   int n = JsonSplitArray(js, "cvd_signals", sigs);
+   for(int i = 0; i < n; i++)
+   {
+      long     bts  = (long)JsonGetNumber(sigs[i], "bar_time");
+      double   px   = JsonGetNumber(sigs[i], "price");
+      string   dir  = JsonGetString(sigs[i], "direction");
+      if(bts <= 0 || px <= 0) continue;
+
+      datetime bt   = (datetime)bts;
+      string   name = ZONE_PREFIX + "cvd_" + IntegerToString(i);
+
+      bool isBear = (dir == "bearish");
+      color  clr  = isBear ? clrRed  : clrLime;
+      // SYMBOL_ARROWUP=233 points up (bullish), SYMBOL_ARROWDOWN=234 points down (bearish)
+      uchar  code = isBear ? 234 : 233;
+
+      if(ObjectFind(0, name) < 0)
+         ObjectCreate(0, name, OBJ_ARROW, 0, bt, px);
+      ObjectSetInteger(0, name, OBJPROP_TIME,       0, bt);
+      ObjectSetDouble (0, name, OBJPROP_PRICE,      0, px);
+      ObjectSetInteger(0, name, OBJPROP_ARROWCODE,  code);
+      ObjectSetInteger(0, name, OBJPROP_COLOR,      clr);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH,      2);
+      ObjectSetInteger(0, name, OBJPROP_ANCHOR,     isBear ? ANCHOR_BOTTOM : ANCHOR_TOP);
+      ObjectSetInteger(0, name, OBJPROP_BACK,       false);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetString (0, name, OBJPROP_TEXT,       (isBear ? "CVD bear div" : "CVD bull div"));
    }
 }
 
@@ -886,6 +1113,47 @@ void FetchAndDrawZones()
       if(lp > 0 && lk != "") DrawLevel(lk, lp);
    }
 
+   //--- green-dotted touch-trigger lines: prices where a LIVE tap arms an entry
+   //    (HVN edge ± hvn_touch_buffer). Only present when touch_arm is enabled server-side.
+   string tl[];
+   int nt = JsonSplitArray(resp, "touch_lines", tl);
+   for(int i = 0; i < nt; i++)
+   {
+      double tp = JsonGetNumber(tl[i], "price");
+      string ts = JsonGetString(tl[i], "side");
+      if(tp > 0) DrawTouchLine(i, ts, tp);
+   }
+
+   //--- parse hvn_cycle_map: [{lo, hi, cycles:[{magic, tf, edge, ...}]}]
+   //    flatten into gHvnCycles[] so UpdateDashboard can display which TF armed each HVN.
+   ArrayResize(gHvnCycles, 0);
+   string hcm[];
+   int nhcm = JsonSplitArray(resp, "hvn_cycle_map", hcm);
+   for(int i = 0; i < nhcm; i++)
+   {
+      double hlo = JsonGetNumber(hcm[i], "lo");
+      double hhi = JsonGetNumber(hcm[i], "hi");
+      // parse the inner cycles array inside this HVN entry
+      string cycs[];
+      int nc = JsonSplitArray(hcm[i], "cycles", cycs);
+      if(nc == 0)
+      {
+         // HVN with no active cycle — still record it so dashboard shows "—"
+         int idx = ArraySize(gHvnCycles); ArrayResize(gHvnCycles, idx + 1);
+         gHvnCycles[idx].lo = hlo; gHvnCycles[idx].hi = hhi;
+         gHvnCycles[idx].magic = 0; gHvnCycles[idx].tf = ""; gHvnCycles[idx].edge = "";
+      }
+      for(int j = 0; j < nc; j++)
+      {
+         int idx = ArraySize(gHvnCycles); ArrayResize(gHvnCycles, idx + 1);
+         gHvnCycles[idx].lo    = hlo;
+         gHvnCycles[idx].hi    = hhi;
+         gHvnCycles[idx].magic = (long)JsonGetNumber(cycs[j], "magic");
+         gHvnCycles[idx].tf    = JsonGetString(cycs[j], "tf");
+         gHvnCycles[idx].edge  = JsonGetString(cycs[j], "edge");
+      }
+   }
+
    //--- draw the last-armed grid's fulcrum (the touched edge the straddle anchors on)
    double fulcrum  = JsonGetNumber(resp, "fulcrum");
    string emitTF   = JsonGetString(resp, "emit_tf");
@@ -915,6 +1183,9 @@ void FetchAndDrawZones()
    //--- ict_fvg overlay (the paper strategy's setup, rebased onto this venue)
    DrawICT(resp);
 
+   //--- CVD divergence arrows: red↓ above bear-div candle, lime↑ below bull-div candle
+   DrawCvdArrows(resp);
+
    //--- computed volume profile (right-margin histogram)
    if(InpDrawVP) DrawProfile(resp);
 
@@ -927,14 +1198,23 @@ void FetchAndDrawZones()
 //| Corner dashboard: trigger, which HVN, max loss if fully hedged    |
 //+------------------------------------------------------------------+
 
-//--- Worst-case loss if EVERY grid leg fills (pendings assumed filled) and price
-//    returns to the fulcrum: the straddle locks buys-above + sells-below, so the
-//    realized loss when whipsawed back to mid = Σ lot·|entry − fulcrum|·money/point.
-//    Open positions + this-magic pendings are both counted (= "all hedged").
+//--- Per-magic fulcrum lookup (from the poll response cache). Returns 0 if unknown.
+double FulcrumForMagic(long magic)
+{
+   for(int k = 0; k < ArraySize(gFulcMagic); k++)
+      if(gFulcMagic[k] == magic) return gFulcPrice[k];
+   return 0.0;
+}
+
+//--- Worst-case loss if EVERY grid leg fills (pendings assumed filled) and price returns
+//    to the fulcrum: the straddle locks buys-above + sells-below, so the realized loss
+//    when whipsawed back to mid = Σ lot·|entry − fulcrum|·money/point. CORRECT for N
+//    PARALLEL cycles: each leg is measured against ITS OWN cycle's fulcrum (by magic),
+//    never one shared value. Legs whose magic has no known fulcrum are skipped (can't
+//    place them on a straddle → not a hedged-whipsaw leg).
 double HedgedLossAtFulcrum(int &nOpen, int &nPend)
 {
    nOpen = 0; nPend = 0;
-   if(gFulcrum <= 0) return 0.0;
    double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    if(tickSize <= 0) return 0.0;
@@ -945,14 +1225,18 @@ double HedgedLossAtFulcrum(int &nOpen, int &nPend)
    {
       if(!posInfo.SelectByIndex(i)) continue;
       if(posInfo.Symbol() != _Symbol || !IsMine(posInfo.Magic())) continue;
-      loss += posInfo.Volume() * MathAbs(posInfo.PriceOpen() - gFulcrum) * perPoint;
+      double f = FulcrumForMagic(posInfo.Magic());
+      if(f <= 0) continue;   // unknown cycle fulcrum → don't fabricate a distance
+      loss += posInfo.Volume() * MathAbs(posInfo.PriceOpen() - f) * perPoint;
       nOpen++;
    }
    for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
       if(!orderInfo.SelectByIndex(i)) continue;
       if(orderInfo.Symbol() != _Symbol || !IsMine(orderInfo.Magic())) continue;
-      loss += orderInfo.VolumeInitial() * MathAbs(orderInfo.PriceOpen() - gFulcrum) * perPoint;
+      double f = FulcrumForMagic(orderInfo.Magic());
+      if(f <= 0) continue;
+      loss += orderInfo.VolumeInitial() * MathAbs(orderInfo.PriceOpen() - f) * perPoint;
       nPend++;
    }
    return loss;
@@ -982,15 +1266,15 @@ void UpdateDashboard()
    if(!InpShowDash) return;
    int dg = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
 
-   if(gFulcrum <= 0)   // nothing armed → single idle row
-   {
-      DashRow(0, "▌ FB GRID — idle", clrSilver);
-      for(int r = 1; r <= 5; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
-      return;
-   }
-
+   // idle = no live legs of ours AND no armed fulcrum on any cycle
    int nOpen = 0, nPend = 0;
    double loss = HedgedLossAtFulcrum(nOpen, nPend);
+   if(nOpen == 0 && nPend == 0 && gFulcrum <= 0)
+   {
+      DashRow(0, "▌ FB GRID — idle", clrSilver);
+      for(int r = 1; r <= 12; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
+      return;
+   }
    string ccy = AccountInfoString(ACCOUNT_CURRENCY);
    string kind = (gTriggerKind == "" ? "—" : gTriggerKind);
    string nodeStr = (gNodeLo > 0 && gNodeHi > 0)
@@ -1004,11 +1288,44 @@ void UpdateDashboard()
    DashRow(4, "Legs:     " + IntegerToString(nOpen) + " open / " + IntegerToString(nPend) + " pend", InpDashColor);
    DashRow(5, "Hedged loss: -" + DoubleToString(loss, 2) + " " + ccy,
            loss > 0 ? clrTomato : clrLimeGreen);
+
+   // HVN → cycle map rows: one row per HVN zone showing which TF cycles are armed
+   // Format: "HVN 3215–3228: 5m·top  15m·bot"  or  "HVN 3215–3228: —"
+   int row = 6;
+   double lastLo = -1;
+   string rowText = "";
+   int nh = ArraySize(gHvnCycles);
+   for(int i = 0; i <= nh; i++)
+   {
+      bool flush = (i == nh) || (i > 0 && gHvnCycles[i].lo != lastLo);
+      if(flush && lastLo >= 0)
+      {
+         // find hi for this zone
+         double lastHi = 0;
+         for(int k = 0; k < nh; k++)
+            if(gHvnCycles[k].lo == lastLo) { lastHi = gHvnCycles[k].hi; break; }
+         string label = "HVN " + DoubleToString(lastLo, dg) + "–" + DoubleToString(lastHi, dg) + ": ";
+         DashRow(row, label + (rowText == "" ? "—" : rowText), clrSteelBlue);
+         row++;
+         rowText = "";
+      }
+      if(i < nh)
+      {
+         lastLo = gHvnCycles[i].lo;
+         if(gHvnCycles[i].magic > 0)
+         {
+            string entry = gHvnCycles[i].tf + (gHvnCycles[i].edge != "" ? "·" + gHvnCycles[i].edge : "");
+            rowText = (rowText == "" ? entry : rowText + "  " + entry);
+         }
+      }
+   }
+   // clear any stale rows beyond what we just drew
+   for(int r = row; r <= row + 4; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
 }
 
 void ClearDashboard()
 {
-   for(int r = 0; r <= 5; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
+   for(int r = 0; r <= 12; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
 }
 
 //+------------------------------------------------------------------+

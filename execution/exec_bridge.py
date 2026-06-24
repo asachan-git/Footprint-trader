@@ -66,7 +66,7 @@ MODIFY_POSITION = "MODIFY_POSITION"  # refresh TP on one side's filled positions
 MAGIC_BASE = 770000
 _STRAT_CODE = {
     "hvn_inside_touch": 1, "squeeze": 2, "vp_level_touch": 3, "imbalance": 4,
-    "hvn_edge": 5, "anchor": 6, "va": 7, "cvd_div": 8,
+    "hvn_edge": 5, "anchor": 6, "va": 7, "cvd_div": 8, "hvn_displacement": 10,
     # Setup-level pseudo-kind: the "vp_levels" parallel setup (va OR vp_level_touch) arms
     # under ONE dedicated magic so the trade report reads it as a single setup. The audit
     # still records the real detector (trigger_kind) that fired.
@@ -243,19 +243,23 @@ class ExecBridge:
     # ── live open-state (EA reports its position/order counts on each poll) ────
     @classmethod
     def set_open(cls, account: str, symbol: str, positions: int, pendings: int,
-                 tf: str = "", now: float | None = None, magic: int = 0) -> None:
+                 tf: str = "", now: float | None = None, magic: int = 0,
+                 buys: int = 0, sells: int = 0) -> None:
         # Cycle state is keyed by MAGIC (strategy×TF), not TF alone — so multiple setups
         # (hvn / squeeze / vp …) run as INDEPENDENT parallel cycles on the same symbol+TF.
+        # buys/sells retained for the cycle_live(2B,3S,…) skip-reason breakdown.
         with cls._lock:
             cls._open[(str(account), symbol, int(magic))] = {
                 "positions": int(positions), "pendings": int(pendings), "tf": tf,
+                "buys": int(buys), "sells": int(sells),
                 "ts": now if now is not None else time.time(),
             }
 
     @classmethod
     def get_open(cls, account: str, symbol: str, tf: str = "", magic: int = 0) -> dict:
         with cls._lock:
-            return dict(cls._open.get((str(account), symbol, int(magic)), {"positions": 0, "pendings": 0}))
+            return dict(cls._open.get((str(account), symbol, int(magic)),
+                                      {"positions": 0, "pendings": 0, "buys": 0, "sells": 0}))
 
     # ── last-armed grid (ground truth for chart drawing + diagnostics) ─────────
     @classmethod
@@ -310,6 +314,29 @@ class ExecBridge:
                     out[int(mg)] = f
         return out
 
+    @classmethod
+    def active_cycles_detail(cls, account: str, broker_symbol: str) -> list[dict]:
+        """All active cycles with full arm metadata: magic, tf, fulcrum, edge, trigger_kind,
+        node_low, node_high. Used by /exec/zones to annotate which cycle sits in which HVN."""
+        out = []
+        with cls._lock:
+            for (acc, sym, mg), m in cls._last_arm.items():
+                if acc != str(account) or sym != broker_symbol or not m.get("active"):
+                    continue
+                f = float(m.get("fulcrum", 0.0) or 0.0)
+                if not (mg and f > 0):
+                    continue
+                out.append({
+                    "magic": int(mg),
+                    "tf": str(m.get("tf") or ""),
+                    "fulcrum": f,
+                    "edge": str(m.get("edge") or ""),
+                    "trigger_kind": str(m.get("trigger_kind") or ""),
+                    "node_low": float(m.get("node_low") or 0.0),
+                    "node_high": float(m.get("node_high") or 0.0),
+                })
+        return out
+
     # ── cycle monitor (server-side exit brain) ─────────────────────────────────
     @classmethod
     def monitor_cycle(cls, account: str, symbol: str, settings: dict | None, *,
@@ -348,6 +375,7 @@ class ExecBridge:
         if fts > 0:
             if positions == 0:
                 cls.set_last_arm(account, symbol, **{**cyc, "active": False, "flatten_ts": 0.0})
+                cls.clear_emit(account, symbol, magic=magic)
             elif (t - fts) > _FLATTEN_GRACE_S:
                 # close demonstrably didn't land (past the queue's reclaim window) → re-issue once
                 cls.enqueue(account, CLOSE_ALL, symbol, comment="FB|flatten|retry", magic=magic, now=t)
@@ -365,13 +393,52 @@ class ExecBridge:
             cyc["pend_seen"] = pend_seen
             cls.set_last_arm(account, symbol, **cyc)
 
+        # FREEZE the VP/HVN structure on FIRST leg fill. Until a position opens the cycle
+        # tracks live VP (cheap re-anchor of resting pendings); once committed, we manage
+        # against the structure that JUSTIFIED the entry — not a morphing live VP (which
+        # caused false fade-flattens). Stores session HVN zones (analysis frame) + step into
+        # the arm under `frozen_zones`; the refresh paths use these instead of live VP, and
+        # fade-flatten is skipped entirely for a frozen cycle. Fires once (vp_frozen guard).
+        if positions > 0 and not cyc.get("vp_frozen"):
+            try:
+                from execution.zone_triggers import _session_hvn_zones
+                from pipeline.state_store import store as _st
+                _atf = cyc.get("armed_tf") or cyc.get("tf") or ""
+                # analysis symbol: monitor gets broker symbol; map back via settings
+                _smap = (settings.get("execution") or {}).get("symbol_map", {}) if isinstance(settings, dict) else {}
+                _b2a = {v: k for k, v in _smap.items()}
+                _asym = _b2a.get(symbol, symbol)
+                _zbars = _st().recent(_asym, _atf, 120) if _atf else []
+                _fz, _ = _session_hvn_zones(_asym, _atf, _zbars) if _atf else ([], "")
+                if _fz:
+                    cyc["frozen_zones"] = [[round(lo, 5), round(hi, 5)] for lo, hi in _fz]
+                cyc["vp_frozen"] = True
+                cls.set_last_arm(account, symbol, **cyc)
+            except Exception:
+                pass  # never break the monitor on a snapshot failure
+
         if positions <= 0:
+            # UNFREEZE on full close. The VP freeze only exists to stop a morphing live
+            # VP from false-fading an OPEN position; once the cycle is flat that risk is
+            # gone. Clearing vp_frozen/frozen_zones lets refresh/fade/TP-refresh — and any
+            # re-fill of resting pendings — track LIVE VP/HVN/LVN again (back to the
+            # pre-first-fill pending-only behavior). Re-fires the snapshot on the next fill.
+            unfroze = False
+            if cyc.get("vp_frozen") and (max_seen > 0 or pend_seen > 0):
+                cyc.pop("vp_frozen", None)
+                cyc.pop("frozen_zones", None)
+                unfroze = True
             # flat. Retire the cycle once it had something live (positions filled OR
             # pendings rested) and now has nothing open AND nothing resting — frees the
             # symbol for a new arm by either tf. The (max/pend)_seen high-water avoids
             # the placement-window race (active set before the EA reports pendings).
             if (max_seen > 0 or pend_seen > 0) and pendings == 0:
                 cls.set_last_arm(account, symbol, **{**cyc, "active": False})
+                cls.clear_emit(account, symbol, magic=magic)
+            elif unfroze:
+                # still active with resting pendings — persist the unfreeze so live-VP
+                # refresh resumes on the resting legs / next fill.
+                cls.set_last_arm(account, symbol, **cyc)
             return None
 
         n = int(cyc.get("n_per_side") or 0)
@@ -383,27 +450,43 @@ class ExecBridge:
         grid_cfg = (settings.get("grid_levels") or {}) if isinstance(settings, dict) else {}
         close_on_full_hedge = bool(grid_cfg.get("cycle_close_on_full_hedge", True))
 
-        # 0.5) bias-side trailing book — directional profit capture, independent of the
-        # 0.4) full-fill breakeven — the moment one side fills ALL its legs the move has
-        # committed that way, so the opposite resting ladder stops being a "catch the other
-        # break" hedge and becomes a stop that would lock the full ladder span if it fills.
-        # Cap that risk immediately: move the committed side to BE (SL = avg entry) so the
-        # filled side can no longer lose, while the opposite ladder stays armed to catch a
-        # reversal. Fires once per side (be_done_{side} guard). Independent of bias_trail's
-        # giveback book — this is risk-capping, that is profit-capturing.
+        # 0.4) full-fill action — one side filled ALL its legs; price committed that way.
+        # cancel_opp=True (default): cancel the opposite side's pendings immediately so
+        # they can't fill on a retrace and create a new unhedged position, then move the
+        # filled side to BE so it can no longer lose. The cycle stays active so net_target
+        # / bias_trail can still exit the filled side profitably.
+        # cancel_opp=False (legacy): leave opposite pendings, only move BE (old behaviour).
+        # Fires once per side (be_done_{side} guard, CAS under lock to prevent spam).
         if bool(grid_cfg.get("fullfill_be_enabled", True)):
+            _cancel_opp = bool(grid_cfg.get("fullfill_cancel_opposite", True))
             _bn = int(cyc.get("buy_n") or 0)
             _sn = int(cyc.get("sell_n") or 0)
             for _side, _need, _have in (("buy", _bn, int(buys or 0)),
                                         ("sell", _sn, int(sells or 0))):
                 if _need > 0 and _have >= _need and not cyc.get(f"be_done_{_side}"):
+                    # CAS under lock: re-check flag so concurrent threads don't both fire.
+                    key = (str(account), symbol, int(magic))
+                    with cls._lock:
+                        live = cls._last_arm.get(key)
+                        if live is None or live.get(f"be_done_{_side}"):
+                            continue   # another thread already set it
+                        live[f"be_done_{_side}"] = True
+                        cyc[f"be_done_{_side}"] = True
+                    try:
+                        persist_arm(account, symbol, int(magic), live)
+                    except Exception:
+                        pass
+                    _opp = "sell" if _side == "buy" else "buy"
+                    if _cancel_opp:
+                        # cancel opposite pendings first so they can't fill on retrace
+                        cls.enqueue(account, CANCEL_PENDINGS, symbol, magic=magic,
+                                    side=_opp, comment=f"FB|fullfill_cancel_opp|{_opp}", now=t)
                     cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=_side,
                                 comment=f"FB|fullfill_be|{_side}", now=t)
-                    cyc[f"be_done_{_side}"] = True
-                    cls.set_last_arm(account, symbol, **cyc)
                     _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
                                       "tf": tf, "magic": magic, "exit_reason": "fullfill_be",
                                       "side": _side, "filled": _have, "need": _need,
+                                      "cancel_opp": _cancel_opp,
                                       "squeeze_ok": cyc.get("squeeze_ok"),
                                       "squeeze_rank": cyc.get("squeeze_rank")})
 
@@ -483,7 +566,15 @@ class ExecBridge:
         if reason is None and 0 < positions < max_seen and pendings > 0 and not bias_booked:
             tol = max(mid * 1e-4, 1e-6) if mid > 0 else 1e-6
             confirms = (tp_up > 0 and mid >= tp_up - tol) or (tp_down > 0 and 0 < mid <= tp_down + tol)
-            reason = "leg_tp" if confirms else "leg_closed_other"
+            # leg_tp closes the WHOLE cycle (both sides + pendings) when a TP-side leg
+            # books — but ONLY if the basket is net-POSITIVE. A TP tag while net-negative
+            # (deep hedge on the other side) is NOT a win; don't realize that loss here —
+            # let net_target / bias_trail / full_hedge own those exits.
+            net_ok = (pnl is None) or (float(pnl) > 0)
+            if confirms and net_ok:
+                reason = "leg_tp"
+            elif not confirms:
+                reason = "leg_closed_other"
 
         # 3) full-hedge backstop (delta-neutral → cut to free margin; realizes a loss)
         if reason is None and close_on_full_hedge and n > 0 \
@@ -617,17 +708,19 @@ class ExecBridge:
             # scope the clear to THIS cycle's magic so a re-arm only cancels its own
             # TF/strategy pendings, never a sibling TF cycle's live orders.
             out.append(cls.enqueue(account, clear_cmd, broker_symbol, magic=magic))
-        buy_tp = getattr(plan, "buy_tp", 0.0) if leg_tp else 0.0
+        buy_tp  = getattr(plan, "buy_tp",  0.0) if leg_tp else 0.0
         sell_tp = getattr(plan, "sell_tp", 0.0) if leg_tp else 0.0
+        buy_sl  = getattr(plan, "buy_sl",  0.0)
+        sell_sl = getattr(plan, "sell_sl", 0.0)
         for i, leg in enumerate(getattr(plan, "buy_legs", []) or []):
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="buy_stop",
-                price=leg.price, lot=leg.lot, sl=0.0, tp=buy_tp,
+                price=leg.price, lot=leg.lot, sl=buy_sl, tp=buy_tp,
                 comment=f"FB|{tag}|{tf_tag}|b{i + 1}", magic=magic))
         for i, leg in enumerate(getattr(plan, "sell_legs", []) or []):
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="sell_stop",
-                price=leg.price, lot=leg.lot, sl=0.0, tp=sell_tp,
+                price=leg.price, lot=leg.lot, sl=sell_sl, tp=sell_tp,
                 comment=f"FB|{tag}|{tf_tag}|s{i + 1}", magic=magic))
         return out
 
@@ -761,6 +854,9 @@ class ExecBridge:
                     "net_target_usd": 0.0, "n_per_side": 0, "step": 0.0,
                     "buy_n": int(m.get("buys", 0)), "sell_n": int(m.get("sells", 0)),
                     "bias_peak": 0.0, "bias_booked": False,
+                    # recovered cycle: suppress full-fill BE (we don't know its real
+                    # buy_n/sell_n target, and we don't want to spam MOVE_BE on a stub).
+                    "be_done_buy": True, "be_done_sell": True,
                     "max_pos_seen": positions, "pend_seen": 0,
                     "flatten_ts": 0.0, "node_low": 0.0, "node_high": 0.0,
                     "squeeze_ok": False, "squeeze_rank": 1.0,

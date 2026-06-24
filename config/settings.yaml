@@ -45,11 +45,19 @@ grid_levels:
   lot_step: 0.25
   tp_atr_mult: 1.5
   hvn_max_legs: 6
+  # Per-TF leg cap (overrides hvn_max_legs for the matching TF). Fast TFs run a tighter
+  # ladder, slow TFs a wider one. The cycle's TF is recovered from its magic (magic % 10).
+  hvn_max_legs_by_tf: {1m: 4, 5m: 5, 15m: 6, 1h: 7}
   # Minimum TP distance ($) beyond the outermost leg — a structural level closer than
   # this is skipped (keep walking out to the next). Stops the tiny-TP-into-own-node bug
   # (a fulcrum on an HVN edge had its into-node TP land ~2pt away). 0 = no floor.
   min_tp_dist: 8.0
-  max_fulcrum_dist_pct: 0.05
+  # Coarse outer guard: reject a fulcrum sitting >this fraction of price away from spot
+  # (a stale/far cached-HVN edge) before any ladder math. The ladder-span gate
+  # (|fulcrum-px| ≤ n·step) is the precise "is price actually at the edge" check; this is
+  # just a sanity bound well outside any real ladder span. 0.05 (±~200pt @ gold) was far
+  # too loose vs legit arms ~6pt off spot — tightened to 0.01 (±~40pt) 2026-06-24.
+  max_fulcrum_dist_pct: 0.01
   # Cycle exit (server-side cycle monitor). DEMO ONLY — strategy is -EV.
   # Net-profit-exit-only: place legs with NO per-order TP so the winning side can't book
   # while the losing side dangles (a per-leg TP hit ≠ a net-positive cycle). The basket
@@ -72,6 +80,7 @@ grid_levels:
   # units of the edge even without crossing it (e.g. 0.5pt catches near-misses on gold).
   # 0.0 = exact touch only (original behaviour). Edge is still the fulcrum price.
   hvn_touch_buffer: 0.5
+  hvn_lookback_bars: 3          # candle-close trigger scans last N bars (restart recovery)
   # Directional skew votes (skew-only — both sides still placed, favoured side heavier):
   # HTF Bollinger bias reads the NEXT TF up's 20-SMA (5m→15m, 15m→1h…) — price above a
   # rising 20MA = bull vote, below a falling one = bear. 2.5σ "edge" votes mean-reversion
@@ -102,8 +111,10 @@ grid_levels:
   # Full-fill breakeven: the moment ONE side fills ALL its legs the move has committed that
   # way, so the opposite resting ladder becomes a stop that would lock the full ladder span.
   # Cap that immediately — move the committed side to BE (SL=avg entry); filled side can no
-  # longer lose, opposite ladder stays armed to catch a reversal. Reduces hedge loss risk.
+  # longer lose. cancel_opposite=true also cancels the other side's pendings so they can't
+  # fill on a retrace and create a new unhedged position.
   fullfill_be_enabled: true
+  fullfill_cancel_opposite: true  # cancel opposite-side pendings when one side fully fills
   # Bias-side trailing book: when ONE side has ALL its legs filled (the move committed
   # that way), track its peak floating P&L; on a give-back from peak, BOOK a fraction of
   # that side and move the rest to breakeven (risk-free runner). Captures directional

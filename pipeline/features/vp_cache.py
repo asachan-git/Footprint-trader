@@ -313,21 +313,56 @@ def _get_offset(sym: dict) -> float:
 
 
 def get(symbol: str, period: str) -> dict | None:
-    """Get cached VP for symbol + period (today / this week), venue-offset applied."""
+    """Get cached VP for symbol + period (today / this week), venue-offset applied.
+
+    For daily: before 20:00 IST (14:30 UTC) uses prev-D VP so Asia/London sessions
+    trade on a completed reference profile. At/after 20:00 IST switches to today's
+    accumulating VP (NY session reference). Falls back to prev-D if today not yet built.
+    """
     cache = _load()
     sym = cache.get(symbol, {})
     now_ts = int(time.time())
     anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
     offset = _get_offset(sym)
     if period == "daily":
-        key = _session_day_key(now_ts, anchor)
-        vp = sym.get("daily", {}).get(key)
+        ist_now = datetime.fromtimestamp(now_ts, tz=_IST)
+        use_prev = ist_now.hour < 20  # before 20:00 IST → use prev-D completed profile
+        if use_prev:
+            prev_key = _session_day_key(now_ts - 86400, anchor)
+            vp = sym.get("daily", {}).get(prev_key)
+        else:
+            key = _session_day_key(now_ts, anchor)
+            vp = sym.get("daily", {}).get(key)
+            if vp is None:
+                prev_key = _session_day_key(now_ts - 86400, anchor)
+                vp = sym.get("daily", {}).get(prev_key)
     elif period == "weekly":
         key = _week_key(now_ts)
         vp = sym.get("weekly", {}).get(key)
     else:
         return None
     return _shift_vp(vp, offset) if vp else None
+
+
+def get_prev_and_today(symbol: str) -> tuple[dict | None, dict | None]:
+    """Return (prev_day_vp, today_vp) for daily period, both venue-offset applied.
+
+    Used by /exec/zones to overlay both periods: prev-D completed profile and the
+    forming today session. Either may be None if not yet cached.
+    """
+    cache = _load()
+    sym = cache.get(symbol, {})
+    now_ts = int(time.time())
+    anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
+    offset = _get_offset(sym)
+
+    today_key = _session_day_key(now_ts, anchor)
+    prev_key = _session_day_key(now_ts - 86400, anchor)
+    daily = sym.get("daily", {})
+
+    today_vp = _shift_vp(daily[today_key], offset) if today_key in daily else None
+    prev_vp = _shift_vp(daily[prev_key], offset) if prev_key in daily else None
+    return prev_vp, today_vp
 
 
 def get_history(symbol: str, period: str, n: int = 5) -> list[dict]:
@@ -360,7 +395,13 @@ def period_profile(symbol: str, period: str) -> dict | None:
     bin_cfg = sym.get("bin_size")
     now_ts = int(time.time())
     if period == "daily":
-        st, en = _day_bounds(_session_day_key(now_ts, anchor), anchor)
+        # Mirror get() cutover: before 20:00 IST use prev-D bars for the histogram.
+        ist_now = datetime.fromtimestamp(now_ts, tz=_IST)
+        if ist_now.hour < 20:
+            day_key = _session_day_key(now_ts - 86400, anchor)
+        else:
+            day_key = _session_day_key(now_ts, anchor)
+        st, en = _day_bounds(day_key, anchor)
     elif period == "weekly":
         st, en = _week_bounds(_week_key(now_ts), anchor)
     else:

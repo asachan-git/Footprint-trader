@@ -126,6 +126,16 @@ def create_app() -> Flask:
     app.register_blueprint(options_decide_bp)
     app.register_blueprint(dashboard_bp)
     app.register_blueprint(strategies_bp)
+    # Restore arm/emit state persisted before the last restart so live cycles
+    # are not orphaned. Must run after blueprints register (imports ExecBridge).
+    try:
+        from execution.exec_bridge import ExecBridge
+        result = ExecBridge.load_persisted_state()
+        import logging as _l
+        _l.getLogger(__name__).info(f"[startup] arm state restored: {result}")
+    except Exception as e:
+        import logging as _l
+        _l.getLogger(__name__).warning(f"[startup] arm state restore failed (non-fatal): {e}")
     return app
 
 

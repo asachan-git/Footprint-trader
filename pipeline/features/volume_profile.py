@@ -333,6 +333,41 @@ def _merge_zones(zones: list[dict], merge_tol: float) -> list[dict]:
     return merged
 
 
+def _subtract_hvn_from_lvn(
+    lvn: list[dict], hvn: list[dict], bin_size: float
+) -> list[dict]:
+    """Clip HVN spans out of LVN spans.
+
+    HVN and LVN are detected independently (peaks vs valleys on the same smoothed
+    array), so their half-height boundaries can spatially overlap — a price bin
+    ends up claimed as BOTH high- and low-volume, which is meaningless. An LVN is
+    by definition the vacuum *between* HVNs, so any overlap is the HVN's. Subtract
+    every HVN interval from each LVN interval (one LVN can split into pieces), then
+    drop sub-bin slivers left behind.
+    """
+    if not lvn or not hvn:
+        return lvn
+    hvn_sorted = sorted(hvn, key=lambda z: z["low"])
+    out: list[dict] = []
+    for z in lvn:
+        segs = [(z["low"], z["high"])]
+        for h in hvn_sorted:
+            nxt: list[tuple[float, float]] = []
+            for lo, hi in segs:
+                if h["high"] <= lo or h["low"] >= hi:   # no overlap → keep whole
+                    nxt.append((lo, hi))
+                    continue
+                if h["low"] > lo:                        # surviving piece left of HVN
+                    nxt.append((lo, h["low"]))
+                if h["high"] < hi:                       # surviving piece right of HVN
+                    nxt.append((h["high"], hi))
+            segs = nxt
+        for lo, hi in segs:
+            if hi - lo >= bin_size:                      # drop sub-bin slivers
+                out.append({"low": round(lo, 4), "high": round(hi, 4)})
+    return sorted(out, key=lambda z: z["low"])
+
+
 def _find_hvn_zones(
     bins: np.ndarray, bin_size: float, price_min: float, top_n: int = 8
 ) -> list[dict]:
@@ -344,7 +379,10 @@ def _find_hvn_zones(
     active = bins[bins > 0]
     if len(active) == 0:
         return []
-    avg = float(active.mean())
+    # MEDIAN baseline (not mean): one dominant POC inflates the mean and lifts the
+    # height bar so strong secondary nodes get excluded. The median is POC-robust →
+    # secondary HVN qualify on their own merit; node count stays stable on skewed days.
+    avg = float(np.median(active))
 
     peaks, _ = find_peaks(smoothed, prominence=avg * 0.5, height=avg)
     if len(peaks) == 0:
@@ -367,7 +405,7 @@ def _find_lvn_zones(
     active_idxs = np.where(bins > 0)[0]
     if len(active_idxs) == 0:
         return []
-    avg = float(bins[active_idxs].mean())
+    avg = float(np.median(bins[active_idxs]))   # median: POC-robust baseline (see HVN)
     first, last = int(active_idxs[0]), int(active_idxs[-1])
     if last - first < 4:
         return []
@@ -451,10 +489,9 @@ def _hvn_lvn(vol_map: dict[float, float]) -> tuple[list[dict], list[dict]]:
     for p, v in vol_map.items():
         idx = max(0, min(NUM_BINS - 1, int((p - p_min) / bin_size)))
         bins[idx] += v
-    return (
-        _find_hvn_zones(bins, bin_size, p_min),
-        _find_lvn_zones(bins, bin_size, p_min),
-    )
+    hvn = _find_hvn_zones(bins, bin_size, p_min)
+    lvn = _subtract_hvn_from_lvn(_find_lvn_zones(bins, bin_size, p_min), hvn, bin_size)
+    return hvn, lvn
 
 
 def _current_position(close: float, poc: float, vah: float, val: float) -> str:
@@ -511,6 +548,7 @@ def compute(
 
     hvn = _find_hvn_zones(bins, used_bin_size, p_min)
     lvn = _find_lvn_zones(bins, used_bin_size, p_min)
+    lvn = _subtract_hvn_from_lvn(lvn, hvn, used_bin_size)   # resolve HVN/LVN overlap
     shape = _classify_shape(bins, poc_idx, lo_idx, hi_idx, n)
 
     # Naked POC: prior-period POC not revisited by this period's bars

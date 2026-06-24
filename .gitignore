@@ -73,3 +73,10 @@ data/iter_compare_*.md
 data/strategies/
 data/reports/
 data/sweeps_*.jsonl
+
+# Live exec-bridge runtime logs + emit/arm state (append-only, not source)
+data/*.log
+data/exec_bridge.jsonl
+data/exec_emit.jsonl
+data/arm_state.jsonl
+data/emit_state.jsonl

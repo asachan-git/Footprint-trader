@@ -24,6 +24,9 @@ from flask import Blueprint, current_app, jsonify, request
 
 LOG = logging.getLogger(__name__)
 
+# HVN rebuild throttle: wall-clock timestamp of last intraday build per symbol
+_vp_last_build: dict[str, float] = {}
+
 from pipeline.footprint import build as build_fp
 from pipeline.mtf_aggregator import maybe_emit
 from pipeline.normalizer import normalize
@@ -368,21 +371,25 @@ def ingest():
             return jsonify({"ok": True, "duplicate": True, "bar_id": bar.bar_id})
         _aggregate_mtf(bar, settings)
 
-        # Intra-day VP refresh — rebuild current-day VP every Nth primary bar
-        # so HVN/LVN, POC, VAH/VAL reflect today's accumulating volume.
+        # Intra-day VP refresh — rebuild at most every `hvn_refresh_interval_min` minutes
+        # (default 15). Throttled by wall clock so HVN zones stay stable intraday.
         if bar.tf == primary_tf:
-            refresh_n = int((settings.get("vp_cache") or {}).get("intraday_refresh_bars", 5))
-            if refresh_n > 0 and (bar.close_ts // 60) % refresh_n == 0:
+            import time as _time
+            _vp_cfg_raw = settings.get("vp_cache", {}) or {}
+            _hvn_interval = int(_vp_cfg_raw.get("hvn_refresh_interval_min", 15)) * 60
+            _last = _vp_last_build.get(bar.symbol, 0.0)
+            if _hvn_interval > 0 and (_time.time() - _last) >= _hvn_interval:
                 try:
                     from pipeline.features.vp_cache import build_and_save as _vp_build
-                    _vp_cfg = settings.get("vp_cache", {}) or {}
                     _vp_build(
                         [bar.symbol], primary_tf,
-                        session_start_utc=_vp_cfg.get("session_start_utc", {}),
-                        vp_bin_size=_vp_cfg.get("vp_bin_size", {}),
-                        venue_price_offset=_vp_cfg.get("venue_price_offset", {}),
+                        session_start_utc=_vp_cfg_raw.get("session_start_utc", {}),
+                        vp_bin_size=_vp_cfg_raw.get("vp_bin_size", {}),
+                        venue_price_offset=_vp_cfg_raw.get("venue_price_offset", {}),
                         symbol_map=(settings.get("execution") or {}).get("symbol_map", {}),
                     )
+                    _vp_last_build[bar.symbol] = _time.time()
+                    LOG.debug(f"[ingest] intraday VP rebuild: {bar.symbol}")
                 except Exception as e:
                     LOG.warning(f"[ingest] intraday VP refresh failed: {e}")
 
@@ -391,6 +398,7 @@ def ingest():
             snapped = snapshot_if_boundary(prev.close_ts, bar.close_ts, bar.symbol, primary_tf)
             if snapped:
                 LOG.info(f"[ingest] VP snapshot: {bar.symbol} {snapped}")
+                import time as _time
                 from pipeline.features.vp_cache import build_and_save
                 _vp_cfg = settings.get("vp_cache", {}) or {}
                 build_and_save(
@@ -400,6 +408,7 @@ def ingest():
                     venue_price_offset=_vp_cfg.get("venue_price_offset", {}),
                     symbol_map=(settings.get("execution") or {}).get("symbol_map", {}),
                 )
+                _vp_last_build[bar.symbol] = _time.time()
                 # Write journal for the day that just closed
                 if snapped.get("daily"):
                     try:

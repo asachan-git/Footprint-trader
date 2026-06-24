@@ -86,7 +86,16 @@ class IctFvg(Coup):
                "cvd_divergence_exit": False,
                "tp_mutation_enabled": False,        # hold the hard 4R TP (no poc_trail/tp_part drift)
                "be_at_r": float(cfg.get("be_at_r", 1.0))}
-        return {**settings, "cycle": cyc}
+        eff = {**settings, "cycle": cyc}
+        # Opt-in LIVE execution on the direct (wine rpyc) adapter — the only path that
+        # can do this strategy's SL-modify/BE/partials. Default OFF → stays paper with
+        # the rest of the fleet. Requires ALLOW_LIVE=1 (router tripwire) AND the wine
+        # MT5 server running (scripts/mt5_server.sh). Routes ONLY this strategy.
+        if bool(cfg.get("live_direct", False)):
+            eff = {**eff, "mode": "live",
+                   "execution": {**(settings.get("execution") or {}),
+                                 "broker": "vantage_mt5_direct"}}
+        return eff
 
     # ── HTF (15m) — unmitigated FVG retrace + rejection arms a directional bias ──
     def _htf_trigger(self, symbol: str) -> dict | None:
