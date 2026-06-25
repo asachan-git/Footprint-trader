@@ -169,17 +169,32 @@ def compute_hvn_tps(symbol: str, edge: float,
     up_ref  = top_leg if top_leg > 0 else edge
     dn_ref  = bot_leg if bot_leg > 0 else edge
 
-    # candidate HVN far-edges that clear the outer leg + min_dist. When skip_node is set,
+    # candidate HVN nodes that clear the outer leg + min_dist. When skip_node is set,
     # restrict to nodes BEYOND the bracketing node (next node up / next node down).
     if skip_node:
         _nlo, _nhi = float(skip_node[0]), float(skip_node[1])
-        up_cands = sorted(hi for lo, hi in zones if hi > up_ref + min_dist and lo >= _nhi - 1e-6)
-        dn_cands = sorted((lo for lo, hi in zones if lo < dn_ref - min_dist and hi <= _nlo + 1e-6), reverse=True)
+        up_zones = sorted([(lo, hi) for lo, hi in zones if hi > up_ref + min_dist and lo >= _nhi - 1e-6],
+                          key=lambda z: z[1])
+        dn_zones = sorted([(lo, hi) for lo, hi in zones if lo < dn_ref - min_dist and hi <= _nlo + 1e-6],
+                          key=lambda z: -z[0])
     else:
-        up_cands = sorted(hi for lo, hi in zones if hi > up_ref + min_dist)
-        dn_cands = sorted((lo for lo, hi in zones if lo < dn_ref - min_dist), reverse=True)
-    tp_up   = up_cands[0] if up_cands else 0.0
-    tp_down = dn_cands[0] if dn_cands else 0.0
+        up_zones = sorted([(lo, hi) for lo, hi in zones if hi > up_ref + min_dist], key=lambda z: z[1])
+        dn_zones = sorted([(lo, hi) for lo, hi in zones if lo < dn_ref - min_dist], key=lambda z: -z[0])
+
+    # Far edge for an intermediate node; CENTER for the extreme (outermost) node on the
+    # chart — price rarely clears the last high-volume node, so its mid is the magnet.
+    def _hvn_target(zs: list, ref: float, sign: int) -> float:
+        if not zs:
+            return 0.0
+        z = zs[0]
+        edge = z[1] if sign > 0 else z[0]
+        if len(zs) == 1:   # extreme node → center (fall back to edge if mid doesn't clear)
+            center = (z[0] + z[1]) / 2.0
+            return center if sign * (center - ref) > min_dist else edge
+        return edge
+
+    tp_up   = _hvn_target(up_zones, up_ref, +1)
+    tp_down = _hvn_target(dn_zones, dn_ref, -1)
 
     if tp_up == 0.0 or tp_down == 0.0:
         from pipeline.features.vp_cache import get as vp_get
@@ -221,20 +236,25 @@ def hvn_or_vp_tp(symbol: str, zones: list[tuple[float, float]],
                  top_leg: float, bot_leg: float, step: float,
                  min_tp_dist: float = 0.0,
                  skip_node: tuple[float, float] | None = None) -> tuple[float, float]:
-    """Unified grid TP: next HVN far edge beyond each outer leg, with two VP-level
-    refinements (per user rule):
+    """Unified grid TP: next HVN beyond each outer leg, with two VP-level refinements and
+    an extreme-node rule (per user rule):
 
+      Far edge vs center — target the chosen HVN's FAR edge when there is another HVN
+        beyond it (price travels through an intermediate node), but target its CENTER when
+        it is the EXTREME (outermost) HVN in that direction on the chart: price rarely
+        punches clean through the last high-volume node, so its mid is the realistic magnet.
       Case 1 — VP level near the next HVN: if a VP level (VAH/VAL/POC/naked-POC) sits
         within 1× step of the chosen HVN far edge, target the VP level instead (cleaner
-        acceptance/rejection magnet than the raw node boundary).
+        acceptance/rejection magnet than the raw node boundary). Skipped for the extreme
+        node (its target is the center, not the edge a VP would snap to).
       Case 2 — next HVN too close: if the nearest HVN far edge is < 2× step beyond the
         outer leg, skip it and target the next VP level beyond the leg; if no VP qualifies,
         walk to the next HVN beyond.
 
     `skip_node`: (node_low, node_high) of the HVN the fulcrum sits INSIDE
     (hvn_inside_touch). When given, the bracketing node's own edges are excluded so TP
-    targets the NEXT node's far edge beyond it, and Case 2 (too-close overshoot) is
-    bypassed — jumping past a whole node already guarantees the TP clears the ladder.
+    targets the NEXT node beyond it, and Case 2 (too-close overshoot) is bypassed —
+    jumping past a whole node already guarantees the TP clears the ladder.
 
     All candidates must clear the outer leg + min_tp_dist. Returns (tp_up, tp_down);
     a side is 0.0 when nothing structural sits beyond it. Pure-structural — no ATR/fib here.
@@ -249,16 +269,17 @@ def hvn_or_vp_tp(symbol: str, zones: list[tuple[float, float]],
     too_close = 2.0 * max(step, 1e-9)   # Case-2 minimum HVN distance from the outer leg
     _skip_case2 = skip_node is not None   # already targeting the next node → no overshoot
 
-    def _pick(edges_sorted: list[float], leg: float, sign: int) -> float:
+    def _pick(zones_sorted: list, leg: float, sign: int) -> float:
         # sign +1 → upward (buy TP above leg); sign -1 → downward (sell TP below leg).
-        # edges_sorted is ordered nearest-first in the travel direction.
-        if not edges_sorted:
+        # zones_sorted is the candidate (lo,hi) nodes ordered nearest-far-edge-first.
+        if not zones_sorted:
             # no HVN beyond → nearest qualifying VP level beyond the leg
             vp_beyond = sorted((v for v in _vps if sign * (v - leg) > min_tp_dist),
                                key=lambda v: sign * (v - leg))
             return vp_beyond[0] if vp_beyond else 0.0
-        hvn = edges_sorted[0]
-        dist = sign * (hvn - leg)
+        ci = 0
+        edge = zones_sorted[ci][1] if sign > 0 else zones_sorted[ci][0]   # far edge
+        dist = sign * (edge - leg)
         # Case 2: HVN too close → prefer next VP level beyond the leg, else next HVN beyond.
         # Skipped when skip_node is set (the candidate is already the next node beyond).
         if not _skip_case2 and dist < too_close:
@@ -266,23 +287,34 @@ def hvn_or_vp_tp(symbol: str, zones: list[tuple[float, float]],
                                key=lambda v: sign * (v - leg))
             if vp_beyond:
                 return vp_beyond[0]
-            return edges_sorted[1] if len(edges_sorted) > 1 else hvn
+            if len(zones_sorted) > 1:
+                ci = 1
+                edge = zones_sorted[ci][1] if sign > 0 else zones_sorted[ci][0]
+        z = zones_sorted[ci]
+        # Extreme (outermost) HVN — nothing beyond it on the chart → target its CENTER. The
+        # center must still clear the ladder; if the leg pokes into this node so the mid
+        # sits behind it, fall back to the far edge (which does clear).
+        if ci == len(zones_sorted) - 1:
+            center = (z[0] + z[1]) / 2.0
+            return center if sign * (center - leg) > min_tp_dist else edge
         # Case 1: a VP level within `near` of the chosen HVN edge → use the VP level.
-        vp_near = [v for v in _vps if abs(v - hvn) <= near and sign * (v - leg) > min_tp_dist]
+        vp_near = [v for v in _vps if abs(v - edge) <= near and sign * (v - leg) > min_tp_dist]
         if vp_near:
             # closest VP to the HVN edge (the magnet we'd actually fill at)
-            return min(vp_near, key=lambda v: abs(v - hvn))
-        return hvn
+            return min(vp_near, key=lambda v: abs(v - edge))
+        return edge
 
     if skip_node:
         _nlo, _nhi = float(skip_node[0]), float(skip_node[1])
-        up_edges = sorted((hi for lo, hi in zones if hi > top_leg + min_tp_dist and lo >= _nhi - 1e-6))
-        dn_edges = sorted((lo for lo, hi in zones if lo < bot_leg - min_tp_dist and hi <= _nlo + 1e-6), reverse=True)
+        up_zones = sorted([(lo, hi) for lo, hi in zones if hi > top_leg + min_tp_dist and lo >= _nhi - 1e-6],
+                          key=lambda z: z[1])
+        dn_zones = sorted([(lo, hi) for lo, hi in zones if lo < bot_leg - min_tp_dist and hi <= _nlo + 1e-6],
+                          key=lambda z: -z[0])
     else:
-        up_edges = sorted((hi for lo, hi in zones if hi > top_leg + min_tp_dist))
-        dn_edges = sorted((lo for lo, hi in zones if lo < bot_leg - min_tp_dist), reverse=True)
-    tp_up   = round(_pick(up_edges, top_leg, +1), 4)
-    tp_down = round(_pick(dn_edges, bot_leg, -1), 4)
+        up_zones = sorted([(lo, hi) for lo, hi in zones if hi > top_leg + min_tp_dist], key=lambda z: z[1])
+        dn_zones = sorted([(lo, hi) for lo, hi in zones if lo < bot_leg - min_tp_dist], key=lambda z: -z[0])
+    tp_up   = round(_pick(up_zones, top_leg, +1), 4)
+    tp_down = round(_pick(dn_zones, bot_leg, -1), 4)
     # final leg-clear guard
     if not (tp_up   > top_leg):          tp_up   = 0.0
     if not (0 < tp_down < bot_leg):      tp_down = 0.0
@@ -443,9 +475,11 @@ def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger |
         ) or {}
         _gcfg = _cfg.get("grid_levels") or {}
         _buf = float(_gcfg.get("hvn_touch_buffer", 0.0))
+        _buf_pct = float(_gcfg.get("hvn_touch_buffer_pct", 0.0))
         _lookback = int(_gcfg.get("hvn_lookback_bars", 3))
     except Exception:
         _buf = 0.0
+        _buf_pct = 0.0
         _lookback = 3
 
     win = _VP_WIN.get(tf, 96)
@@ -475,13 +509,14 @@ def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger |
                 continue
             if not (lo < c < hi):            # candle must CLOSE inside this node
                 continue
-            touch_top = h >= hi - _buf       # wick reached edge or came within buffer
-            touch_bot = lo_p <= lo + _buf
+            _buf_eff = max(_buf, width * _buf_pct)   # width-relative tap tolerance
+            touch_top = h >= hi - _buf_eff   # wick reached edge or came within (relative) buffer
+            touch_bot = lo_p <= lo + _buf_eff
             if not (touch_top or touch_bot):
                 # closed inside but no edge tapped — report the nearest miss
                 _hvn_dbg(f"  bar[{bar_idx}] c={c:.2f} h={h:.2f} l={lo_p:.2f} INSIDE "
-                         f"[{lo:.2f},{hi:.2f}]: no edge tap "
-                         f"(top short by {hi - _buf - h:.2f}, bot short by {lo_p - (lo + _buf):.2f})")
+                         f"[{lo:.2f},{hi:.2f}] buf_eff={_buf_eff:.2f}: no edge tap "
+                         f"(top short by {hi - _buf_eff - h:.2f}, bot short by {lo_p - (lo + _buf_eff):.2f})")
                 continue
             if touch_top and touch_bot:
                 edge, side = (hi, "top") if abs(hi - c) <= abs(lo - c) else (lo, "bottom")
@@ -549,9 +584,12 @@ def touch_arm_trigger(symbol: str, tf: str, live_price: float) -> Trigger | None
         _cfg = _yaml.safe_load(
             (__import__("pathlib").Path(__file__).resolve().parent.parent / "config" / "settings.yaml").read_text()
         ) or {}
-        _buf = float((_cfg.get("grid_levels") or {}).get("hvn_touch_buffer", 0.0))
+        _gcfg2 = _cfg.get("grid_levels") or {}
+        _buf = float(_gcfg2.get("hvn_touch_buffer", 0.0))
+        _buf_pct = float(_gcfg2.get("hvn_touch_buffer_pct", 0.0))
     except Exception:
         _buf = 0.0
+        _buf_pct = 0.0
 
     win = _VP_WIN.get(tf, 96)
     bars = store().recent(symbol, tf, win + 5)
@@ -573,8 +611,9 @@ def touch_arm_trigger(symbol: str, tf: str, live_price: float) -> Trigger | None
             continue
         if not (lo <= live_price <= hi):       # live price must be INSIDE the node body
             continue
-        touch_top = live_price >= hi - _buf    # inside, within buffer of the top edge
-        touch_bot = live_price <= lo + _buf    # inside, within buffer of the bottom edge
+        _buf_eff = max(_buf, width * _buf_pct)  # width-relative tap tolerance
+        touch_top = live_price >= hi - _buf_eff  # inside, within (relative) buffer of top edge
+        touch_bot = live_price <= lo + _buf_eff  # inside, within (relative) buffer of bottom edge
         if not (touch_top or touch_bot):       # inside but not near an edge → no tap
             continue
         if touch_top and touch_bot:   # degenerate thin node — take nearer edge
