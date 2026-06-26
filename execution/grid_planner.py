@@ -82,7 +82,7 @@ class GridPlan:
 # only). The detector still runs but can never win the structural hint, so no VP-level
 # straddles arm. Re-add "vp_level_touch" here to revive it.
 _HINT_GROUPS = {
-    "structural": {"hvn_inside_touch", "squeeze", "hvn_displacement"},
+    "structural": {"hvn_inside_touch", "squeeze", "hvn_displacement", "bb_expansion_touch"},
     # LVN displacement: vp_level_touch is the only detector that arms on an LVN.
     # The planner narrows it to level_type=="lvn" (see plan_grid_levels) so only the
     # vacuum fires. Neutral straddle-in-vacuum: price sits in the LVN, leaves fast one
@@ -190,7 +190,7 @@ def _should_skip(trigger: Trigger | None, regime, fulcrum: float,
     # (an HVN edge or a POC/VA/LVN line, which usually lives inside a node); only skip
     # other fulcrums that fall *inside* a node body.
     if (trigger.kind not in ("hvn_edge", "hvn_inside_touch", "hvn_displacement",
-                             "vp_level_touch", "squeeze")
+                             "vp_level_touch", "squeeze", "bb_expansion_touch")
             and _price_inside_hvn(fulcrum, daily_vp)):
         return True, "chop:inside_hvn"
     if daily_vp and daily_vp.get("current_position") == "at_poc":
@@ -199,7 +199,8 @@ def _should_skip(trigger: Trigger | None, regime, fulcrum: float,
         # (price rejected the HVN boundary), not POC balance — straddle the tapped edge.
         _poc_ok = (trigger.kind == "vp_level_touch"
                    and trigger.context.get("level_type") in ("poc", "naked_poc"))
-        _structural = trigger.kind in ("hvn_inside_touch", "hvn_displacement")
+        _structural = trigger.kind in ("hvn_inside_touch", "hvn_displacement",
+                                       "bb_expansion_touch")
         if not (_poc_ok or _structural):
             return True, "chop:at_poc"
     # Genuine balance/chop = regime is uncertain AND there IS initial-balance data
@@ -207,7 +208,8 @@ def _should_skip(trigger: Trigger | None, regime, fulcrum: float,
     # they represent committed directional flow between zones, not oscillation.
     rtype = getattr(regime, "type", "uncertain")
     ib_range = getattr(regime, "ib_range", 0.0) or 0.0
-    _is_structural = trigger.kind in ("hvn_inside_touch", "hvn_displacement")
+    _is_structural = trigger.kind in ("hvn_inside_touch", "hvn_displacement",
+                                      "bb_expansion_touch")
     if (not _is_structural and rtype == "uncertain" and ib_range > 0
             and getattr(regime, "ib_expansion_pct", 0.0) < 0.5):
         return True, "chop:uncertain_no_expansion"
@@ -280,12 +282,9 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
             (step_mult * atr) if atr > 0 else swing_range / 5.0, 1e-6)
         return n, round(step, 4)
 
-    # hvn_inside_touch: spacing is pure ATR-mult; leg count = node_width / step so a
-    # WIDER node gets MORE legs (the user's rule). No width-floor on the step (that
-    # would widen spacing on big nodes → fewer legs, the opposite of intended). Uses
-    # its OWN cap (hvn_max_legs), not the regime chop cap — the skip-gate already
-    # filters genuine chop, and width-driven count is the whole point here.
-    if trigger.kind == "hvn_inside_touch":
+    # hvn_inside_touch / bb_expansion_touch: spacing is pure ATR-mult; leg count from
+    # raw_range / step (wider = more legs). Uses hvn_max_legs cap, not regime chop cap.
+    if trigger.kind in ("hvn_inside_touch", "bb_expansion_touch"):
         step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
         n = int(round(trigger.raw_range / step)) if step > 0 else 2
         n = max(2, min(hvn_max_legs, n))
@@ -327,6 +326,17 @@ def _resolve_skew(trigger: Trigger, regime, cfg: dict | None = None,
             votes -= 2; why.append("hvn reject-top→fade down")
         elif edge == "bottom":
             votes += 2; why.append("hvn reject-bottom→fade up")
+
+    # bb_expansion_touch: footprint-confirmed absorption → weight 2 (strong directional);
+    # no absorption (continuation/neutral) → weight 1 (HTF-aligned fade only).
+    if trigger.kind == "bb_expansion_touch":
+        fp_signal = trigger.context.get("fp_signal", "neutral")
+        weight = 2 if fp_signal == "absorption" else 1
+        b = trigger.context.get("bias", "none")
+        if b == "sell":
+            votes -= weight; why.append(f"bb_expansion {fp_signal}→sell")
+        elif b == "buy":
+            votes += weight; why.append(f"bb_expansion {fp_signal}→buy")
 
     bias = trigger.context.get("bias", "none")
     if bias == "buy":
@@ -378,8 +388,11 @@ def _build_legs(fulcrum: float, n: int, step: float, skew: str,
     elif skew == "sell":
         sell_n = n + 1
 
-    buy_lots = _ladder(buy_n, base_lot, lot_step, heavy_near_mid=(skew == "buy"))
-    sell_lots = _ladder(sell_n, base_lot, lot_step, heavy_near_mid=(skew == "sell"))
+    # Both sides increase with distance from fulcrum (light near mid, heavy far).
+    # The bias side still gets the extra leg and wider total exposure via skew;
+    # accumulating more size as price moves deeper is better than front-loading the first fill.
+    buy_lots = _ladder(buy_n, base_lot, lot_step, heavy_near_mid=False)
+    sell_lots = _ladder(sell_n, base_lot, lot_step, heavy_near_mid=False)
 
     buy_legs = [Leg(price=round(fulcrum + i * step, 4), lot=buy_lots[i - 1])
                 for i in range(1, buy_n + 1)]
@@ -634,12 +647,15 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     # only when there is literally no HVN out there). Refreshed every 15m as the HVN rebuilds.
     from execution.zone_triggers import hvn_or_vp_tp as _hvn_or_vp_tp
     from execution.zone_triggers import compute_hvn_tps as _compute_hvn_tps
-    from pipeline.features.vp_cache import get as _vp_get
     top_leg = max((l.price for l in buy_legs),  default=fulcrum)
     bot_leg = min((l.price for l in sell_legs), default=fulcrum)
     min_tp_dist = float(grid_cfg.get("min_tp_dist", 0.0) or 0.0)
+    # Use the already-merged daily_vp (prev-D + today) — same source the trigger used.
+    # Re-fetching vp_get("daily") here only returns ONE period, so if today's session is
+    # still sparse (no HVN zones yet) and the trigger fired on a prev-D node, _dz would
+    # be empty and every TP fallback produces 0. daily_vp is already in scope.
     _dz = [(float(z["low"]), float(z["high"]))
-           for z in ((_vp_get(symbol, "daily") or {}).get("hvn_zones") or [])]
+           for z in ((daily_vp or {}).get("hvn_zones") or [])]
     # hvn_inside_touch arms INSIDE a node, so its TP must target the NEXT node's far edge,
     # not the node price is already in. Use the SAME session zones the trigger armed on
     # (rolling today + cached prev-D) and pass skip_node = the touched node's bounds so the
@@ -670,6 +686,61 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         if buy_tp  == 0.0 and _ctp_up > top_leg:        buy_tp  = round(_ctp_up, 4)
         if sell_tp == 0.0 and 0 < _ctp_dn < bot_leg:    sell_tp = round(_ctp_dn, 4)
 
+    # BB 2.5σ — compete with structural target: use whichever appears first (nearer to the
+    # outer leg). Falls back to BB when structural is 0. Uses the TF bars already fetched.
+    from execution.zone_triggers import bb_tp as _bb_tp
+    _bb_up, _bb_dn = _bb_tp(bars, cfg=grid_cfg)
+    if _bb_up > top_leg:
+        buy_tp  = round(min(buy_tp, _bb_up) if buy_tp  > top_leg    else _bb_up, 4)
+    if 0 < _bb_dn < bot_leg:
+        sell_tp = round(max(sell_tp, _bb_dn) if 0 < sell_tp < bot_leg else _bb_dn, 4)
+
+    # bb_expansion_touch: bias-side TP = BB mid (20-SMA mean reversion target).
+    # Overrides structural/BB-2.5σ fallback: the 2.5σ fallback targets the OPPOSITE band
+    # (too far), and next-HVN may lie outside min_tp_dist. The mid is the correct target —
+    # price just tapped 2.5σ and the thesis is reversion to the mean.
+    if fulcrum_t.kind == "bb_expansion_touch":
+        _bb_mid_tp = float((fulcrum_t.context or {}).get("bb_mid") or 0.0)
+        _bias      = (fulcrum_t.context or {}).get("bias", "")
+        if _bb_mid_tp > 0:
+            if _bias == "sell" and _bb_mid_tp < bot_leg:
+                sell_tp = round(_bb_mid_tp, 4)
+            elif _bias == "buy" and _bb_mid_tp > top_leg:
+                buy_tp  = round(_bb_mid_tp, 4)
+
+    # ATR ceiling — last-resort when all structural + BB lookups yield 0 for a side.
+    # Ensures every leg always carries a ceiling (avoids tp=0 orders at range extremes
+    # where no HVN sits above/below the ladder and BB is inside it). Uses tp_atr_mult
+    # measured from the outer leg, not the fulcrum.
+    _tp_atr_mult = float(grid_cfg.get("tp_atr_mult", 1.5) or 1.5)
+    if buy_tp  == 0.0 and atr > 0:
+        buy_tp  = round(top_leg + _tp_atr_mult * atr, 4)
+    if sell_tp == 0.0 and atr > 0:
+        sell_tp = round(bot_leg - _tp_atr_mult * atr, 4)
+
+    # Session-aware TP extension: during London/NY open, if ATR is expanding vs recent
+    # mean, skip the nearest HVN and target the next structural node beyond. CVD direction
+    # gates each side — extend buy TP only when session CVD is net-bullish, sell when bearish.
+    from execution.zone_triggers import (in_session_window as _in_sess,
+                                         session_atr_ratio as _sess_atr_ratio)
+    _sess_atr_thresh = float(grid_cfg.get("session_tp_atr_ratio", 1.6) or 1.6)
+    if _in_sess() and _sess_atr_ratio(bars) >= _sess_atr_thresh:
+        _sess_cvd = sum(float(getattr(b, "delta", 0) or 0) for b in bars)
+        _extend_buy  = _sess_cvd >= 0   # net buying → upside has momentum
+        _extend_sell = _sess_cvd <= 0   # net selling → downside has momentum
+        if _extend_buy and buy_tp > top_leg:
+            # Find the next structural node above the current buy_tp.
+            _ext_up, _ = _hvn_or_vp_tp(symbol, _dz, buy_tp, buy_tp - step,
+                                        step, min_tp_dist=step, skip_node=None)
+            if _ext_up > buy_tp:
+                buy_tp = round(_ext_up, 4)
+        if _extend_sell and 0 < sell_tp < bot_leg:
+            # Find the next structural node below the current sell_tp.
+            _, _ext_dn = _hvn_or_vp_tp(symbol, _dz, sell_tp + step, sell_tp,
+                                        step, min_tp_dist=step, skip_node=None)
+            if 0 < _ext_dn < sell_tp:
+                sell_tp = round(_ext_dn, 4)
+
     # HVN displacement keeps ONLY its SL override (counter-side = displacement candle
     # extreme); its TP now follows the unified next-HVN-far-edge rule above.
     buy_sl = sell_sl = 0.0
@@ -684,6 +755,20 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
             elif direction == "sell":
                 sell_sl = 0.0
                 buy_sl  = round(extreme, 4)   # counter side (buys): SL = candle low
+
+    # BB expansion touch: counter-side SL = BB mid (the fulcrum itself).
+    # If price returns to the 20-SMA after touching the 2.5σ band, the directional
+    # thesis has failed. Bias side has no hard SL — fullfill_be / bias_trail own exit.
+    if fulcrum_t.kind == "bb_expansion_touch":
+        bb_mid_sl = float(fulcrum_t.context.get("bb_mid") or 0.0)
+        bias_dir  = fulcrum_t.context.get("bias", "")
+        if bb_mid_sl > 0:
+            if bias_dir == "sell":
+                sell_sl = 0.0
+                buy_sl  = round(bb_mid_sl, 4)   # counter (buys): SL if price reclaims BB mid
+            elif bias_dir == "buy":
+                buy_sl  = 0.0
+                sell_sl = round(bb_mid_sl, 4)   # counter (sells): SL if price returns to BB mid
 
     plan = GridPlan(
         verdict="arm",

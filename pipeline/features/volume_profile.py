@@ -315,9 +315,35 @@ def _zones_from_peaks(
     return sorted(result, key=lambda z: z["low"])
 
 
-def _smooth(bins: np.ndarray, n_bins: int) -> np.ndarray:
-    """Gaussian smoothing — sigma fixed at 1.5 bins (just enough to merge tick noise)."""
-    return gaussian_filter1d(bins.astype(float), sigma=1.5)
+_HVN_SMOOTH_PRICE_CACHE: float | None = None
+
+
+def _hvn_smooth_price() -> float:
+    """Gaussian smoothing WIDTH in PRICE units (settings.grid_levels.vp_smooth_price,
+    default 1.5). The per-call sigma is max(1.5 bins, this / bin_size) — so the smoothing
+    covers a constant price width regardless of bin: coarse-bin symbols stay at the legacy
+    1.5-bin floor (unchanged), fine-bin symbols (e.g. XAU @0.25) get proportionally MORE
+    smoothing so single-bin noise doesn't fragment into spurious 1pt nodes. Cached once."""
+    global _HVN_SMOOTH_PRICE_CACHE
+    if _HVN_SMOOTH_PRICE_CACHE is None:
+        val = 1.5
+        try:
+            import yaml as _yaml
+            import pathlib as _pl
+            _cfg = _yaml.safe_load(
+                (_pl.Path(__file__).resolve().parent.parent.parent / "config" / "settings.yaml").read_text()
+            ) or {}
+            val = float((_cfg.get("grid_levels") or {}).get("vp_smooth_price", 1.5))
+        except Exception:
+            val = 1.5
+        _HVN_SMOOTH_PRICE_CACHE = val if val > 0 else 1.5
+    return _HVN_SMOOTH_PRICE_CACHE
+
+
+def _smooth(bins: np.ndarray, sigma_bins: float = 1.5) -> np.ndarray:
+    """Gaussian smoothing. sigma_bins floored at 1.5 (legacy) — see _hvn_smooth_price for
+    the price-constant scaling that callers compute from bin_size."""
+    return gaussian_filter1d(bins.astype(float), sigma=max(1.5, sigma_bins))
 
 
 def _merge_zones(zones: list[dict], merge_tol: float) -> list[dict]:
@@ -368,27 +394,53 @@ def _subtract_hvn_from_lvn(
     return sorted(out, key=lambda z: z["low"])
 
 
+_HVN_REL_HEIGHT_CACHE: float | None = None
+
+
+def _hvn_rel_height() -> float:
+    """HVN peak-width measurement height (scipy peak_widths rel_height). LOWER = tighter
+    nodes (width measured nearer the peak tip), separating adjacent peaks that blur into one
+    wide blob at 0.5. Read once from settings.grid_levels.vp_hvn_rel_height (default 0.5 =
+    legacy). Cached so the (cheap) yaml read happens once per process."""
+    global _HVN_REL_HEIGHT_CACHE
+    if _HVN_REL_HEIGHT_CACHE is None:
+        val = 0.5
+        try:
+            import yaml as _yaml
+            import pathlib as _pl
+            _cfg = _yaml.safe_load(
+                (_pl.Path(__file__).resolve().parent.parent.parent / "config" / "settings.yaml").read_text()
+            ) or {}
+            val = float((_cfg.get("grid_levels") or {}).get("vp_hvn_rel_height", 0.5))
+        except Exception:
+            val = 0.5
+        _HVN_REL_HEIGHT_CACHE = val if 0.0 < val <= 1.0 else 0.5
+    return _HVN_REL_HEIGHT_CACHE
+
+
 def _find_hvn_zones(
-    bins: np.ndarray, bin_size: float, price_min: float, top_n: int = 8
+    bins: np.ndarray, bin_size: float, price_min: float, top_n: int = 8,
+    rel_height: float | None = None,
 ) -> list[dict]:
     """HVN via Gaussian-smoothed bins, prominence ≥ 0.5×avg, height ≥ avg.
     Adjacent zones within 2×bin_size are merged (Sierra/Bookmap convention).
+    `rel_height` (None → config vp_hvn_rel_height) sets how far down each peak its width is
+    measured: lower = tighter nodes that don't blur adjacent peaks into one wide blob.
     """
     n = len(bins)
-    smoothed = _smooth(bins, n)
+    # price-constant smoothing: sigma = price_width / bin_size (floored at 1.5 bins in _smooth)
+    smoothed = _smooth(bins, _hvn_smooth_price() / bin_size if bin_size else 1.5)
     active = bins[bins > 0]
     if len(active) == 0:
         return []
-    # MEDIAN baseline (not mean): one dominant POC inflates the mean and lifts the
-    # height bar so strong secondary nodes get excluded. The median is POC-robust →
-    # secondary HVN qualify on their own merit; node count stays stable on skewed days.
-    avg = float(np.median(active))
+    avg = float(active.mean())
 
     peaks, _ = find_peaks(smoothed, prominence=avg * 0.5, height=avg)
     if len(peaks) == 0:
         return []
 
-    _, _, left_ips, right_ips = peak_widths(smoothed, peaks, rel_height=0.5)
+    _rh = rel_height if rel_height is not None else _hvn_rel_height()
+    _, _, left_ips, right_ips = peak_widths(smoothed, peaks, rel_height=_rh)
     zones = _zones_from_peaks(bins, peaks, left_ips, right_ips, bin_size, price_min, top_n=top_n * 2)
     merged = _merge_zones(zones, merge_tol=bin_size)  # 1× bin_size gap = same cluster
     return merged[:top_n]
@@ -401,11 +453,11 @@ def _find_lvn_zones(
     Adjacent valleys within 2×bin_size are merged.
     """
     n = len(bins)
-    smoothed = _smooth(bins, n)
+    smoothed = _smooth(bins, _hvn_smooth_price() / bin_size if bin_size else 1.5)
     active_idxs = np.where(bins > 0)[0]
     if len(active_idxs) == 0:
         return []
-    avg = float(np.median(bins[active_idxs]))   # median: POC-robust baseline (see HVN)
+    avg = float(bins[active_idxs].mean())
     first, last = int(active_idxs[0]), int(active_idxs[-1])
     if last - first < 4:
         return []

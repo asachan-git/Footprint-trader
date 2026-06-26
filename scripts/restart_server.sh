@@ -11,8 +11,11 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# 1 — stop the current Flask listener on :5000 (if any)
-PID="$(lsof -ti:5000 2>/dev/null | head -1)"
+# 1 — stop the current Flask listener on :5000 (if any).
+# MUST scope to the LISTEN socket: a plain `lsof -ti:5000` also returns CLIENT
+# connections (e.g. the MT5/wine EA polling us), and killing those would take down
+# MetaTrader instead of Flask. -sTCP:LISTEN selects only the server process.
+PID="$(lsof -ti:5000 -sTCP:LISTEN 2>/dev/null | head -1)"
 if [[ -n "$PID" ]]; then
   echo "[restart] stopping Flask (pid $PID)..."
   kill "$PID" 2>/dev/null || true

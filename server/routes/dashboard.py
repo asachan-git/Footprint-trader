@@ -1075,6 +1075,49 @@ def _build_snapshot(settings: dict, symbol: str, tf: str, minutes: int,
     except Exception as _e:
         LOG.warning(f"[dashboard] swing_sweeps failed: {_e}")
 
+    # Active grid cycles — all arms whose analysis symbol matches the chart symbol.
+    # Includes TF, strategy kind, net_target and bias_trail thresholds so the dashboard
+    # can show which cycles are live and how far from exit each one is.
+    grid_cycles = []
+    try:
+        from execution.exec_bridge import ExecBridge as _EB, tf_from_magic as _tfm
+        _gl = settings.get("grid_levels") or {}
+        _by_tf  = _gl.get("cycle_net_target_by_tf") or {}
+        _act_tf = _gl.get("bias_trail_activate_by_tf") or {}
+        _sq_tm  = float(_gl.get("squeeze_target_mult", 1.0) or 1.0)
+        _sq_tr  = float(_gl.get("squeeze_trail_mult", 1.0) or 1.0)
+        _net_fb = float(_gl.get("cycle_net_target_usd", 0.0) or 0.0)
+        _tr_fb  = float(_gl.get("bias_trail_activate_usd", 5.0) or 5.0)
+        _gvbk   = float(_gl.get("bias_trail_giveback_pct", 40.0) or 40.0)
+        _smap   = settings.get("execution", {}).get("symbol_map", {}) or {}
+        broker_sym = _smap.get(symbol, symbol)
+        for (acc, sym_k, mg), arm in _EB._last_arm.items():
+            if not arm.get("active"): continue
+            if sym_k != broker_sym and sym_k != symbol: continue
+            _tf = _tfm(int(mg or 0))
+            _net   = float(_by_tf.get(_tf, _net_fb) or _net_fb)
+            _trail = float(_act_tf.get(_tf, _tr_fb) or _tr_fb)
+            if arm.get("squeeze_ok"):
+                _net   *= _sq_tm
+                _trail *= _sq_tr
+            _os = _EB.get_open(str(acc), sym_k, magic=int(mg or 0))
+            grid_cycles.append({
+                "magic": mg, "tf": _tf,
+                "trigger_kind": arm.get("trigger_kind", ""),
+                "fulcrum": arm.get("fulcrum", 0.0),
+                "buy_n": arm.get("buy_n", 0), "sell_n": arm.get("sell_n", 0),
+                "buys_open": _os.get("buys", 0), "sells_open": _os.get("sells", 0),
+                "pendings": _os.get("pendings", 0),
+                "tp_up": arm.get("tp_up", 0.0), "tp_down": arm.get("tp_down", 0.0),
+                "net_target": _net, "bias_trail_activate": _trail,
+                "bias_trail_giveback_pct": _gvbk,
+                "bias_peak": round(float(arm.get("bias_peak") or 0.0), 2),
+                "bias_booked": bool(arm.get("bias_booked")),
+                "squeeze_ok": bool(arm.get("squeeze_ok")),
+            })
+    except Exception as _e:
+        LOG.warning(f"[dashboard] grid_cycles failed: {_e}")
+
     return {
         "symbol": symbol,
         "tf": tf,
@@ -1096,6 +1139,7 @@ def _build_snapshot(settings: dict, symbol: str, tf: str, minutes: int,
         "ab_stats": ab_stats,
         "historical_sweeps": historical_sweeps,
         "swing_points": swing_points,
+        "grid_cycles": grid_cycles,
     }
 
 

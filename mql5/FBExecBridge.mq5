@@ -60,12 +60,17 @@ input bool   InpShowDash        = true;          // Show trigger/HVN/hedged-loss
 input int    InpDashFontSize    = 9;             // Dashboard font size
 input color  InpDashColor       = clrWhite;      // Dashboard text colour
 
+input group "=== Equity target (hard local stop) ==="
+input double InpEquityTarget    = 0.0;     // Halt EA when account EQUITY ≥ this ($; 0 = off)
+input bool   InpHaltRemovesEA   = false;   // true = ExpertRemove() after flatten; false = stop trading, stay loaded
+
 CTrade        trade;
 COrderInfo    orderInfo;
 CPositionInfo posInfo;
 
 string   gAccount       = "";
 datetime gLastZoneFetch = 0;
+bool     gHalted        = false;   // equity target reached → flattened, no more polling/placing
 
 //--- last-armed grid metadata (cached from /exec/zones) for the corner dashboard
 double   gFulcrum       = 0.0;
@@ -83,6 +88,12 @@ double   gFulcPrice[];
 //    with zero or more active cycles anchored inside it.
 struct HvnCycleEntry { double lo; double hi; long magic; string tf; string edge; };
 HvnCycleEntry gHvnCycles[];   // flat: one row per (HVN, cycle) pair
+
+struct GridCycleInfo { long magic; string tf; string kind; double fulcrum;
+                       double tp_up; double tp_down;
+                       int buy_n; int sell_n;
+                       double net_target; double trail_activate; bool squeeze_ok; };
+GridCycleInfo gGridCycles[];   // active cycles from /exec/zones grid_cycles array
 
 //--- chart-overlay indicator handles (3σ Bollinger Bands + FBSqueeze BBW% subwindow)
 int      gBBHandle      = INVALID_HANDLE;
@@ -258,6 +269,20 @@ bool ExecPlacePending(const string cmd, ulong &ticket, int &retcode, string &err
          if(price > bid - minStop - point) { err = "sell_stop inside freeze"; retcode = 0; ticket = 0; return false; }
          ok = trade.SellStop(lot, price, sym, sl, tp, ORDER_TIME_GTC, 0, comment);
       }
+      else if(orderType == "buy_limit")
+      {
+         // buy_limit fills on a dip — must sit BELOW the ask by at least the stops level
+         double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+         if(price > ask - minStop - point) { err = "buy_limit inside freeze"; retcode = 0; ticket = 0; return false; }
+         ok = trade.BuyLimit(lot, price, sym, sl, tp, ORDER_TIME_GTC, 0, comment);
+      }
+      else if(orderType == "sell_limit")
+      {
+         // sell_limit fills on a pop — must sit ABOVE the bid by at least the stops level
+         double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+         if(price < bid + minStop + point) { err = "sell_limit inside freeze"; retcode = 0; ticket = 0; return false; }
+         ok = trade.SellLimit(lot, price, sym, sl, tp, ORDER_TIME_GTC, 0, comment);
+      }
       else
       {
          err = "unknown order_type " + orderType; retcode = 0; ticket = 0; return false;
@@ -365,6 +390,29 @@ int CountMyPendings()
       if(orderInfo.SelectByIndex(i))
          if(IsMine(orderInfo.Magic()) && orderInfo.Symbol() == _Symbol) n++;
    return n;
+}
+
+//+------------------------------------------------------------------+
+//| Flatten EVERYTHING this EA owns on this chart's symbol: cancel    |
+//| all our pendings + close all our positions. Used by the equity    |
+//| target hard-stop (local failsafe, independent of the server).     |
+//+------------------------------------------------------------------+
+void CloseAllMine(int &closed, int &cancelled)
+{
+   closed = 0; cancelled = 0;
+   ulong pend[];
+   for(int i = 0; i < OrdersTotal(); i++)
+      if(orderInfo.SelectByIndex(i) && IsMine(orderInfo.Magic()) && orderInfo.Symbol() == _Symbol)
+      { int n = ArraySize(pend); ArrayResize(pend, n + 1); pend[n] = orderInfo.Ticket(); }
+   for(int i = 0; i < ArraySize(pend); i++)
+      if(trade.OrderDelete(pend[i])) cancelled++;
+
+   ulong pos[];
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(posInfo.SelectByIndex(i) && IsMine(posInfo.Magic()) && posInfo.Symbol() == _Symbol)
+      { int n = ArraySize(pos); ArrayResize(pos, n + 1); pos[n] = posInfo.Ticket(); }
+   for(int i = 0; i < ArraySize(pos); i++)
+      if(trade.PositionClose(pos[i], InpSlippage)) closed++;
 }
 
 //--- Per-side open counts + basket floating P&L (for the server cycle monitor).
@@ -981,16 +1029,14 @@ void ZoneText(const string suf, datetime t, double price, const string text, col
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
 }
 
-//--- Computed volume profile: one horizontal bar per price bin, length ∝ volume.
-//    InpVPLeft=true  → VPFR style: anchor at leftmost visible bar, bars extend right into chart.
-//    InpVPLeft=false → right-margin style: anchor at last candle, bars extend into future.
-//    Parses {profile:[{price,vol}], vp_bin} from /exec/zones. POC (max-vol) bar highlighted.
-void DrawProfile(const string js)
+//--- Draw one VP histogram. t0 = session anchor time; all bars extend rightward.
+//    Objects named ZONE_PREFIX+"vp"+profIdx+"_"+binIdx so ClearZones sweeps them.
+void DrawOneProfile(const string profJs, const int profIdx)
 {
-   double vpbin = JsonGetNumber(js, "vp_bin");
+   double vpbin = JsonGetNumber(profJs, "vp_bin");
    if(vpbin <= 0) return;
    string ps[];
-   int n = JsonSplitArray(js, "profile", ps);
+   int n = JsonSplitArray(profJs, "profile", ps);
    if(n <= 0) return;
 
    double price[], vol[];
@@ -1007,31 +1053,96 @@ void DrawProfile(const string js)
    int      secs = PeriodSeconds(PERIOD_CURRENT);
    double   half = vpbin / 2.0;
 
+   // Anchor at the session's actual start time (unix ts from server).
+   // iBarShift snaps to the nearest bar; iTime gives its chart-aligned open time.
    datetime t0;
-   if(InpVPLeft)
+   long start_ts = (long)JsonGetNumber(profJs, "start_ts");
+   if(start_ts > 0)
    {
-      // Leftmost visible bar: ChartGetInteger(CHART_FIRST_VISIBLE_BAR) = bar index,
-      // iTime converts to datetime. The VP spans rightward from there.
+      int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, (datetime)start_ts, false);
+      t0 = (barIdx >= 0) ? iTime(_Symbol, PERIOD_CURRENT, barIdx) : (datetime)start_ts;
+   }
+   else if(InpVPLeft)
+   {
       int firstBar = (int)ChartGetInteger(0, CHART_FIRST_VISIBLE_BAR);
       t0 = iTime(_Symbol, PERIOD_CURRENT, firstBar);
    }
    else
    {
-      t0 = TimeCurrent();  // right of last candle
+      t0 = TimeCurrent();
    }
 
+   string pfx = ZONE_PREFIX + "vp" + IntegerToString(profIdx) + "_";
    for(int i = 0; i < n; i++)
    {
       double   frac  = vol[i] / maxv;
       datetime t1    = t0 + (int)(frac * InpVPMaxBars * secs) + secs;
       bool     isPoc = (vol[i] >= maxv);
       color    c     = isPoc ? InpVPPocColor : InpVPColor;
-      string   name  = ZONE_PREFIX + "vp_" + IntegerToString(i);
+      string   name  = pfx + IntegerToString(i);
       if(ObjectFind(0, name) < 0)
       {
          ObjectCreate(0, name, OBJ_RECTANGLE, 0, t0, price[i] - half, t1, price[i] + half);
          ObjectSetInteger(0, name, OBJPROP_BACK,       true);
          ObjectSetInteger(0, name, OBJPROP_FILL,       true);
+         ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      }
+      else
+      {
+         ObjectSetInteger(0, name, OBJPROP_TIME,  0, t0);
+         ObjectSetInteger(0, name, OBJPROP_TIME,  1, t1);
+         ObjectSetDouble (0, name, OBJPROP_PRICE, 0, price[i] - half);
+         ObjectSetDouble (0, name, OBJPROP_PRICE, 1, price[i] + half);
+      }
+      ObjectSetInteger(0, name, OBJPROP_COLOR,   c);
+      ObjectSetInteger(0, name, OBJPROP_BGCOLOR, c);
+   }
+}
+
+//--- Draw session-anchored VP histograms from /exec/zones "profiles" array.
+//    Falls back to legacy flat "profile"/"vp_bin" keys if "profiles" is absent.
+void DrawProfile(const string js)
+{
+   string profs[];
+   int np = JsonSplitArray(js, "profiles", profs);
+   if(np > 0)
+   {
+      for(int p = 0; p < np; p++)
+         DrawOneProfile(profs[p], p);
+      return;
+   }
+   // Legacy fallback: single flat profile, anchored at visible-range left or right margin.
+   double vpbin = JsonGetNumber(js, "vp_bin");
+   if(vpbin <= 0) return;
+   string ps[];
+   int n = JsonSplitArray(js, "profile", ps);
+   if(n <= 0) return;
+   double price[], vol[];
+   ArrayResize(price, n); ArrayResize(vol, n);
+   double maxv = 0.0;
+   for(int i = 0; i < n; i++)
+   {
+      price[i] = JsonGetNumber(ps[i], "price");
+      vol[i]   = JsonGetNumber(ps[i], "vol");
+      if(vol[i] > maxv) maxv = vol[i];
+   }
+   if(maxv <= 0.0) return;
+   int      secs = PeriodSeconds(PERIOD_CURRENT);
+   double   half = vpbin / 2.0;
+   datetime t0;
+   if(InpVPLeft) { int fb = (int)ChartGetInteger(0, CHART_FIRST_VISIBLE_BAR); t0 = iTime(_Symbol, PERIOD_CURRENT, fb); }
+   else          { t0 = TimeCurrent(); }
+   for(int i = 0; i < n; i++)
+   {
+      double   frac = vol[i] / maxv;
+      datetime t1   = t0 + (int)(frac * InpVPMaxBars * secs) + secs;
+      color    c    = (vol[i] >= maxv) ? InpVPPocColor : InpVPColor;
+      string   name = ZONE_PREFIX + "vp0_" + IntegerToString(i);
+      if(ObjectFind(0, name) < 0)
+      {
+         ObjectCreate(0, name, OBJ_RECTANGLE, 0, t0, price[i] - half, t1, price[i] + half);
+         ObjectSetInteger(0, name, OBJPROP_BACK, true);
+         ObjectSetInteger(0, name, OBJPROP_FILL, true);
          ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
       }
       else
@@ -1084,6 +1195,119 @@ void DrawCvdArrows(const string js)
    }
 }
 
+//--- Draw the EXACT node a cycle armed on (node_low..node_high) as a bright outlined
+//    rectangle + label, with the touched edge as a solid line. The daily HVN/LVN zones
+//    are the cached profile; a grid arms on its per-TF ROLLING VP whose edges can differ
+//    (esp. 1m), so without this the touched edge is invisible. Named ZONE_PREFIX → swept.
+void DrawArmedNode(int idx, const string tf, const string edge, double lo, double hi, double fulcrum)
+{
+   if(lo <= 0 || hi <= 0) return;
+   if(hi < lo) { double t = lo; lo = hi; hi = t; }
+   int      secs = PeriodSeconds(PERIOD_CURRENT);
+   datetime tL = TimeCurrent() - 120 * secs, tR = TimeCurrent() + 20 * secs;
+   color    clr = clrMagenta;   // ties the node to its magenta-dashed fulcrum line
+
+   string name = ZONE_PREFIX + "arm_" + IntegerToString(idx);
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_RECTANGLE, 0, tL, lo, tR, hi);
+      ObjectSetInteger(0, name, OBJPROP_BACK,       false);   // outline on top of zones
+      ObjectSetInteger(0, name, OBJPROP_FILL,       false);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+   }
+   else
+   {
+      ObjectSetInteger(0, name, OBJPROP_TIME,  0, tL);
+      ObjectSetInteger(0, name, OBJPROP_TIME,  1, tR);
+      ObjectSetDouble (0, name, OBJPROP_PRICE, 0, lo);
+      ObjectSetDouble (0, name, OBJPROP_PRICE, 1, hi);
+   }
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_SOLID);
+
+   if(InpShowZoneLabels)
+      ZoneText("armtxt_" + IntegerToString(idx), tR, (edge == "top") ? hi : lo,
+               "ARM " + tf + (edge == "" ? "" : " " + edge) + " " +
+               DoubleToString(lo, _Digits) + "-" + DoubleToString(hi, _Digits), clr);
+}
+
+//--- TP lines + label for each active grid cycle. Drawn dashed; color-coded by TF.
+//    Objects named ZONE_PREFIX+"cyc_"+magic+"_up/dn/lbl" → swept by ClearZones().
+void DrawGridCycles()
+{
+   int dg = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   int n  = ArraySize(gGridCycles);
+   for(int i = 0; i < n; i++)
+   {
+      string ms   = IntegerToString(gGridCycles[i].magic);
+      string ctf  = gGridCycles[i].tf;
+      string cknd = gGridCycles[i].kind;
+      double cup  = gGridCycles[i].tp_up;
+      double cdn  = gGridCycles[i].tp_down;
+      double cful = gGridCycles[i].fulcrum;
+      double cnet = gGridCycles[i].net_target;
+      bool   csq  = gGridCycles[i].squeeze_ok;
+      // TF color: 1m=aqua 5m=lime 15m=gold 1h=orange else=silver
+      color clr = clrSilver;
+      if(ctf == "1m")       clr = clrAqua;
+      else if(ctf == "5m")  clr = clrLime;
+      else if(ctf == "15m") clr = clrGold;
+      else if(ctf == "1h")  clr = clrOrange;
+
+      // TP-up line
+      string uname = ZONE_PREFIX + "cyc_" + ms + "_up";
+      if(cup > 0)
+      {
+         if(ObjectFind(0, uname) < 0) ObjectCreate(0, uname, OBJ_HLINE, 0, 0, cup);
+         ObjectSetDouble (0, uname, OBJPROP_PRICE, 0, cup);
+         ObjectSetInteger(0, uname, OBJPROP_COLOR, clr);
+         ObjectSetInteger(0, uname, OBJPROP_STYLE, STYLE_DASH);
+         ObjectSetInteger(0, uname, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, uname, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, uname, OBJPROP_BACK, true);
+         ObjectSetString (0, uname, OBJPROP_TEXT, ctf + " " + cknd + " TP↑ tgt=" + DoubleToString(cnet, 0));
+      }
+      else ObjectDelete(0, uname);
+
+      // TP-down line
+      string dname = ZONE_PREFIX + "cyc_" + ms + "_dn";
+      if(cdn > 0)
+      {
+         if(ObjectFind(0, dname) < 0) ObjectCreate(0, dname, OBJ_HLINE, 0, 0, cdn);
+         ObjectSetDouble (0, dname, OBJPROP_PRICE, 0, cdn);
+         ObjectSetInteger(0, dname, OBJPROP_COLOR, clr);
+         ObjectSetInteger(0, dname, OBJPROP_STYLE, STYLE_DASH);
+         ObjectSetInteger(0, dname, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, dname, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, dname, OBJPROP_BACK, true);
+         ObjectSetString (0, dname, OBJPROP_TEXT, ctf + " " + cknd + " TP↓ tgt=" + DoubleToString(cnet, 0));
+      }
+      else ObjectDelete(0, dname);
+
+      // Label at TP-up or fulcrum in the right margin
+      double lbPx = (cup > 0) ? cup : ((cful > 0) ? cful : 0.0);
+      string lname = ZONE_PREFIX + "cyc_" + ms + "_lbl";
+      if(lbPx > 0)
+      {
+         datetime tR = TimeCurrent() + 20 * PeriodSeconds(PERIOD_CURRENT);
+         string lbtxt = ctf + " " + cknd + " net=" + DoubleToString(cnet, 0) + (csq ? " SQ" : "");
+         if(ObjectFind(0, lname) < 0) ObjectCreate(0, lname, OBJ_TEXT, 0, tR, lbPx);
+         ObjectSetInteger(0, lname, OBJPROP_TIME,  0, tR);
+         ObjectSetDouble (0, lname, OBJPROP_PRICE, 0, lbPx);
+         ObjectSetString (0, lname, OBJPROP_TEXT,  " " + lbtxt);
+         ObjectSetString (0, lname, OBJPROP_FONT,  "Consolas");
+         ObjectSetInteger(0, lname, OBJPROP_FONTSIZE, 7);
+         ObjectSetInteger(0, lname, OBJPROP_COLOR, clr);
+         ObjectSetInteger(0, lname, OBJPROP_ANCHOR, ANCHOR_LEFT);
+         ObjectSetInteger(0, lname, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, lname, OBJPROP_BACK,  false);
+      }
+      else ObjectDelete(0, lname);
+   }
+}
+
 void FetchAndDrawZones()
 {
    string body = StringFormat("{\"account\":\"%s\",\"symbol\":\"%s\",\"tf\":\"%s\"}",
@@ -1122,6 +1346,21 @@ void FetchAndDrawZones()
       double tp = JsonGetNumber(tl[i], "price");
       string ts = JsonGetString(tl[i], "side");
       if(tp > 0) DrawTouchLine(i, ts, tp);
+   }
+
+   //--- armed-node overlay: the EXACT node each active cycle triggered on (any TF), drawn
+   //    as a magenta outline so the touched edge is visible even when it sits off the daily
+   //    HVN/LVN grid (the per-TF rolling VP differs from the cached daily profile).
+   string an[];
+   int nan = JsonSplitArray(resp, "armed_nodes", an);
+   for(int i = 0; i < nan; i++)
+   {
+      double alo = JsonGetNumber(an[i], "node_low");
+      double ahi = JsonGetNumber(an[i], "node_high");
+      double af  = JsonGetNumber(an[i], "fulcrum");
+      string atf = JsonGetString(an[i], "tf");
+      string aed = JsonGetString(an[i], "edge");
+      if(alo > 0 && ahi > 0) DrawArmedNode(i, atf, aed, alo, ahi, af);
    }
 
    //--- parse hvn_cycle_map: [{lo, hi, cycles:[{magic, tf, edge, ...}]}]
@@ -1188,6 +1427,27 @@ void FetchAndDrawZones()
 
    //--- computed volume profile (right-margin histogram)
    if(InpDrawVP) DrawProfile(resp);
+
+   //--- active grid cycles: TP lines + right-margin labels (TF / strategy / net_target)
+   ArrayResize(gGridCycles, 0);
+   string gcs[];
+   int ngc = JsonSplitArray(resp, "grid_cycles", gcs);
+   ArrayResize(gGridCycles, ngc);
+   for(int i = 0; i < ngc; i++)
+   {
+      gGridCycles[i].magic         = (long)JsonGetNumber(gcs[i], "magic");
+      gGridCycles[i].tf            = JsonGetString(gcs[i], "tf");
+      gGridCycles[i].kind          = JsonGetString(gcs[i], "kind");
+      gGridCycles[i].fulcrum       = JsonGetNumber(gcs[i], "fulcrum");
+      gGridCycles[i].tp_up         = JsonGetNumber(gcs[i], "tp_up");
+      gGridCycles[i].tp_down       = JsonGetNumber(gcs[i], "tp_down");
+      gGridCycles[i].buy_n         = (int)JsonGetNumber(gcs[i], "buy_n");
+      gGridCycles[i].sell_n        = (int)JsonGetNumber(gcs[i], "sell_n");
+      gGridCycles[i].net_target    = JsonGetNumber(gcs[i], "net_target");
+      gGridCycles[i].trail_activate= JsonGetNumber(gcs[i], "trail_activate");
+      gGridCycles[i].squeeze_ok    = (JsonGetNumber(gcs[i], "squeeze_ok") > 0.5);
+   }
+   DrawGridCycles();
 
    if(InpVerbose && (n > 0 || nl > 0))
       Print("🟦 Drew ", n, " zones + ", nl, " VP levels | fulcrum ",
@@ -1266,6 +1526,14 @@ void UpdateDashboard()
    if(!InpShowDash) return;
    int dg = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
 
+   if(gHalted)
+   {
+      DashRow(0, "▌ FB GRID — HALTED (equity target "
+              + DoubleToString(InpEquityTarget, 2) + ")", clrOrange);
+      for(int r = 1; r <= 12; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
+      return;
+   }
+
    // idle = no live legs of ours AND no armed fulcrum on any cycle
    int nOpen = 0, nPend = 0;
    double loss = HedgedLossAtFulcrum(nOpen, nPend);
@@ -1319,8 +1587,28 @@ void UpdateDashboard()
          }
       }
    }
+   // Active cycle rows: one per active grid cycle (TF / kind / net_target / trail)
+   int ngc2 = ArraySize(gGridCycles);
+   if(ngc2 > 0)
+   {
+      DashRow(row, "── Active cycles ──", clrDimGray); row++;
+      for(int i = 0; i < ngc2 && i < 8; i++)
+      {
+         color gcClr = clrSilver;
+         if(gGridCycles[i].tf == "1m")       gcClr = clrAqua;
+         else if(gGridCycles[i].tf == "5m")  gcClr = clrLime;
+         else if(gGridCycles[i].tf == "15m") gcClr = clrGold;
+         else if(gGridCycles[i].tf == "1h")  gcClr = clrOrange;
+         string gcTxt = gGridCycles[i].tf + " " + gGridCycles[i].kind
+                        + "  tgt=" + DoubleToString(gGridCycles[i].net_target, 0)
+                        + "  trail=" + DoubleToString(gGridCycles[i].trail_activate, 0)
+                        + (gGridCycles[i].squeeze_ok ? " SQ" : "");
+         DashRow(row, gcTxt, gcClr); row++;
+      }
+   }
+
    // clear any stale rows beyond what we just drew
-   for(int r = row; r <= row + 4; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
+   for(int r = row; r <= row + 12; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
 }
 
 void ClearDashboard()
@@ -1392,6 +1680,30 @@ int OnInit()
 
 void OnTimer()
 {
+   //--- equity target hard-stop (local failsafe): once account EQUITY (balance + floating
+   //    P&L) reaches the target, flatten everything this EA holds on this symbol and stop
+   //    trading. Latched via gHalted so it fires once. Checked BEFORE polling so no new
+   //    legs place after.
+   if(gHalted) return;
+   if(InpEquityTarget > 0.0)
+   {
+      double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(eq >= InpEquityTarget)
+      {
+         int closed = 0, cancelled = 0;
+         CloseAllMine(closed, cancelled);
+         gHalted = true;
+         Print("🎯 EQUITY TARGET HIT: equity ", DoubleToString(eq, 2), " ≥ ",
+               DoubleToString(InpEquityTarget, 2), " → flattened (", closed, " closed, ",
+               cancelled, " cancelled). EA HALTED.");
+         Alert("FB EA halted: equity ", DoubleToString(eq, 2),
+               " reached target ", DoubleToString(InpEquityTarget, 2));
+         UpdateDashboard();
+         if(InpHaltRemovesEA) ExpertRemove();
+         return;
+      }
+   }
+
    PollAndExecute();
 
    //--- redraw HVN/LVN zones on a slower cadence (they change per bar, not per tick)

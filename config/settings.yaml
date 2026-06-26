@@ -1,4 +1,4 @@
-mode: paper              # journal | paper | live  (live also needs env ALLOW_LIVE=1)
+mode: live              # journal | paper | live  (live also needs env ALLOW_LIVE=1)
 trading_mode: grid            # buy_sell_only | grid  (grid: Claude designs full 5-leg plan via submit_grid_plan; buy_sell_only: mechanical Fib placer)
 
 # Standardized data window across all analysis modules (sweep, delta_div, wick_trap, cvd_vote)
@@ -41,13 +41,43 @@ instrument:
 # Footprint-driven neutral-grid placement (/exec/emit_grid + FBExecBridge EA).
 # Planner reads these via .get() defaults — block is optional but canonical here.
 grid_levels:
-  base_lot: 0.25
-  lot_step: 0.25
+
+  # ── TUNING (adjust frequently based on account size / market conditions) ─────
+  # Position sizing
+  base_lot: 0.25           # smallest leg lot; ladder scales up by lot_step per leg
+  lot_step: 0.25           # lot increment per leg (leg_i = base + i×step, capped at max_lots)
+  max_lots: 1.0           # hard cap per leg regardless of risk math
+
+  # Ladder shape
+  hvn_max_legs_by_tf: {1m: 4, 5m: 5, 15m: 6, 1h: 7}   # legs per side per TF
+
+  # Cycle profit targets — primary basket exit (net floating ≥ target → CLOSE_ALL)
+  # Values are in native account currency (USC cents for Vantage XAUUSD.pc cent account;
+  # plain USD for a standard USD account). 1 USD = 100 USC on a cent account.
+  cycle_net_target_by_tf: {1m: 250.0, 5m: 750.0, 15m: 1500.0, 1h: 3000.0}
+  cycle_net_target_usd: 5000.0   # fallback when TF not in by_tf map (high backstop)
+
+  # Bias trail — arms when peak floating ≥ activate, fires on giveback% retrace.
+  # Values are in native account currency (same note as cycle_net_target above).
+  bias_trail_activate_by_tf: {1m: 150.0, 5m: 400.0, 15m: 750.0, 1h: 1500.0}
+  bias_trail_giveback_pct: 35    # fire when floating retraces this % off the peak
+  bias_book_frac: 0.5            # fraction of bias-side positions to close at trail trigger
+
+  # Squeeze multiplier — when a cycle was armed on a confirmed squeeze (squeeze_ok=True),
+  # scale up targets so the system holds the runner longer into the expansion move.
+  squeeze_target_mult: 2.0       # multiply cycle_net_target when squeeze_ok
+  squeeze_trail_mult: 2.0        # multiply bias_trail_activate when squeeze_ok
+
+  # Arm filter
+  require_squeeze_gate: false    # true = only arm when vol is coiled (structural setups exempt)
+
+  # Safety
+  fullfill_be_enabled: true      # move filled side to BE when all legs fill; keeps cycle alive
+  fullfill_cancel_opposite: true
+  # ─────────────────────────────────────────────────────────────────────────────
+
   tp_atr_mult: 1.5
   hvn_max_legs: 6
-  # Per-TF leg cap (overrides hvn_max_legs for the matching TF). Fast TFs run a tighter
-  # ladder, slow TFs a wider one. The cycle's TF is recovered from its magic (magic % 10).
-  hvn_max_legs_by_tf: {1m: 4, 5m: 5, 15m: 6, 1h: 7}
   # Minimum TP distance ($) beyond the outermost leg — a structural level closer than
   # this is skipped (keep walking out to the next). Stops the tiny-TP-into-own-node bug
   # (a fulcrum on an HVN edge had its into-node TP land ~2pt away). 0 = no floor.
@@ -57,7 +87,7 @@ grid_levels:
   # (|fulcrum-px| ≤ n·step) is the precise "is price actually at the edge" check; this is
   # just a sanity bound well outside any real ladder span. 0.05 (±~200pt @ gold) was far
   # too loose vs legit arms ~6pt off spot — tightened to 0.01 (±~40pt) 2026-06-24.
-  max_fulcrum_dist_pct: 0.01
+  max_fulcrum_dist_pct: 0.02
   # Cycle exit (server-side cycle monitor). DEMO ONLY — strategy is -EV.
   # Net-profit-exit-only: place legs with NO per-order TP so the winning side can't book
   # while the losing side dangles (a per-leg TP hit ≠ a net-positive cycle). The basket
@@ -80,7 +110,30 @@ grid_levels:
   # units of the edge even without crossing it (e.g. 0.5pt catches near-misses on gold).
   # 0.0 = exact touch only (original behaviour). Edge is still the fulcrum price.
   hvn_touch_buffer: 0.5
+  # Width-relative buffer: a wide node's edge is unreachable with a flat 0.5pt buffer
+  # (a 49pt node never gets a tap), so the effective buffer is max(hvn_touch_buffer,
+  # node_width × hvn_touch_buffer_pct). 0.10 = a tap within 10% of the node width counts.
+  # 0.0 disables the relative term (flat buffer only). 0.10 = tap within 10% of node width
+  # counts — lets a wide node's edge register on rotational days WITHOUT changing node
+  # geometry / grid sizing / structural-TP (exits are net-$ targets, so this is surgical).
+  hvn_touch_buffer_pct: 0.10
   hvn_lookback_bars: 3          # candle-close trigger scans last N bars (restart recovery)
+  # BROKER ORDER-RATE THROTTLE: min seconds between MODIFY_PENDING/MODIFY_POSITION per
+  # (cycle, side). The HVN-tracking refresh used to re-modify every ~60s × many cycles =
+  # ~1500 modifications/hr, which trips broker HFT-abuse limits. 300 = pendings/TPs re-track
+  # the HVN at most every 5 min per side. 0 = no throttle (old behaviour).
+  modify_cooldown_s: 100
+  # VP HVN node tightness (scipy peak_widths rel_height in volume_profile._find_hvn_zones).
+  # LOWER = tighter nodes: a peak's width is measured nearer its tip, so adjacent peaks that
+  # blur into one wide blob at 0.5 separate into distinct tappable nodes. SYSTEM-WIDE: also
+  # narrows TP next-HVN targets, fade detection, VA. 0.5 = legacy wide (prior behaviour);
+  # 0.3 ≈ half-width. Reverted to 0.5 per user (prev logic worked better).
+  vp_hvn_rel_height: 0.5
+  # VP smoothing WIDTH in PRICE units (Gaussian, in volume_profile._smooth). Per-call sigma
+  # = max(1.5 bins, vp_smooth_price / bin_size) → constant price-width smoothing: coarse-bin
+  # symbols (BTC) stay at the legacy 1.5-bin floor; fine-bin XAU (0.25) gets more so single-bin
+  # noise doesn't fragment into 1pt nodes. ≥1.0 re-blobs XAU into one wide node — keep ~0.5.
+  vp_smooth_price: 0.7
   # Directional skew votes (skew-only — both sides still placed, favoured side heavier):
   # HTF Bollinger bias reads the NEXT TF up's 20-SMA (5m→15m, 15m→1h…) — price above a
   # rising 20MA = bull vote, below a falling one = bear. 2.5σ "edge" votes mean-reversion
@@ -89,17 +142,12 @@ grid_levels:
   htf_bias_enabled: true
   htf_bias_period: 20
   htf_bias_slope_bars: 3
-  htf_bias_map: {1m: "15m", 5m: "15m", 15m: "1h", 1h: "4h"}
+  htf_bias_map: {1m: "5m", 5m: "15m", 15m: "1h", 1h: "4h"}
   bb_edge_enabled: true
   bb_edge_sigma: 2.5
-  cycle_net_target_usd: 500.0      # base net floating-$ target; tune on demo (micro-lot swings are small)
-  # Per-TF override of the base net-$ target. The cycle's TF is recovered from its magic
-  # (magic % 10), so each parallel TF pool can carry its own profit target — fast TFs book
-  # small swings, slow TFs hold for larger moves. Any TF absent here falls back to
-  # cycle_net_target_usd above. Keys are TF strings ("1m","5m","15m","1h").
-  cycle_net_target_by_tf: {1m: 1000.0, 5m: 2000.0, 15m: 4000.0, 1h: 8000.0}
-  cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full
-  cycle_min_target_usd: 0.20     # floor; must be >0 so a hedged cycle still has a positive net-$ exit
+  # cycle_net_target_* and bias_trail_* moved to TUNING block at top of grid_levels
+  cycle_hedge_decay_pct: 20      # effective target decays this % as the basket hedges to full
+  cycle_min_target_usd: 50     # floor; must be >0 so a hedged cycle still has a positive net-$ exit
   cycle_close_on_full_hedge: true  # cut a fully-hedged (delta-neutral) cycle to free margin
   # Orphan-pending sweep: a never-filled pending leg anchored on a fulcrum HVN that has
   # since DISAPPEARED from the live VP gets cancelled — but ONLY once the cycle's other
@@ -113,16 +161,13 @@ grid_levels:
   # Cap that immediately — move the committed side to BE (SL=avg entry); filled side can no
   # longer lose. cancel_opposite=true also cancels the other side's pendings so they can't
   # fill on a retrace and create a new unhedged position.
-  fullfill_be_enabled: true
-  fullfill_cancel_opposite: true  # cancel opposite-side pendings when one side fully fills
+  # fullfill_be_* moved to TUNING block at top of grid_levels
   # Bias-side trailing book: when ONE side has ALL its legs filled (the move committed
   # that way), track its peak floating P&L; on a give-back from peak, BOOK a fraction of
   # that side and move the rest to breakeven (risk-free runner). Captures directional
   # profit the net-basket exit masks (a hedge leg drags net down → target never hits).
   bias_trail_enabled: true
-  bias_trail_activate_usd: 5.0   # bias-side floating must PEAK ≥ this ($) to arm the trail
-  bias_trail_giveback_pct: 50    # fire when floating retraces this % off the peak
-  bias_book_frac: 0.5            # fraction of the bias side's positions to book at the trigger
+  bias_trail_activate_usd: 5.0   # fallback when TF not in bias_trail_activate_by_tf
   # Intrabar touch-arm: arm the straddle the moment LIVE price taps an HVN edge and ticks
   # back inside (mini-rejection), without waiting for the candle to close. Checked every EA
   # poll (~1s). Filters breakouts via the tick-reversal confirm. Close-driven emit still
@@ -149,6 +194,16 @@ grid_levels:
   squeeze_min_on_bars: 6     # require ≥this consecutive compressed bars before a release fires
   squeeze_max_bars_since_release: 0   # bars allowed between coil-release and arm; 0 = NO limit
   squeeze_release_lookback: 120       # how far back to scan for the coil (bounded by history, not freshness)
+  # ── BB expansion touch trigger ──────────────────────────────────────────────
+  # Arms when: squeeze released → BB expanding → price taps the 2.5σ band
+  # + HTF BB direction aligns (hard gate) + optional footprint absorption confirms.
+  # Fulcrum = BB mid (20-SMA); counter-side SL = BB mid (answers the "SL at center" question).
+  bb_expansion_touch_enabled: true
+  bb_expansion_post_squeeze_bars: 10  # max bars after squeeze release to be "post-squeeze"
+  bb_expansion_touch_sigma: 2.5       # band edge σ to detect as a touch (2.0 = earlier, 3.0 = extreme)
+  bb_expansion_touch_lookback: 3      # scan last N bars for a band touch during the expansion
+  bb_expansion_htf_gate: true         # upper touch needs HTF bearish; lower touch needs HTF bullish
+  bb_expansion_fp_gate: true          # require close-failure absorption on the touch bar
   # Vol-compression GATE (applies to ALL triggers, not just squeeze): only arm a grid when
   # vol has coiled (BB 3σ compression now, or a ≥squeeze_min_on_bars coil that ended within
   # squeeze_gate_max_bars). A straddle pays on expansion FROM a coil → this filters the
@@ -157,7 +212,6 @@ grid_levels:
   # each tagged squeeze_ok in the arm + exit audits (data/exec_emit.jsonl) so outcomes can
   # be bucketed squeeze-pass vs squeeze-fail. Flip to true to ENFORCE (skip uncoiled) once
   # the data favours the gate. The label is stamped either way.
-  require_squeeze_gate: true
   squeeze_gate_max_bars: 10  # how stale a just-ended coil may be and still pass the gate
 
 # Startup preflight — server REFUSES to start unless footprint + VP data are present.
@@ -206,7 +260,26 @@ vp_cache:
   #   BTC tick = 0.1 → 1.0 = 10-tick bins
   vp_bin_size:
     BTCUSDT:  25.0          # 25$ bins (Sierra/Bookmap convention for BTC ~1300/day range = ~52 bins)
-    XAUTUSDT: 1.0           # 1$ bins (was 0.5; gives ~25 bins per day for typical XAU range)
+    XAUTUSDT: 0.4           # 0.4 = coarsest bin where the 1.5-bin smoothing floor (0.6$) still
+                            # lands below gold's ~2$ node spacing → resolves 3 distinct HVN + clean
+                            # LVNs (bin 1.0 collapsed to ONE 18$ blob with 0 LVNs). Edge precision
+                            # ±0.2 vs ±0.5 at 1.0. The old jitter→broker-churn risk is now handled
+                            # centrally by grid_levels.modify_cooldown_s (caps mods ~1.3/min
+                            # regardless of edge wiggle), so fine bin no longer means HFT churn.
+  # ── DRAWN VP histogram only (TV/GoCharting-style smooth curve) — fully decoupled from the
+  # detection/grid bins above, so this doesn't change HVN/LVN, fulcrum, or grid sizing.
+  # vp_profile_bin: finer per-symbol bin used ONLY for the chart histogram (high resolution).
+  # vp_profile_smooth: Gaussian sigma (PRICE units) applied to the drawn curve. 0 = raw bars.
+  # The server smooths then downsamples to ≤256 points so fine bins stay performant on the EA.
+  vp_profile_bin:
+    XAUTUSDT: 0.1            # 0.1$ (full tick res) for a smooth gold profile; grid still uses 0.4
+  vp_profile_smooth: 1.0    # Gaussian (price units) — visible curve; 0 = raw bars, 1.5 over-blobs
+  vp_profile_points: 150    # number of histogram ROWS (bars). Volume is SUMMED per row, so fewer
+                            # rows = chunkier TV-like bars without losing volume. ~50-200 typical.
+  # Drawn HVN/LVN: merge prev-D ∪ today into ONE clean set; combine nodes within this gap ($)
+  # so the chart isn't a cluttered interleave of two overlapping sets. 0 = overlaps only.
+  vp_zone_merge_gap: 0.0
+  vp_draw_today_zones: false  # true = restore the old prev-D + today_* dual overlay (distinct colors)
   # Intra-day VP refresh — rebuild current day's POC/VAH/VAL/HVN/LVN every N
   # primary-TF bars. Default 5 = every 5 minutes at 1m primary TF. Set 0 to disable.
   intraday_refresh_bars: 5

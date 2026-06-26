@@ -141,16 +141,26 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
             return   # cycle retired — nothing more to refresh
 
         # DRIFT or RE-ANCHOR: shift fulcrum + pendings to best_edge (still on real structure).
+        # DEFER, don't drop: advance the persisted fulcrum ONLY when the broker MODIFY actually
+        # fired. If throttled (modify_cooldown_s not yet elapsed → enqueue returns None), leave
+        # the fulcrum at the last APPLIED edge so the FULL accumulated delta re-applies on the
+        # next poll past the cooldown — pendings re-track the HVN once per modify_cooldown_s
+        # interval instead of having mid-cooldown drift advance state but never reach the broker.
         if abs(venue_delta) > 0.1:
             _kind = "fulcrum_shift" if best_dist <= _drift_cap else "fulcrum_reanchor"
             new_fulcrum_venue = round(old_fulcrum_venue + venue_delta, 4)
-            arm = {**arm, "fulcrum": new_fulcrum_venue}
-            ExecBridge.set_last_arm(account, broker_symbol, **arm)
-            ExecBridge.enqueue_modify_pending(account, broker_symbol, magic, price_delta=venue_delta)
-            _emit_audit({"account": account, "symbol": analysis_symbol, "tf": tf,
-                         "verdict": _kind, "magic": magic, "poll": True,
-                         "old_fulcrum": old_fulcrum_venue, "new_fulcrum": new_fulcrum_venue,
-                         "delta": venue_delta, "bracketed": _bracketed})
+            if ExecBridge.enqueue_modify_pending(account, broker_symbol, magic,
+                                                 price_delta=venue_delta) is not None:
+                arm = {**arm, "fulcrum": new_fulcrum_venue}
+                ExecBridge.set_last_arm(account, broker_symbol, **arm)
+                _emit_audit({"account": account, "symbol": analysis_symbol, "tf": tf,
+                             "verdict": _kind, "magic": magic, "poll": True,
+                             "old_fulcrum": old_fulcrum_venue, "new_fulcrum": new_fulcrum_venue,
+                             "delta": venue_delta, "bracketed": _bracketed})
+            else:
+                # throttled → pendings are still at the un-shifted edge; compute TPs from THERE
+                # (not the new edge) so the structural TP stays consistent with the live orders.
+                best_edge = edge_raw
 
     # recompute TPs from the (possibly shifted) edge, with the min-distance floor
     # (analysis frame: min_tp_dist is venue-$, un-rebase by /ratio)
@@ -186,6 +196,13 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
                                        min_dist=_min_tp_raw, top_leg=_top_leg, bot_leg=_bot_leg)
         if raw_tp_up   == 0.0: raw_tp_up   = _c_up
         if raw_tp_down == 0.0: raw_tp_down = _c_dn
+    from execution.zone_triggers import bb_tp as _bb_tp
+    _bb_bars = store().recent(analysis_symbol, tf, 25)
+    _bb_up, _bb_dn = _bb_tp(_bb_bars, cfg=settings.get("grid_levels") or {})
+    if _bb_up > _top_leg:
+        raw_tp_up   = _bb_up if raw_tp_up   == 0.0 else min(raw_tp_up,   _bb_up)
+    if 0 < _bb_dn < _bot_leg:
+        raw_tp_down = _bb_dn if raw_tp_down == 0.0 else max(raw_tp_down, _bb_dn)
     # Guard: TP must lie strictly beyond the outermost leg or the grid can't profit on that
     # side — drop it to 0 (leave the existing TP untouched) rather than set an inside-ladder TP.
     if not (raw_tp_up   and raw_tp_up   > _top_leg):       raw_tp_up   = 0.0
@@ -195,26 +212,28 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
     old_up = float(arm.get("tp_up") or 0.0)
     old_down = float(arm.get("tp_down") or 0.0)
     if (new_tp_up and abs(new_tp_up - old_up) > 0.05) or (new_tp_down and abs(new_tp_down - old_down) > 0.05):
-        ExecBridge.set_last_arm(account, broker_symbol,
-                                **{**arm, "tp_up": new_tp_up, "tp_down": new_tp_down})
-        if new_tp_up:
-            ExecBridge.enqueue_modify_pending(account, broker_symbol, magic,
-                                              price_delta=0.0, new_tp=new_tp_up, side="buy")
-            if _open_buys:
-                ExecBridge.enqueue_modify_position(account, broker_symbol, magic,
-                                                   new_tp=new_tp_up, side="buy",
-                                                   comment="FB|tp_refresh|buy")
-        if new_tp_down:
-            ExecBridge.enqueue_modify_pending(account, broker_symbol, magic,
-                                              price_delta=0.0, new_tp=new_tp_down, side="sell")
-            if _open_sells:
-                ExecBridge.enqueue_modify_position(account, broker_symbol, magic,
-                                                   new_tp=new_tp_down, side="sell",
-                                                   comment="FB|tp_refresh|sell")
-        _emit_audit({"account": account, "symbol": analysis_symbol, "tf": tf,
-                     "verdict": "tp_refresh", "magic": magic, "poll": True,
-                     "tp_up_old": old_up, "tp_down_old": old_down,
-                     "tp_up": new_tp_up, "tp_down": new_tp_down})
+        # DEFER, don't drop (same rule as the fulcrum shift): persist a side's new TP ONLY when
+        # its MODIFY actually fired. A throttled side keeps its OLD tp_up/tp_down so the refresh
+        # re-attempts each poll until modify_cooldown_s elapses — TP re-tracks the HVN once per
+        # interval rather than recording a new value that never reached the broker. buy/sell are
+        # separate throttle slots, so each side defers independently.
+        _tp_arm = dict(arm)
+        _tp_changed = False
+        if new_tp_up and ExecBridge.enqueue_modify_pending(
+                account, broker_symbol, magic, price_delta=0.0, new_tp=new_tp_up, side="buy") is not None:
+            _tp_arm["tp_up"] = new_tp_up
+            _tp_changed = True
+        if new_tp_down and ExecBridge.enqueue_modify_pending(
+                account, broker_symbol, magic, price_delta=0.0, new_tp=new_tp_down, side="sell") is not None:
+            _tp_arm["tp_down"] = new_tp_down
+            _tp_changed = True
+        # positions updated on bar close only (exec_emit_grid), not on every 1s poll
+        if _tp_changed:
+            ExecBridge.set_last_arm(account, broker_symbol, **_tp_arm)
+            _emit_audit({"account": account, "symbol": analysis_symbol, "tf": tf,
+                         "verdict": "tp_refresh", "magic": magic, "poll": True,
+                         "tp_up_old": old_up, "tp_down_old": old_down,
+                         "tp_up": _tp_arm.get("tp_up", old_up), "tp_down": _tp_arm.get("tp_down", old_down)})
 
 
 def _cancel_orphan_on_hvn_gone(account: str, broker_symbol: str, analysis_symbol: str,
@@ -733,6 +752,12 @@ def exec_emit_grid():
                                                min_dist=_min_tp_raw, top_leg=_top_leg_r, bot_leg=_bot_leg_r)
                     if raw_tp_up   == 0.0: raw_tp_up   = _cu
                     if raw_tp_down == 0.0: raw_tp_down = _cd
+                from execution.zone_triggers import bb_tp as _bb_tp
+                _bb_up, _bb_dn = _bb_tp(_sbars, cfg=settings.get("grid_levels") or {})
+                if _bb_up > _top_leg_r:
+                    raw_tp_up   = _bb_up if raw_tp_up   == 0.0 else min(raw_tp_up,   _bb_up)
+                if 0 < _bb_dn < _bot_leg_r:
+                    raw_tp_down = _bb_dn if raw_tp_down == 0.0 else max(raw_tp_down, _bb_dn)
                 if not (raw_tp_up   and raw_tp_up   > _top_leg_r):     raw_tp_up   = 0.0
                 if not (raw_tp_down and 0 < raw_tp_down < _bot_leg_r): raw_tp_down = 0.0
                 new_tp_up   = round(raw_tp_up   * _ratio, 4) if raw_tp_up   else 0.0
@@ -816,10 +841,16 @@ def exec_emit_grid():
     _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
     node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
     node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
+    # Count ACTUAL placed commands (some legs may be skipped when already behind market).
+    # bias_trail requires buys >= buy_n; using planned len() would make it unreachable
+    # for any arm where one or more legs were behind-market at placement time.
+    from execution.exec_bridge import PLACE_PENDING as _PP
+    _placed_buy  = sum(1 for c in cmds if c.type == _PP and c.order_type == "buy_stop")
+    _placed_sell = sum(1 for c in cmds if c.type == _PP and c.order_type == "sell_stop")
     ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum, edge=edge,
                             trigger_kind=plan.trigger_kind, venue_mid=quote["mid"], magic=leg_magic,
                             n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
-                            buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
+                            buy_n=_placed_buy, sell_n=_placed_sell,
                             bias_peak=0.0, bias_booked=False,
                             be_done_buy=False, be_done_sell=False,
                             node_low=round(node_low, 5), node_high=round(node_high, 5),
@@ -993,21 +1024,78 @@ def exec_zones():
     def _rebase_price(p: float) -> float:
         return round(p * _zone_ratio, 5) if _zone_ratio != 1.0 else round(p, 5)
 
+    _vpc = (settings.get("vp_cache") or {}) if isinstance(settings, dict) else {}
+    _draw_dual = bool(_vpc.get("vp_draw_today_zones", False))
+
+    def _collect(period, key):
+        return [(float(z["low"]), float(z["high"]))
+                for z in ((period.get(key) or []) if period else [])]
+
+    # Session-aware zone drawing:
+    #   Asia              → prev-D only (today barely started, prev-D = reference)
+    #   London / Overlap  → prev-D + today merged (both sessions in play)
+    #   NY                → today only; prev-D zones only where outside today's range
+    #   Off               → prev-D only (session closed)
+    # Fallback: if the preferred source is empty, drop to whichever exists.
+    from pipeline.features.session import current_session as _cur_sess
+    _sess = _cur_sess(symbol=symbol).session   # Asia|London|Overlap|NY|Off
+
     zones = []
-    # Prev-D zones (completed session reference) — drawn with standard HVN/LVN colors.
-    for z in (_prev_daily.get("hvn_zones") or [] if _prev_daily else []):
-        zones.append({"kind": "hvn", "lo": _rebase_price(float(z["low"])),
-                      "hi": _rebase_price(float(z["high"]))})
-    for z in (_prev_daily.get("lvn_zones") or [] if _prev_daily else []):
-        zones.append({"kind": "lvn", "lo": _rebase_price(float(z["low"])),
-                      "hi": _rebase_price(float(z["high"]))})
-    # Today's forming zones — drawn with "_today" kinds so the EA colors them distinctly.
-    for z in (_today_daily.get("hvn_zones") or [] if _today_daily else []):
-        zones.append({"kind": "hvn_today", "lo": _rebase_price(float(z["low"])),
-                      "hi": _rebase_price(float(z["high"]))})
-    for z in (_today_daily.get("lvn_zones") or [] if _today_daily else []):
-        zones.append({"kind": "lvn_today", "lo": _rebase_price(float(z["low"])),
-                      "hi": _rebase_price(float(z["high"]))})
+    if _draw_dual:
+        # explicit dual-overlay mode: prev-D as hvn/lvn, today as hvn_today/lvn_today
+        for lo, hi in _collect(_prev_daily, "hvn_zones"):
+            zones.append({"kind": "hvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+        for lo, hi in _collect(_prev_daily, "lvn_zones"):
+            zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+        for lo, hi in _collect(_today_daily, "hvn_zones"):
+            zones.append({"kind": "hvn_today", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+        for lo, hi in _collect(_today_daily, "lvn_zones"):
+            zones.append({"kind": "lvn_today", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+    elif _sess in ("Asia", "Off"):
+        # prev-D only; fall back to today if prev-D not yet cached
+        _src = _prev_daily or _today_daily
+        for lo, hi in _collect(_src, "hvn_zones"):
+            zones.append({"kind": "hvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+        for lo, hi in _collect(_src, "lvn_zones"):
+            zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+    elif _sess in ("London", "Overlap"):
+        # prev-D + today — today drawn with distinct color so overlap is visible
+        for lo, hi in _collect(_prev_daily, "hvn_zones"):
+            zones.append({"kind": "hvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+        for lo, hi in _collect(_prev_daily, "lvn_zones"):
+            zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+        for lo, hi in _collect(_today_daily, "hvn_zones"):
+            zones.append({"kind": "hvn_today", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+        for lo, hi in _collect(_today_daily, "lvn_zones"):
+            zones.append({"kind": "lvn_today", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+    else:
+        # NY: today's zones primary; add prev-D zones only outside today's price range
+        _today_hvn = _collect(_today_daily, "hvn_zones")
+        _today_lvn = _collect(_today_daily, "lvn_zones")
+        _today_all = _today_hvn + _today_lvn
+        if _today_all:
+            _today_floor = min(lo for lo, hi in _today_all)
+            _today_ceil  = max(hi for lo, hi in _today_all)
+        else:
+            _today_floor = _today_ceil = 0.0
+        for lo, hi in _today_hvn:
+            zones.append({"kind": "hvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+        for lo, hi in _today_lvn:
+            zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+        # prev-D zones that don't overlap today's range at all
+        _outside = lambda lo, hi: _today_floor == 0.0 or hi <= _today_floor or lo >= _today_ceil
+        for lo, hi in _collect(_prev_daily, "hvn_zones"):
+            if _outside(lo, hi):
+                zones.append({"kind": "hvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+        for lo, hi in _collect(_prev_daily, "lvn_zones"):
+            if _outside(lo, hi):
+                zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+        # if today has no zones yet, fall back to prev-D entirely
+        if not _today_all:
+            for lo, hi in _collect(_prev_daily, "hvn_zones"):
+                zones.append({"kind": "hvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+            for lo, hi in _collect(_prev_daily, "lvn_zones"):
+                zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
 
     # VP point-levels the grid actually TRIGGERS on (vp_level_touch fulcrums), drawn as
     # labeled lines — only the levels enabled in grid_levels.vp_fulcrum_levels. Same
@@ -1028,11 +1116,20 @@ def exec_zones():
                 levels.append({"kind": _out_k, "price": _rebase_price(float(_v))})
 
     # Computed volume-at-price histogram (venue-shifted) for the EA to draw as a sideways
-    # profile. Rebuilt from bars (cache keeps only aggregates). Same daily window as zones.
-    prof = vp_cache.period_profile(symbol, "daily") or {}
-    profile = [{"price": _rebase_price(float(b["price"])), "vol": b["vol"]}
-               for b in prof.get("profile", [])]
-    vp_bin = round(float(prof.get("bin", 0.0)) * _zone_ratio, 5) if prof.get("bin") else 0.0
+    # profile. Returns two sessions (prev-D + today) each with start_ts so the EA can
+    # anchor each histogram at its session open rather than the visible-range edge.
+    _sess_profs = vp_cache.period_profiles_session(symbol)
+    profiles = []
+    for _sp in _sess_profs:
+        _pb = round(float(_sp.get("bin", 0.0)) * _zone_ratio, 5) if _sp.get("bin") else 0.0
+        _pp = [{"price": _rebase_price(float(b["price"])), "vol": b["vol"]}
+               for b in _sp.get("profile", [])]
+        if _pb > 0 and _pp:
+            profiles.append({"vp_bin": _pb, "profile": _pp, "start_ts": _sp.get("start_ts", 0)})
+    # Backward-compat single profile: use the last entry (most recent session).
+    _latest = profiles[-1] if profiles else {}
+    profile = _latest.get("profile", [])
+    vp_bin = _latest.get("vp_bin", 0.0)
     # dashboard shows the cycle for the EA's drawn TF (body.tf). Cycles are now per-TF,
     # so without a tf we'd find nothing — default to the zone TF the EA reports.
     zone_tf = str(body.get("tf") or "")
@@ -1129,11 +1226,44 @@ def exec_zones():
     armed_nodes = [c for c in _active_cycles
                    if float(c.get("node_low") or 0.0) > 0 and float(c.get("node_high") or 0.0) > 0]
 
+    # Grid cycle overlay: active cycles with TF, strategy, TP lines and profit targets.
+    # Parsed by EA to draw TP lines and dashboard rows.
+    _gl2 = settings.get("grid_levels") or {}
+    _gc_by_tf  = _gl2.get("cycle_net_target_by_tf") or {}
+    _gc_act_tf = _gl2.get("bias_trail_activate_by_tf") or {}
+    _gc_sq_tm  = float(_gl2.get("squeeze_target_mult", 1.0) or 1.0)
+    _gc_sq_tr  = float(_gl2.get("squeeze_trail_mult", 1.0) or 1.0)
+    _gc_net_fb = float(_gl2.get("cycle_net_target_usd", 0.0) or 0.0)
+    _gc_tr_fb  = float(_gl2.get("bias_trail_activate_usd", 5.0) or 5.0)
+    grid_cycles = []
+    for _cyc in _active_cycles:
+        _mg  = int(_cyc.get("magic") or 0)
+        _tf  = tf_from_magic(_mg)
+        _net = float(_gc_by_tf.get(_tf, _gc_net_fb) or _gc_net_fb)
+        _tr  = float(_gc_act_tf.get(_tf, _gc_tr_fb) or _gc_tr_fb)
+        if _cyc.get("squeeze_ok"):
+            _net *= _gc_sq_tm
+            _tr  *= _gc_sq_tr
+        grid_cycles.append({
+            "magic": _mg, "tf": _tf,
+            "kind": _cyc.get("trigger_kind", ""),
+            "fulcrum": _cyc.get("fulcrum", 0.0),
+            "tp_up": _cyc.get("tp_up", 0.0),
+            "tp_down": _cyc.get("tp_down", 0.0),
+            "buy_n": _cyc.get("buy_n", 0),
+            "sell_n": _cyc.get("sell_n", 0),
+            "net_target": round(_net, 2),
+            "trail_activate": round(_tr, 2),
+            "squeeze_ok": bool(_cyc.get("squeeze_ok")),
+        })
+
     return jsonify({"ok": True, "zones": zones, "levels": levels, "ict": ict_out,
                     "profile": profile, "vp_bin": vp_bin,
+                    "profiles": profiles,
                     "touch_lines": touch_lines,
                     "hvn_cycle_map": hvn_cycle_map,
                     "armed_nodes": armed_nodes,
+                    "grid_cycles": grid_cycles,
                     "cvd_signals": cvd_signals,
                     "venue_mid": quote.get("mid", 0.0),
                     "symbol": symbol, "broker_symbol": broker_symbol,
@@ -1151,6 +1281,53 @@ def exec_queue():
     account = request.args.get("account")
     return jsonify({"ok": True, "commands": ExecBridge.snapshot(account),
                     "last_poll_body": getattr(ExecBridge, "last_poll_body", None)})
+
+
+@bp.get("/exec/cycle_status")
+def exec_cycle_status():
+    """Live snapshot: for every active cycle, show current pnl vs net_target and
+    bias_trail thresholds. Useful for verifying exits are evaluating correctly."""
+    if not _auth_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    account = request.args.get("account", "")
+    _settings = current_app.config.get("FB_SETTINGS") or {}
+    grid_cfg = _settings.get("grid_levels") or {}
+    by_tf = grid_cfg.get("cycle_net_target_by_tf") or {}
+    act_by_tf = grid_cfg.get("bias_trail_activate_by_tf") or {}
+    giveback = float(grid_cfg.get("bias_trail_giveback_pct", 40.0) or 40.0)
+    sq_t_mult = float(grid_cfg.get("squeeze_target_mult", 1.0) or 1.0)
+    sq_trail_mult = float(grid_cfg.get("squeeze_trail_mult", 1.0) or 1.0)
+    base_fallback = float(grid_cfg.get("cycle_net_target_usd", 0.0) or 0.0)
+    trail_fallback = float(grid_cfg.get("bias_trail_activate_usd", 5.0) or 5.0)
+
+    rows = []
+    for (acc, sym, mg), arm in ExecBridge._last_arm.items():
+        if account and str(acc) != str(account):
+            continue
+        if not arm.get("active"):
+            continue
+        tf = tf_from_magic(int(mg or 0))
+        net = float(by_tf.get(tf, base_fallback) or base_fallback)
+        trail = float(act_by_tf.get(tf, trail_fallback) or trail_fallback)
+        if arm.get("squeeze_ok"):
+            net   *= sq_t_mult
+            trail *= sq_trail_mult
+        open_s = ExecBridge.get_open(str(acc), sym, magic=int(mg or 0))
+        rows.append({
+            "account": str(acc), "symbol": sym, "magic": mg, "tf": tf,
+            "trigger_kind": arm.get("trigger_kind", ""),
+            "fulcrum": arm.get("fulcrum", 0.0),
+            "buy_n": arm.get("buy_n", 0), "sell_n": arm.get("sell_n", 0),
+            "buys_open": open_s.get("buys", 0), "sells_open": open_s.get("sells", 0),
+            "pendings": open_s.get("pendings", 0),
+            "net_target": net, "bias_trail_activate": trail,
+            "bias_trail_giveback_pct": giveback,
+            "bias_booked": bool(arm.get("bias_booked")),
+            "bias_peak": round(float(arm.get("bias_peak") or 0.0), 2),
+            "tp_up": arm.get("tp_up", 0.0), "tp_down": arm.get("tp_down", 0.0),
+            "squeeze_ok": bool(arm.get("squeeze_ok")),
+        })
+    return jsonify({"ok": True, "cycles": rows})
 
 
 @bp.post("/exec/close_magic")

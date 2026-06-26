@@ -365,9 +365,12 @@ def _rolling_hvn(symbol: str, tf: str, bars: list[Bar]) -> list[tuple[float, flo
     if len(bars) < win:
         return []
     try:
-        from pipeline.features.volume_profile import compute as vp_compute, DEFAULT_BIN_SIZE
+        # Honor the configured vp_bin_size[symbol] (falls back to DEFAULT_BIN_SIZE) so the
+        # rolling VP matches the cached daily VP — else a config bin change only affects the
+        # cache and the rolling source (the trigger's primary) keeps the hardcoded default.
+        from pipeline.features.volume_profile import compute as vp_compute, _resolve_bin_size
         vp = vp_compute(bars[-win:], "daily", bars[-1].ohlc.c,
-                        bin_size=DEFAULT_BIN_SIZE.get(symbol))
+                        bin_size=_resolve_bin_size(symbol))
         return [(float(z["low"]), float(z["high"])) for z in (vp.hvn_zones or [])]
     except Exception:
         return []
@@ -932,6 +935,65 @@ def bb_edge_vote(symbol: str, tf: str, cfg: dict | None = None) -> tuple[int, st
     return 0, f"px {z:.1f}σ (inside edge)"
 
 
+def bb_tp(bars: list, cfg: dict | None = None) -> tuple[float, float]:
+    """Upper/lower Bollinger Band levels as a last-resort TP when no structural exit exists.
+
+    Used as the final fallback in the TP cascade (after HVN far-edge, VAH/VAL/LVN, POC,
+    fib-ext) so a cycle always has a target rather than 0. Band recomputed each refresh,
+    so the target tracks the live regime rather than a frozen arm-time level.
+
+    Returns (bb_upper, bb_lower) at `bb_tp_sigma` (default 2.5) stddevs from the
+    `squeeze_bb_period`-bar (default 20) SMA. Both 0.0 when bars are insufficient.
+    """
+    cfg = cfg or {}
+    period = int(cfg.get("squeeze_bb_period", 20))
+    sigma = float(cfg.get("bb_tp_sigma", 2.5))
+    if len(bars) < period:
+        return 0.0, 0.0
+    closes = [float(b.ohlc.c) for b in bars[-period:]]
+    sma = sum(closes) / period
+    var = sum((c - sma) ** 2 for c in closes) / period
+    sd = math.sqrt(var)
+    if sd <= 0:
+        return 0.0, 0.0
+    return round(sma + sigma * sd, 4), round(sma - sigma * sd, 4)
+
+
+# London open (07:30–10:00 UTC) and NY open (13:30–16:00 UTC).
+_SESSION_WINDOWS_UTC: list[tuple[int, int, int, int]] = [
+    (7, 30, 10, 0),
+    (13, 30, 16, 0),
+]
+
+
+def in_session_window(now_utc=None) -> bool:
+    """True when current UTC time is inside a London or NY open momentum window."""
+    from datetime import datetime, timezone
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    t = now_utc.hour * 60 + now_utc.minute
+    return any(h0 * 60 + m0 <= t < h1 * 60 + m1
+               for h0, m0, h1, m1 in _SESSION_WINDOWS_UTC)
+
+
+def session_atr_ratio(bars, window: int = 20) -> float:
+    """Ratio of smoothed-recent bar range to rolling-mean range.
+    Uses the last 3 bars as 'current' (avoids single-bar spikes) vs the preceding
+    `window` bars as the baseline. Returns 1.0 when insufficient data."""
+    if not bars or len(bars) < window + 4:
+        return 1.0
+    try:
+        ranges = [float(b.high - b.low) for b in bars
+                  if hasattr(b, "high") and hasattr(b, "low")]
+        if len(ranges) < window + 4:
+            return 1.0
+        current  = sum(ranges[-3:]) / 3.0
+        baseline = sum(ranges[-window - 3:-3]) / window
+        return current / baseline if baseline > 0 else 1.0
+    except Exception:
+        return 1.0
+
+
 def squeeze_gate(symbol: str, tf: str, cfg: dict | None = None) -> tuple[bool, float]:
     """Vol-compression GATE for grid arming (NOT a release trigger). A neutral straddle
     should only be placed when volatility has COILED — it profits on the expansion either
@@ -1127,6 +1189,220 @@ def _t_squeeze(symbol: str, tf: str, current_price: float, atr: float,
     )
 
 
+def _t_bb_expansion_touch(symbol: str, tf: str, current_price: float, atr: float,
+                          cfg: dict | None = None) -> Trigger | None:
+    """Post-squeeze BB expansion + band edge touch trigger.
+
+    Pattern (all three required):
+      1. BBW was coiled (rank ≤ bbw_pct) for ≥ squeeze_min_on_bars within the last
+         bb_expansion_post_squeeze_bars bars, and has since released.
+      2. Price wick reached the bb_expansion_touch_sigma band (default 2.5σ) within the
+         last bb_expansion_touch_lookback bars during the expansion phase.
+      3. HTF BB direction (bb_htf_bias) HARD-GATES: upper-band touch requires HTF bearish
+         (≤ −1); lower-band touch requires HTF bullish (≥ +1).  Disable with
+         bb_expansion_htf_gate: false.
+
+    Footprint overlay (bb_expansion_fp_gate: true):
+      close_failure_absorption on the touching bar → fp_signal="absorption" (reversal)
+      no absorption + delta confirming direction → fp_signal="continuation"
+
+    Fulcrum = BB mid (20-SMA) at the touch bar — the natural invalidation SL.
+    The counter-side SL is wired to this fulcrum in grid_planner (same mechanic as
+    hvn_displacement's candle-extreme SL).
+    """
+    cfg = cfg or {}
+    if not bool(cfg.get("bb_expansion_touch_enabled", True)):
+        return None
+
+    period       = int(cfg.get("squeeze_bb_period", 20))
+    bb_mult      = float(cfg.get("squeeze_bb_mult", 3.0))
+    bbw_pct      = float(cfg.get("squeeze_bbw_pct", 0.15))
+    bbw_window   = int(cfg.get("squeeze_bbw_window", 100))
+    min_on       = int(cfg.get("squeeze_min_on_bars", 6))
+    post_bars    = int(cfg.get("bb_expansion_post_squeeze_bars", 10))
+    touch_sigma  = float(cfg.get("bb_expansion_touch_sigma", 2.5))
+    touch_lb     = int(cfg.get("bb_expansion_touch_lookback", 3))
+    htf_gate     = bool(cfg.get("bb_expansion_htf_gate", True))
+    fp_gate      = bool(cfg.get("bb_expansion_fp_gate", True))
+
+    from pipeline.state_store import store
+    need = period + bbw_window + post_bars + touch_lb + 8
+    bars = store().recent(symbol, tf, need)
+    n = len(bars)
+    if n < period + bbw_window + 2:
+        return None
+
+    closes = [b.ohlc.c for b in bars]
+
+    def _sd(vals: list[float]) -> float:
+        m = sum(vals) / len(vals)
+        return math.sqrt(sum((v - m) ** 2 for v in vals) / len(vals))
+
+    # --- precompute BBW + per-bar BB bands ---
+    bbw        = [0.0] * n
+    bb_mid_a   = [0.0] * n
+    bb_upper_a = [0.0] * n   # at touch_sigma
+    bb_lower_a = [0.0] * n
+
+    for e in range(period - 1, n):
+        w   = closes[e - period + 1:e + 1]
+        mid = sum(w) / len(w)
+        sd  = _sd(w)
+        bb_mid_a[e]   = mid
+        bb_upper_a[e] = mid + touch_sigma * sd
+        bb_lower_a[e] = mid - touch_sigma * sd
+        bbw[e] = (2.0 * bb_mult * sd) / mid if mid > 0 else 0.0
+
+    def _rank(e: int) -> float:
+        lo = e - bbw_window + 1
+        if lo < period - 1:
+            return 1.0
+        hist = bbw[lo:e + 1]
+        return sum(1 for v in hist if v <= bbw[e]) / len(hist)
+
+    last = n - 1
+
+    # Step 1 — must be in expansion now (not still coiled)
+    if _rank(last) <= bbw_pct:
+        return None
+
+    # Step 2 — find the most recent coil that ended within post_bars + touch_lb bars
+    coil_end = -1
+    min_coil_rank = 1.0
+    coil_run = 0
+    scan_limit = min(last - (period - 1), post_bars + touch_lb + 6)
+    for i in range(1, scan_limit + 1):
+        e = last - i
+        if e < period - 1:
+            break
+        if _rank(e) <= bbw_pct:
+            # walk backwards to measure consecutive coil run
+            k, run = e, 0
+            while k >= period - 1 and _rank(k) <= bbw_pct:
+                r = _rank(k)
+                if r < min_coil_rank:
+                    min_coil_rank = r
+                run += 1
+                k -= 1
+            if run >= min_on:
+                coil_end = e
+                coil_run = run
+            break   # only need the most recent coil
+
+    if coil_end < 0:
+        return None
+
+    bars_since_release = last - coil_end
+    if bars_since_release > post_bars + touch_lb:
+        return None
+
+    # Step 3 — band touch within the expansion window (coil_end+1 … last, up to touch_lb)
+    touch_idx  = -1
+    touch_side = ""
+    touch_price = 0.0
+    touch_bb_mid = 0.0
+
+    scan_from = max(coil_end + 1, last - touch_lb + 1)
+    for i in range(last, scan_from - 1, -1):
+        if bb_upper_a[i] <= 0:
+            continue
+        bar_i = bars[i]
+        if bar_i.ohlc.h >= bb_upper_a[i]:
+            touch_idx  = i
+            touch_side = "upper"
+            touch_price = bb_upper_a[i]
+            touch_bb_mid = bb_mid_a[i]
+            break
+        if bar_i.ohlc.l <= bb_lower_a[i]:
+            touch_idx  = i
+            touch_side = "lower"
+            touch_price = bb_lower_a[i]
+            touch_bb_mid = bb_mid_a[i]
+            break
+
+    if touch_idx < 0:
+        return None
+
+    # Step 4 — HTF hard gate: upper touch needs HTF bearish; lower needs HTF bullish
+    htf_vote, htf_why = bb_htf_bias(symbol, tf, cfg)
+    if htf_gate:
+        if touch_side == "upper" and htf_vote >= 0:
+            return None
+        if touch_side == "lower" and htf_vote <= 0:
+            return None
+
+    bias_dir = "sell" if touch_side == "upper" else "buy"
+
+    # Step 5 — footprint at the touch bar
+    fp_signal = "neutral"
+    if fp_gate:
+        try:
+            from pipeline.footprint import build as build_fp
+            from pipeline.features.absorption import detect_close_failure_absorption
+            from pipeline.features.delta import bar_delta
+            touch_bar = bars[touch_idx]
+            fp = build_fp(touch_bar)
+            absorbs = detect_close_failure_absorption(touch_bar, fp)
+            delta   = bar_delta(fp)
+            absorb_sides = {a.side for a in absorbs}
+            if touch_side == "upper" and "sell" in absorb_sides:
+                fp_signal = "absorption"   # buyers pushed to upper BB, got absorbed
+            elif touch_side == "lower" and "buy" in absorb_sides:
+                fp_signal = "absorption"   # sellers pushed to lower BB, got absorbed
+            elif touch_side == "upper" and delta > 0:
+                fp_signal = "continuation" # aggressive buyers at upper BB → breakout
+            elif touch_side == "lower" and delta < 0:
+                fp_signal = "continuation" # aggressive sellers at lower BB → breakdown
+        except Exception:
+            pass
+
+    # confidence: coil depth + footprint boost + HTF strength
+    depth = max(0.0, (bbw_pct - min_coil_rank) / bbw_pct) if bbw_pct > 0 else 0.0
+    conf  = min(0.90, 0.55 + 0.30 * depth)
+    if fp_signal == "absorption":
+        conf = min(0.95, conf + 0.10)
+    conf = min(0.95, conf + 0.03 * abs(htf_vote))
+
+    # raw_range = full BB width at touch bar (feeds step sizing)
+    raw_range = bb_upper_a[touch_idx] - bb_lower_a[touch_idx]
+    if raw_range <= 0:
+        raw_range = 3.0 * atr if atr > 0 else 1.0
+
+    # TP: next HVN beyond the touch side
+    tp_up, tp_down = 0.0, 0.0
+    try:
+        from pipeline.features.vp_cache import get as vp_get
+        _dvp   = vp_get(symbol, "daily") or {}
+        _zones = [(float(z["low"]), float(z["high"]))
+                  for z in (_dvp.get("hvn_zones") or [])]
+        if _zones:
+            tp_up, tp_down = compute_hvn_tps(symbol, touch_bb_mid, _zones)
+    except Exception:
+        pass
+
+    return Trigger(
+        kind="bb_expansion_touch",
+        fulcrum_price=float(touch_price),
+        raw_range=float(raw_range),
+        confidence=float(conf),
+        context={
+            "bias":               bias_dir,
+            "interpretation":     ("reversal"      if fp_signal == "absorption"
+                                   else "continuation" if fp_signal == "continuation"
+                                   else "fade"),
+            "touch_side":         touch_side,
+            "touch_price":        round(touch_price, 4),
+            "bb_mid":             round(touch_bb_mid, 4),
+            "htf_why":            htf_why,
+            "fp_signal":          fp_signal,
+            "coil_bars":          int(coil_run),
+            "bars_since_release": int(bars_since_release),
+            "tp_up":              float(tp_up),
+            "tp_down":            float(tp_down),
+        },
+    )
+
+
 def _t_cvd_div(symbol: str, tf: str, current_price: float, latest: Bar | None) -> Trigger | None:
     """CVD / delta divergence pivot. Exhaustion at the current bar's extreme is
     the fulcrum; bias points toward the divergence resolution."""
@@ -1282,6 +1558,7 @@ def detect_all(symbol: str, tf: str, current_price: float, regime,
         _t_va(symbol, current_price, regime, daily_vp),
         _t_vp_level_touch(symbol, tf, current_price, daily_vp, atr, cfg),
         _t_squeeze(symbol, tf, current_price, atr, cfg),
+        _t_bb_expansion_touch(symbol, tf, current_price, atr, cfg),
         _t_cvd_div(symbol, tf, current_price, latest),
     ):
         if t is not None:

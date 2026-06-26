@@ -20,16 +20,16 @@ ACCOUNT="${2:?account login required (e.g. 25230425)}"
 SYMBOL="${3:-XAUUSD+}"
 
 # Per-TF setup lists:
-#   1m  — hvn_inside_touch only
-#   5m  — hvn_inside_touch + squeeze + hvn_displacement + hvn_edge
-#   15m — hvn_inside_touch + squeeze + hvn_displacement + hvn_edge
+#   1m  — hvn_inside_touch + bb_expansion_touch
+#   5m  — hvn_inside_touch + squeeze + hvn_displacement + hvn_edge + bb_expansion_touch
+#   15m — hvn_inside_touch + squeeze + hvn_displacement + hvn_edge + bb_expansion_touch
 # hvn_edge reads the SAME daily/weekly VP the chart draws (vp_cache.get), so it arms
 # on the HVN edge-touch you see on the chart — unlike hvn_inside_touch, which measures
 # the rolling-window VP and a stricter close-inside+wick-reject geometry.
 # Override per-TF with FB_SETUPS_1M / FB_SETUPS_5M / FB_SETUPS_15M env vars.
-SETUPS_1M=(${FB_SETUPS_1M:-hvn_inside_touch})
-SETUPS_5M=(${FB_SETUPS_5M:-hvn_inside_touch squeeze hvn_displacement hvn_edge})
-SETUPS_15M=(${FB_SETUPS_15M:-hvn_inside_touch squeeze hvn_displacement hvn_edge})
+SETUPS_1M=(${FB_SETUPS_1M:-hvn_inside_touch bb_expansion_touch})
+SETUPS_5M=(${FB_SETUPS_5M:-hvn_inside_touch squeeze hvn_displacement hvn_edge bb_expansion_touch})
+SETUPS_15M=(${FB_SETUPS_15M:-hvn_inside_touch squeeze hvn_displacement hvn_edge bb_expansion_touch})
 SETUPS_1H=(${FB_SETUPS_1H:-hvn_displacement})
 
 emit_loop() {
@@ -64,11 +64,11 @@ else:
   done
 }
 
-# Uniform 1m TP/order refresh: every 1m bar close, re-target EVERY active cycle (any TF)
-# against the live HVN — so all orders track structure at a steady 1m cadence regardless
-# of which TF armed them. Independent of the emit setups (refresh ≠ arm).
+# TP/order refresh: re-target EVERY active cycle (any TF) against the live HVN. Cadence
+# raised 60s→300s to cut broker order-modification rate (the server-side modify_cooldown_s
+# is the hard per-cycle cap; this just lowers how often we even attempt a re-target).
 refresh_loop() {
-  local interval=60 offset=5
+  local interval=300 offset=5
   echo "[refresh] started — every ${interval}s → re-target all active cycles"
   while true; do
     local now next sleep_s ts resp n

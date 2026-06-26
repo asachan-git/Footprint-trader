@@ -60,9 +60,11 @@ MODIFY_POSITION = "MODIFY_POSITION"  # refresh TP on one side's filled positions
 
 # ── per-strategy × per-TF magic scheme ───────────────────────────────────────
 # magic = MAGIC_BASE + strat_code·10 + tf_code  →  e.g. hvn·15m = 770013,
-# squeeze·1h = 770024. The EA owns the whole [MAGIC_BASE, MAGIC_BASE+99] range; the
-# tf is recoverable as magic % 10, so the server can attribute each EA-reported
-# position pool to the TF cycle that owns it (enables parallel per-TF cycles).
+# squeeze·1h = 770024. Each strategy occupies its own decade (strat·10 .. strat·10+9);
+# the tf is recoverable as magic % 10, so the server attributes each EA-reported position
+# pool to the TF cycle that owns it (enables parallel per-TF cycles). NOTE: strat_code can
+# exceed 9 (hvn_displacement=10 → 7701xx), so the owned upper bound is derived from the max
+# strat code below — NOT a hardcoded +100 (that silently dropped displacement cycles).
 MAGIC_BASE = 770000
 _STRAT_CODE = {
     "hvn_inside_touch": 1, "squeeze": 2, "vp_level_touch": 3, "imbalance": 4,
@@ -74,6 +76,10 @@ _STRAT_CODE = {
 }
 _TF_CODE = {"1m": 1, "5m": 2, "15m": 3, "1h": 4}
 _CODE_TF = {v: k for k, v in _TF_CODE.items()}
+# Upper bound of our owned magic range, derived from the highest strat decade (+9 for tf,
+# +1 exclusive). With hvn_displacement=10 this is 770110 — so 7701xx displacement magics
+# are recognized instead of being silently treated as "not ours" by a hardcoded +100.
+_MAGIC_MAX = MAGIC_BASE + (max(_STRAT_CODE.values()) + 1) * 10
 
 
 def magic_for(trigger_kind: str, tf: str) -> int:
@@ -83,9 +89,31 @@ def magic_for(trigger_kind: str, tf: str) -> int:
 
 def tf_from_magic(magic: int) -> str:
     """Recover the TF a magic belongs to (magic % 10). '' if not one of ours."""
-    if magic < MAGIC_BASE or magic >= MAGIC_BASE + 100:
+    if magic < MAGIC_BASE or magic >= _MAGIC_MAX:
         return ""
     return _CODE_TF.get(int(magic) % 10, "")
+
+
+_MODIFY_COOLDOWN_CACHE: float | None = None
+
+
+def _modify_cooldown_s() -> float:
+    """Min seconds between MODIFY enqueues per (cycle, side, kind) — broker order-rate cap.
+    Read once from grid_levels.modify_cooldown_s (default 0 = no throttle)."""
+    global _MODIFY_COOLDOWN_CACHE
+    if _MODIFY_COOLDOWN_CACHE is None:
+        v = 0.0
+        try:
+            import yaml as _yaml
+            import pathlib as _pl
+            _cfg = _yaml.safe_load(
+                (_pl.Path(__file__).resolve().parent.parent / "config" / "settings.yaml").read_text()
+            ) or {}
+            v = float((_cfg.get("grid_levels") or {}).get("modify_cooldown_s", 0.0) or 0.0)
+        except Exception:
+            v = 0.0
+        _MODIFY_COOLDOWN_CACHE = max(0.0, v)
+    return _MODIFY_COOLDOWN_CACHE
 
 
 _RECLAIM_AFTER_S = 10.0   # IN_FLIGHT with no ack this long → back to PENDING
@@ -141,6 +169,7 @@ class ExecBridge:
     _quotes: dict[tuple, dict] = {}         # (account, broker_symbol) → {bid,ask,mid,ts}
     _last_emit: dict[tuple, float] = {}     # (account, symbol, tf) → last emitted fulcrum
     _last_arm: dict[tuple, dict] = {}       # (account, broker_symbol) → last armed grid metadata
+    _last_modify_ts: dict[tuple, float] = {}  # (acct, sym, magic, side, kind) → last MODIFY enqueue ts (broker-rate throttle)
     _open: dict[tuple, dict] = {}           # (account, broker_symbol) → {positions, pendings, ts}
     _ict_overlay: dict[str, dict] = {}      # analysis_symbol → ict_fvg setup (analysis frame)
     # daily P&L target tracking — keyed by account
@@ -510,7 +539,14 @@ class ExecBridge:
                 if peak != float(cyc.get("bias_peak") or 0.0):
                     cyc["bias_peak"] = peak
                     cls.set_last_arm(account, symbol, **cyc)
-                activate = float(grid_cfg.get("bias_trail_activate_usd", 5.0) or 0.0)
+                # Per-TF activate (mirrors cycle_net_target_by_tf): scale the trail-arm
+                # threshold to the TF so a big-target cycle isn't BE-locked on a tiny wiggle.
+                _act_by_tf = grid_cfg.get("bias_trail_activate_by_tf") or {}
+                _act_base = grid_cfg.get("bias_trail_activate_usd", 5.0)
+                activate = float((_act_by_tf.get(tf, _act_base) if isinstance(_act_by_tf, dict)
+                                  else _act_base) or 0.0)
+                if cyc.get("squeeze_ok"):
+                    activate *= float(grid_cfg.get("squeeze_trail_mult", 1.0) or 1.0)
                 giveback = float(grid_cfg.get("bias_trail_giveback_pct", 40.0) or 0.0)
                 book_frac = float(grid_cfg.get("bias_book_frac", 0.5) or 0.5)
                 if (activate > 0 and peak >= activate
@@ -543,6 +579,9 @@ class ExecBridge:
         by_tf = grid_cfg.get("cycle_net_target_by_tf") or {}
         if isinstance(by_tf, dict) and tf and tf in by_tf:
             base_target = float(by_tf.get(tf) or base_target)
+        if cyc.get("squeeze_ok"):
+            sq_mult = float(grid_cfg.get("squeeze_target_mult", 1.0) or 1.0)
+            base_target *= sq_mult
         if reason is None and base_target > 0 and pnl is not None \
                 and buys is not None and sells is not None:
             decay = float(grid_cfg.get("cycle_hedge_decay_pct", 0.0) or 0.0) / 100.0
@@ -712,40 +751,87 @@ class ExecBridge:
         sell_tp = getattr(plan, "sell_tp", 0.0) if leg_tp else 0.0
         buy_sl  = getattr(plan, "buy_sl",  0.0)
         sell_sl = getattr(plan, "sell_sl", 0.0)
+        # Breakout straddle: buy_stop ABOVE the trigger, sell_stop BELOW it — STOPS ONLY.
+        # A buy leg the market has already risen above can't be a buy_stop (a stop below
+        # market is invalid) and we do NOT flip it to a buy_limit (that would be a dip-buy,
+        # the opposite thesis). Same for a sell leg below market. Such behind-market legs
+        # are breakout levels price already cleared → SKIPPED (logged), not placed. When no
+        # live quote is cached, place all (the EA's own freeze guard is the backstop).
+        _q = cls.get_quote(account, broker_symbol) or {}
+        _ask = float(_q.get("ask") or 0.0)
+        _bid = float(_q.get("bid") or 0.0)
+        _skipped_buy = _skipped_sell = 0
         for i, leg in enumerate(getattr(plan, "buy_legs", []) or []):
+            if _ask > 0 and leg.price <= _ask:   # below market → not a valid buy_stop
+                _skipped_buy += 1
+                continue
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="buy_stop",
                 price=leg.price, lot=leg.lot, sl=buy_sl, tp=buy_tp,
                 comment=f"FB|{tag}|{tf_tag}|b{i + 1}", magic=magic))
         for i, leg in enumerate(getattr(plan, "sell_legs", []) or []):
+            if _bid > 0 and leg.price >= _bid:    # above market → not a valid sell_stop
+                _skipped_sell += 1
+                continue
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="sell_stop",
                 price=leg.price, lot=leg.lot, sl=sell_sl, tp=sell_tp,
                 comment=f"FB|{tag}|{tf_tag}|s{i + 1}", magic=magic))
+        if _skipped_buy or _skipped_sell:
+            import logging
+            logging.getLogger(__name__).info(
+                f"[exec] {broker_symbol} magic={magic}: skipped {_skipped_buy} buy + "
+                f"{_skipped_sell} sell leg(s) already behind market (bid={_bid} ask={_ask}) "
+                f"— breakout straddle places stops only")
         return out
+
+    @classmethod
+    def _modify_throttled(cls, account: str, broker_symbol: str, magic: int,
+                          side: str, kind: str) -> bool:
+        """Broker-rate throttle: at most one MODIFY per (cycle, side, kind) every
+        grid_levels.modify_cooldown_s seconds. A full refresh batch (buy/sell/fulcrum =
+        distinct side/kind keys) passes the first time, then is suppressed until the
+        cooldown elapses — keeps the per-account order-modification rate well under the
+        levels that trip broker HFT-abuse limits. 0/absent cooldown = no throttle."""
+        cd = _modify_cooldown_s()
+        if cd <= 0:
+            return False
+        k = (str(account), broker_symbol, int(magic), side or "", kind)
+        now = time.time()
+        with cls._lock:
+            if now - cls._last_modify_ts.get(k, 0.0) < cd:
+                return True
+            cls._last_modify_ts[k] = now
+        return False
 
     @classmethod
     def enqueue_modify_pending(cls, account: str, broker_symbol: str, magic: int,
                                price_delta: float, new_tp: float = 0.0,
-                               side: str = "") -> "Command":
+                               side: str = "") -> "Command | None":
         """Shift all pending stop orders for `magic` by `price_delta` and update TP.
 
         price_delta: signed pts to add to each pending's current price (+ = up, - = down).
         new_tp: replacement TP for all legs on that side; 0 = leave unchanged.
-        side: "buy", "sell", or "" (both).
-        """
+        side: "buy", "sell", or "" (both). Returns None when throttled (rate cap)."""
+        # kind distinguishes a fulcrum SHIFT (price_delta) from a TP-only refresh so the two
+        # don't share a cooldown slot (each is independently rate-limited).
+        _kind = "pend_shift" if abs(price_delta) > 0 else "pend_tp"
+        if cls._modify_throttled(account, broker_symbol, magic, side, _kind):
+            return None
         return cls.enqueue(account, MODIFY_PENDING, broker_symbol,
                            magic=magic, price=price_delta, tp=new_tp, side=side)
 
     @classmethod
     def enqueue_modify_position(cls, account: str, broker_symbol: str, magic: int,
                                 new_tp: float, side: str = "",
-                                comment: str = "") -> "Command":
+                                comment: str = "") -> "Command | None":
         """Refresh TP on FILLED positions for `magic` on `side` (SL left unchanged).
 
         Complements enqueue_modify_pending: pending legs track the HVN via MODIFY_PENDING,
-        filled legs track it via this. side: "buy", "sell", or "" (both).
-        """
+        filled legs track it via this. side: "buy", "sell", or "" (both). Returns None when
+        throttled (broker-rate cap)."""
+        if cls._modify_throttled(account, broker_symbol, magic, side, "pos_tp"):
+            return None
         return cls.enqueue(account, MODIFY_POSITION, broker_symbol,
                            magic=magic, tp=new_tp, side=side, comment=comment)
 
@@ -842,10 +928,24 @@ class ExecBridge:
                 if positions <= 0:
                     continue
                 existing = cls.get_last_arm(account, broker_symbol, magic=mg)
-                if existing:
+                if existing and existing.get("active"):
+                    continue  # already tracked
+                if existing and not existing.get("active"):
+                    # Reaped (active=False) but positions still open in MT5 — reaper fired
+                    # before the EA reported orders within the placement grace window.
+                    # Reactivate using original arm metadata so net_target/bias_trail manage them.
+                    reactivated = dict(existing)
+                    reactivated["active"] = True
+                    reactivated["max_pos_seen"] = max(int(existing.get("max_pos_seen") or 0), positions)
+                    cls.set_last_arm(account, broker_symbol, magic=mg, **reactivated)
+                    stubbed.append(mg)
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"[exec_bridge] reconcile: reactivated reaped magic {mg} "
+                        f"({positions} positions) for {account}/{broker_symbol}")
                     continue
-                # Orphaned live position — create a stub that marks cycle as active
-                # so monitor_cycle tracks P&L and position_open gate fires.
+                # No entry at all — create a minimal stub so monitor_cycle can
+                # track P&L and the position_open gate fires correctly.
                 tf_stub = tf_from_magic(mg) or "1m"
                 stub = {
                     "active": True, "armed_tf": tf_stub, "tf": tf_stub,

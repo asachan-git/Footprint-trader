@@ -1,7 +1,7 @@
 """Trading session detection + HTF SMA bias.
 
 Session windows (UTC):
-  Asia:             00:00 - 07:00  — low liquidity (esp. for gold)
+  Asia:             22:00 - 07:00  — gold reopens 22:00 UTC (CME open)
   London:           07:00 - 12:00  — high activity
   London+NY Overlap: 12:00 - 16:00 — highest liquidity, best setups
   NY:               16:00 - 21:00  — good activity
@@ -43,15 +43,15 @@ def current_session(ts: int | None = None, symbol: str | None = None) -> Session
     Without symbol: uses the generic Forex/equity schedule (off during Asia + Off).
     """
     utc_hour = int(time.gmtime(ts or time.time()).tm_hour)
-    if 0 <= utc_hour < 7:
+    if utc_hour >= 22 or utc_hour < 7:   # 22:00-07:00 UTC — gold reopens at 22:00
         session = "Asia"
-    elif 7 <= utc_hour < 12:
+    elif utc_hour < 12:
         session = "London"
-    elif 12 <= utc_hour < 16:
+    elif utc_hour < 16:
         session = "Overlap"
-    elif 16 <= utc_hour < 21:
+    elif utc_hour < 21:
         session = "NY"
-    else:
+    else:                                  # 21:00-22:00 UTC — gold inactive gap
         session = "Off"
 
     if symbol is not None and symbol in _SYMBOL_INACTIVE_HOURS:
