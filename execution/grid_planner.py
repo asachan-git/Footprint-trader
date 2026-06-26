@@ -263,11 +263,12 @@ def _candle_conviction(symbol: str, tf: str) -> float:
 
 def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
                conviction: float, hvn_max_legs: int = 8,
-               lvn_legs_per_side: int = 1) -> tuple[int, float]:
+               lvn_legs_per_side: int = 1,
+               mean_rev_step_mult: float = MEAN_REV_STEP_MULT) -> tuple[int, float]:
     """N (capped by regime.max_legs) and step ($) from ATR + swing range +
     candle conviction. HVN node width floors the step so legs span the node."""
     rtype = getattr(regime, "type", "uncertain")
-    step_mult = TREND_STEP_MULT if rtype in ("trend_up", "trend_down") else MEAN_REV_STEP_MULT
+    step_mult = TREND_STEP_MULT if rtype in ("trend_up", "trend_down") else mean_rev_step_mult
     max_legs = int(getattr(regime, "max_legs", 5) or 5)
 
     # LVN displacement (straddle-in-vacuum): step = node_width/2 puts the inner buy/
@@ -487,6 +488,7 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     # TF is known here, so hvn_max_legs_by_tf (keyed "1m"/"5m"/"15m"/"1h") overrides the
     # global hvn_max_legs. Any TF absent falls back to the global.
     hvn_max_legs = int(grid_cfg.get("hvn_max_legs", 8))
+    mean_rev_step_mult = float(grid_cfg.get("mean_rev_step_mult") or MEAN_REV_STEP_MULT)
     _legs_by_tf = grid_cfg.get("hvn_max_legs_by_tf") or {}
     if isinstance(_legs_by_tf, dict) and tf and tf in _legs_by_tf:
         hvn_max_legs = int(_legs_by_tf.get(tf) or hvn_max_legs)
@@ -615,7 +617,8 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     conviction = _candle_conviction(symbol, tf)
     n, step = _size_grid(fulcrum_t, regime, atr, swing_range, conviction,
                          hvn_max_legs=hvn_max_legs,
-                         lvn_legs_per_side=lvn_legs_per_side)
+                         lvn_legs_per_side=lvn_legs_per_side,
+                         mean_rev_step_mult=mean_rev_step_mult)
     # Freeze-aware floor: ensure the innermost leg (fulcrum ± step) clears the broker's
     # min-stop distance. min_step_venue is in the VENUE frame; convert to the analysis
     # frame here (× current/venue) since the step is rebased back by venue/current later.

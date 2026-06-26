@@ -50,6 +50,7 @@ grid_levels:
 
   # Ladder shape
   hvn_max_legs_by_tf: {1m: 4, 5m: 5, 15m: 6, 1h: 7}   # legs per side per TF
+  mean_rev_step_mult: 0.30   # step = this × ATR between legs (lower = tighter grid, faster TP hits)
 
   # Cycle profit targets — primary basket exit (net floating ≥ target → CLOSE_ALL)
   # Values are in native account currency (USC cents for Vantage XAUUSD.pc cent account;
