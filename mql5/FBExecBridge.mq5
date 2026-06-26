@@ -1516,15 +1516,13 @@ void DashRow(int row, const string text, color clr)
 {
    string name = DASH_PREFIX + IntegerToString(row);
    if(ObjectFind(0, name) < 0)
-   {
       ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
-      ObjectSetInteger(0, name, OBJPROP_CORNER,     CORNER_LEFT_UPPER);
-      ObjectSetInteger(0, name, OBJPROP_ANCHOR,     ANCHOR_LEFT_UPPER);
-      ObjectSetInteger(0, name, OBJPROP_XDISTANCE,  10);
-      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
-      ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
-      ObjectSetString (0, name, OBJPROP_FONT,       "Consolas");
-   }
+   ObjectSetInteger(0, name, OBJPROP_CORNER,     CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR,     ANCHOR_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE,  10);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+   ObjectSetString (0, name, OBJPROP_FONT,       "Consolas");
    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, 18 + row * (InpDashFontSize + 8));
    ObjectSetInteger(0, name, OBJPROP_FONTSIZE,  InpDashFontSize);
    ObjectSetInteger(0, name, OBJPROP_COLOR,     clr);
