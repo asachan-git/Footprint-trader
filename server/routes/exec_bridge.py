@@ -1187,35 +1187,22 @@ def exec_zones():
             "cycles": matched,
         })
 
-    # CVD divergence signals — scan recent bars on the zone TF so the EA can mark
-    # divergence candles with arrows. Looks back `cvd_lookback` bars (default 50) for
-    # any bar where price broke the prior-window extreme but delta lagged.
+    # CVD divergence signals — same pivot-based algorithm as the footprint dashboard
+    # (scan_divergences: swing high/low pairs where price makes new extreme but CVD lags).
     cvd_signals = []
     try:
-        from pipeline.features.delta_divergence import detect as _cvd_detect
+        from pipeline.features.cvd_candlestick import scan_divergences as _cvd_scan
         from pipeline.state_store import store as _cvd_store
         _cvd_tf = zone_tf or "15m"
-        _cvd_window = 5
-        _cvd_lookback = 50
-        # TF → seconds so we can compute bar OPEN time (MT5 bars are keyed by open time).
         _tf_secs = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400,
                     "1d": 86400}.get(_cvd_tf, 900)
-        _cvd_bars = _cvd_store().recent(symbol, _cvd_tf, _cvd_lookback + _cvd_window + 2)
-        for _i in range(_cvd_window, len(_cvd_bars)):
-            _bar = _cvd_bars[_i]
-            _hist = _cvd_bars[max(0, _i - _cvd_window):_i]
-            _dd = _cvd_detect(_bar, _hist, window=_cvd_window)
-            if _dd.fired:
-                # price anchor: bearish → candle high (price made new high, delta failed)
-                #               bullish → candle low (price made new low, delta failed)
-                _px = _bar.ohlc.h if _dd.direction == "bearish" else _bar.ohlc.l
-                # MT5 places objects by bar OPEN time; close_ts - tf_secs = open_ts.
-                _open_ts = int(_bar.close_ts) - _tf_secs
-                cvd_signals.append({
-                    "bar_time": _open_ts,
-                    "price": _rebase_price(float(_px)),
-                    "direction": _dd.direction,
-                })
+        _cvd_bars = _cvd_store().recent(symbol, _cvd_tf, 80)
+        for _d in _cvd_scan(_cvd_bars, lookback=3):
+            cvd_signals.append({
+                "bar_time": int(_d["ts"]) - _tf_secs,
+                "price": _rebase_price(float(_d["price"])),
+                "direction": "bearish" if _d["type"] == "bear" else "bullish",
+            })
     except Exception:
         pass
 
