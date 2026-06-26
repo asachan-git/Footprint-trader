@@ -196,6 +196,50 @@ class ExecBridge:
                     best, best_ts = m, ts
             return dict(best) if best else None
 
+    @classmethod
+    def active_fulcrums(cls, account: str, broker_symbol: str) -> dict[int, float]:
+        """Per-magic venue fulcrum for every ACTIVE cycle on (account, symbol). Lets the
+        EA compute hedged loss correctly with N parallel cycles — each cycle's legs
+        measured against ITS OWN fulcrum, not one shared value. {magic: fulcrum}."""
+        out: dict[int, float] = {}
+        with cls._lock:
+            for (acc, sym, mg), m in cls._last_arm.items():
+                if acc != str(account) or sym != broker_symbol or not m.get("active"):
+                    continue
+                f = float(m.get("fulcrum", 0.0) or 0.0)
+                if mg and f > 0:
+                    out[int(mg)] = f
+        return out
+
+    @classmethod
+    def active_cycles_detail(cls, account: str, broker_symbol: str) -> list[dict]:
+        """All active cycles with full arm metadata. Used by /exec/zones to annotate
+        which cycle sits in which HVN and to build the dashboard grid_cycles array."""
+        out = []
+        with cls._lock:
+            for (acc, sym, mg), m in cls._last_arm.items():
+                if acc != str(account) or sym != broker_symbol or not m.get("active"):
+                    continue
+                f = float(m.get("fulcrum", 0.0) or 0.0)
+                if not (mg and f > 0):
+                    continue
+                out.append({
+                    "magic": int(mg),
+                    "tf": str(m.get("tf") or ""),
+                    "fulcrum": f,
+                    "edge": str(m.get("edge") or ""),
+                    "trigger_kind": str(m.get("trigger_kind") or ""),
+                    "node_low": float(m.get("node_low") or 0.0),
+                    "node_high": float(m.get("node_high") or 0.0),
+                    "tp_up":   float(m.get("tp_up") or 0.0),
+                    "tp_down": float(m.get("tp_down") or 0.0),
+                    "buy_n":   int(m.get("buy_n") or 0),
+                    "sell_n":  int(m.get("sell_n") or 0),
+                    "squeeze_ok": bool(m.get("squeeze_ok")),
+                })
+        return out
+
+
     # ── cycle monitor (server-side exit brain) ─────────────────────────────────
     @classmethod
     def monitor_cycle(cls, account: str, symbol: str, settings: dict | None, *,
