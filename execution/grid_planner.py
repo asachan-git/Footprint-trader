@@ -75,6 +75,8 @@ class GridPlan:
     # can bucket outcomes squeeze-pass vs squeeze-fail.
     squeeze_ok: bool = False
     squeeze_rank: float = 1.0
+    base_lot: float = 0.0   # ladder base — used by enqueue to re-index lots for behind-market skips
+    lot_step: float = 0.0
 
 
 # trigger-hint groups: a hint may name one kind, a comma list, or a group keyword.
@@ -795,6 +797,8 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         analysis_anchor=round(current_price, 4),
         venue_anchor=round(current_price, 4),
         trigger_context=dict(fulcrum_t.context or {}),
+        base_lot=base_lot,
+        lot_step=lot_step,
     )
 
     # Re-anchor onto the execution venue's live price (if the EA supplied one).

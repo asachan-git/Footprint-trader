@@ -761,28 +761,43 @@ class ExecBridge:
         _ask = float(_q.get("ask") or 0.0)
         _bid = float(_q.get("bid") or 0.0)
         _skipped_buy = _skipped_sell = 0
+        # Re-index lots for behind-market skips: if the nearest N legs are skipped,
+        # the placed legs get lots starting from index 1 (base_lot + 0·step, base_lot + 1·step…)
+        # rather than from their original position (which would put a 1.25-lot as the first entry).
+        _base_lot = float(getattr(plan, "base_lot", 0.0) or 0.0)
+        _lot_step = float(getattr(plan, "lot_step", 0.0) or 0.0)
+        _placed_buy = 0
         for i, leg in enumerate(getattr(plan, "buy_legs", []) or []):
             if _ask > 0 and leg.price <= _ask:   # below market → not a valid buy_stop
                 _skipped_buy += 1
                 continue
+            lot = (round(_base_lot + _placed_buy * _lot_step, 2)
+                   if _base_lot > 0 and _skipped_buy > 0 else leg.lot)
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="buy_stop",
-                price=leg.price, lot=leg.lot, sl=buy_sl, tp=buy_tp,
+                price=leg.price, lot=lot, sl=buy_sl, tp=buy_tp,
                 comment=f"FB|{tag}|{tf_tag}|b{i + 1}", magic=magic))
+            _placed_buy += 1
+        _placed_sell = 0
         for i, leg in enumerate(getattr(plan, "sell_legs", []) or []):
             if _bid > 0 and leg.price >= _bid:    # above market → not a valid sell_stop
                 _skipped_sell += 1
                 continue
+            lot = (round(_base_lot + _placed_sell * _lot_step, 2)
+                   if _base_lot > 0 and _skipped_sell > 0 else leg.lot)
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="sell_stop",
-                price=leg.price, lot=leg.lot, sl=sell_sl, tp=sell_tp,
+                price=leg.price, lot=lot, sl=sell_sl, tp=sell_tp,
                 comment=f"FB|{tag}|{tf_tag}|s{i + 1}", magic=magic))
+            _placed_sell += 1
         if _skipped_buy or _skipped_sell:
             import logging
+            _reindexed = (_base_lot > 0 and (_skipped_buy > 0 or _skipped_sell > 0))
             logging.getLogger(__name__).info(
                 f"[exec] {broker_symbol} magic={magic}: skipped {_skipped_buy} buy + "
-                f"{_skipped_sell} sell leg(s) already behind market (bid={_bid} ask={_ask}) "
-                f"— breakout straddle places stops only")
+                f"{_skipped_sell} sell leg(s) already behind market (bid={_bid} ask={_ask})"
+                + (f"; lots re-indexed from base_lot={_base_lot}" if _reindexed else "")
+                + " — breakout straddle places stops only")
         return out
 
     @classmethod
