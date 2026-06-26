@@ -374,15 +374,8 @@ def ingest():
             refresh_n = int((settings.get("vp_cache") or {}).get("intraday_refresh_bars", 5))
             if refresh_n > 0 and (bar.close_ts // 60) % refresh_n == 0:
                 try:
-                    from pipeline.features.vp_cache import build_and_save as _vp_build
-                    _vp_cfg = settings.get("vp_cache", {}) or {}
-                    _vp_build(
-                        [bar.symbol], primary_tf,
-                        session_start_utc=_vp_cfg.get("session_start_utc", {}),
-                        vp_bin_size=_vp_cfg.get("vp_bin_size", {}),
-                        venue_price_offset=_vp_cfg.get("venue_price_offset", {}),
-                        symbol_map=(settings.get("execution") or {}).get("symbol_map", {}),
-                    )
+                    from pipeline.features.vp_cache import refresh_today as _vp_today
+                    _vp_today(bar.symbol, primary_tf)
                 except Exception as e:
                     LOG.warning(f"[ingest] intraday VP refresh failed: {e}")
 

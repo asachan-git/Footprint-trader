@@ -68,6 +68,7 @@ def exec_poll():
     settings_cfg = current_app.config.get("FB_SETTINGS")
     magics = body.get("magics")
     if sym and isinstance(magics, list) and magics:
+        grid_cfg = ((settings_cfg or {}).get("grid_levels") or {})
         for m in magics:
             try:
                 mg = int(m.get("magic", 0))
@@ -75,11 +76,55 @@ def exec_poll():
                 if not tf_m:
                     continue
                 b = int(m.get("buys", 0)); s = int(m.get("sells", 0))
-                ExecBridge.set_open(account, sym, b + s, int(m.get("pendings", 0)), tf=tf_m, magic=mg)
+                pend = int(m.get("pendings", 0))
+                buy_pnl  = float(m.get("buy_pnl",  0.0))
+                sell_pnl = float(m.get("sell_pnl", 0.0))
+                ExecBridge.set_open(account, sym, b + s, pend, tf=tf_m, magic=mg)
+
+                # Stateless trail SL — fires purely from live poll data, no arm state
+                # needed. EA's "only improve" guard acts as the ratchet: it will never
+                # widen a stop already set, so sending locked_pnl every poll is safe.
+                # When P&L is at peak the SL tightens; when P&L retraces the server
+                # sends a lower value and the EA silently skips it.
+                if bool(grid_cfg.get("bias_trail_enabled", True)) and (b + s) > 0:
+                    combined = buy_pnl + sell_pnl
+                    _act_by_tf = grid_cfg.get("bias_trail_activate_by_tf") or {}
+                    activate   = float(_act_by_tf.get(tf_m) or grid_cfg.get("bias_trail_activate_usd", 5.0) or 0.0)
+                    if activate > 0 and combined >= activate:
+                        bias  = "buy"  if (b > 0 and buy_pnl  > 0 and buy_pnl  >= sell_pnl) else \
+                                "sell" if (s > 0 and sell_pnl > 0) else ""
+                        hedge = ("sell" if bias == "buy" else "buy") if bias else ""
+                        _gb_bias  = grid_cfg.get("bias_trail_giveback_pct_by_tf") or {}
+                        _gb_hedge = grid_cfg.get("hedge_trail_giveback_pct_by_tf") or {}
+                        gb_bias   = float(_gb_bias.get(tf_m)  or grid_cfg.get("bias_trail_giveback_pct",  40.0) or 0.0)
+                        gb_hedge  = float(_gb_hedge.get(tf_m) or grid_cfg.get("hedge_trail_giveback_pct", 40.0) or 0.0)
+                        if bias:
+                            side_pnl = buy_pnl if bias == "buy" else sell_pnl
+                            if side_pnl > 0:
+                                ExecBridge.enqueue(account, "MODIFY_SL", sym, magic=mg, side=bias,
+                                                   locked_pnl=side_pnl * (1.0 - gb_bias / 100.0),
+                                                   comment=f"FB|tsl|{tf_m}|{bias}|bias")
+                        if hedge:
+                            hedge_pnl = sell_pnl if bias == "buy" else buy_pnl
+                            hedge_n   = s        if bias == "buy" else b
+                            if hedge_n > 0 and hedge_pnl > 0:
+                                ExecBridge.enqueue(account, "MODIFY_SL", sym, magic=mg, side=hedge,
+                                                   locked_pnl=hedge_pnl * (1.0 - gb_hedge / 100.0),
+                                                   comment=f"FB|tsl|{tf_m}|{hedge}|hedge")
+
+                # Reconcile: synthesise arm state for exit logic (net_target / full_hedge /
+                # one_sided_remnant) if positions exist but no arm state (post-restart).
+                if (b + s > 0) and not ExecBridge.get_last_arm(account, sym, magic=mg):
+                    ExecBridge.set_last_arm(account, sym, tf=tf_m, magic=mg,
+                                            active=True, max_pos_seen=b + s, pend_seen=pend,
+                                            n_per_side=0, tp_up=0.0, tp_down=0.0,
+                                            cycle_trail_peak=0.0, flatten_ts=0.0)
+                    LOG.info(f"[reconcile] {sym} magic={mg} tf={tf_m} synthesised arm "
+                             f"from live positions (buys={b} sells={s})")
+
                 ExecBridge.monitor_cycle(account, sym, settings_cfg, tf=tf_m, magic=mg,
                                          pnl=float(m.get("pnl", 0.0)), buys=b, sells=s,
-                                         buy_pnl=float(m.get("buy_pnl", 0.0)),
-                                         sell_pnl=float(m.get("sell_pnl", 0.0)))
+                                         buy_pnl=buy_pnl, sell_pnl=sell_pnl)
             except Exception:
                 LOG.exception("[exec] per-magic cycle monitor error")  # never break the poll
     elif sym and ("positions" in body or "pendings" in body):
@@ -200,6 +245,18 @@ def exec_emit_grid():
         return jsonify({"ok": True, "verdict": "skip", "skip_reason": "position_open",
                         "symbol": symbol, "broker_symbol": broker_symbol, "tf": tf,
                         "open": open_state})
+    # Trail-SL guard: if the trail has already set a broker-side SL for this cycle
+    # (bias_peak >= activate), don't re-arm with fresh pending orders — the existing
+    # positions are protected and new legs would open unprotected exposure.
+    if not force and arm.get("active"):
+        _grid_cfg = (settings.get("grid_levels") or {})
+        _act_by_tf = _grid_cfg.get("bias_trail_activate_by_tf") or {}
+        _activate = float(_act_by_tf.get(tf) or _grid_cfg.get("bias_trail_activate_usd") or 0.0)
+        _peak = float(arm.get("bias_peak") or 0.0)
+        if _activate > 0 and _peak >= _activate:
+            return jsonify({"ok": True, "verdict": "skip", "skip_reason": "trail_sl_active",
+                            "symbol": symbol, "broker_symbol": broker_symbol, "tf": tf,
+                            "bias_peak": _peak, "activate": _activate})
         # active+flat, or inactive → fall through and (re)arm this TF's straddle
 
     # Fulcrum dedup: ONE grid per touched-level episode. Skip if the fulcrum hasn't
@@ -440,3 +497,90 @@ def exec_queue():
     account = request.args.get("account")
     return jsonify({"ok": True, "commands": ExecBridge.snapshot(account),
                     "last_poll_body": getattr(ExecBridge, "last_poll_body", None)})
+
+
+@bp.route("/exec/tp_refresh", methods=["POST"])
+def tp_refresh():
+    """Recompute HVN TP targets for all active cycles and enqueue MODIFY_TP if
+    either target shifted by more than `min_shift` points. Called every 120s by
+    the emitter so pending orders + open position TPs track the rolling VP."""
+    if not _auth_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    settings = current_app.config["FB_SETTINGS"]
+    body = request.get_json(silent=True) or {}
+    account = str(body.get("account") or "")
+    req_symbol = body.get("symbol") or settings["instrument"]["symbol"]
+    min_shift = float(body.get("min_shift", 1.0) or 1.0)
+
+    symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
+    broker_to_analysis = {v: k for k, v in symbol_map.items()}
+    analysis_sym = broker_to_analysis.get(req_symbol, req_symbol)
+    broker_symbol = symbol_map.get(analysis_sym, req_symbol)
+
+    from execution import zone_triggers
+    from pipeline.features import vp_cache
+
+    quote = ExecBridge.get_quote(account, broker_symbol) or {}
+    mid = float(quote.get("mid") or 0.0)
+
+    refreshed, skipped = 0, 0
+    with ExecBridge._lock:
+        cycles = {
+            (acc, sym, mg): m
+            for (acc, sym, mg), m in ExecBridge._last_arm.items()
+            if acc == str(account) and sym == broker_symbol and m.get("active")
+        }
+
+    for (acc, sym, mg), cyc in cycles.items():
+        old_tp_up   = float(cyc.get("tp_up")   or 0.0)
+        old_tp_down = float(cyc.get("tp_down") or 0.0)
+        if old_tp_up == 0.0 and old_tp_down == 0.0:
+            skipped += 1
+            continue
+
+        # Recompute from fresh VP using current mid as the probe price
+        probe = mid if mid > 0 else float(cyc.get("fulcrum") or 0.0)
+        t = zone_triggers._t_hvn_edge(analysis_sym, probe)
+        new_tp_up   = float((t.context.get("tp_up")   if t else None) or 0.0)
+        new_tp_down = float((t.context.get("tp_down") if t else None) or 0.0)
+
+        # Fall back to session zones if hvn_edge didn't yield useful targets
+        if new_tp_up == 0.0 and new_tp_down == 0.0:
+            from pipeline.state_store import store as _store
+            from pipeline.features.volume_profile import compute as vp_compute, DEFAULT_BIN_SIZE
+            tf = str(cyc.get("tf") or "15m")
+            win = zone_triggers._VP_WIN.get(tf, 96)
+            bars = _store().recent(analysis_sym, tf, win + 5)
+            if len(bars) >= 2:
+                zones, _ = zone_triggers._session_hvn_zones(analysis_sym, tf, bars)
+                fulcrum = float(cyc.get("fulcrum") or probe)
+                tops = [hi for lo, hi in zones if hi > fulcrum]
+                bots = [lo for lo, hi in zones if lo < fulcrum]
+                new_tp_up   = min(tops) if tops else 0.0
+                new_tp_down = max(bots) if bots else 0.0
+
+        shift_up   = abs(new_tp_up   - old_tp_up)   if new_tp_up   > 0 else 0.0
+        shift_down = abs(new_tp_down - old_tp_down) if new_tp_down > 0 else 0.0
+        if shift_up < min_shift and shift_down < min_shift:
+            skipped += 1
+            continue
+
+        # Rebase from analysis to venue frame
+        ratio = (float(quote.get("mid") or 0.0) / float(cyc.get("venue_mid") or 1.0)) if cyc.get("venue_mid") else 1.0
+        ratio = ratio if 0.9 < ratio < 1.1 else 1.0
+        buy_tp_venue  = round(new_tp_up   * ratio, 4) if new_tp_up   > 0 else 0.0
+        sell_tp_venue = round(new_tp_down * ratio, 4) if new_tp_down > 0 else 0.0
+
+        ExecBridge.enqueue(account, "MODIFY_TP", broker_symbol, magic=int(mg),
+                           buy_tp=buy_tp_venue, sell_tp=sell_tp_venue)
+        with ExecBridge._lock:
+            cyc2 = ExecBridge._last_arm.get((acc, sym, mg)) or {}
+            if cyc2:
+                cyc2["tp_up"]   = new_tp_up
+                cyc2["tp_down"] = new_tp_down
+        LOG.info(f"[tp_refresh] {broker_symbol} magic={mg} "
+                 f"tp_up {old_tp_up:.2f}→{new_tp_up:.2f} "
+                 f"tp_down {old_tp_down:.2f}→{new_tp_down:.2f}")
+        refreshed += 1
+
+    return jsonify({"ok": True, "refreshed": refreshed, "skipped": skipped})

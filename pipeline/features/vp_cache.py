@@ -308,6 +308,44 @@ def build_and_save(
     LOG.info(f"[vp_cache] saved → {CACHE_FILE}")
 
 
+def refresh_today(symbol: str, primary_tf: str = "1m") -> bool:
+    """Recompute only today's VP entry for one symbol. Fast path for 1m intraday refresh.
+
+    Skips the full 5-day loop and the 100k-bar reload that build_and_save does.
+    Returns True if the entry was updated, False if not enough bars (<30).
+    """
+    from pipeline.state_store import store as _store
+    from .volume_profile import compute
+    cache = _load()
+    sym_cache = cache.get(symbol)
+    if sym_cache is None:
+        return False
+    anchor: SessionAnchor = _normalize_anchor(sym_cache.get("session_start_utc") or 0)
+    bin_size: float | None = float(sym_cache["bin_size"]) if "bin_size" in sym_cache else None
+
+    now_ts = int(time.time())
+    date_key = _session_day_key(now_ts, anchor)
+    start_ts, end_ts = _day_bounds(date_key, anchor)
+
+    # Only load bars for today's session window (not 100k)
+    s = _store()
+    today_bars = [b for b in s.recent(symbol, primary_tf, 1500)
+                  if start_ts <= b.close_ts < min(end_ts, now_ts)]
+    if len(today_bars) < 30:
+        return False
+
+    latest_close = today_bars[-1].ohlc.c
+    vp = compute(today_bars, "cached", latest_close, bin_size=bin_size)
+    if not vp:
+        return False
+
+    vp["price_range_high"] = round(max(b.ohlc.h for b in today_bars), 4)
+    vp["price_range_low"]  = round(min(b.ohlc.l for b in today_bars), 4)
+    sym_cache["daily"][date_key] = vp
+    _save(cache)
+    return True
+
+
 def _get_offset(sym: dict) -> float:
     return float(sym.get("venue_price_offset") or 0.0)
 
@@ -372,9 +410,16 @@ def period_profile(symbol: str, period: str) -> dict | None:
     res = _build_bins(bars, bin_size=float(bin_cfg) if bin_cfg else None)
     if not res:
         return None
-    bins, centers, bin_size, _pmin, _pmax = res
-    profile = [{"price": round(float(centers[i]) + offset, 5), "vol": round(float(bins[i]), 2)}
-               for i in range(len(bins)) if bins[i] > 0]
+    bins, centers, bin_size, _pmin, _pmax, ask_bins, bid_bins = res
+    profile = [
+        {
+            "price":   round(float(centers[i]) + offset, 5),
+            "vol":     round(float(bins[i]),     2),
+            "ask_vol": round(float(ask_bins[i]), 2),
+            "bid_vol": round(float(bid_bins[i]), 2),
+        }
+        for i in range(len(bins)) if bins[i] > 0
+    ]
     return {"bin": round(float(bin_size), 5), "profile": profile}
 
 

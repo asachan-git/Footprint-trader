@@ -112,13 +112,16 @@ def _t_imbalance(symbol: str, tf: str, current_price: float) -> Trigger | None:
 
 def _t_hvn_edge(symbol: str, current_price: float) -> Trigger | None:
     """Nearest HVN boundary edge. Node width (high-low) is the raw_range that
-    sizes the grid: price reverts to the other edge or breaks to the next HVN."""
+    sizes the grid: price reverts to the other edge or breaks to the next HVN.
+    TP targets use the same HVN→HVN logic as hvn_inside_touch: nearest node top
+    above / node bottom below the tapped edge across all daily+weekly zones."""
     try:
         from pipeline.features.vp_cache import get as vp_get
     except Exception:
         return None
 
-    best: tuple[float, float, float] | None = None  # (dist, edge_price, node_width)
+    all_zones: list[tuple[float, float]] = []
+    best: tuple[float, float, float, str] | None = None  # (dist, edge, width, side)
     for period in ("daily", "weekly"):
         vp = vp_get(symbol, period)
         if not vp:
@@ -126,23 +129,38 @@ def _t_hvn_edge(symbol: str, current_price: float) -> Trigger | None:
         for hvn in vp.get("hvn_zones") or []:
             lo, hi = float(hvn["low"]), float(hvn["high"])
             width = hi - lo
-            for edge in (lo, hi):
+            all_zones.append((lo, hi))
+            for edge, side in ((lo, "bottom"), (hi, "top")):
                 d = abs(edge - current_price)
                 if best is None or d < best[0]:
-                    best = (d, edge, width)
+                    best = (d, edge, width, side)
     if best is None:
         return None
 
-    _dist, edge, width = best
-    # Confidence higher when price is genuinely AT the edge (within ~25% of width).
+    _dist, edge, width, side = best
     proximity = 1.0 - min(1.0, _dist / width) if width > 0 else 0.0
     conf = min(0.9, 0.5 + 0.4 * proximity)
+
+    node_low  = (edge - width) if side == "top" else edge
+    node_high = edge if side == "top" else (edge + width)
+
+    # HVN→HVN targets: exclude the current node so TP lands on the NEXT node
+    # beyond, not the current node's far side (which sits inside the ladder).
+    # top edge touch → tp_down = first node bottom strictly below node_low
+    # bottom edge touch → tp_up = first node top strictly above node_high
+    tops_above = [hi for lo, hi in all_zones if hi > node_high]
+    bots_below = [lo for lo, hi in all_zones if lo < node_low]
+    tp_up   = min(tops_above) if tops_above else 0.0
+    tp_down = max(bots_below) if bots_below else 0.0
+
     return Trigger(
         kind="hvn_edge",
         fulcrum_price=float(edge),
         raw_range=float(width),
         confidence=float(conf),
-        context={"bias": "none"},
+        context={"bias": "none", "edge": side,
+                 "node_low": float(node_low), "node_high": float(node_high),
+                 "tp_up": float(tp_up), "tp_down": float(tp_down)},
     )
 
 

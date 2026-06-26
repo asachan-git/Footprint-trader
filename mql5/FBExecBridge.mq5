@@ -552,7 +552,8 @@ bool ExecCloseSide(const string cmd, int &closed, string &err)
             int n = ArraySize(tk); ArrayResize(tk, n + 1); tk[n] = posInfo.Ticket();
          }
    int total   = ArraySize(tk);
-   int toClose = (int)MathCeil(total * frac);
+   // floor so at least 1 position always remains for MOVE_BE; min 1 if any exist
+   int toClose = (total <= 1) ? total : (int)MathMin(MathFloor(total * frac), total - 1);
    for(int i = 0; i < toClose && i < total; i++)
    {
       if(trade.PositionClose(tk[i], InpSlippage)) closed++;
@@ -577,15 +578,154 @@ bool ExecMoveBE(const string cmd, int &moved, string &err)
       if(!posInfo.SelectByIndex(i)) continue;
       if(posInfo.Magic() != magic || posInfo.Symbol() != sym
          || posInfo.PositionType() != want) continue;
-      double be = posInfo.PriceOpen();
-      double tp = posInfo.TakeProfit();
+      double point   = SymbolInfoDouble(sym, SYMBOL_POINT);
+      long   stopLvl = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
+      double minDist = MathMax(stopLvl * point, 1.0 * point); // at least 1pt buffer
+      double open    = posInfo.PriceOpen();
+      double tp      = posInfo.TakeProfit();
+      // BE = entry ± minDist so broker stop-level is always satisfied
+      double be = (want == POSITION_TYPE_BUY) ? open - minDist : open + minDist;
       // only tighten toward breakeven (never loosen an existing protective stop)
       double curSL = posInfo.StopLoss();
       bool improve = (want == POSITION_TYPE_BUY) ? (curSL <= 0 || be > curSL)
                                                  : (curSL <= 0 || be < curSL);
       if(!improve) continue;
-      if(trade.PositionModify(posInfo.Ticket(), be, tp)) moved++;
+      bool ok2 = false;
+      for(int attempt = 0; attempt < 3; attempt++)
+      {
+         if(trade.PositionModify(posInfo.Ticket(), be, tp)) { ok2 = true; break; }
+         int rc = (int)trade.ResultRetcode();
+         bool transient = (rc == TRADE_RETCODE_PRICE_OFF || rc == TRADE_RETCODE_REQUOTE ||
+                           rc == TRADE_RETCODE_PRICE_CHANGED || rc == TRADE_RETCODE_TIMEOUT ||
+                           rc == TRADE_RETCODE_CONNECTION);
+         if(!transient || attempt == 2) break;
+         Sleep(200);
+      }
+      if(ok2) moved++;
       else { allOk = false; err = "modify fail #" + IntegerToString((long)posInfo.Ticket()); }
+   }
+   return allOk;
+}
+
+bool ExecModifySL(const string cmd, int &modified, string &err)
+{
+   string sym        = JsonGetString(cmd, "symbol");
+   long   magic      = (long)JsonGetNumber(cmd, "magic");
+   string side       = JsonGetString(cmd, "side");
+   double lockedPnl  = JsonGetNumber(cmd, "locked_pnl");  // $ amount to lock in
+   ENUM_POSITION_TYPE want = (side == "buy") ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+   modified = 0; err = ""; bool allOk = true;
+
+   // Sum total lots on this side to convert locked P&L → per-position SL price
+   double tickVal  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize <= 0) { err = "no tick size"; return false; }
+   double perPoint = tickVal / tickSize;   // $ per 1.0 price-unit per lot
+
+   double totalLots = 0.0;
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(posInfo.SelectByIndex(i))
+         if(posInfo.Magic() == magic && posInfo.Symbol() == sym && posInfo.PositionType() == want)
+            totalLots += posInfo.Volume();
+   if(totalLots <= 0) return true;   // nothing to protect
+
+   double point   = SymbolInfoDouble(sym, SYMBOL_POINT);
+   long   stopLvl = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist = MathMax(stopLvl * point, 1.0 * point);
+
+   // sl_price for a buy = entry + locked_pnl / (totalLots × perPoint)
+   // All positions share the same locked-profit distance from their own entry, so
+   // the aggregate P&L at the SL equals lockedPnl regardless of entry spread.
+   double pnlPerLotPerPoint = lockedPnl / (totalLots * perPoint);
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Magic() != magic || posInfo.Symbol() != sym || posInfo.PositionType() != want) continue;
+      double open = posInfo.PriceOpen();
+      double tp   = posInfo.TakeProfit();
+      double sl   = (want == POSITION_TYPE_BUY) ? open + pnlPerLotPerPoint * posInfo.Volume()
+                                                : open - pnlPerLotPerPoint * posInfo.Volume();
+      // Enforce minimum broker stop distance from current price
+      double curBid = SymbolInfoDouble(sym, SYMBOL_BID);
+      double curAsk = SymbolInfoDouble(sym, SYMBOL_ASK);
+      if(want == POSITION_TYPE_BUY)
+         sl = MathMin(sl, curBid - minDist);   // SL must be below current bid
+      else
+         sl = MathMax(sl, curAsk + minDist);   // SL must be above current ask
+      // Only move SL if it's an improvement (never widen a tighter stop)
+      double curSL = posInfo.StopLoss();
+      bool improve = (want == POSITION_TYPE_BUY) ? (curSL <= 0 || sl > curSL)
+                                                 : (curSL <= 0 || sl < curSL);
+      if(!improve) continue;
+      bool ok2 = false;
+      for(int attempt = 0; attempt < 3; attempt++)
+      {
+         if(trade.PositionModify(posInfo.Ticket(), sl, tp)) { ok2 = true; break; }
+         int rc = (int)trade.ResultRetcode();
+         bool transient = (rc == TRADE_RETCODE_PRICE_OFF || rc == TRADE_RETCODE_REQUOTE ||
+                           rc == TRADE_RETCODE_PRICE_CHANGED || rc == TRADE_RETCODE_TIMEOUT ||
+                           rc == TRADE_RETCODE_CONNECTION);
+         if(!transient || attempt == 2) break;
+         Sleep(200);
+      }
+      if(ok2) modified++;
+      else { allOk = false; err = "sl modify fail #" + IntegerToString((long)posInfo.Ticket()); }
+   }
+   return allOk;
+}
+
+bool ExecModifyTP(const string cmd, int &modified, string &err)
+{
+   string sym    = JsonGetString(cmd, "symbol");
+   long   magic  = (long)JsonGetNumber(cmd, "magic");
+   double buy_tp = JsonGetNumber(cmd, "buy_tp");
+   double sell_tp= JsonGetNumber(cmd, "sell_tp");
+   modified = 0; err = ""; bool allOk = true;
+
+   // Update TP on open positions
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Magic() != magic || posInfo.Symbol() != sym) continue;
+      double tp = (posInfo.PositionType() == POSITION_TYPE_BUY) ? buy_tp : sell_tp;
+      if(tp <= 0) continue;
+      bool ok2 = false;
+      for(int attempt = 0; attempt < 3; attempt++)
+      {
+         if(trade.PositionModify(posInfo.Ticket(), posInfo.StopLoss(), tp)) { ok2 = true; break; }
+         int rc = (int)trade.ResultRetcode();
+         bool transient = (rc == TRADE_RETCODE_PRICE_OFF || rc == TRADE_RETCODE_REQUOTE ||
+                           rc == TRADE_RETCODE_PRICE_CHANGED || rc == TRADE_RETCODE_TIMEOUT ||
+                           rc == TRADE_RETCODE_CONNECTION);
+         if(!transient || attempt == 2) break;
+         Sleep(200);
+      }
+      if(ok2) modified++;
+      else { allOk = false; err = "pos modify fail #" + IntegerToString((long)posInfo.Ticket()); }
+   }
+   // Update TP on pending orders
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(!orderInfo.SelectByIndex(i)) continue;
+      if(orderInfo.Magic() != magic || orderInfo.Symbol() != sym) continue;
+      double tp = (orderInfo.OrderType() == ORDER_TYPE_BUY_STOP) ? buy_tp : sell_tp;
+      if(tp <= 0) continue;
+      bool ok3 = false;
+      for(int attempt = 0; attempt < 3; attempt++)
+      {
+         if(trade.OrderModify(orderInfo.Ticket(), orderInfo.PriceOpen(),
+                              orderInfo.StopLoss(), tp, orderInfo.TypeTime(),
+                              orderInfo.TimeExpiration())) { ok3 = true; break; }
+         int rc = (int)trade.ResultRetcode();
+         bool transient = (rc == TRADE_RETCODE_PRICE_OFF || rc == TRADE_RETCODE_REQUOTE ||
+                           rc == TRADE_RETCODE_PRICE_CHANGED || rc == TRADE_RETCODE_TIMEOUT ||
+                           rc == TRADE_RETCODE_CONNECTION);
+         if(!transient || attempt == 2) break;
+         Sleep(200);
+      }
+      if(ok3) modified++;
+      else { allOk = false; err = "ord modify fail #" + IntegerToString((long)orderInfo.Ticket()); }
    }
    return allOk;
 }
@@ -678,6 +818,28 @@ void PollAndExecute()
          if(InpVerbose)
             Print(ok ? "✅ " : "⚠️ ", "MOVE_BE ", JsonGetString(cmds[i], "side"),
                   " → moved ", movedN, (err == "" ? "" : " | " + err));
+      }
+      else if(type == "MODIFY_SL")
+      {
+         int modN = 0;
+         ok = ExecModifySL(cmds[i], modN, err);
+         extra = StringFormat(",\"modified\":%d", modN);
+         if(InpVerbose)
+            Print(ok ? "✅ " : "⚠️ ", "MODIFY_SL magic=", (long)JsonGetNumber(cmds[i], "magic"),
+                  " side=", JsonGetString(cmds[i], "side"),
+                  " locked_pnl=", JsonGetNumber(cmds[i], "locked_pnl"),
+                  " → modified ", modN, (err == "" ? "" : " | " + err));
+      }
+      else if(type == "MODIFY_TP")
+      {
+         int modN = 0;
+         ok = ExecModifyTP(cmds[i], modN, err);
+         extra = StringFormat(",\"modified\":%d", modN);
+         if(InpVerbose)
+            Print(ok ? "✅ " : "⚠️ ", "MODIFY_TP magic=", (long)JsonGetNumber(cmds[i], "magic"),
+                  " buy_tp=", JsonGetNumber(cmds[i], "buy_tp"),
+                  " sell_tp=", JsonGetNumber(cmds[i], "sell_tp"),
+                  " → modified ", modN, (err == "" ? "" : " | " + err));
       }
       else
       {
@@ -861,9 +1023,57 @@ void ZoneText(const string suf, datetime t, double price, const string text, col
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
 }
 
-//--- Computed volume profile: one horizontal bar per price bin, length ∝ volume, drawn
-//    into the EMPTY future margin (right of the last candle) so it never overlays price.
-//    Parses {profile:[{price,vol}], vp_bin} from /exec/zones. POC (max-vol) bar highlighted.
+//--- Computed volume profile drawn into the future margin (right of last candle).
+//    Each bin is split into two rectangles: ASK (buyers, cyan) to the right,
+//    BID (sellers, red) to the left of a shared origin at t0. Total width ∝ vol.
+//    POC bin: ask=gold, bid=orange. Falls back to a single gray bar when ask/bid absent.
+void DrawVPBin(int idx, double price, double half,
+               double askFrac, double bidFrac, double totalFrac,
+               bool isPoc, int secs)
+{
+   datetime t0    = TimeCurrent();
+   int      maxBars = InpVPMaxBars;
+
+   string nameA = ZONE_PREFIX + "vp_a" + IntegerToString(idx);  // ask (right)
+   string nameB = ZONE_PREFIX + "vp_b" + IntegerToString(idx);  // bid (left)
+
+   // Ask bar: t0 → t0 + askFrac * maxBars bars (cyan / gold at POC)
+   datetime tA = t0 + (int)(askFrac * maxBars * secs) + secs;
+   color    cA = isPoc ? clrGoldenrod   : clrCadetBlue;
+
+   if(ObjectFind(0, nameA) < 0)
+   {
+      ObjectCreate(0, nameA, OBJ_RECTANGLE, 0, t0, price - half, tA, price + half);
+      ObjectSetInteger(0, nameA, OBJPROP_BACK, true); ObjectSetInteger(0, nameA, OBJPROP_FILL, true);
+      ObjectSetInteger(0, nameA, OBJPROP_SELECTABLE, false);
+   }
+   else
+   {
+      ObjectSetInteger(0, nameA, OBJPROP_TIME, 0, t0); ObjectSetInteger(0, nameA, OBJPROP_TIME, 1, tA);
+      ObjectSetDouble (0, nameA, OBJPROP_PRICE, 0, price - half); ObjectSetDouble(0, nameA, OBJPROP_PRICE, 1, price + half);
+   }
+   ObjectSetInteger(0, nameA, OBJPROP_COLOR, cA); ObjectSetInteger(0, nameA, OBJPROP_BGCOLOR, cA);
+
+   // Bid bar: stacked after ask bar, extends further right (bid share of total width)
+   datetime tBstart = tA;
+   datetime tBend   = t0 + (int)(totalFrac * maxBars * secs) + secs;
+   color    cB = isPoc ? clrDarkOrange : clrIndianRed;
+
+   if(tBend <= tBstart) tBend = tBstart + secs;  // always draw at least 1 bar wide
+   if(ObjectFind(0, nameB) < 0)
+   {
+      ObjectCreate(0, nameB, OBJ_RECTANGLE, 0, tBstart, price - half, tBend, price + half);
+      ObjectSetInteger(0, nameB, OBJPROP_BACK, true); ObjectSetInteger(0, nameB, OBJPROP_FILL, true);
+      ObjectSetInteger(0, nameB, OBJPROP_SELECTABLE, false);
+   }
+   else
+   {
+      ObjectSetInteger(0, nameB, OBJPROP_TIME, 0, tBstart); ObjectSetInteger(0, nameB, OBJPROP_TIME, 1, tBend);
+      ObjectSetDouble (0, nameB, OBJPROP_PRICE, 0, price - half); ObjectSetDouble(0, nameB, OBJPROP_PRICE, 1, price + half);
+   }
+   ObjectSetInteger(0, nameB, OBJPROP_COLOR, cB); ObjectSetInteger(0, nameB, OBJPROP_BGCOLOR, cB);
+}
+
 void DrawProfile(const string js)
 {
    double vpbin = JsonGetNumber(js, "vp_bin");
@@ -872,43 +1082,28 @@ void DrawProfile(const string js)
    int n = JsonSplitArray(js, "profile", ps);
    if(n <= 0) return;
 
-   double price[], vol[];
+   double price[], vol[], askVol[], bidVol[];
    ArrayResize(price, n); ArrayResize(vol, n);
+   ArrayResize(askVol, n); ArrayResize(bidVol, n);
    double maxv = 0.0;
    for(int i = 0; i < n; i++)
    {
-      price[i] = JsonGetNumber(ps[i], "price");
-      vol[i]   = JsonGetNumber(ps[i], "vol");
+      price[i]  = JsonGetNumber(ps[i], "price");
+      vol[i]    = JsonGetNumber(ps[i], "vol");
+      askVol[i] = JsonGetNumber(ps[i], "ask_vol");
+      bidVol[i] = JsonGetNumber(ps[i], "bid_vol");
       if(vol[i] > maxv) maxv = vol[i];
    }
    if(maxv <= 0.0) return;
 
-   int      secs = PeriodSeconds(PERIOD_CURRENT);
-   datetime t0   = TimeCurrent();
-   double   half = vpbin / 2.0;
+   int    secs = PeriodSeconds(PERIOD_CURRENT);
+   double half = vpbin / 2.0;
    for(int i = 0; i < n; i++)
    {
-      double   frac = vol[i] / maxv;
-      datetime t1   = t0 + (int)(frac * InpVPMaxBars * secs) + secs;  // +secs so tiny bins still show
-      bool     isPoc = (vol[i] >= maxv);
-      color    c     = isPoc ? InpVPPocColor : InpVPColor;
-      string   name  = ZONE_PREFIX + "vp_" + IntegerToString(i);
-      if(ObjectFind(0, name) < 0)
-      {
-         ObjectCreate(0, name, OBJ_RECTANGLE, 0, t0, price[i] - half, t1, price[i] + half);
-         ObjectSetInteger(0, name, OBJPROP_BACK,       true);
-         ObjectSetInteger(0, name, OBJPROP_FILL,       true);
-         ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
-      }
-      else
-      {
-         ObjectSetInteger(0, name, OBJPROP_TIME,  0, t0);
-         ObjectSetInteger(0, name, OBJPROP_TIME,  1, t1);
-         ObjectSetDouble (0, name, OBJPROP_PRICE, 0, price[i] - half);
-         ObjectSetDouble (0, name, OBJPROP_PRICE, 1, price[i] + half);
-      }
-      ObjectSetInteger(0, name, OBJPROP_COLOR,   c);
-      ObjectSetInteger(0, name, OBJPROP_BGCOLOR, c);
+      bool   isPoc     = (vol[i] >= maxv);
+      double totalFrac = vol[i] / maxv;
+      double askFrac   = (askVol[i] / maxv);
+      DrawVPBin(i, price[i], half, askFrac, (bidVol[i] / maxv), totalFrac, isPoc, secs);
    }
 }
 

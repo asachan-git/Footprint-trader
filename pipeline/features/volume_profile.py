@@ -149,7 +149,9 @@ def _build_bins(
         bin_size = (p_max - p_min) / num_bins
         n = num_bins
 
-    bins = np.zeros(n, dtype=float)
+    bins     = np.zeros(n, dtype=float)
+    ask_bins = np.zeros(n, dtype=float)  # aggressor buys  (taker lifted ask)
+    bid_bins = np.zeros(n, dtype=float)  # aggressor sells (taker hit bid)
     bin_centers = np.array([p_min + (i + 0.5) * bin_size for i in range(n)])
 
     def _bin_of(price: float) -> int:
@@ -161,10 +163,12 @@ def _build_bins(
             # True orderflow: aggregate exact-price ladder volumes
             for lvl in bar.bid_ladder:
                 if lvl.vol > 0:
-                    bins[_bin_of(lvl.price)] += lvl.vol
+                    bid_bins[_bin_of(lvl.price)] += lvl.vol
+                    bins[_bin_of(lvl.price)]     += lvl.vol
             for lvl in bar.ask_ladder:
                 if lvl.vol > 0:
-                    bins[_bin_of(lvl.price)] += lvl.vol
+                    ask_bins[_bin_of(lvl.price)] += lvl.vol
+                    bins[_bin_of(lvl.price)]     += lvl.vol
         else:
             # Fallback for ladder-less bars (degenerate synthetic data)
             v = abs(bar.delta or 0.0)
@@ -173,9 +177,12 @@ def _build_bins(
             b_lo = _bin_of(bar.ohlc.l)
             b_hi = _bin_of(bar.ohlc.h)
             span = max(b_hi - b_lo + 1, 1)
-            bins[b_lo:b_hi + 1] += v / span
+            half = v / 2.0 / span
+            bins[b_lo:b_hi + 1]     += v / span
+            ask_bins[b_lo:b_hi + 1] += half
+            bid_bins[b_lo:b_hi + 1] += half
 
-    return bins, bin_centers, bin_size, p_min, p_max
+    return bins, bin_centers, bin_size, p_min, p_max, ask_bins, bid_bins
 
 
 def _build_price_map(bars) -> dict[float, float]:
@@ -492,7 +499,7 @@ def compute(
             total_volume=0.0, price_range=0.0, bar_count=len(bars),
         )
 
-    bins, _bin_centers, used_bin_size, p_min, p_max = built
+    bins, _bin_centers, used_bin_size, p_min, p_max, _ask_bins, _bid_bins = built
     n = len(bins)
 
     max_v = float(bins.max())
@@ -550,7 +557,8 @@ DEFAULT_BIN_SIZE: dict[str, float] = {
     "BTCUSDT": 25.0,    # $25 bins (Sierra/Bookmap convention; ~52 bins per $1300 daily range)
     "XAUTUSDT": 1.0,    # $1 bins
     "BTCUSD": 25.0,     # Vantage CFD
-    "XAUUSD+": 1.0,     # Vantage CFD
+    "XAUUSD+": 1.0,     # Vantage CFD (legacy)
+    "XAUUSD.pc": 1.0,   # USC CFD
     "XAUUSD": 1.0,      # generic spot XAU
 }
 
@@ -596,7 +604,7 @@ def from_store(symbol: str, primary_tf: str, period: str) -> VolumeProfilePeriod
     if prev_period_bars:
         prev_built = _build_bins(prev_period_bars[-500:], bin_size=bin_size)
         if prev_built is not None:
-            prev_bins, _, prev_bin_size, prev_p_min, _ = prev_built
+            prev_bins, _, prev_bin_size, prev_p_min, _, _pa, _pb = prev_built
             n = len(prev_bins)
             max_v = float(prev_bins.max())
             tied = [i for i in range(n) if prev_bins[i] == max_v]

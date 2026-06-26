@@ -80,7 +80,7 @@ class GridPlan:
 # only). The detector still runs but can never win the structural hint, so no VP-level
 # straddles arm. Re-add "vp_level_touch" here to revive it.
 _HINT_GROUPS = {
-    "structural": {"hvn_inside_touch", "squeeze"},
+    "structural": {"hvn_edge", "hvn_inside_touch", "squeeze"},
     # LVN displacement: vp_level_touch is the only detector that arms on an LVN.
     # The planner narrows it to level_type=="lvn" (see plan_grid_levels) so only the
     # vacuum fires. Neutral straddle-in-vacuum: price sits in the LVN, leaves fast one
@@ -489,6 +489,11 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
 
     triggers = zone_triggers.detect_all(symbol, tf, current_price, regime,
                                         atr=atr, daily_vp=daily_vp, cfg=grid_cfg)
+    # Hard gate: only allow triggers that are in the settings.yaml triggers list.
+    # This makes the yaml config authoritative — hvn_edge won't fire unless added there.
+    enabled_kinds = set(grid_cfg.get("triggers") or [])
+    if enabled_kinds:
+        triggers = [t for t in triggers if t.kind in enabled_kinds]
     hint_set = _hint_set(trigger_hint)
     if hint_set:
         hinted = [t for t in triggers if t.kind in hint_set]

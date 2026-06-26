@@ -68,6 +68,30 @@ P5=$!
 emit_loop 1m  60   3 &
 P1=$!
 
-echo "[auto_exec_emit] running — 1H($P1H) 15m($P15) 5m($P5) 1m($P1). Ctrl-C to stop."
-trap 'kill $P1H $P15 $P5 $P1 2>/dev/null; echo "[auto_exec_emit] stopped."; exit 0' INT TERM
+# TP refresh loop — every 120s recompute HVN targets and enqueue MODIFY_TP for any
+# active cycle whose tp_up/tp_down shifted by ≥1pt (rolling VP tracks intraday HVN drift).
+tp_refresh_loop() {
+  echo "[tp_refresh] started — every 120s → $SYMBOL acct $ACCOUNT"
+  while true; do
+    sleep 120
+    local ts resp
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    resp=$(curl -s -X POST "${FLASK}/exec/tp_refresh" \
+      -H "Content-Type: application/json" \
+      -d "{\"account\":\"${ACCOUNT}\",\"symbol\":\"${SYMBOL}\",\"min_shift\":1.0}")
+    local note
+    note=$(echo "$resp" | python3 -c "
+import sys, json
+try: r = json.load(sys.stdin)
+except Exception: print('parse-err'); sys.exit()
+print(f\"refreshed={r.get('refreshed',0)} skipped={r.get('skipped',0)}\")
+" 2>/dev/null || echo "err")
+    echo "$ts [tp_refresh] $note"
+  done
+}
+tp_refresh_loop &
+PTP=$!
+
+echo "[auto_exec_emit] running — 1H($P1H) 15m($P15) 5m($P5) 1m($P1) tp_refresh($PTP). Ctrl-C to stop."
+trap 'kill $P1H $P15 $P5 $P1 $PTP 2>/dev/null; echo "[auto_exec_emit] stopped."; exit 0' INT TERM
 wait

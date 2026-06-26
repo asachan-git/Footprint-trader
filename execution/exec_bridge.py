@@ -20,15 +20,19 @@ drops the queue — order intents are ephemeral); the audit log is durable.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+LOG = logging.getLogger(__name__)
+
 _ROOT = Path(__file__).resolve().parent.parent
 _AUDIT_LOG = _ROOT / "data" / "exec_bridge.jsonl"
 _EMIT_LOG = _ROOT / "data" / "exec_emit.jsonl"   # ground-truth arm/exit decisions
+_ARM_STATE_FILE = _ROOT / "data" / "arm_state.json"  # persisted across restarts
 
 
 def _emit_exit_audit(row: dict) -> None:
@@ -105,6 +109,9 @@ class Command:
     magic: int = 0            # per-strategy magic (0 → EA uses its default InpMagic)
     side: str = ""            # "buy"|"sell" for CLOSE_SIDE / MOVE_BE
     frac: float = 0.0         # fraction of that side's positions to close (CLOSE_SIDE)
+    buy_tp: float = 0.0       # MODIFY_TP: new TP for buy positions/orders
+    sell_tp: float = 0.0      # MODIFY_TP: new TP for sell positions/orders
+    locked_pnl: float = 0.0   # MODIFY_SL: dollar P&L to lock in (EA converts to SL price)
     status: str = PENDING
     ts_created: float = 0.0
     ts_sent: float = 0.0
@@ -118,7 +125,28 @@ class Command:
                      sl=self.sl, tp=self.tp, comment=self.comment)
         elif self.type in (CLOSE_SIDE, MOVE_BE):
             d.update(side=self.side, frac=self.frac, comment=self.comment)
+        elif self.type == "MODIFY_TP":
+            d.update(buy_tp=self.buy_tp, sell_tp=self.sell_tp)
+        elif self.type == "MODIFY_SL":
+            d.update(side=self.side, locked_pnl=self.locked_pnl)
         return d
+
+
+def _load_arm_state() -> dict:
+    """Load persisted arm state from disk. Keys are JSON-serialised tuples."""
+    try:
+        raw = json.loads(_ARM_STATE_FILE.read_text())
+        return {tuple(json.loads(k)): v for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+def _save_arm_state(arms: dict) -> None:
+    try:
+        out = {json.dumps(list(k)): v for k, v in arms.items()}
+        _ARM_STATE_FILE.write_text(json.dumps(out))
+    except Exception as e:
+        LOG.warning(f"[arm_state] save failed: {e}")
 
 
 class ExecBridge:
@@ -129,7 +157,7 @@ class ExecBridge:
     _seq: list[str] = []                    # insertion order (FIFO dispatch)
     _quotes: dict[tuple, dict] = {}         # (account, broker_symbol) → {bid,ask,mid,ts}
     _last_emit: dict[tuple, float] = {}     # (account, symbol, tf) → last emitted fulcrum
-    _last_arm: dict[tuple, dict] = {}       # (account, broker_symbol) → last armed grid metadata
+    _last_arm: dict[tuple, dict] = _load_arm_state()  # persisted across restarts
     _open: dict[tuple, dict] = {}           # (account, broker_symbol) → {positions, pendings, ts}
     _ict_overlay: dict[str, dict] = {}      # analysis_symbol → ict_fvg setup (analysis frame)
 
@@ -172,6 +200,7 @@ class ExecBridge:
         key_magic = int(magic or meta.get("magic", 0) or 0)
         with cls._lock:
             cls._last_arm[(str(account), broker_symbol, key_magic)] = dict(meta, tf=tf, magic=key_magic)
+            _save_arm_state(cls._last_arm)
 
     @classmethod
     def get_last_arm(cls, account: str, broker_symbol: str, tf: str = "", magic: int = 0) -> dict | None:
@@ -280,7 +309,7 @@ class ExecBridge:
                 cls.set_last_arm(account, symbol, **{**cyc, "active": False, "flatten_ts": 0.0})
             elif (t - fts) > _FLATTEN_GRACE_S:
                 # close demonstrably didn't land (past the queue's reclaim window) → re-issue once
-                cls.enqueue(account, CLOSE_ALL, symbol, comment="FB|flatten|retry", magic=magic, now=t)
+                cls.enqueue(account, CLOSE_ALL, symbol, comment=f"FB|flatten|{tf}|retry", magic=magic, now=t)
                 cls.set_last_arm(account, symbol, **{**cyc, "flatten_ts": t})
             return None
 
@@ -302,6 +331,13 @@ class ExecBridge:
             # the placement-window race (active set before the EA reports pendings).
             if (max_seen > 0 or pend_seen > 0) and pendings == 0:
                 cls.set_last_arm(account, symbol, **{**cyc, "active": False})
+            elif pendings > 0 and max_seen > 0:
+                # Positions closed (TP/SL/manual) but opposite-side pending orders remain.
+                # Cancel them so they don't fill into an unprotected new position.
+                cls.enqueue(account, CANCEL_PENDINGS, symbol, magic=magic,
+                            comment=f"FB|cancel_stale|{tf}", now=t)
+                LOG.info(f"[reconcile] {symbol} magic={magic} positions gone, "
+                         f"cancelling {pendings} stale pendings")
             return None
 
         n = int(cyc.get("n_per_side") or 0)
@@ -316,50 +352,74 @@ class ExecBridge:
         min_target = float(grid_cfg.get("cycle_min_target_usd", 0.20) or 0.0)
         close_on_full_hedge = bool(grid_cfg.get("cycle_close_on_full_hedge", True))
 
-        # 0.5) bias-side trailing book — directional profit capture, independent of the
-        # net-basket exit (which a hedge leg can mask). Gate: a side has ALL its legs
-        # filled (the move committed your way). Track that side's peak floating P&L; when
-        # it gives back ≥ giveback% from the peak, BOOK half that side and move the rest
-        # to breakeven (risk-free runner). Fires once per cycle (bias_booked guard).
+        # 0.5) Cycle-level trailing SL — tracks ONE combined (buy+sell) peak for the
+        # whole cycle. When combined P&L retraces from that peak, both sides get a
+        # broker-side SL: bias side uses bias_trail_* giveback, hedge side uses
+        # hedge_trail_* giveback (can be set tighter or wider independently).
         if (bool(grid_cfg.get("bias_trail_enabled", True))
                 and not cyc.get("bias_booked")
                 and buy_pnl is not None and sell_pnl is not None):
-            buy_n = int(cyc.get("buy_n") or 0)
-            sell_n = int(cyc.get("sell_n") or 0)
+            buy_pnl_f  = float(buy_pnl  or 0.0)
+            sell_pnl_f = float(sell_pnl or 0.0)
+            buys_n  = int(buys  or 0)
+            sells_n = int(sells or 0)
+            combined_pnl = buy_pnl_f + sell_pnl_f
+            # Identify which side is the bias (higher positive P&L).
             bias = ""
-            if buy_n > 0 and int(buys or 0) >= buy_n:
+            if buys_n > 0 and buy_pnl_f > 0 and buy_pnl_f >= sell_pnl_f:
                 bias = "buy"
-            elif sell_n > 0 and int(sells or 0) >= sell_n:
+            elif sells_n > 0 and sell_pnl_f > 0:
                 bias = "sell"
             if bias:
-                side_pnl = float(buy_pnl if bias == "buy" else sell_pnl)
-                peak = max(float(cyc.get("bias_peak") or 0.0), side_pnl)
-                if peak != float(cyc.get("bias_peak") or 0.0):
-                    cyc["bias_peak"] = peak
+                old_peak = float(cyc.get("cycle_trail_peak") or 0.0)
+                peak = max(old_peak, combined_pnl)
+                _act_by_tf = grid_cfg.get("bias_trail_activate_by_tf") or {}
+                activate   = float(_act_by_tf.get(tf) or grid_cfg.get("bias_trail_activate_usd", 5.0) or 0.0)
+                if peak > old_peak:
+                    cyc["cycle_trail_peak"] = peak
                     cls.set_last_arm(account, symbol, **cyc)
-                activate = float(grid_cfg.get("bias_trail_activate_usd", 5.0) or 0.0)
-                giveback = float(grid_cfg.get("bias_trail_giveback_pct", 40.0) or 0.0)
-                book_frac = float(grid_cfg.get("bias_book_frac", 0.5) or 0.5)
-                if (activate > 0 and peak >= activate
-                        and side_pnl <= peak * (1.0 - giveback / 100.0)):
-                    cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic, side=bias,
-                                frac=book_frac, comment=f"FB|book|{bias}", now=t)
-                    cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=bias,
-                                comment=f"FB|be|{bias}", now=t)
-                    cls.set_last_arm(account, symbol, **{**cyc, "bias_booked": True})
-                    _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
-                                      "tf": tf, "magic": magic, "exit_reason": "bias_book_trail",
-                                      "bias": bias, "peak": round(peak, 2),
-                                      "side_pnl": round(side_pnl, 2), "book_frac": book_frac,
-                                      "squeeze_ok": cyc.get("squeeze_ok"),
-                                      "squeeze_rank": cyc.get("squeeze_rank")})
-                    return "bias_book_trail"   # cycle continues (runner + hedge); no flatten
+                    LOG.info(f"[trail] {symbol} magic={magic} cycle peak "
+                             f"{old_peak:.2f}→{peak:.2f} (combined={combined_pnl:.2f})")
+                    if activate > 0 and peak >= activate:
+                        # Bias side SL
+                        _give_bias = grid_cfg.get("bias_trail_giveback_pct_by_tf") or {}
+                        gb_bias    = float(_give_bias.get(tf) or grid_cfg.get("bias_trail_giveback_pct", 40.0) or 0.0)
+                        if (bias == "buy" and buys_n > 0 and buy_pnl_f > 0) or \
+                           (bias == "sell" and sells_n > 0 and sell_pnl_f > 0):
+                            side_pnl_bias = buy_pnl_f if bias == "buy" else sell_pnl_f
+                            locked_bias   = side_pnl_bias * (1.0 - gb_bias / 100.0)
+                            cls.enqueue(account, "MODIFY_SL", symbol, magic=magic, side=bias,
+                                        locked_pnl=locked_bias,
+                                        comment=f"FB|tsl|{tf}|{bias}|bias", now=t)
+                        # Hedge side SL
+                        hedge = "sell" if bias == "buy" else "buy"
+                        hedge_pnl_f = sell_pnl_f if bias == "buy" else buy_pnl_f
+                        hedge_n     = sells_n    if bias == "buy" else buys_n
+                        _give_hedge = grid_cfg.get("hedge_trail_giveback_pct_by_tf") or {}
+                        gb_hedge    = float(_give_hedge.get(tf) or grid_cfg.get("hedge_trail_giveback_pct", 40.0) or 0.0)
+                        if hedge_n > 0 and hedge_pnl_f > 0:
+                            locked_hedge = hedge_pnl_f * (1.0 - gb_hedge / 100.0)
+                            cls.enqueue(account, "MODIFY_SL", symbol, magic=magic, side=hedge,
+                                        locked_pnl=locked_hedge,
+                                        comment=f"FB|tsl|{tf}|{hedge}|hedge", now=t)
+                        cls.enqueue(account, "CANCEL_PENDINGS", symbol, magic=magic,
+                                    comment=f"FB|tsl|{tf}|cancel_pend", now=t)
+                        LOG.info(f"[trail] {symbol} magic={magic} tf={tf} cycle SL set "
+                                 f"peak={peak:.2f} bias={bias} gb_bias={gb_bias}% gb_hedge={gb_hedge}%")
 
         reason: str | None = None
         detail: dict = {}
 
-        # 1) flatten-rest — a filled leg closed while the opposite ladder still rests.
-        if 0 < positions < max_seen and pendings > 0:
+        # 1) flatten-rest — a filled leg closed while the opposite ladder still rests,
+        # OR one side of a fully-filled squeeze cycle exited (trail SL / TP / manual)
+        # leaving the other side open with no pending orders to cancel.
+        _buys_n  = int(buys  or 0)
+        _sells_n = int(sells or 0)
+        one_sided_remnant = (
+            positions > 0 and pendings == 0 and max_seen > 0
+            and ((_buys_n == 0) != (_sells_n == 0))  # exactly one side is flat
+        )
+        if (0 < positions < max_seen and pendings > 0) or one_sided_remnant:
             tol = max(mid * 1e-4, 1e-6) if mid > 0 else 1e-6
             confirms = (tp_up > 0 and mid >= tp_up - tol) or (tp_down > 0 and 0 < mid <= tp_down + tol)
             reason = "leg_tp" if confirms else "leg_closed_other"
@@ -382,7 +442,7 @@ class ExecBridge:
         if reason is None:
             return None
 
-        cls.enqueue(account, CLOSE_ALL, symbol, comment=f"FB|flatten|{reason}", magic=magic, now=t)
+        cls.enqueue(account, CLOSE_ALL, symbol, comment=f"FB|flatten|{tf}|{reason}", magic=magic, now=t)
         cls.set_last_arm(account, symbol, **{**cyc, "flatten_ts": t})
         _emit_exit_audit({"account": str(account), "broker_symbol": symbol, "tf": tf, "magic": magic,
                           "exit_reason": reason, "armed_tf": cyc.get("armed_tf", ""),
@@ -446,12 +506,16 @@ class ExecBridge:
     def enqueue(cls, account: str, type: str, symbol: str, *, order_type: str = "",
                 price: float = 0.0, lot: float = 0.0, sl: float = 0.0, tp: float = 0.0,
                 comment: str = "", magic: int = 0, side: str = "", frac: float = 0.0,
+                buy_tp: float = 0.0, sell_tp: float = 0.0,
+                locked_pnl: float = 0.0,
                 now: float | None = None) -> Command:
         cmd = Command(
             id=uuid.uuid4().hex[:12], account=str(account), type=type, symbol=symbol,
             order_type=order_type, price=round(float(price), 5), lot=round(float(lot), 2),
             sl=round(float(sl), 5), tp=round(float(tp), 5), comment=comment,
             magic=int(magic), side=side, frac=float(frac),
+            buy_tp=round(float(buy_tp), 5), sell_tp=round(float(sell_tp), 5),
+            locked_pnl=round(float(locked_pnl), 2),
             ts_created=now if now is not None else time.time(),
         )
         with cls._lock:

@@ -110,7 +110,7 @@ def main() -> None:
     if built is None:
         print("\n  ⚠ Cannot compute VP — no valid bars")
         return
-    bins, _bin_centers, bin_size, p_min, p_max = built
+    bins, _bin_centers, bin_size, p_min, p_max, _ask_bins, _bid_bins = built
     n_bins = len(bins)
     total_vol = float(bins.sum())
 
