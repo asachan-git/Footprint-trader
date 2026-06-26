@@ -392,6 +392,16 @@ int CountMyPendings()
    return n;
 }
 
+double PnlForMagic(long magic)
+{
+   double total = 0.0;
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(posInfo.SelectByIndex(i))
+         if(posInfo.Magic() == magic && posInfo.Symbol() == _Symbol)
+            total += posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+   return total;
+}
+
 //+------------------------------------------------------------------+
 //| Flatten EVERYTHING this EA owns on this chart's symbol: cancel    |
 //| all our pendings + close all our positions. Used by the equity    |
@@ -1594,12 +1604,18 @@ void UpdateDashboard()
       DashRow(row, "── Active cycles ──", clrDimGray); row++;
       for(int i = 0; i < ngc2 && i < 8; i++)
       {
-         color gcClr = clrSilver;
-         if(gGridCycles[i].tf == "1m")       gcClr = clrAqua;
+         double gcPnl = PnlForMagic(gGridCycles[i].magic);
+         color gcClr;
+         if(gcPnl > 0.01)       gcClr = clrLimeGreen;
+         else if(gcPnl < -0.01) gcClr = clrTomato;
+         else if(gGridCycles[i].tf == "1m")  gcClr = clrAqua;
          else if(gGridCycles[i].tf == "5m")  gcClr = clrLime;
          else if(gGridCycles[i].tf == "15m") gcClr = clrGold;
          else if(gGridCycles[i].tf == "1h")  gcClr = clrOrange;
+         else                                gcClr = clrSilver;
+         string gcPnlStr = (gcPnl >= 0 ? "+" : "") + DoubleToString(gcPnl, 2);
          string gcTxt = gGridCycles[i].tf + " " + gGridCycles[i].kind
+                        + "  pnl=" + gcPnlStr
                         + "  tgt=" + DoubleToString(gGridCycles[i].net_target, 0)
                         + "  trail=" + DoubleToString(gGridCycles[i].trail_activate, 0)
                         + (gGridCycles[i].squeeze_ok ? " SQ" : "");
