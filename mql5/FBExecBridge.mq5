@@ -356,6 +356,39 @@ int CountMyPendings()
    return n;
 }
 
+double PnlForMagic(long magic)
+{
+   double total = 0.0;
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(posInfo.SelectByIndex(i))
+         if(posInfo.Magic() == magic && posInfo.Symbol() == _Symbol)
+            total += posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+   return total;
+}
+
+//+------------------------------------------------------------------+
+//| Flatten EVERYTHING this EA owns on this chart's symbol: cancel    |
+//| all our pendings + close all our positions. Used by the equity    |
+//| target hard-stop (local failsafe, independent of the server).     |
+//+------------------------------------------------------------------+
+void CloseAllMine(int &closed, int &cancelled)
+{
+   closed = 0; cancelled = 0;
+   ulong pend[];
+   for(int i = 0; i < OrdersTotal(); i++)
+      if(orderInfo.SelectByIndex(i) && IsMine(orderInfo.Magic()) && orderInfo.Symbol() == _Symbol)
+      { int n = ArraySize(pend); ArrayResize(pend, n + 1); pend[n] = orderInfo.Ticket(); }
+   for(int i = 0; i < ArraySize(pend); i++)
+      if(trade.OrderDelete(pend[i])) cancelled++;
+
+   ulong pos[];
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(posInfo.SelectByIndex(i) && IsMine(posInfo.Magic()) && posInfo.Symbol() == _Symbol)
+      { int n = ArraySize(pos); ArrayResize(pos, n + 1); pos[n] = posInfo.Ticket(); }
+   for(int i = 0; i < ArraySize(pos); i++)
+      if(trade.PositionClose(pos[i], InpSlippage)) closed++;
+}
+
 //--- Per-side open counts + basket floating P&L (for the server cycle monitor).
 //    NOTE: POSITION_COMMISSION is often 0 on the open position (commission lands on
 //    the deal), so pnl may understate true cost — verify on the demo broker.
@@ -1004,6 +1037,65 @@ void UpdateDashboard()
    DashRow(4, "Legs:     " + IntegerToString(nOpen) + " open / " + IntegerToString(nPend) + " pend", InpDashColor);
    DashRow(5, "Hedged loss: -" + DoubleToString(loss, 2) + " " + ccy,
            loss > 0 ? clrTomato : clrLimeGreen);
+
+   // HVN → cycle map rows: one row per HVN zone showing which TF cycles are armed
+   // Format: "HVN 3215–3228: 5m·top  15m·bot"  or  "HVN 3215–3228: —"
+   int row = 6;
+   double lastLo = -1;
+   string rowText = "";
+   int nh = ArraySize(gHvnCycles);
+   for(int i = 0; i <= nh; i++)
+   {
+      bool flush = (i == nh) || (i > 0 && gHvnCycles[i].lo != lastLo);
+      if(flush && lastLo >= 0)
+      {
+         // find hi for this zone
+         double lastHi = 0;
+         for(int k = 0; k < nh; k++)
+            if(gHvnCycles[k].lo == lastLo) { lastHi = gHvnCycles[k].hi; break; }
+         string label = "HVN " + DoubleToString(lastLo, dg) + "–" + DoubleToString(lastHi, dg) + ": ";
+         DashRow(row, label + (rowText == "" ? "—" : rowText), clrSteelBlue);
+         row++;
+         rowText = "";
+      }
+      if(i < nh)
+      {
+         lastLo = gHvnCycles[i].lo;
+         if(gHvnCycles[i].magic > 0)
+         {
+            string entry = gHvnCycles[i].tf + (gHvnCycles[i].edge != "" ? "·" + gHvnCycles[i].edge : "");
+            rowText = (rowText == "" ? entry : rowText + "  " + entry);
+         }
+      }
+   }
+   // Active cycle rows: one per active grid cycle (TF / kind / net_target / trail)
+   int ngc2 = ArraySize(gGridCycles);
+   if(ngc2 > 0)
+   {
+      DashRow(row, "── Active cycles ──", clrDimGray); row++;
+      for(int i = 0; i < ngc2 && i < 8; i++)
+      {
+         double gcPnl = PnlForMagic(gGridCycles[i].magic);
+         color gcClr;
+         if(gcPnl > 0.01)       gcClr = clrLimeGreen;
+         else if(gcPnl < -0.01) gcClr = clrTomato;
+         else if(gGridCycles[i].tf == "1m")  gcClr = clrAqua;
+         else if(gGridCycles[i].tf == "5m")  gcClr = clrLime;
+         else if(gGridCycles[i].tf == "15m") gcClr = clrGold;
+         else if(gGridCycles[i].tf == "1h")  gcClr = clrOrange;
+         else                                gcClr = clrSilver;
+         string gcPnlStr = (gcPnl >= 0 ? "+" : "") + DoubleToString(gcPnl, 2);
+         string gcTxt = gGridCycles[i].tf + " " + gGridCycles[i].kind
+                        + "  pnl=" + gcPnlStr
+                        + "  tgt=" + DoubleToString(gGridCycles[i].net_target, 0)
+                        + "  trail=" + DoubleToString(gGridCycles[i].trail_activate, 0)
+                        + (gGridCycles[i].squeeze_ok ? " SQ" : "");
+         DashRow(row, gcTxt, gcClr); row++;
+      }
+   }
+
+   // clear any stale rows beyond what we just drew
+   for(int r = row; r <= row + 12; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
 }
 
 void ClearDashboard()
