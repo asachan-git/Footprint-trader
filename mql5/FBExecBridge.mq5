@@ -59,6 +59,10 @@ input bool   InpShowDash        = true;          // Show trigger/HVN/hedged-loss
 input int    InpDashFontSize    = 9;             // Dashboard font size
 input int    InpDashRowPad      = 14;            // Extra pixels between rows (increase on Wine/Mac)
 input color  InpDashColor       = clrWhite;      // Dashboard text colour
+input double InpEquityTarget    = -500.0;        // Equity drawdown hard-stop (local failsafe, 0 = off)
+
+struct HvnCycleEntry { double lo, hi; long magic; string tf, edge; };
+struct GridCycleEntry { long magic; string tf, kind; double net_target, trail_activate; bool squeeze_ok; };
 
 CTrade        trade;
 COrderInfo    orderInfo;
@@ -73,6 +77,10 @@ double   gNodeLo        = 0.0;
 double   gNodeHi        = 0.0;
 string   gTriggerKind   = "";
 string   gEmitEdge      = "";
+
+//--- per-cycle arrays refreshed from /exec/zones (hvn_cycles + grid_cycles)
+HvnCycleEntry  gHvnCycles[];
+GridCycleEntry gGridCycles[];
 
 //--- chart-overlay indicator handles (3σ Bollinger Bands + FBSqueeze BBW% subwindow)
 int      gBBHandle      = INVALID_HANDLE;
@@ -169,6 +177,18 @@ int JsonSplitArray(const string js, const string arrKey, string &out[])
 }
 
 int JsonSplitCommands(const string js, string &out[]) { return JsonSplitArray(js, "commands", out); }
+
+bool JsonGetBool(const string js, const string key)
+{
+   string pat = "\"" + key + "\"";
+   int k = StringFind(js, pat);
+   if(k < 0) return false;
+   int colon = StringFind(js, ":", k + StringLen(pat));
+   if(colon < 0) return false;
+   int i = colon + 1;
+   while(i < StringLen(js) && StringGetCharacter(js, i) == ' ') i++;
+   return StringSubstr(js, i, 4) == "true";
+}
 
 //+------------------------------------------------------------------+
 //| HTTP POST helper. Returns HTTP code (-1 on transport error).     |
@@ -952,6 +972,33 @@ void FetchAndDrawZones()
 
    //--- computed volume profile (right-margin histogram)
    if(InpDrawVP) DrawProfile(resp);
+
+   //--- active grid cycles (for the dashboard cycle rows)
+   string gcs[];
+   int ngc = JsonSplitArray(resp, "grid_cycles", gcs);
+   ArrayResize(gGridCycles, ngc);
+   for(int i = 0; i < ngc; i++)
+   {
+      gGridCycles[i].magic          = (long)JsonGetNumber(gcs[i], "magic");
+      gGridCycles[i].tf             = JsonGetString(gcs[i], "tf");
+      gGridCycles[i].kind           = JsonGetString(gcs[i], "trigger_kind");
+      gGridCycles[i].net_target     = JsonGetNumber(gcs[i], "net_target");
+      gGridCycles[i].trail_activate = JsonGetNumber(gcs[i], "trail_activate");
+      gGridCycles[i].squeeze_ok     = JsonGetBool(gcs[i], "squeeze_ok");
+   }
+
+   //--- HVN-to-cycle map (for the dashboard zone rows)
+   string hvcs[];
+   int nhvc = JsonSplitArray(resp, "hvn_cycles", hvcs);
+   ArrayResize(gHvnCycles, nhvc);
+   for(int i = 0; i < nhvc; i++)
+   {
+      gHvnCycles[i].lo    = JsonGetNumber(hvcs[i], "lo");
+      gHvnCycles[i].hi    = JsonGetNumber(hvcs[i], "hi");
+      gHvnCycles[i].magic = (long)JsonGetNumber(hvcs[i], "magic");
+      gHvnCycles[i].tf    = JsonGetString(hvcs[i], "tf");
+      gHvnCycles[i].edge  = JsonGetString(hvcs[i], "edge");
+   }
 
    if(InpVerbose && (n > 0 || nl > 0))
       Print("🟦 Drew ", n, " zones + ", nl, " VP levels | fulcrum ",

@@ -401,6 +401,26 @@ def exec_zones():
             ict_out["side"] = ov.get("side", "")
             ict_out["status"] = ov.get("status", "")
 
+    # Active cycles for the EA dashboard: grid_cycles (one row per cycle) +
+    # hvn_cycles (cycles mapped to their HVN node lo/hi for zone grouping).
+    grid_cfg = settings.get("grid_levels") or {}
+    by_tf = grid_cfg.get("cycle_net_target_by_tf") or {}
+    act_by_tf = grid_cfg.get("bias_trail_activate_by_tf") or {}
+    base_target = float(grid_cfg.get("cycle_net_target_usd", 0.0) or 0.0)
+    trail_fallback = float(grid_cfg.get("bias_trail_activate_usd", 5.0) or 5.0)
+
+    cycles_detail = ExecBridge.active_cycles_detail(account, broker_symbol)
+    grid_cycles, hvn_cycles = [], []
+    for c in cycles_detail:
+        tf = c.get("tf", "")
+        net = float((by_tf.get(tf) if isinstance(by_tf, dict) else None) or base_target)
+        trail = float((act_by_tf.get(tf) if isinstance(act_by_tf, dict) else None) or trail_fallback)
+        grid_cycles.append({**c, "net_target": net, "trail_activate": trail})
+        lo, hi = float(c.get("node_low") or 0.0), float(c.get("node_high") or 0.0)
+        if lo > 0 and hi > 0:
+            hvn_cycles.append({"lo": lo, "hi": hi, "magic": c["magic"],
+                               "tf": tf, "edge": c.get("edge", "")})
+
     return jsonify({"ok": True, "zones": zones, "levels": levels, "ict": ict_out,
                     "profile": profile, "vp_bin": vp_bin,
                     "venue_mid": quote.get("mid", 0.0),
@@ -409,7 +429,8 @@ def exec_zones():
                     "emit_edge": arm.get("edge", ""),
                     "trigger_kind": arm.get("trigger_kind", ""),
                     "node_low": arm.get("node_low", 0.0),
-                    "node_high": arm.get("node_high", 0.0)})
+                    "node_high": arm.get("node_high", 0.0),
+                    "grid_cycles": grid_cycles, "hvn_cycles": hvn_cycles})
 
 
 @bp.get("/exec/queue")
