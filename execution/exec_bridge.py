@@ -73,6 +73,10 @@ _STRAT_CODE = {
     # under ONE dedicated magic so the trade report reads it as a single setup. The audit
     # still records the real detector (trigger_kind) that fired.
     "vp_levels": 9,
+    # BB-expansion touch: post-squeeze band-touch with footprint absorption confirm.
+    # Must be registered here so it gets its own isolated magic decade; otherwise unknown
+    # trigger_kinds all fall to strat_code=0 and share the same cycle-state slot.
+    "bb_expansion_touch": 11,
 }
 _TF_CODE = {"1m": 1, "5m": 2, "15m": 3, "1h": 4}
 _CODE_TF = {v: k for k, v in _TF_CODE.items()}
@@ -534,9 +538,10 @@ class ExecBridge:
             buy_n = int(cyc.get("buy_n") or 0)
             sell_n = int(cyc.get("sell_n") or 0)
             bias = ""
-            if buy_n > 0 and int(buys or 0) >= buy_n:
+            _bias_peak_set = float(cyc.get("bias_peak") or 0.0) > 0.0
+            if buy_n > 0 and int(buys or 0) > 0 and (int(buys or 0) >= buy_n or _bias_peak_set):
                 bias = "buy"
-            elif sell_n > 0 and int(sells or 0) >= sell_n:
+            elif sell_n > 0 and int(sells or 0) > 0 and (int(sells or 0) >= sell_n or _bias_peak_set):
                 bias = "sell"
             if bias:
                 side_pnl = float(buy_pnl if bias == "buy" else sell_pnl)
