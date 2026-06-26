@@ -345,8 +345,8 @@ class ExecBridge:
 
     @classmethod
     def active_cycles_detail(cls, account: str, broker_symbol: str) -> list[dict]:
-        """All active cycles with full arm metadata: magic, tf, fulcrum, edge, trigger_kind,
-        node_low, node_high. Used by /exec/zones to annotate which cycle sits in which HVN."""
+        """All active cycles with full arm metadata. Used by /exec/zones to annotate
+        which cycle sits in which HVN and to build the dashboard grid_cycles array."""
         out = []
         with cls._lock:
             for (acc, sym, mg), m in cls._last_arm.items():
@@ -363,6 +363,11 @@ class ExecBridge:
                     "trigger_kind": str(m.get("trigger_kind") or ""),
                     "node_low": float(m.get("node_low") or 0.0),
                     "node_high": float(m.get("node_high") or 0.0),
+                    "tp_up":   float(m.get("tp_up") or 0.0),
+                    "tp_down": float(m.get("tp_down") or 0.0),
+                    "buy_n":   int(m.get("buy_n") or 0),
+                    "sell_n":  int(m.get("sell_n") or 0),
+                    "squeeze_ok": bool(m.get("squeeze_ok")),
                 })
         return out
 
