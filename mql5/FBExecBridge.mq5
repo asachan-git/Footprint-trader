@@ -58,6 +58,7 @@ input int    InpSqMinOn         = 6;      // min coil bars (MATCH squeeze_min_on
 input group "=== Corner dashboard ==="
 input bool   InpShowDash        = true;          // Show trigger/HVN/hedged-loss panel (top-right)
 input int    InpDashFontSize    = 9;             // Dashboard font size
+input int    InpDashRowPad      = 14;            // Extra pixels between rows (increase on Wine/Mac)
 input color  InpDashColor       = clrWhite;      // Dashboard text colour
 
 input group "=== Equity target (hard local stop) ==="
@@ -1557,7 +1558,7 @@ void NetPosition(long magic, double &netLots, string &netSide)
 //--- Black background rectangle behind the label rows. Height resizes to fit.
 void DrawDashBg(int totalRows)
 {
-   int h = 10 + (totalRows + 1) * (InpDashFontSize + 8);
+   int h = 10 + (totalRows + 1) * (InpDashFontSize + InpDashRowPad);
    if(ObjectFind(0, DASH_BG) < 0)
    {
       ObjectCreate(0, DASH_BG, OBJ_RECTANGLE_LABEL, 0, 0, 0);
@@ -1587,7 +1588,7 @@ void DashRow(int row, const string text, color clr)
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
    ObjectSetString (0, name, OBJPROP_FONT,       "Consolas");
-   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, 18 + row * (InpDashFontSize + 8));
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, 18 + row * (InpDashFontSize + InpDashRowPad));
    ObjectSetInteger(0, name, OBJPROP_FONTSIZE,  InpDashFontSize);
    ObjectSetInteger(0, name, OBJPROP_COLOR,     clr);
    ObjectSetString (0, name, OBJPROP_TEXT,      text);
