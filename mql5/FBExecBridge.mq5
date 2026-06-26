@@ -17,7 +17,7 @@
 //|    POST {InpBridgeURL}/exec/ack   {account, results:[...]}        |
 //+------------------------------------------------------------------+
 #property copyright "Aniket"
-#property version   "1.03"
+#property version   "1.04"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -102,6 +102,7 @@ int      gSqSubwin      = -1;
 
 #define ZONE_PREFIX "FBZone_"
 #define DASH_PREFIX "FBDash_"   // separate prefix → ClearZones() won't sweep the dashboard
+#define DASH_BG     "FBDash_bg" // black background rectangle for the panel
 
 //+------------------------------------------------------------------+
 //| Minimal flat-JSON scalar extractors (contract is flat per object)|
@@ -1512,6 +1513,69 @@ double HedgedLossAtFulcrum(int &nOpen, int &nPend)
    return loss;
 }
 
+//--- Closed P&L today (deals) + open floating for one magic. Used for per-strategy day PnL row.
+double DailyPnlForMagic(long magic)
+{
+   datetime dayStart = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
+   double closed = 0.0;
+   if(HistorySelect(dayStart, TimeCurrent()))
+   {
+      int total = HistoryDealsTotal();
+      for(int i = 0; i < total; i++)
+      {
+         ulong ticket = HistoryDealGetTicket(i);
+         if(ticket == 0) continue;
+         if((long)HistoryDealGetInteger(ticket, DEAL_MAGIC) != magic) continue;
+         if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+         ENUM_DEAL_ENTRY ent = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(ticket, DEAL_ENTRY);
+         if(ent == DEAL_ENTRY_OUT || ent == DEAL_ENTRY_OUT_BY || ent == DEAL_ENTRY_INOUT)
+            closed += HistoryDealGetDouble(ticket, DEAL_PROFIT)
+                    + HistoryDealGetDouble(ticket, DEAL_SWAP)
+                    + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+      }
+   }
+   return closed + PnlForMagic(magic);
+}
+
+//--- Net position for one magic: buyLots − sellLots. netSide = "B","S","—".
+void NetPosition(long magic, double &netLots, string &netSide)
+{
+   double buyLots = 0.0, sellLots = 0.0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Magic() != magic || posInfo.Symbol() != _Symbol) continue;
+      if(posInfo.PositionType() == POSITION_TYPE_BUY) buyLots  += posInfo.Volume();
+      else                                            sellLots += posInfo.Volume();
+   }
+   double net = buyLots - sellLots;
+   if(net > 0.001)       { netLots = net;  netSide = "B"; }
+   else if(net < -0.001) { netLots = -net; netSide = "S"; }
+   else                  { netLots = 0.0;  netSide = "—"; }
+}
+
+//--- Black background rectangle behind the label rows. Height resizes to fit.
+void DrawDashBg(int totalRows)
+{
+   int h = 10 + (totalRows + 1) * (InpDashFontSize + 8);
+   if(ObjectFind(0, DASH_BG) < 0)
+   {
+      ObjectCreate(0, DASH_BG, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, DASH_BG, OBJPROP_CORNER,     CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, DASH_BG, OBJPROP_XDISTANCE,  0);
+      ObjectSetInteger(0, DASH_BG, OBJPROP_YDISTANCE,  0);
+      ObjectSetInteger(0, DASH_BG, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, DASH_BG, OBJPROP_HIDDEN,     true);
+   }
+   ObjectSetInteger(0, DASH_BG, OBJPROP_XSIZE,       410);
+   ObjectSetInteger(0, DASH_BG, OBJPROP_YSIZE,       h);
+   ObjectSetInteger(0, DASH_BG, OBJPROP_BGCOLOR,     clrBlack);
+   ObjectSetInteger(0, DASH_BG, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, DASH_BG, OBJPROP_COLOR,       clrDimGray);
+   ObjectSetInteger(0, DASH_BG, OBJPROP_WIDTH,       1);
+   ObjectSetInteger(0, DASH_BG, OBJPROP_BACK,        true);
+}
+
 void DashRow(int row, const string text, color clr)
 {
    string name = DASH_PREFIX + IntegerToString(row);
@@ -1536,37 +1600,39 @@ void UpdateDashboard()
 
    if(gHalted)
    {
-      DashRow(0, "▌ FB GRID — HALTED (equity target "
-              + DoubleToString(InpEquityTarget, 2) + ")", clrOrange);
-      for(int r = 1; r <= 12; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
+      DrawDashBg(1);
+      DashRow(0, "■ FB GRID  HALTED  eq≥" + DoubleToString(InpEquityTarget, 0), clrOrange);
+      for(int r = 1; r <= 30; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
       return;
    }
 
-   // idle = no live legs of ours AND no armed fulcrum on any cycle
    int nOpen = 0, nPend = 0;
    double loss = HedgedLossAtFulcrum(nOpen, nPend);
-   if(nOpen == 0 && nPend == 0 && gFulcrum <= 0)
+   if(nOpen == 0 && nPend == 0 && gFulcrum <= 0 && ArraySize(gGridCycles) == 0)
    {
-      DashRow(0, "▌ FB GRID — idle", clrSilver);
-      for(int r = 1; r <= 12; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
+      DrawDashBg(1);
+      DashRow(0, "▌ FB GRID  idle", clrDimGray);
+      for(int r = 1; r <= 30; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
       return;
    }
-   string ccy = AccountInfoString(ACCOUNT_CURRENCY);
-   string kind = (gTriggerKind == "" ? "—" : gTriggerKind);
+
+   string ccy     = AccountInfoString(ACCOUNT_CURRENCY);
+   string kind    = (gTriggerKind == "" ? "—" : gTriggerKind);
    string nodeStr = (gNodeLo > 0 && gNodeHi > 0)
-                    ? DoubleToString(gNodeLo, dg) + "–" + DoubleToString(gNodeHi, dg)
-                    : "—";
+                    ? DoubleToString(gNodeLo, dg) + "–" + DoubleToString(gNodeHi, dg) : "—";
+   string edgeTxt = (gEmitEdge == "" ? "" : "  " + gEmitEdge);
 
-   DashRow(0, "▌ FB GRID", InpDashColor);
-   DashRow(1, "Trigger:  " + kind + (gEmitEdge == "" ? "" : " " + gEmitEdge), InpDashColor);
-   DashRow(2, "Trig px:  " + DoubleToString(gFulcrum, dg), clrAqua);
-   DashRow(3, "HVN:      " + nodeStr, clrSteelBlue);
-   DashRow(4, "Legs:     " + IntegerToString(nOpen) + " open / " + IntegerToString(nPend) + " pend", InpDashColor);
-   DashRow(5, "Hedged loss: -" + DoubleToString(loss, 2) + " " + ccy,
-           loss > 0 ? clrTomato : clrLimeGreen);
+   // ── Header block ──────────────────────────────────────────────────
+   DashRow(0, "▌ FB GRID", clrWhite);
+   DashRow(1, "◈ " + kind + edgeTxt, clrCyan);           // setup name — pops in cyan
+   DashRow(2, "⊙ " + DoubleToString(gFulcrum, dg), clrYellow);  // fulcrum price — yellow
+   DashRow(3, "≡ " + nodeStr, clrDodgerBlue);             // HVN range — blue
+   DashRow(4, IntegerToString(nOpen) + " open  " + IntegerToString(nPend) + " pend",
+           clrSilver);
+   DashRow(5, "hedge –" + DoubleToString(loss, 2) + " " + ccy,
+           loss > 0.01 ? clrRed : clrDimGray);
 
-   // HVN → cycle map rows: one row per HVN zone showing which TF cycles are armed
-   // Format: "HVN 3215–3228: 5m·top  15m·bot"  or  "HVN 3215–3228: —"
+   // ── HVN → cycle map ───────────────────────────────────────────────
    int row = 6;
    double lastLo = -1;
    string rowText = "";
@@ -1576,58 +1642,74 @@ void UpdateDashboard()
       bool flush = (i == nh) || (i > 0 && gHvnCycles[i].lo != lastLo);
       if(flush && lastLo >= 0)
       {
-         // find hi for this zone
          double lastHi = 0;
          for(int k = 0; k < nh; k++)
             if(gHvnCycles[k].lo == lastLo) { lastHi = gHvnCycles[k].hi; break; }
-         string label = "HVN " + DoubleToString(lastLo, dg) + "–" + DoubleToString(lastHi, dg) + ": ";
-         DashRow(row, label + (rowText == "" ? "—" : rowText), clrSteelBlue);
-         row++;
-         rowText = "";
+         string lbl = "HVN " + DoubleToString(lastLo, dg) + "–" + DoubleToString(lastHi, dg) + "  ";
+         DashRow(row, lbl + (rowText == "" ? "—" : rowText), clrDodgerBlue);
+         row++; rowText = "";
       }
       if(i < nh)
       {
          lastLo = gHvnCycles[i].lo;
          if(gHvnCycles[i].magic > 0)
          {
-            string entry = gHvnCycles[i].tf + (gHvnCycles[i].edge != "" ? "·" + gHvnCycles[i].edge : "");
-            rowText = (rowText == "" ? entry : rowText + "  " + entry);
+            string ent = gHvnCycles[i].tf + (gHvnCycles[i].edge != "" ? "·" + gHvnCycles[i].edge : "");
+            rowText = (rowText == "" ? ent : rowText + "  " + ent);
          }
       }
    }
-   // Active cycle rows: one per active grid cycle (TF / kind / net_target / trail)
+
+   // ── Active cycles ─────────────────────────────────────────────────
    int ngc2 = ArraySize(gGridCycles);
    if(ngc2 > 0)
    {
-      DashRow(row, "── Active cycles ──", clrDimGray); row++;
+      DashRow(row, "── cycles ──────────────────────────", clrDimGray); row++;
       for(int i = 0; i < ngc2 && i < 8; i++)
       {
-         double gcPnl = PnlForMagic(gGridCycles[i].magic);
+         long   mg      = gGridCycles[i].magic;
+         string ctf     = gGridCycles[i].tf;
+         string cknd    = gGridCycles[i].kind;
+         double gcPnl   = PnlForMagic(mg);          // floating only
+         double gcDay   = DailyPnlForMagic(mg);     // closed-today + floating
+         double netLots; string netSide;
+         NetPosition(mg, netLots, netSide);
+
+         // TF accent color (flat/idle state)
+         color tfClr = clrSilver;
+         if(ctf == "1m")       tfClr = clrAqua;
+         else if(ctf == "5m")  tfClr = clrLime;
+         else if(ctf == "15m") tfClr = clrGold;
+         else if(ctf == "1h")  tfClr = clrOrange;
+
+         // Row color: drive off floating P&L for urgency
          color gcClr;
-         if(gcPnl > 0.01)       gcClr = clrLimeGreen;
-         else if(gcPnl < -0.01) gcClr = clrTomato;
-         else if(gGridCycles[i].tf == "1m")  gcClr = clrAqua;
-         else if(gGridCycles[i].tf == "5m")  gcClr = clrLime;
-         else if(gGridCycles[i].tf == "15m") gcClr = clrGold;
-         else if(gGridCycles[i].tf == "1h")  gcClr = clrOrange;
-         else                                gcClr = clrSilver;
-         string gcPnlStr = (gcPnl >= 0 ? "+" : "") + DoubleToString(gcPnl, 2);
-         string gcTxt = gGridCycles[i].tf + " " + gGridCycles[i].kind
-                        + "  pnl=" + gcPnlStr
-                        + "  tgt=" + DoubleToString(gGridCycles[i].net_target, 0)
-                        + "  trail=" + DoubleToString(gGridCycles[i].trail_activate, 0)
-                        + (gGridCycles[i].squeeze_ok ? " SQ" : "");
+         if(gcPnl > 0.01)       gcClr = clrChartreuse;
+         else if(gcPnl < -0.01) gcClr = clrRed;
+         else                   gcClr = tfClr;
+
+         // Format: "► 5m hvn_touch  F:+12.50  D:+45.00  T:750  net:0.25S"
+         string fStr = (gcPnl  >= 0 ? "+" : "") + DoubleToString(gcPnl,  2);
+         string dStr = (gcDay  >= 0 ? "+" : "") + DoubleToString(gcDay,  2);
+         string nStr = (netLots > 0) ? DoubleToString(netLots, 2) + netSide : netSide;
+         string gcTxt = "► " + ctf + " " + cknd
+                        + "  F:" + fStr
+                        + "  D:" + dStr
+                        + "  T:" + DoubleToString(gGridCycles[i].net_target, 0)
+                        + "  " + nStr
+                        + (gGridCycles[i].squeeze_ok ? " ◈" : "");
          DashRow(row, gcTxt, gcClr); row++;
       }
    }
 
-   // clear any stale rows beyond what we just drew
-   for(int r = row; r <= row + 12; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
+   DrawDashBg(row);
+   for(int r = row; r <= row + 15; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
 }
 
 void ClearDashboard()
 {
-   for(int r = 0; r <= 12; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
+   ObjectDelete(0, DASH_BG);
+   for(int r = 0; r <= 30; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
 }
 
 //+------------------------------------------------------------------+
@@ -1642,7 +1724,7 @@ int OnInit()
    bool tradeAllowed = TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) &&
                        MQLInfoInteger(MQL_TRADE_ALLOWED);
    Print("─────────────────────────────────────────────");
-   Print("✅ FBExecBridge v1.03 — executor + labels + VP histogram + BB/squeeze pane");
+   Print("✅ FBExecBridge v1.04 — executor + labels + VP histogram + BB/squeeze pane + black panel");
    Print("    Account:   ", gAccount);
    Print("    Bridge:    ", InpBridgeURL, "  (poll ", InpPollMs, "ms)");
    Print("    Magic:     ", InpMagic, "..", InpMagic + InpMagicRange - 1, " (strategy×TF range)");
