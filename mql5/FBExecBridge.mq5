@@ -617,6 +617,42 @@ bool ExecModifyTP(const string cmd, int &modified, string &err)
    return allOk;
 }
 
+bool ExecModifySL(const string cmd, int &modified, string &err)
+{
+   string sym     = JsonGetString(cmd, "symbol");
+   long   magic   = (long)JsonGetNumber(cmd, "magic");
+   double buy_sl  = JsonGetNumber(cmd, "buy_sl");   // SL price for buy positions (0 = skip)
+   double sell_sl = JsonGetNumber(cmd, "sell_sl");  // SL price for sell positions (0 = skip)
+   modified = 0; err = ""; bool allOk = true;
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Magic() != magic || posInfo.Symbol() != sym) continue;
+      bool isBuy = (posInfo.PositionType() == POSITION_TYPE_BUY);
+      double sl = isBuy ? buy_sl : sell_sl;
+      if(sl <= 0) continue;
+      // Only-improve guard: never widen an existing SL.
+      double cur_sl = posInfo.StopLoss();
+      if(isBuy  && cur_sl > 0 && sl <= cur_sl) continue;  // buy SL must move up
+      if(!isBuy && cur_sl > 0 && sl >= cur_sl) continue;  // sell SL must move down
+      bool ok2 = false;
+      for(int attempt = 0; attempt < 3; attempt++)
+      {
+         if(trade.PositionModify(posInfo.Ticket(), sl, posInfo.TakeProfit())) { ok2 = true; break; }
+         int rc = (int)trade.ResultRetcode();
+         bool transient = (rc == TRADE_RETCODE_PRICE_OFF || rc == TRADE_RETCODE_REQUOTE ||
+                           rc == TRADE_RETCODE_PRICE_CHANGED || rc == TRADE_RETCODE_TIMEOUT ||
+                           rc == TRADE_RETCODE_CONNECTION);
+         if(!transient || attempt == 2) break;
+         Sleep(200);
+      }
+      if(ok2) modified++;
+      else { allOk = false; err = "sl modify fail #" + IntegerToString((long)posInfo.Ticket()); }
+   }
+   return allOk;
+}
+
 //+------------------------------------------------------------------+
 //| Poll the queue, execute commands, build + POST the ack array.    |
 //+------------------------------------------------------------------+
@@ -706,6 +742,17 @@ void PollAndExecute()
             Print(ok ? "✅ " : "⚠️ ", "MODIFY_TP magic=", (long)JsonGetNumber(cmds[i], "magic"),
                   " buy_tp=", JsonGetNumber(cmds[i], "buy_tp"),
                   " sell_tp=", JsonGetNumber(cmds[i], "sell_tp"),
+                  " → modified ", modN, (err == "" ? "" : " | " + err));
+      }
+      else if(type == "MODIFY_SL")
+      {
+         int modN = 0;
+         ok = ExecModifySL(cmds[i], modN, err);
+         extra = StringFormat(",\"modified\":%d", modN);
+         if(InpVerbose)
+            Print(ok ? "✅ " : "⚠️ ", "MODIFY_SL magic=", (long)JsonGetNumber(cmds[i], "magic"),
+                  " buy_sl=", JsonGetNumber(cmds[i], "buy_sl"),
+                  " sell_sl=", JsonGetNumber(cmds[i], "sell_sl"),
                   " → modified ", modN, (err == "" ? "" : " | " + err));
       }
       else
@@ -1085,7 +1132,7 @@ void DrawHvnTriggerEdges()
 
       // The triggered edge (or both edges if not yet armed)
       double edgePx = armed
-                      ? ((gHvnCycles[i].edge == "hi") ? hi : lo)
+                      ? ((gHvnCycles[i].edge == "top") ? hi : lo)
                       : 0.0;
 
       if(armed && edgePx > 0)
