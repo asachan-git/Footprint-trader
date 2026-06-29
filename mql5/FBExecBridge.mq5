@@ -552,125 +552,12 @@ bool ExecCloseSide(const string cmd, int &closed, string &err)
             int n = ArraySize(tk); ArrayResize(tk, n + 1); tk[n] = posInfo.Ticket();
          }
    int total   = ArraySize(tk);
-   // floor so at least 1 position always remains for MOVE_BE; min 1 if any exist
+   // floor: always leave at least 1 position open so the hedge leg still runs
    int toClose = (total <= 1) ? total : (int)MathMin(MathFloor(total * frac), total - 1);
    for(int i = 0; i < toClose && i < total; i++)
    {
       if(trade.PositionClose(tk[i], InpSlippage)) closed++;
       else { allOk = false; err = "close fail #" + IntegerToString((long)tk[i]); }
-   }
-   return allOk;
-}
-
-//+------------------------------------------------------------------+
-//| Move one side's positions' SL to breakeven (risk-free runner).    |
-//+------------------------------------------------------------------+
-bool ExecMoveBE(const string cmd, int &moved, string &err)
-{
-   string sym   = JsonGetString(cmd, "symbol");
-   long   magic = (long)JsonGetNumber(cmd, "magic");
-   string side  = JsonGetString(cmd, "side");
-   ENUM_POSITION_TYPE want = (side == "buy") ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
-   moved = 0; err = ""; bool allOk = true;
-
-   for(int i = 0; i < PositionsTotal(); i++)
-   {
-      if(!posInfo.SelectByIndex(i)) continue;
-      if(posInfo.Magic() != magic || posInfo.Symbol() != sym
-         || posInfo.PositionType() != want) continue;
-      double point   = SymbolInfoDouble(sym, SYMBOL_POINT);
-      long   stopLvl = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
-      double minDist = MathMax(stopLvl * point, 1.0 * point); // at least 1pt buffer
-      double open    = posInfo.PriceOpen();
-      double tp      = posInfo.TakeProfit();
-      // BE = entry ± minDist so broker stop-level is always satisfied
-      double be = (want == POSITION_TYPE_BUY) ? open - minDist : open + minDist;
-      // only tighten toward breakeven (never loosen an existing protective stop)
-      double curSL = posInfo.StopLoss();
-      bool improve = (want == POSITION_TYPE_BUY) ? (curSL <= 0 || be > curSL)
-                                                 : (curSL <= 0 || be < curSL);
-      if(!improve) continue;
-      bool ok2 = false;
-      for(int attempt = 0; attempt < 3; attempt++)
-      {
-         if(trade.PositionModify(posInfo.Ticket(), be, tp)) { ok2 = true; break; }
-         int rc = (int)trade.ResultRetcode();
-         bool transient = (rc == TRADE_RETCODE_PRICE_OFF || rc == TRADE_RETCODE_REQUOTE ||
-                           rc == TRADE_RETCODE_PRICE_CHANGED || rc == TRADE_RETCODE_TIMEOUT ||
-                           rc == TRADE_RETCODE_CONNECTION);
-         if(!transient || attempt == 2) break;
-         Sleep(200);
-      }
-      if(ok2) moved++;
-      else { allOk = false; err = "modify fail #" + IntegerToString((long)posInfo.Ticket()); }
-   }
-   return allOk;
-}
-
-bool ExecModifySL(const string cmd, int &modified, string &err)
-{
-   string sym        = JsonGetString(cmd, "symbol");
-   long   magic      = (long)JsonGetNumber(cmd, "magic");
-   string side       = JsonGetString(cmd, "side");
-   double lockedPnl  = JsonGetNumber(cmd, "locked_pnl");  // $ amount to lock in
-   ENUM_POSITION_TYPE want = (side == "buy") ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
-   modified = 0; err = ""; bool allOk = true;
-
-   // Sum total lots on this side to convert locked P&L → per-position SL price
-   double tickVal  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
-   if(tickSize <= 0) { err = "no tick size"; return false; }
-   double perPoint = tickVal / tickSize;   // $ per 1.0 price-unit per lot
-
-   double totalLots = 0.0;
-   for(int i = 0; i < PositionsTotal(); i++)
-      if(posInfo.SelectByIndex(i))
-         if(posInfo.Magic() == magic && posInfo.Symbol() == sym && posInfo.PositionType() == want)
-            totalLots += posInfo.Volume();
-   if(totalLots <= 0) return true;   // nothing to protect
-
-   double point   = SymbolInfoDouble(sym, SYMBOL_POINT);
-   long   stopLvl = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
-   double minDist = MathMax(stopLvl * point, 1.0 * point);
-
-   // sl_price for a buy = entry + locked_pnl / (totalLots × perPoint)
-   // All positions share the same locked-profit distance from their own entry, so
-   // the aggregate P&L at the SL equals lockedPnl regardless of entry spread.
-   double pnlPerLotPerPoint = lockedPnl / (totalLots * perPoint);
-
-   for(int i = 0; i < PositionsTotal(); i++)
-   {
-      if(!posInfo.SelectByIndex(i)) continue;
-      if(posInfo.Magic() != magic || posInfo.Symbol() != sym || posInfo.PositionType() != want) continue;
-      double open = posInfo.PriceOpen();
-      double tp   = posInfo.TakeProfit();
-      double sl   = (want == POSITION_TYPE_BUY) ? open + pnlPerLotPerPoint * posInfo.Volume()
-                                                : open - pnlPerLotPerPoint * posInfo.Volume();
-      // Enforce minimum broker stop distance from current price
-      double curBid = SymbolInfoDouble(sym, SYMBOL_BID);
-      double curAsk = SymbolInfoDouble(sym, SYMBOL_ASK);
-      if(want == POSITION_TYPE_BUY)
-         sl = MathMin(sl, curBid - minDist);   // SL must be below current bid
-      else
-         sl = MathMax(sl, curAsk + minDist);   // SL must be above current ask
-      // Only move SL if it's an improvement (never widen a tighter stop)
-      double curSL = posInfo.StopLoss();
-      bool improve = (want == POSITION_TYPE_BUY) ? (curSL <= 0 || sl > curSL)
-                                                 : (curSL <= 0 || sl < curSL);
-      if(!improve) continue;
-      bool ok2 = false;
-      for(int attempt = 0; attempt < 3; attempt++)
-      {
-         if(trade.PositionModify(posInfo.Ticket(), sl, tp)) { ok2 = true; break; }
-         int rc = (int)trade.ResultRetcode();
-         bool transient = (rc == TRADE_RETCODE_PRICE_OFF || rc == TRADE_RETCODE_REQUOTE ||
-                           rc == TRADE_RETCODE_PRICE_CHANGED || rc == TRADE_RETCODE_TIMEOUT ||
-                           rc == TRADE_RETCODE_CONNECTION);
-         if(!transient || attempt == 2) break;
-         Sleep(200);
-      }
-      if(ok2) modified++;
-      else { allOk = false; err = "sl modify fail #" + IntegerToString((long)posInfo.Ticket()); }
    }
    return allOk;
 }
@@ -809,26 +696,6 @@ void PollAndExecute()
          if(InpVerbose)
             Print(ok ? "✅ " : "⚠️ ", "CLOSE_SIDE ", JsonGetString(cmds[i], "side"),
                   " → booked ", closedN, (err == "" ? "" : " | " + err));
-      }
-      else if(type == "MOVE_BE")
-      {
-         int movedN = 0;
-         ok = ExecMoveBE(cmds[i], movedN, err);
-         extra = StringFormat(",\"moved\":%d", movedN);
-         if(InpVerbose)
-            Print(ok ? "✅ " : "⚠️ ", "MOVE_BE ", JsonGetString(cmds[i], "side"),
-                  " → moved ", movedN, (err == "" ? "" : " | " + err));
-      }
-      else if(type == "MODIFY_SL")
-      {
-         int modN = 0;
-         ok = ExecModifySL(cmds[i], modN, err);
-         extra = StringFormat(",\"modified\":%d", modN);
-         if(InpVerbose)
-            Print(ok ? "✅ " : "⚠️ ", "MODIFY_SL magic=", (long)JsonGetNumber(cmds[i], "magic"),
-                  " side=", JsonGetString(cmds[i], "side"),
-                  " locked_pnl=", JsonGetNumber(cmds[i], "locked_pnl"),
-                  " → modified ", modN, (err == "" ? "" : " | " + err));
       }
       else if(type == "MODIFY_TP")
       {

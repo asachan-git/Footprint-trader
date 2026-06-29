@@ -346,21 +346,24 @@ def _resolve_skew(trigger: Trigger, regime, cfg: dict | None = None,
 
 # ── legs ────────────────────────────────────────────────────────────────────
 
-def _ladder(n: int, base_lot: float, lot_step: float, heavy_near_mid: bool) -> list[float]:
+def _ladder(n: int, base_lot: float, lot_step: float, heavy_near_mid: bool,
+            max_lot: float = 0.0) -> list[float]:
     """LINEAR_REVERSED (heavy near mid) or LINEAR (light near mid), matching the
     EA's ResolveLotForIndex semantics. Index 1 = nearest the fulcrum."""
+    cap = max_lot if max_lot > 0 else float("inf")
     lots = []
     for i in range(1, n + 1):
         if heavy_near_mid:
             raw = base_lot + (n - i) * lot_step
         else:
             raw = base_lot + (i - 1) * lot_step
-        lots.append(round(max(base_lot, raw), 2))
+        lots.append(round(min(cap, max(base_lot, raw)), 2))
     return lots
 
 
 def _build_legs(fulcrum: float, n: int, step: float, skew: str,
-                base_lot: float, lot_step: float) -> tuple[list[Leg], list[Leg]]:
+                base_lot: float, lot_step: float,
+                max_lot: float = 0.0) -> tuple[list[Leg], list[Leg]]:
     """fulcrum ± i·step prices. Favoured side gets the heavier/longer ladder."""
     buy_n = n
     sell_n = n
@@ -370,8 +373,8 @@ def _build_legs(fulcrum: float, n: int, step: float, skew: str,
     elif skew == "sell":
         sell_n = n + 1
 
-    buy_lots = _ladder(buy_n, base_lot, lot_step, heavy_near_mid=(skew == "buy"))
-    sell_lots = _ladder(sell_n, base_lot, lot_step, heavy_near_mid=(skew == "sell"))
+    buy_lots = _ladder(buy_n, base_lot, lot_step, heavy_near_mid=(skew == "buy"), max_lot=max_lot)
+    sell_lots = _ladder(sell_n, base_lot, lot_step, heavy_near_mid=(skew == "sell"), max_lot=max_lot)
 
     buy_legs = [Leg(price=round(fulcrum + i * step, 4), lot=buy_lots[i - 1])
                 for i in range(1, buy_n + 1)]
@@ -456,6 +459,7 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     grid_cfg = (settings.get("grid_levels") or {}) if isinstance(settings, dict) else {}
     base_lot = float(grid_cfg.get("base_lot", 0.01))
     lot_step = float(grid_cfg.get("lot_step", 0.01))
+    max_lot_per_leg = float(grid_cfg.get("max_lot_per_leg", 0.0) or 0.0)
     tp_mult = float(grid_cfg.get("tp_atr_mult", 1.5))
     hvn_max_legs = int(grid_cfg.get("hvn_max_legs", 8))
     lvn_legs_per_side = int(grid_cfg.get("lvn_legs_per_side", 1))
@@ -562,7 +566,8 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
                             regime=getattr(regime, "type", "unknown"),
                             atr=round(atr, 4), plan_id=plan_id)
 
-    buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
+    buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step,
+                                       max_lot=max_lot_per_leg)
     buy_tp, sell_tp = _resolve_tps(symbol, fulcrum, buy_legs, sell_legs, atr, tp_mult)
 
     # Structural TP override: any trigger that pre-computed tp_up/tp_down (HVN

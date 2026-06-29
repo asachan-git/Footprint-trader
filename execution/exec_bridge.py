@@ -55,7 +55,6 @@ PLACE_PENDING = "PLACE_PENDING"
 CLOSE_ALL = "CLOSE_ALL"          # close positions + cancel pendings (deliberate flatten)
 CANCEL_PENDINGS = "CANCEL_PENDINGS"  # cancel pendings ONLY, leave positions (safe re-arm)
 CLOSE_SIDE = "CLOSE_SIDE"        # close a fraction of ONE side's positions (bias-side booking)
-MOVE_BE = "MOVE_BE"              # move one side's positions' SL to breakeven (risk-free runner)
 
 # ── per-strategy × per-TF magic scheme ───────────────────────────────────────
 # magic = MAGIC_BASE + strat_code·10 + tf_code  →  e.g. hvn·15m = 770013,
@@ -107,11 +106,10 @@ class Command:
     tp: float = 0.0
     comment: str = ""
     magic: int = 0            # per-strategy magic (0 → EA uses its default InpMagic)
-    side: str = ""            # "buy"|"sell" for CLOSE_SIDE / MOVE_BE
+    side: str = ""            # "buy"|"sell" for CLOSE_SIDE
     frac: float = 0.0         # fraction of that side's positions to close (CLOSE_SIDE)
     buy_tp: float = 0.0       # MODIFY_TP: new TP for buy positions/orders
     sell_tp: float = 0.0      # MODIFY_TP: new TP for sell positions/orders
-    locked_pnl: float = 0.0   # MODIFY_SL: dollar P&L to lock in (EA converts to SL price)
     status: str = PENDING
     ts_created: float = 0.0
     ts_sent: float = 0.0
@@ -123,12 +121,10 @@ class Command:
         if self.type == PLACE_PENDING:
             d.update(order_type=self.order_type, price=self.price, lot=self.lot,
                      sl=self.sl, tp=self.tp, comment=self.comment)
-        elif self.type in (CLOSE_SIDE, MOVE_BE):
+        elif self.type == CLOSE_SIDE:
             d.update(side=self.side, frac=self.frac, comment=self.comment)
         elif self.type == "MODIFY_TP":
             d.update(buy_tp=self.buy_tp, sell_tp=self.sell_tp)
-        elif self.type == "MODIFY_SL":
-            d.update(side=self.side, locked_pnl=self.locked_pnl)
         return d
 
 
@@ -332,12 +328,14 @@ class ExecBridge:
             if (max_seen > 0 or pend_seen > 0) and pendings == 0:
                 cls.set_last_arm(account, symbol, **{**cyc, "active": False})
             elif pendings > 0 and max_seen > 0:
-                # Positions closed (TP/SL/manual) but opposite-side pending orders remain.
-                # Cancel them so they don't fill into an unprotected new position.
+                # Positions filled+closed, opposite-side pendings stranded (orphans).
+                # Cancel + retire so the zone is free to re-arm.
                 cls.enqueue(account, CANCEL_PENDINGS, symbol, magic=magic,
-                            comment=f"FB|cancel_stale|{tf}", now=t)
-                LOG.info(f"[reconcile] {symbol} magic={magic} positions gone, "
-                         f"cancelling {pendings} stale pendings")
+                            comment=f"FB|orphan_cancel|{tf}", now=t)
+                cls.set_last_arm(account, symbol, **{**cyc, "active": False})
+                cls.clear_emit(account, symbol, magic=magic)
+                LOG.info(f"[monitor] orphan pendings {symbol} magic={magic} "
+                         f"max_seen={max_seen} pendings={pendings} — retired + CANCEL_PENDINGS")
             return None
 
         n = int(cyc.get("n_per_side") or 0)
@@ -381,31 +379,19 @@ class ExecBridge:
                     LOG.info(f"[trail] {symbol} magic={magic} cycle peak "
                              f"{old_peak:.2f}→{peak:.2f} (combined={combined_pnl:.2f})")
                     if activate > 0 and peak >= activate:
-                        # Bias side SL
                         _give_bias = grid_cfg.get("bias_trail_giveback_pct_by_tf") or {}
                         gb_bias    = float(_give_bias.get(tf) or grid_cfg.get("bias_trail_giveback_pct", 40.0) or 0.0)
-                        if (bias == "buy" and buys_n > 0 and buy_pnl_f > 0) or \
-                           (bias == "sell" and sells_n > 0 and sell_pnl_f > 0):
-                            side_pnl_bias = buy_pnl_f if bias == "buy" else sell_pnl_f
-                            locked_bias   = side_pnl_bias * (1.0 - gb_bias / 100.0)
-                            cls.enqueue(account, "MODIFY_SL", symbol, magic=magic, side=bias,
-                                        locked_pnl=locked_bias,
-                                        comment=f"FB|tsl|{tf}|{bias}|bias", now=t)
-                        # Hedge side SL
-                        hedge = "sell" if bias == "buy" else "buy"
-                        hedge_pnl_f = sell_pnl_f if bias == "buy" else buy_pnl_f
-                        hedge_n     = sells_n    if bias == "buy" else buys_n
-                        _give_hedge = grid_cfg.get("hedge_trail_giveback_pct_by_tf") or {}
-                        gb_hedge    = float(_give_hedge.get(tf) or grid_cfg.get("hedge_trail_giveback_pct", 40.0) or 0.0)
-                        if hedge_n > 0 and hedge_pnl_f > 0:
-                            locked_hedge = hedge_pnl_f * (1.0 - gb_hedge / 100.0)
-                            cls.enqueue(account, "MODIFY_SL", symbol, magic=magic, side=hedge,
-                                        locked_pnl=locked_hedge,
-                                        comment=f"FB|tsl|{tf}|{hedge}|hedge", now=t)
-                        cls.enqueue(account, "CANCEL_PENDINGS", symbol, magic=magic,
-                                    comment=f"FB|tsl|{tf}|cancel_pend", now=t)
-                        LOG.info(f"[trail] {symbol} magic={magic} tf={tf} cycle SL set "
-                                 f"peak={peak:.2f} bias={bias} gb_bias={gb_bias}% gb_hedge={gb_hedge}%")
+                        side_pnl_bias = buy_pnl_f if bias == "buy" else sell_pnl_f
+                        if side_pnl_bias <= peak * (gb_bias / 100.0):
+                            book_frac = float(grid_cfg.get("bias_book_frac", 0.5) or 0.5)
+                            cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic, side=bias,
+                                        frac=book_frac, comment=f"FB|tsl|{tf}|{bias}", now=t)
+                            cls.enqueue(account, CANCEL_PENDINGS, symbol, magic=magic,
+                                        comment=f"FB|tsl|{tf}|cancel_pend", now=t)
+                            cyc["bias_booked"] = True
+                            cls.set_last_arm(account, symbol, **cyc)
+                            LOG.info(f"[trail] {symbol} magic={magic} tf={tf} bias={bias} "
+                                     f"peak={peak:.2f} gave back >{gb_bias}% → CLOSE_SIDE frac={book_frac}")
 
         reason: str | None = None
         detail: dict = {}
