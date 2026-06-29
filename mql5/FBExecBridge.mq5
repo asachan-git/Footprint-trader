@@ -1112,9 +1112,47 @@ void FetchAndDrawZones()
 
    DrawHvnTriggerEdges();
 
+   //--- Re-derive gFulcrum from the nearest ARMED hvn_cycle edge so the magenta line
+   //    always matches one of the cyan trigger lines. The zones-endpoint `fulcrum` field
+   //    is scoped to InpZoneTF only — with multi-TF cycles it pointed to the wrong cycle.
+   {
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double bestDist = DBL_MAX;
+      int    bestIdx  = -1;
+      int nh2 = ArraySize(gHvnCycles);
+      for(int i = 0; i < nh2; i++)
+      {
+         if(gHvnCycles[i].magic <= 0) continue;
+         double ep = (gHvnCycles[i].edge == "top") ? gHvnCycles[i].hi : gHvnCycles[i].lo;
+         double d  = MathAbs(ep - bid);
+         if(d < bestDist) { bestDist = d; bestIdx = i; }
+      }
+      if(bestIdx >= 0)
+      {
+         double ep = (gHvnCycles[bestIdx].edge == "top")
+                     ? gHvnCycles[bestIdx].hi : gHvnCycles[bestIdx].lo;
+         gFulcrum     = ep;
+         gNodeLo      = gHvnCycles[bestIdx].lo;
+         gNodeHi      = gHvnCycles[bestIdx].hi;
+         gTriggerKind = gHvnCycles[bestIdx].trigger_kind;
+         gEmitEdge    = gHvnCycles[bestIdx].edge;
+         // redraw magenta line from the cycle-matched edge
+         string fname2 = ZONE_PREFIX + "fulcrum";
+         if(ObjectFind(0, fname2) < 0) ObjectCreate(0, fname2, OBJ_HLINE, 0, 0, ep);
+         ObjectSetDouble (0, fname2, OBJPROP_PRICE, 0, ep);
+         ObjectSetInteger(0, fname2, OBJPROP_COLOR, clrMagenta);
+         ObjectSetInteger(0, fname2, OBJPROP_STYLE, STYLE_DASH);
+         ObjectSetInteger(0, fname2, OBJPROP_WIDTH, 2);
+         ObjectSetInteger(0, fname2, OBJPROP_BACK,  false);
+         ObjectSetInteger(0, fname2, OBJPROP_SELECTABLE, false);
+         ObjectSetString (0, fname2, OBJPROP_TEXT,
+            "fulcrum " + gHvnCycles[bestIdx].tf + " " + gHvnCycles[bestIdx].edge);
+      }
+   }
+
    if(InpVerbose && (n > 0 || nl > 0))
       Print("🟦 Drew ", n, " zones + ", nl, " VP levels | fulcrum ",
-            DoubleToString(fulcrum, _Digits), " (", emitTF, " ", emitEdge, ")");
+            DoubleToString(gFulcrum, _Digits), " (", gTriggerKind, " ", gEmitEdge, ")");
 }
 
 //--- Draw a bold HLINE at the exact edge of each armed HVN where the entry trigger fired.
