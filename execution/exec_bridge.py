@@ -300,6 +300,7 @@ class ExecBridge:
         if fts > 0:
             if positions == 0:
                 cls.set_last_arm(account, symbol, **{**cyc, "active": False, "flatten_ts": 0.0})
+                cls.clear_emit(account, symbol, magic=magic)
             elif (t - fts) > _FLATTEN_GRACE_S:
                 # close demonstrably didn't land (past the queue's reclaim window) → re-issue once
                 cls.enqueue(account, CLOSE_ALL, symbol, comment="FB|flatten|retry", magic=magic, now=t)
@@ -324,6 +325,7 @@ class ExecBridge:
             # the placement-window race (active set before the EA reports pendings).
             if (max_seen > 0 or pend_seen > 0) and pendings == 0:
                 cls.set_last_arm(account, symbol, **{**cyc, "active": False})
+                cls.clear_emit(account, symbol, magic=magic)  # allow fresh re-arm on any edge
             return None
 
         n = int(cyc.get("n_per_side") or 0)
