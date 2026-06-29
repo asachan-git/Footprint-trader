@@ -210,18 +210,21 @@ def _shift_vp(vp: dict, offset: float) -> dict:
 
 
 def _compute_venue_offset(symbol: str, broker_symbol: str, bybit_last_close: float) -> float:
-    """Fetch Vantage mid and return (vantage_mid - bybit_close). Returns 0.0 on failure."""
+    """Return (vantage_mid - bybit_close). Uses EA-cached quote first (no MetaAPI needed)."""
+    # Primary: EA poll cache — populated within seconds of first EA connection.
     try:
-        from execution.venue_translator import fetch_venue_quote
-        quote = fetch_venue_quote("vantage_mt5", broker_symbol)
-        if quote.get("ok") and quote.get("mid"):
-            offset = float(quote["mid"]) - bybit_last_close
-            LOG.info(f"[vp_cache] {symbol} venue offset: vantage_mid={quote['mid']:.2f} "
-                     f"bybit_close={bybit_last_close:.2f} → offset={offset:+.2f}")
-            return offset
-        LOG.info(f"[vp_cache] {symbol} venue quote unavailable ({quote.get('error')}) — offset=0")
-    except Exception as e:
-        LOG.info(f"[vp_cache] {symbol} venue offset fetch failed: {e} — offset=0")
+        from execution.exec_bridge import ExecBridge
+        with ExecBridge._lock:
+            for (_acc, sym), q in ExecBridge._quotes.items():
+                if sym == broker_symbol and q.get("mid"):
+                    offset = float(q["mid"]) - bybit_last_close
+                    LOG.info(f"[vp_cache] {symbol} venue offset (EA quote): "
+                             f"vantage_mid={q['mid']:.2f} bybit_close={bybit_last_close:.2f} "
+                             f"→ offset={offset:+.2f}")
+                    return offset
+    except Exception:
+        pass
+    LOG.info(f"[vp_cache] {symbol} venue quote unavailable (EA not polled yet) — offset=0")
     return 0.0
 
 
@@ -376,6 +379,55 @@ def period_profile(symbol: str, period: str) -> dict | None:
     profile = [{"price": round(float(centers[i]) + offset, 5), "vol": round(float(bins[i]), 2)}
                for i in range(len(bins)) if bins[i] > 0]
     return {"bin": round(float(bin_size), 5), "profile": profile}
+
+
+def daily_profiles_history(symbol: str, n: int = 5) -> list[dict]:
+    """Per-price volume histograms for the last N daily sessions (oldest first).
+
+    Each entry: {period_key, session_start_ts, bin, profile:[{price,vol}]}.
+    Sessions with < 30 bars are omitted. Used by the EA to draw per-day VP anchored
+    at each session's open timestamp."""
+    from pipeline.state_store import store as _store
+    from .volume_profile import _build_bins
+    cache = _load()
+    sym = cache.get(symbol, {})
+    anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
+    offset = _get_offset(sym)
+    bin_cfg = sym.get("bin_size")
+    now_ts = int(time.time())
+    is_24_7 = isinstance(anchor, int) and anchor == 0  # BTC/Binance: UTC-midnight anchor
+    raw_keys = sorted((sym.get("daily") or {}).keys())
+    # XAU (and other session-anchored markets) don't trade weekends — skip those keys.
+    if not is_24_7:
+        raw_keys = [k for k in raw_keys if datetime.strptime(k, "%Y-%m-%d").weekday() < 5]
+    daily_keys = raw_keys[-n:]
+    cached_daily = sym.get("daily") or {}
+    result = []
+    for key in daily_keys:
+        st, en = _day_bounds(key, anchor)
+        end = min(en, now_ts)
+        bars = [b for b in _store().recent(symbol, "1m", 100_000) if st <= b.close_ts < end]
+        if len(bars) < 30:
+            continue
+        res = _build_bins(bars, bin_size=float(bin_cfg) if bin_cfg else None)
+        if not res:
+            continue
+        bins, centers, bin_size, _pmin, _pmax = res
+        profile = [{"price": round(float(centers[i]) + offset, 5), "vol": round(float(bins[i]), 2)}
+                   for i in range(len(bins)) if bins[i] > 0]
+        # Pull cached VAH/VAL/POC (venue-offset applied) for the session lines overlay.
+        cached = _shift_vp(cached_daily.get(key) or {}, offset)
+        result.append({
+            "period_key": key,
+            "session_start_ts": st,
+            "session_end_ts": end,
+            "poc": round(float(cached["poc"]), 5) if cached.get("poc") else 0.0,
+            "vah": round(float(cached["vah"]), 5) if cached.get("vah") else 0.0,
+            "val": round(float(cached["val"]), 5) if cached.get("val") else 0.0,
+            "bin": round(float(bin_size), 5),
+            "profile": profile,
+        })
+    return result
 
 
 def get_va_regime(

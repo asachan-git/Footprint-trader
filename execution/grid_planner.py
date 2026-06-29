@@ -184,12 +184,11 @@ def _should_skip(trigger: Trigger | None, regime, fulcrum: float,
     """Don't arm a straddle where price will oscillate through both ladders."""
     if trigger is None:
         return True, "no_trigger"
-    # HVN-edge / inside-touch / VP-level triggers ARE meant to sit ON structure
-    # (an HVN edge or a POC/VA/LVN line, which usually lives inside a node); only skip
-    # other fulcrums that fall *inside* a node body.
-    if (trigger.kind not in ("hvn_edge", "hvn_inside_touch", "vp_level_touch", "squeeze")
-            and _price_inside_hvn(fulcrum, daily_vp)):
-        return True, "chop:inside_hvn"
+    # hvn_inside_touch: price confirmed inside the node with an edge tap — no chop gates apply.
+    if trigger.kind == "hvn_inside_touch":
+        return False, ""
+    # chop:inside_hvn gate removed — emitter is constrained to hvn_edge/hvn_inside_touch
+    # only, so any non-structural fallback is caught by the route's trigger_mismatch check.
     if daily_vp and daily_vp.get("current_position") == "at_poc":
         # a POC / naked-POC fulcrum SHOULD arm at the POC — that's the setup, not chop.
         if not (trigger.kind == "vp_level_touch"
@@ -382,6 +381,68 @@ def _build_legs(fulcrum: float, n: int, step: float, skew: str,
 
 # ── TP snapping ─────────────────────────────────────────────────────────────
 
+def _vp_bb_fallback_tp(side: str, outer_leg: float,
+                       daily_vp: dict | None, bars: list,
+                       atr_based_tp: float,
+                       fulcrum: float = 0.0) -> float:
+    """Fallback TP chain when no next-HVN target is available.
+
+    Priority:
+      1. Nearest VP key level (VAH/VAL/POC/naked_poc) or HVN node edge beyond the outer leg
+      2. Same VP levels beyond the fulcrum — catches levels between fulcrum and outer_leg
+         (e.g. VAH just above a broken HVN top, filtered by outer_leg check in step 1)
+      3. BB 2.3σ band
+      4. atr_based_tp (outer_leg ± ATR mult) — unchanged
+
+    side: "buy" (target above) | "sell" (target below)
+    fulcrum: secondary search anchor when step 1 yields nothing
+    """
+    def _vp_candidates(threshold: float) -> list[float]:
+        out: list[float] = []
+        if not daily_vp:
+            return out
+        for key in ("vah", "val", "poc", "naked_poc"):
+            v = daily_vp.get(key)
+            if v:
+                fv = float(v)
+                if side == "buy" and fv > threshold:
+                    out.append(fv)
+                elif side == "sell" and 0 < fv < threshold:
+                    out.append(fv)
+        for z in (daily_vp.get("hvn_zones") or []):
+            try:
+                lo, hi = float(z["low"]), float(z["high"])
+                if side == "buy" and lo > threshold:
+                    out.append(lo)
+                elif side == "sell" and hi > 0 and hi < threshold:
+                    out.append(hi)
+            except (KeyError, TypeError, ValueError):
+                pass
+        return out
+
+    cands = _vp_candidates(outer_leg)
+    if cands:
+        return round(min(cands) if side == "buy" else max(cands), 4)
+
+    if fulcrum > 0:
+        cands = _vp_candidates(fulcrum)
+        if cands:
+            return round(min(cands) if side == "buy" else max(cands), 4)
+
+    if len(bars) >= 20:
+        closes = [b.ohlc.c for b in bars[-20:]]
+        sma = sum(closes) / 20.0
+        std = (sum((c - sma) ** 2 for c in closes) / 20.0) ** 0.5
+        if std > 0:
+            bb_target = round(sma + 2.3 * std, 4) if side == "buy" else round(sma - 2.3 * std, 4)
+            if side == "buy" and bb_target > outer_leg:
+                return bb_target
+            if side == "sell" and 0 < bb_target < outer_leg:
+                return bb_target
+
+    return atr_based_tp
+
+
 def _resolve_tps(symbol: str, fulcrum: float, buy_legs: list[Leg],
                  sell_legs: list[Leg], atr: float, tp_mult: float = 1.5) -> tuple[float, float]:
     """Snap TP beyond the outer leg to the nearest strong structural zone;
@@ -509,7 +570,8 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     # far cached-HVN edge). Measured in the ANALYSIS frame, before any rebase. Such a
     # fulcrum both rebases to a garbage offset and places stops far off the venue's
     # market. Catches the stale-HVN bug the honest sim labeler exposed.
-    if not skip and fulcrum_t is not None and current_price > 0 and max_fulcrum_dist_pct > 0:
+    if (not skip and fulcrum_t is not None and current_price > 0 and max_fulcrum_dist_pct > 0
+            and fulcrum_t.kind != "hvn_inside_touch"):
         dist_pct = abs(fulcrum_t.fulcrum_price - current_price) / current_price
         if dist_pct > max_fulcrum_dist_pct:
             skip, reason = True, f"fulcrum_too_far:{dist_pct:.3f}>{max_fulcrum_dist_pct}"
@@ -542,6 +604,22 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         if step < min_step_analysis:
             step = round(min_step_analysis, 4)
 
+    # HVN-edge snap: non-HVN triggers (VP-level POC/VAH/VAL) place the fulcrum at an
+    # arbitrary VP level that may not sit on a structural boundary. Snap the fulcrum to
+    # the nearest HVN zone edge (lo or hi) when one falls within 2×step. Triggers that
+    # already set fulcrum to an HVN boundary (hvn_edge, hvn_inside_touch) are left alone.
+    if fulcrum_t.kind not in ("hvn_edge", "hvn_inside_touch") and step > 0:
+        snap_tol = 2.0 * step
+        hvn_zones, _ = zone_triggers._session_hvn_zones(symbol, tf, bars)
+        best_edge, best_dist = None, snap_tol
+        for zo_lo, zo_hi in hvn_zones:
+            for edge in (zo_lo, zo_hi):
+                d = abs(edge - fulcrum)
+                if d < best_dist:
+                    best_dist, best_edge = d, edge
+        if best_edge is not None:
+            fulcrum = round(best_edge, 4)
+
     # Ladder-span gate: a neutral straddle only works if price sits INSIDE the ladder
     # [fulcrum − n·step, fulcrum + n·step]. If the fulcrum is a level price has already
     # run away from, the near-side stops land on the wrong side of market and the broker
@@ -560,37 +638,45 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
     buy_tp, sell_tp = _resolve_tps(symbol, fulcrum, buy_legs, sell_legs, atr, tp_mult)
 
-    # Structural TP override: any trigger that pre-computed tp_up/tp_down (HVN
-    # node edges for hvn_inside_touch; adjacent VP levels for vp_level_touch) targets
-    # that structure. Guard: the target must lie BEYOND the OUTER leg, else it would
-    # sit inside the ladder and the grid could never profit — in that case keep the
-    # _resolve_tps()/ATR fallback already computed above.
-    tp_up = float(fulcrum_t.context.get("tp_up", 0.0) or 0.0)
+    # Structural TP override: any trigger that pre-computed tp_up/tp_down (next-HVN
+    # edges for hvn_inside_touch / hvn_edge; adjacent VP levels for vp_level_touch)
+    # targets that structure. Guard: must lie BEYOND the outer leg.
+    tp_up   = float(fulcrum_t.context.get("tp_up",   0.0) or 0.0)
     tp_down = float(fulcrum_t.context.get("tp_down", 0.0) or 0.0)
-    if tp_up or tp_down:
-        top_leg = max((l.price for l in buy_legs), default=fulcrum)
-        bot_leg = min((l.price for l in sell_legs), default=fulcrum)
-        if tp_up > top_leg:
-            buy_tp = round(tp_up, 4)
-        if 0.0 < tp_down < bot_leg:
-            sell_tp = round(tp_down, 4)
+    top_leg = max((l.price for l in buy_legs),  default=fulcrum)
+    bot_leg = min((l.price for l in sell_legs), default=fulcrum)
+    _buy_tp_structural  = False
+    _sell_tp_structural = False
+    if tp_up > top_leg:
+        buy_tp = round(tp_up, 4)
+        _buy_tp_structural = True
+    if 0.0 < tp_down < bot_leg:
+        sell_tp = round(tp_down, 4)
+        _sell_tp_structural = True
 
-    # HVN inside-touch reversion TP: the fade INTO the node targets the POC (the node's
-    # acceptance magnet), not the far next-HVN. Tapped TOP → sells fade DOWN to POC;
-    # tapped BOTTOM → buys revert UP to POC. Breakout side keeps its far next-HVN target
-    # (tp_up/tp_down above). Only when POC sits beyond the inner leg on the fade side
-    # (else it'd sit inside the ladder → keep the structural/ATR target).
+    # HVN inside-touch reversion TP: fade targets the OPPOSITE EDGE of the same node.
+    #   tapped TOP edge → sells fade DOWN → TP at node_low
+    #   tapped BOTTOM edge → buys revert UP → TP at node_high
     if (fulcrum_t.kind == "hvn_inside_touch"
             and bool(grid_cfg.get("hvn_reversion_bias", True))):
-        poc = float((daily_vp or {}).get("poc", 0.0) or 0.0)
-        edge = fulcrum_t.context.get("edge", "")
-        bot_leg = min((l.price for l in sell_legs), default=fulcrum)
-        top_leg = max((l.price for l in buy_legs), default=fulcrum)
-        if poc > 0:
-            if edge == "top" and poc < bot_leg:        # fade down to POC (sell side)
-                sell_tp = round(poc, 4)
-            elif edge == "bottom" and poc > top_leg:   # revert up to POC (buy side)
-                buy_tp = round(poc, 4)
+        edge      = fulcrum_t.context.get("edge", "")
+        node_low  = float(fulcrum_t.context.get("node_low",  0.0) or 0.0)
+        node_high = float(fulcrum_t.context.get("node_high", 0.0) or 0.0)
+        if edge == "top" and node_low > 0 and node_low < bot_leg:
+            sell_tp = round(node_low, 4)
+            _sell_tp_structural = True
+        elif edge == "bottom" and node_high > 0 and node_high > top_leg:
+            buy_tp = round(node_high, 4)
+            _buy_tp_structural = True
+
+    # VP + BB fallback: when no next-HVN structural target was found for a side,
+    # try VP levels (VAH/VAL/POC/naked_poc/HVN edges) beyond the outer leg,
+    # then beyond the fulcrum (catches levels between fulcrum and outer_leg),
+    # then BB 2.3σ.
+    if not _buy_tp_structural:
+        buy_tp = _vp_bb_fallback_tp("buy",  top_leg, daily_vp, bars, buy_tp,  fulcrum=fulcrum)
+    if not _sell_tp_structural:
+        sell_tp = _vp_bb_fallback_tp("sell", bot_leg, daily_vp, bars, sell_tp, fulcrum=fulcrum)
 
     plan = GridPlan(
         verdict="arm",

@@ -22,7 +22,7 @@ SYMBOL="${3:-XAUUSD+}"
 # Three parallel grid setups — each posts its OWN trigger_hint and (post-P1 magic re-key)
 # arms an INDEPENDENT cycle on the same symbol+TF, so they coexist and can be reviewed
 # separately by magic: hvn_inside_touch (strat 1), squeeze (2), vp_levels = va+vp (7/3).
-SETUPS=(hvn_inside_touch squeeze vp_levels)
+SETUPS=(hvn_edge hvn_inside_touch)
 
 emit_loop() {
   local tf="$1" interval="$2" offset="$3"
@@ -59,15 +59,13 @@ else:
 # Each TF runs an INDEPENDENT parallel cycle (server keys cycles by TF, isolates by
 # strategy×TF magic) — they no longer contend for the symbol. Offsets keep coincident
 # closes off the same instant (avoids a thundering-herd at :00).
-emit_loop 1h  3600 20 &
-P1H=$!
-emit_loop 15m 900  8 &
+emit_loop 15m 900  1 &
 P15=$!
-emit_loop 5m  300  12 &
+emit_loop 5m  300  1 &
 P5=$!
-emit_loop 1m  60   3 &
+emit_loop 1m  60   1 &
 P1=$!
 
-echo "[auto_exec_emit] running — 1H($P1H) 15m($P15) 5m($P5) 1m($P1). Ctrl-C to stop."
-trap 'kill $P1H $P15 $P5 $P1 2>/dev/null; echo "[auto_exec_emit] stopped."; exit 0' INT TERM
+echo "[auto_exec_emit] running — 15m($P15) 5m($P5) 1m($P1). Ctrl-C to stop."
+trap 'kill $P15 $P5 $P1 2>/dev/null; echo "[auto_exec_emit] stopped."; exit 0' INT TERM
 wait

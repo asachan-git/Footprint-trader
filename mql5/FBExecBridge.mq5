@@ -17,7 +17,7 @@
 //|    POST {InpBridgeURL}/exec/ack   {account, results:[...]}        |
 //+------------------------------------------------------------------+
 #property copyright "Aniket"
-#property version   "1.03"
+#property version   "1.06"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -44,6 +44,11 @@ input bool   InpDrawVP         = true;          // Draw computed volume profile 
 input int    InpVPMaxBars      = 50;            // VP histogram max width (bars)
 input color  InpVPColor        = clrDimGray;    // VP histogram bar colour
 input color  InpVPPocColor     = clrGoldenrod;  // VP histogram POC (max) bar colour
+input bool   InpDrawDailyVP    = true;          // Draw per-session VP anchored at session open
+input int    InpDailyVPDays    = 3;             // Number of past sessions to draw (incl. today)
+input int    InpDailyVPMaxBars = 30;            // Daily VP histogram max width (bars)
+input color  InpDailyVPColor   = C'40,60,80';   // Daily VP bar colour (dim blue-grey)
+input color  InpDailyVPPocColor= C'80,130,60';  // Daily VP POC colour (muted green)
 
 input group "=== Bollinger / squeeze pane ==="
 input bool   InpShowBB          = true;   // Draw 3σ Bollinger Bands on the price chart
@@ -57,7 +62,9 @@ input int    InpSqMinOn         = 6;      // min coil bars (MATCH squeeze_min_on
 input group "=== Corner dashboard ==="
 input bool   InpShowDash        = true;          // Show trigger/HVN/hedged-loss panel (top-right)
 input int    InpDashFontSize    = 9;             // Dashboard font size
+input int    InpDashRowPad      = 14;            // Extra pixels between rows (increase on Wine/Mac)
 input color  InpDashColor       = clrWhite;      // Dashboard text colour
+input double InpEquityTarget    = -500.0;        // Equity drawdown hard-stop (local failsafe, 0 = off)
 
 CTrade        trade;
 COrderInfo    orderInfo;
@@ -73,6 +80,13 @@ double   gNodeHi        = 0.0;
 string   gTriggerKind   = "";
 string   gEmitEdge      = "";
 
+struct HvnCycleEntry { double lo, hi; long magic; string tf, edge; };
+struct GridCycleEntry { long magic; string tf, kind; double net_target, trail_activate; bool squeeze_ok; };
+
+//--- per-cycle arrays refreshed from /exec/zones (hvn_cycles + grid_cycles)
+HvnCycleEntry  gHvnCycles[];
+GridCycleEntry gGridCycles[];
+
 //--- chart-overlay indicator handles (3σ Bollinger Bands + FBSqueeze BBW% subwindow)
 int      gBBHandle      = INVALID_HANDLE;
 int      gSqHandle      = INVALID_HANDLE;
@@ -80,6 +94,7 @@ int      gSqSubwin      = -1;
 
 #define ZONE_PREFIX "FBZone_"
 #define DASH_PREFIX "FBDash_"   // separate prefix → ClearZones() won't sweep the dashboard
+#define DASH_BG     "FBDash_bg" // black background rectangle for the panel
 
 //+------------------------------------------------------------------+
 //| Minimal flat-JSON scalar extractors (contract is flat per object)|
@@ -167,6 +182,18 @@ int JsonSplitArray(const string js, const string arrKey, string &out[])
 }
 
 int JsonSplitCommands(const string js, string &out[]) { return JsonSplitArray(js, "commands", out); }
+
+bool JsonGetBool(const string js, const string key)
+{
+   string pat = "\"" + key + "\"";
+   int k = StringFind(js, pat);
+   if(k < 0) return false;
+   int colon = StringFind(js, ":", k + StringLen(pat));
+   if(colon < 0) return false;
+   int i = colon + 1;
+   while(i < StringLen(js) && StringGetCharacter(js, i) == ' ') i++;
+   return StringSubstr(js, i, 4) == "true";
+}
 
 //+------------------------------------------------------------------+
 //| HTTP POST helper. Returns HTTP code (-1 on transport error).     |
@@ -354,6 +381,34 @@ int CountMyPendings()
       if(orderInfo.SelectByIndex(i))
          if(IsMine(orderInfo.Magic()) && orderInfo.Symbol() == _Symbol) n++;
    return n;
+}
+
+double PnlForMagic(long magic)
+{
+   double total = 0.0;
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(posInfo.SelectByIndex(i))
+         if(posInfo.Magic() == magic && posInfo.Symbol() == _Symbol)
+            total += posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+   return total;
+}
+
+void CloseAllMine(int &closed, int &cancelled)
+{
+   closed = 0; cancelled = 0;
+   ulong pend[];
+   for(int i = 0; i < OrdersTotal(); i++)
+      if(orderInfo.SelectByIndex(i) && IsMine(orderInfo.Magic()) && orderInfo.Symbol() == _Symbol)
+      { int n = ArraySize(pend); ArrayResize(pend, n + 1); pend[n] = orderInfo.Ticket(); }
+   for(int i = 0; i < ArraySize(pend); i++)
+      if(trade.OrderDelete(pend[i])) cancelled++;
+
+   ulong pos[];
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(posInfo.SelectByIndex(i) && IsMine(posInfo.Magic()) && posInfo.Symbol() == _Symbol)
+      { int n = ArraySize(pos); ArrayResize(pos, n + 1); pos[n] = posInfo.Ticket(); }
+   for(int i = 0; i < ArraySize(pos); i++)
+      if(trade.PositionClose(pos[i], InpSlippage)) closed++;
 }
 
 //--- Per-side open counts + basket floating P&L (for the server cycle monitor).
@@ -857,10 +912,125 @@ void DrawProfile(const string js)
    }
 }
 
+//--- Per-session VP histograms: one profile per past day, drawn leftward from that
+//    session's open timestamp so each day's activity stays in its own time slot.
+//    Objects named FBVpD_{dayIdx}_{binIdx} — cleared before each redraw.
+void ClearDailyProfiles()
+{
+   int total = ObjectsTotal(0, 0, -1);
+   for(int i = total - 1; i >= 0; i--)
+   {
+      string name = ObjectName(0, i, 0, -1);
+      if(StringFind(name, "FBVpD_") == 0) ObjectDelete(0, name);
+   }
+}
+
+void DrawDailyProfiles(const string js)
+{
+   if(!InpDrawDailyVP) return;
+   string days[];
+   int nd = JsonSplitArray(js, "daily_profiles", days);
+   if(nd <= 0) return;
+
+   ClearDailyProfiles();
+
+   int secs = PeriodSeconds(PERIOD_CURRENT);
+   for(int d = 0; d < nd; d++)
+   {
+      double vpbin = JsonGetNumber(days[d], "bin");
+      if(vpbin <= 0.0) continue;
+      datetime t0 = (datetime)(long)JsonGetNumber(days[d], "session_start_ts");
+      if(t0 <= 0) continue;
+
+      string ps[];
+      int np = JsonSplitArray(days[d], "profile", ps);
+      if(np <= 0) continue;
+
+      double price[], vol[];
+      ArrayResize(price, np); ArrayResize(vol, np);
+      double maxv = 0.0;
+      for(int i = 0; i < np; i++)
+      {
+         price[i] = JsonGetNumber(ps[i], "price");
+         vol[i]   = JsonGetNumber(ps[i], "vol");
+         if(vol[i] > maxv) maxv = vol[i];
+      }
+      if(maxv <= 0.0) continue;
+
+      datetime t1_end = (datetime)(long)JsonGetNumber(days[d], "session_end_ts");
+      if(t1_end <= t0) t1_end = t0 + 86400;
+
+      // Max bar width capped to the session window so each day's histogram stays independent.
+      long maxWidth = (long)MathMin((long)(InpDailyVPMaxBars * secs), (long)(t1_end - t0));
+
+      double half = vpbin / 2.0;
+      for(int i = 0; i < np; i++)
+      {
+         if(vol[i] <= 0.0) continue;
+         double   frac  = vol[i] / maxv;
+         datetime t1vp  = t0 + (datetime)(frac * maxWidth) + secs;
+         bool     isPoc = (vol[i] >= maxv);
+         color    c     = isPoc ? InpDailyVPPocColor : InpDailyVPColor;
+         string   name  = "FBVpD_" + IntegerToString(d) + "_" + IntegerToString(i);
+         if(ObjectFind(0, name) < 0)
+         {
+            ObjectCreate(0, name, OBJ_RECTANGLE, 0, t0, price[i] - half, t1vp, price[i] + half);
+            ObjectSetInteger(0, name, OBJPROP_BACK,       true);
+            ObjectSetInteger(0, name, OBJPROP_FILL,       true);
+            ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+         }
+         else
+         {
+            ObjectSetInteger(0, name, OBJPROP_TIME,  0, t0);
+            ObjectSetInteger(0, name, OBJPROP_TIME,  1, t1vp);
+            ObjectSetDouble (0, name, OBJPROP_PRICE, 0, price[i] - half);
+            ObjectSetDouble (0, name, OBJPROP_PRICE, 1, price[i] + half);
+         }
+         ObjectSetInteger(0, name, OBJPROP_COLOR,   c);
+         ObjectSetInteger(0, name, OBJPROP_BGCOLOR, c);
+      }
+
+      //--- VAH / VAL / POC session lines (trend lines spanning session open → close)
+      double poc = JsonGetNumber(days[d], "poc");
+      double vah = JsonGetNumber(days[d], "vah");
+      double val = JsonGetNumber(days[d], "val");
+      string dstr = IntegerToString(d);
+      string lvls[3]; double lvlp[3]; color lvlc[3]; string lvln[3];
+      lvls[0] = "poc"; lvlp[0] = poc; lvlc[0] = clrGoldenrod;   lvln[0] = "POC";
+      lvls[1] = "vah"; lvlp[1] = vah; lvlc[1] = clrDodgerBlue;  lvln[1] = "VAH";
+      lvls[2] = "val"; lvlp[2] = val; lvlc[2] = clrDodgerBlue;  lvln[2] = "VAL";
+      for(int k = 0; k < 3; k++)
+      {
+         if(lvlp[k] <= 0.0) continue;
+         string name = "FBVpD_" + dstr + "_" + lvls[k];
+         if(ObjectFind(0, name) < 0)
+         {
+            ObjectCreate(0, name, OBJ_TREND, 0, t0, lvlp[k], t1_end, lvlp[k]);
+            ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT,  false);
+            ObjectSetInteger(0, name, OBJPROP_BACK,       true);
+            ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+         }
+         else
+         {
+            ObjectSetInteger(0, name, OBJPROP_TIME,  0, t0);
+            ObjectSetDouble (0, name, OBJPROP_PRICE, 0, lvlp[k]);
+            ObjectSetInteger(0, name, OBJPROP_TIME,  1, t1_end);
+            ObjectSetDouble (0, name, OBJPROP_PRICE, 1, lvlp[k]);
+         }
+         ObjectSetInteger(0, name, OBJPROP_COLOR, lvlc[k]);
+         ObjectSetInteger(0, name, OBJPROP_STYLE, lvls[k] == "poc" ? STYLE_SOLID : STYLE_DOT);
+         ObjectSetInteger(0, name, OBJPROP_WIDTH, lvls[k] == "poc" ? 1 : 1);
+         if(InpShowZoneLabels && d == nd - 1)  // label only the most recent session to avoid clutter
+            ZoneText("dvp_lbl_" + dstr + "_" + lvls[k], t1_end,
+                     lvlp[k], lvln[k] + " " + DoubleToString(lvlp[k], _Digits), lvlc[k]);
+      }
+   }
+}
+
 void FetchAndDrawZones()
 {
-   string body = StringFormat("{\"account\":\"%s\",\"symbol\":\"%s\",\"tf\":\"%s\"}",
-                              gAccount, _Symbol, InpZoneTF);
+   string body = StringFormat("{\"account\":\"%s\",\"symbol\":\"%s\",\"tf\":\"%s\",\"vp_days\":%d}",
+                              gAccount, _Symbol, InpZoneTF, InpDrawDailyVP ? InpDailyVPDays : 0);
    string resp;
    int code = HttpPost(InpBridgeURL + "/exec/zones", body, resp);
    if(code != 200) return;
@@ -915,8 +1085,11 @@ void FetchAndDrawZones()
    //--- ict_fvg overlay (the paper strategy's setup, rebased onto this venue)
    DrawICT(resp);
 
-   //--- computed volume profile (right-margin histogram)
+   //--- computed volume profile (right-margin histogram for current session)
    if(InpDrawVP) DrawProfile(resp);
+
+   //--- per-session VP histograms anchored at each day's session open
+   DrawDailyProfiles(resp);
 
    if(InpVerbose && (n > 0 || nl > 0))
       Print("🟦 Drew ", n, " zones + ", nl, " VP levels | fulcrum ",
@@ -1023,7 +1196,7 @@ int OnInit()
    bool tradeAllowed = TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) &&
                        MQLInfoInteger(MQL_TRADE_ALLOWED);
    Print("─────────────────────────────────────────────");
-   Print("✅ FBExecBridge v1.03 — executor + labels + VP histogram + BB/squeeze pane");
+   Print("✅ FBExecBridge v1.05 — executor + labels + VP histogram + per-session daily VP");
    Print("    Account:   ", gAccount);
    Print("    Bridge:    ", InpBridgeURL, "  (poll ", InpPollMs, "ms)");
    Print("    Magic:     ", InpMagic, "..", InpMagic + InpMagicRange - 1, " (strategy×TF range)");
@@ -1105,6 +1278,7 @@ void OnDeinit(const int reason)
 {
    EventKillTimer();
    ClearZones();
+   ClearDailyProfiles();
    ClearDashboard();
 
    //--- tear down the BB / squeeze overlays we attached (guarded so we never touch a

@@ -135,9 +135,14 @@ def exec_emit_grid():
 
     # broker↔analysis symbol resolution (same map as /grid_levels)
     symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
+    broker_aliases = (settings.get("execution") or {}).get("broker_aliases") or {}
     broker_to_analysis = {v: k for k, v in symbol_map.items()}
-    symbol = broker_to_analysis.get(req_symbol, req_symbol)
-    broker_symbol = symbol_map.get(symbol, req_symbol)
+    if req_symbol in broker_aliases:
+        symbol = str(broker_aliases[req_symbol])
+        broker_symbol = req_symbol
+    else:
+        symbol = broker_to_analysis.get(req_symbol, req_symbol)
+        broker_symbol = symbol_map.get(symbol, req_symbol)
 
     # venue quote the EA last reported (the rebase target)
     quote = ExecBridge.get_quote(account, broker_symbol)
@@ -328,15 +333,12 @@ def exec_test_order():
 
 @bp.post("/exec/zones")
 def exec_zones():
-    """HVN/LVN zones for the EA to draw — the SAME source the dashboard renders:
-    the cached, session-anchored DAILY VP (vp_cache.get), already venue-shifted by
-    the configured additive offset. This deliberately matches the dashboard's
-    VolumeProfile panel, NOT the rolling-window VP the grid trigger uses (so the
-    drawn zones are for visual parity; the armed fulcrum may sit on a session-rolling
-    edge that differs slightly).
+    """HVN/LVN zones for the EA to draw — uses _session_hvn_zones (rolling today +
+    cached prev-day) so drawn zones match exactly where arms fire. Daily VP key
+    levels (poc/vah/val) come from the static daily VP for the level overlay.
 
-    Body: {account, symbol(broker or analysis), [tf]}. `tf` is accepted but ignored —
-    daily VP is one period. Returns {ok, zones:[{kind, lo, hi}], venue_mid, fulcrum}.
+    Body: {account, symbol(broker or analysis), [tf]}. Returns
+    {ok, zones:[{kind, lo, hi}], levels, venue_mid, fulcrum}.
     """
     if not _auth_ok():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
@@ -345,26 +347,41 @@ def exec_zones():
     account = str(body.get("account") or "")
     req_symbol = body.get("symbol") or settings["instrument"]["symbol"]
 
-    symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
+    exec_cfg = settings.get("execution") or {}
+    symbol_map = exec_cfg.get("symbol_map") or {}
+    broker_aliases = exec_cfg.get("broker_aliases") or {}  # extra broker→analysis aliases
     broker_to_analysis = {v: k for k, v in symbol_map.items()}
-    symbol = broker_to_analysis.get(req_symbol, req_symbol)
-    broker_symbol = symbol_map.get(symbol, req_symbol)
+    if req_symbol in broker_aliases:
+        symbol = str(broker_aliases[req_symbol])
+        broker_symbol = req_symbol
+    else:
+        symbol = broker_to_analysis.get(req_symbol, req_symbol)
+        broker_symbol = symbol_map.get(symbol, req_symbol)
 
-    # Same call as the dashboard (server/routes/dashboard.py): cached daily VP with
-    # the additive venue offset already applied → zones are in the venue frame.
+    zone_tf = str(body.get("tf") or "5m")
+
+    # HVN zones: use _session_hvn_zones (rolling intraday + cached prev-day) — the same
+    # source zone_triggers uses when deciding to arm. Drawn zones now match arm fulcrums.
     from pipeline.features import vp_cache
-    daily = vp_cache.get(symbol, "daily") or {}
+    from pipeline.state_store import store as _store
+    from execution.zone_triggers import _session_hvn_zones
+    try:
+        bars = _store().recent(symbol, zone_tf, 200)
+        session_zones, _ = _session_hvn_zones(symbol, zone_tf, bars)
+    except Exception:
+        session_zones = []
+
     zones = []
-    for z in (daily.get("hvn_zones") or []):
-        zones.append({"kind": "hvn", "lo": round(float(z["low"]), 5),
-                      "hi": round(float(z["high"]), 5)})
+    for lo, hi in session_zones:
+        zones.append({"kind": "hvn", "lo": round(float(lo), 5), "hi": round(float(hi), 5)})
+
+    # LVN zones still from daily VP (no rolling LVN source yet)
+    daily = vp_cache.get(symbol, "daily") or {}
     for z in (daily.get("lvn_zones") or []):
         zones.append({"kind": "lvn", "lo": round(float(z["low"]), 5),
                       "hi": round(float(z["high"]), 5)})
 
-    # VP point-levels the grid actually TRIGGERS on (vp_level_touch fulcrums), drawn as
-    # labeled lines — only the levels enabled in grid_levels.vp_fulcrum_levels. Same
-    # venue-shifted daily VP, so they line up with the zones above and the dashboard.
+    # VP point-levels (poc/vah/val/naked_poc) from daily VP for the level overlay.
     enabled = set((settings.get("grid_levels") or {}).get("vp_fulcrum_levels", []) or [])
     levels = []
     for k in ("poc", "vah", "val", "naked_poc"):
@@ -373,8 +390,7 @@ def exec_zones():
             if isinstance(v, (int, float)) and v > 0:
                 levels.append({"kind": k, "price": round(float(v), 5)})
 
-    # Computed volume-at-price histogram (venue-shifted) for the EA to draw as a sideways
-    # profile. Rebuilt from bars (cache keeps only aggregates). Same daily window as zones.
+    # Computed volume-at-price histogram from daily VP.
     prof = vp_cache.period_profile(symbol, "daily") or {}
     profile = prof.get("profile", [])
     vp_bin = prof.get("bin", 0.0)
@@ -382,7 +398,6 @@ def exec_zones():
     quote = ExecBridge.get_quote(account, broker_symbol) or {}
     # dashboard shows the cycle for the EA's drawn TF (body.tf). Cycles are now per-TF,
     # so without a tf we'd find nothing — default to the zone TF the EA reports.
-    zone_tf = str(body.get("tf") or "")
     arm = ExecBridge.get_active_arm_for_tf(account, broker_symbol, zone_tf) or {}
 
     # ict_fvg paper-strategy overlay (entry/SL/TP, fib zone, FVGs, ChoCh) — published in
@@ -401,8 +416,18 @@ def exec_zones():
             ict_out["side"] = ov.get("side", "")
             ict_out["status"] = ov.get("status", "")
 
+    # Per-day VP histograms anchored at each session's open — for EA chart drawing.
+    n_days = int((body.get("vp_days") or 0) or 3)
+    daily_profiles: list = []
+    if n_days > 0:
+        try:
+            daily_profiles = vp_cache.daily_profiles_history(symbol, n=n_days)
+        except Exception:
+            daily_profiles = []
+
     return jsonify({"ok": True, "zones": zones, "levels": levels, "ict": ict_out,
                     "profile": profile, "vp_bin": vp_bin,
+                    "daily_profiles": daily_profiles,
                     "venue_mid": quote.get("mid", 0.0),
                     "symbol": symbol, "broker_symbol": broker_symbol,
                     "fulcrum": arm.get("fulcrum", 0.0), "emit_tf": arm.get("tf", ""),

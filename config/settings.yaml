@@ -1,4 +1,4 @@
-mode: paper              # journal | paper | live  (live also needs env ALLOW_LIVE=1)
+mode: live              # journal | paper | live  (live also needs env ALLOW_LIVE=1)
 trading_mode: grid            # buy_sell_only | grid  (grid: Claude designs full 5-leg plan via submit_grid_plan; buy_sell_only: mechanical Fib placer)
 
 # Standardized data window across all analysis modules (sweep, delta_div, wick_trap, cvd_vote)
@@ -41,8 +41,8 @@ instrument:
 # Footprint-driven neutral-grid placement (/exec/emit_grid + FBExecBridge EA).
 # Planner reads these via .get() defaults — block is optional but canonical here.
 grid_levels:
-  base_lot: 0.01
-  lot_step: 0.01
+  base_lot: 0.35
+  lot_step: 0.35
   tp_atr_mult: 1.5
   hvn_max_legs: 8
   max_fulcrum_dist_pct: 0.05
@@ -75,7 +75,7 @@ grid_levels:
   htf_bias_map: {1m: "15m", 5m: "15m", 15m: "1h", 1h: "4h"}
   bb_edge_enabled: true
   bb_edge_sigma: 2.5
-  cycle_net_target_usd: 50.0      # base net floating-$ target; tune on demo (micro-lot swings are small)
+  cycle_net_target_usd: 5000.0      # base net floating-$ target; tune on demo (micro-lot swings are small)
   cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full
   cycle_min_target_usd: 0.20     # floor; must be >0 so a hedged cycle still has a positive net-$ exit
   cycle_close_on_full_hedge: true  # cut a fully-hedged (delta-neutral) cycle to free margin
@@ -88,7 +88,7 @@ grid_levels:
   bias_trail_giveback_pct: 40    # fire when floating retraces this % off the peak
   bias_book_frac: 0.5            # fraction of the bias side's positions to book at the trigger
   # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
-  triggers: [hvn_inside_touch, squeeze]   # "structural" group the emitter arms (vp_level_touch disabled)
+  triggers: [hvn_edge, hvn_inside_touch, squeeze]
   vp_fulcrum_levels: [poc, vah, val, naked_poc, lvn]   # which VP levels are fulcrums
   vp_tol_atr_mult: 0.25      # tap "test" band = max(this·ATR, vp_tol_pct·price)
   vp_tol_pct: 0.0005         # ATR-free floor for the tap band (replay safety)
@@ -175,13 +175,16 @@ vp_cache:
     BTCUSDT: null
     XAUTUSDT: "auto"
 
-# Execution venue (Vantage MT5 via MetaApi)
+# Execution venue (direct MT5 via FBExecBridge EA)
 execution:
-  broker: vantage_mt5
+  broker: vantage_mt5_direct
   tradable_symbols: [XAUTUSDT, BTCUSDT]
   symbol_map:
     XAUTUSDT: "XAUUSD+"
     BTCUSDT:  "BTCUSD"
+  # Extra broker symbols that alias to an analysis symbol (secondary accounts / prop firms)
+  broker_aliases:
+    "XAUUSD.pc": XAUTUSDT
   # Risk-adjusted sizing: lots = (balance × risk_per_trade_pct) / (SL_distance × contract_size)
   # Set risk_per_trade_pct = 0 to disable; falls back to default_lots.
   risk_per_trade_pct: 0.0025    # 0.25% of equity per trade

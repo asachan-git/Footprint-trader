@@ -110,39 +110,78 @@ def _t_imbalance(symbol: str, tf: str, current_price: float) -> Trigger | None:
     )
 
 
-def _t_hvn_edge(symbol: str, current_price: float) -> Trigger | None:
-    """Nearest HVN boundary edge. Node width (high-low) is the raw_range that
-    sizes the grid: price reverts to the other edge or breaks to the next HVN."""
+def _t_hvn_edge(symbol: str, tf: str, current_price: float) -> Trigger | None:
+    """The just-closed candle's high or low TOUCHES an HVN boundary edge from outside
+    the node (wick reaches the edge but the candle does NOT close inside the node).
+    This is the "tap and decide" setup — grid straddles the edge; the move that follows
+    (bounce or break) fills one side.
+
+    Condition: bar.high ≥ node_low  OR  bar.low ≤ node_high, with close OUTSIDE the node.
+    Uses _session_hvn_zones (same source as hvn_inside_touch) so drawn zones match.
+    tp_up/tp_down = far edge of nearest HVN above/below for structural TP override.
+    """
     try:
-        from pipeline.features.vp_cache import get as vp_get
+        from pipeline.state_store import store
     except Exception:
         return None
 
-    best: tuple[float, float, float] | None = None  # (dist, edge_price, node_width)
-    for period in ("daily", "weekly"):
-        vp = vp_get(symbol, period)
-        if not vp:
+    win = _VP_WIN.get(tf, 96)
+    bars = store().recent(symbol, tf, win + 5)
+    if len(bars) < 2:
+        return None
+
+    zones, _sess = _session_hvn_zones(symbol, tf, bars)
+    if not zones:
+        return None
+
+    cur = bars[-1]
+    c, h, lo_p = cur.ohlc.c, cur.ohlc.h, cur.ohlc.l
+
+    best = None  # (dist_to_close, edge_price, node_lo, node_hi, edge_side)
+    for node_lo, node_hi in zones:
+        width = node_hi - node_lo
+        if width <= 0:
             continue
-        for hvn in vp.get("hvn_zones") or []:
-            lo, hi = float(hvn["low"]), float(hvn["high"])
-            width = hi - lo
-            for edge in (lo, hi):
-                d = abs(edge - current_price)
-                if best is None or d < best[0]:
-                    best = (d, edge, width)
+        _buf = 0.25
+        # Touch from below: bar.high within 0.1pt of node_lo, close outside
+        if h >= node_lo - _buf and c < node_lo:
+            dist = abs(c - node_lo)
+            if best is None or dist < best[0]:
+                best = (dist, node_lo, node_lo, node_hi, "bottom")
+        # Touch from above: bar.low within 0.1pt of node_hi, close outside
+        if lo_p <= node_hi + _buf and c > node_hi:
+            dist = abs(c - node_hi)
+            if best is None or dist < best[0]:
+                best = (dist, node_hi, node_lo, node_hi, "top")
+
     if best is None:
         return None
 
-    _dist, edge, width = best
-    # Confidence higher when price is genuinely AT the edge (within ~25% of width).
+    _dist, edge_price, node_lo, node_hi, edge_side = best
+    width = node_hi - node_lo
+
+    # TP: far edge of nearest HVN strictly above/below
+    tops_above = [hi for lo, hi in zones if lo > node_hi]
+    bots_below = [lo for lo, hi in zones if hi < node_lo]
+    tp_up   = min(tops_above) if tops_above else 0.0
+    tp_down = max(bots_below) if bots_below else 0.0
+
     proximity = 1.0 - min(1.0, _dist / width) if width > 0 else 0.0
     conf = min(0.9, 0.5 + 0.4 * proximity)
+
     return Trigger(
         kind="hvn_edge",
-        fulcrum_price=float(edge),
+        fulcrum_price=float(edge_price),
         raw_range=float(width),
         confidence=float(conf),
-        context={"bias": "none"},
+        context={
+            "edge": edge_side,
+            "node_low": float(node_lo),
+            "node_high": float(node_hi),
+            "tp_up": float(tp_up),
+            "tp_down": float(tp_down),
+            "bias": "none",
+        },
     )
 
 
@@ -272,8 +311,9 @@ def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger |
             continue
         if not (lo < c < hi):            # the candle must CLOSE inside this node
             continue
-        touch_top = h >= hi
-        touch_bot = lo_p <= lo
+        _buf = 0.25
+        touch_top = h >= hi - _buf
+        touch_bot = lo_p <= lo + _buf
         if not (touch_top or touch_bot):  # …and tap an edge with its wick
             continue
         # which edge: if both wicks pierced, take the one the close sits nearer
@@ -821,7 +861,7 @@ def detect_all(symbol: str, tf: str, current_price: float, regime,
     out: list[Trigger] = []
     for t in (
         _t_imbalance(symbol, tf, current_price),
-        _t_hvn_edge(symbol, current_price),
+        _t_hvn_edge(symbol, tf, current_price),
         _t_hvn_inside_touch(symbol, tf, current_price),
         _t_anchor(symbol, current_price, atr, latest),
         _t_va(symbol, current_price, regime, daily_vp),
