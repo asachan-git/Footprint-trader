@@ -430,11 +430,19 @@ def exec_zones():
             if isinstance(v, (int, float)) and v > 0:
                 levels.append({"kind": k, "price": round(float(v), 5)})
 
-    # Computed volume-at-price histogram (venue-shifted) for the EA to draw as a sideways
-    # profile. Rebuilt from bars (cache keeps only aggregates). Same daily window as zones.
-    prof = vp_cache.period_profile(symbol, "daily") or {}
-    profile = prof.get("profile", [])
-    vp_bin = prof.get("bin", 0.0)
+    # Computed volume-at-price histograms: prev-D + today, smoothed, venue-shifted.
+    # Each entry has {vp_bin, profile, start_ts} so the EA anchors at session open.
+    _sess_profs = vp_cache.period_profiles_session(symbol)
+    profiles = []
+    for _sp in _sess_profs:
+        _pb = _sp.get("bin", 0.0)
+        _pp = _sp.get("profile", [])
+        if _pb > 0 and _pp:
+            profiles.append({"vp_bin": round(float(_pb), 5), "profile": _pp,
+                             "start_ts": _sp.get("start_ts", 0)})
+    _latest = profiles[-1] if profiles else {}
+    profile = _latest.get("profile", [])
+    vp_bin = _latest.get("vp_bin", 0.0)
 
     quote = ExecBridge.get_quote(account, broker_symbol) or {}
     # dashboard shows the cycle for the EA's drawn TF (body.tf). Cycles are now per-TF,

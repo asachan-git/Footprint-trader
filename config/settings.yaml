@@ -45,6 +45,7 @@ grid_levels:
   lot_step: 0.25
   tp_atr_mult: 1.5
   hvn_max_legs: 6
+  max_lot_per_leg: 1.0            # per-leg lot cap (0 = uncapped)
   max_fulcrum_dist_pct: 0.05
   # Cycle exit (server-side cycle monitor). DEMO ONLY — strategy is -EV.
   # Net-profit-exit-only: place legs with NO per-order TP so the winning side can't book
@@ -185,7 +186,16 @@ vp_cache:
   #   BTC tick = 0.1 → 1.0 = 10-tick bins
   vp_bin_size:
     BTCUSDT:  25.0          # 25$ bins (Sierra/Bookmap convention for BTC ~1300/day range = ~52 bins)
-    XAUTUSDT: 1.0           # 1$ bins (was 0.5; gives ~25 bins per day for typical XAU range)
+    XAUTUSDT: 1.0           # 1$ bins for detection/HVN/LVN
+  # ── Drawn VP histogram only (decoupled from detection bins above) ──────────
+  # vp_profile_bin: finer bin used ONLY for chart drawing (doesn't affect HVN/LVN/grid).
+  # vp_profile_smooth: Gaussian sigma in price units (0 = raw bars, 1.0 = smooth curve).
+  # vp_profile_points: max histogram rows sent to EA (~50-200).
+  vp_profile_bin:
+    XAUTUSDT: 0.1           # 0.1$ (full tick res) for a smooth gold profile
+    BTCUSDT:  5.0           # 5$ for BTC
+  vp_profile_smooth: 1.0   # Gaussian in price units — 1.0 good for XAU
+  vp_profile_points: 150   # rows sent to EA
   # Intra-day VP refresh — rebuild current day's POC/VAH/VAL/HVN/LVN every N
   # primary-TF bars. Default 5 = every 5 minutes at 1m primary TF. Set 0 to disable.
   intraday_refresh_bars: 1

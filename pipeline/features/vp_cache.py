@@ -382,15 +382,75 @@ def poc_sequence(symbol: str, period: str, n: int = 5) -> list[float | None]:
     return [e.get("poc") for e in get_history(symbol, period, n)]
 
 
+_PROFILE_CFG_CACHE: dict | None = None
+
+
+def _profile_draw_cfg() -> dict:
+    """Load vp_profile_bin/smooth/points from settings.yaml (cached after first read)."""
+    global _PROFILE_CFG_CACHE
+    if _PROFILE_CFG_CACHE is None:
+        cfg: dict = {"bin": {}, "smooth": 0.0, "points": 150}
+        try:
+            import pathlib as _pl, yaml as _yaml
+            _s = _yaml.safe_load(
+                (_pl.Path(__file__).resolve().parent.parent.parent / "config" / "settings.yaml").read_text()
+            ) or {}
+            _g = _s.get("vp_cache") or {}
+            cfg["bin"] = _g.get("vp_profile_bin") or {}
+            cfg["smooth"] = float(_g.get("vp_profile_smooth", 0.0) or 0.0)
+            cfg["points"] = int(_g.get("vp_profile_points", 150) or 150)
+        except Exception:
+            pass
+        _PROFILE_CFG_CACHE = cfg
+    return _PROFILE_CFG_CACHE
+
+
+def _profile_from_bars(bars: list, draw_cfg: dict, draw_bin, offset: float) -> dict | None:
+    """Build a smoothed, decimated VP histogram from a bar list for chart drawing.
+
+    Applies optional Gaussian smoothing (draw_cfg["smooth"] price-units sigma) and
+    downsamples to ≤ draw_cfg["points"] rows. Returns {"bin", "profile"} or None."""
+    from .volume_profile import _build_bins
+    import numpy as _np
+    if len(bars) < 30:
+        return None
+    res = _build_bins(bars, bin_size=draw_bin)
+    if not res:
+        return None
+    bins, centers, bin_size, _pmin, _pmax, _ask, _bid = res
+    _raw = _np.asarray(bins, dtype=float)
+    _nz = _np.nonzero(_raw > 0)[0]
+    if len(_nz) == 0:
+        return None
+    _lo, _hi = int(_nz[0]), int(_nz[-1])
+    _smooth_px = float(draw_cfg.get("smooth") or 0.0)
+    _pts = int(draw_cfg.get("points") or 150)
+    if _smooth_px > 0 and bin_size > 0:
+        try:
+            from scipy.ndimage import gaussian_filter1d as _gauss
+            _raw = _gauss(_raw, sigma=max(0.5, _smooth_px / bin_size))
+        except ImportError:
+            pass
+    _active = _hi - _lo + 1
+    _step = max(1, _active // _pts) if _pts > 0 else 1
+    profile = []
+    for i in range(_lo, _hi + 1, _step):
+        j = min(i + _step, _hi + 1)
+        vol = float(_raw[i:j].sum())
+        if vol <= 0:
+            continue
+        price = float(_np.mean(centers[i:j])) + offset
+        profile.append({"price": round(price, 5), "vol": round(vol, 2)})
+    return {"bin": round(float(bin_size) * _step, 5), "profile": profile}
+
+
 def period_profile(symbol: str, period: str) -> dict | None:
     """Per-price volume histogram for the symbol's CURRENT period, venue-offset applied.
 
-    The cache stores only aggregates (POC/zones/etc), so the bins are rebuilt here from
-    stored 1m bars over the same session window get() uses — for the EA's VP overlay.
-    Returns {"bin": <width>, "profile": [{price, vol}, ...]} (vol>0 bins, venue-shifted),
-    or None if <30 bars (matches _compute_period_vp's floor)."""
+    Before 20:00 IST uses the previous completed session (richer data); at/after 20:00 IST
+    switches to today's forming session. Applies Gaussian smoothing + point decimation from
+    vp_cache.vp_profile_bin/smooth/points settings for a clean chart curve."""
     from pipeline.state_store import store as _store
-    from .volume_profile import _build_bins
     cache = _load()
     sym = cache.get(symbol, {})
     anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
@@ -398,29 +458,52 @@ def period_profile(symbol: str, period: str) -> dict | None:
     bin_cfg = sym.get("bin_size")
     now_ts = int(time.time())
     if period == "daily":
-        st, en = _day_bounds(_session_day_key(now_ts, anchor), anchor)
+        ist_now = datetime.fromtimestamp(now_ts, tz=_IST)
+        if ist_now.hour < 20:
+            day_key = _session_day_key(now_ts - 86400, anchor)
+        else:
+            day_key = _session_day_key(now_ts, anchor)
+        st, en = _day_bounds(day_key, anchor)
     elif period == "weekly":
         st, en = _week_bounds(_week_key(now_ts), anchor)
     else:
         return None
     end = min(en, now_ts)
     bars = [b for b in _store().recent(symbol, "1m", 100_000) if st <= b.close_ts < end]
-    if len(bars) < 30:
-        return None
-    res = _build_bins(bars, bin_size=float(bin_cfg) if bin_cfg else None)
-    if not res:
-        return None
-    bins, centers, bin_size, _pmin, _pmax, ask_bins, bid_bins = res
-    profile = [
-        {
-            "price":   round(float(centers[i]) + offset, 5),
-            "vol":     round(float(bins[i]),     2),
-            "ask_vol": round(float(ask_bins[i]), 2),
-            "bid_vol": round(float(bid_bins[i]), 2),
-        }
-        for i in range(len(bins)) if bins[i] > 0
-    ]
-    return {"bin": round(float(bin_size), 5), "profile": profile}
+    _draw_cfg = _profile_draw_cfg()
+    _draw_bin = float((_draw_cfg["bin"] or {}).get(symbol, 0.0) or 0.0) or (float(bin_cfg) if bin_cfg else None)
+    return _profile_from_bars(bars, _draw_cfg, _draw_bin, offset)
+
+
+def period_profiles_session(symbol: str) -> list[dict]:
+    """Return smoothed VP histograms for prev-D and today's sessions, each with start_ts.
+
+    Returns a list (oldest first) of {"bin", "profile", "start_ts"} dicts for the EA to
+    draw session-anchored profiles. Sessions with < 30 bars are omitted."""
+    from pipeline.state_store import store as _store
+    cache = _load()
+    sym = cache.get(symbol, {})
+    anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
+    offset = _get_offset(sym)
+    bin_cfg = sym.get("bin_size")
+    now_ts = int(time.time())
+    _draw_cfg = _profile_draw_cfg()
+    _draw_bin = float((_draw_cfg["bin"] or {}).get(symbol, 0.0) or 0.0) or (float(bin_cfg) if bin_cfg else None)
+
+    today_key = _session_day_key(now_ts, anchor)
+    prev_key = _session_day_key(now_ts - 86400, anchor)
+
+    all_bars = _store().recent(symbol, "1m", 100_000)
+    results = []
+    for day_key in (prev_key, today_key):
+        st, en = _day_bounds(day_key, anchor)
+        end = min(en, now_ts)
+        bars = [b for b in all_bars if st <= b.close_ts < end]
+        prof = _profile_from_bars(bars, _draw_cfg, _draw_bin, offset)
+        if prof:
+            prof["start_ts"] = st
+            results.append(prof)
+    return results
 
 
 def get_va_regime(
