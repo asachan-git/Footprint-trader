@@ -335,6 +335,67 @@ class ExecBridge:
         mid = float(q.get("mid") or 0.0)
 
         grid_cfg = (settings.get("grid_levels") or {}) if isinstance(settings, dict) else {}
+
+        # Fulcrum-drift: every fulcrum_refresh_s (default 300 = 5m), check whether the
+        # HVN zone edge has shifted since the cycle was armed. Update stored fulcrum +
+        # node bounds (display / TP accuracy). When no fills yet, also cancel stale
+        # pending orders and clear the dedup so the emitter re-arms at the new edge
+        # on the next bar close. When fills exist, metadata update only.
+        _fr_interval = float(grid_cfg.get("fulcrum_refresh_s", 300.0) or 300.0)
+        _last_fr = float(cyc.get("fulcrum_refresh_ts") or cyc.get("ts") or 0.0)
+        if (mid > 0 and (t - _last_fr) >= _fr_interval
+                and cyc.get("trigger_kind") in ("hvn_edge", "hvn_inside_touch")):
+            try:
+                from execution.zone_triggers import _session_hvn_zones as _shz
+                from pipeline.state_store import store as _pss
+                _exec_cfg = (settings or {}).get("execution") or {}
+                _sym_map = _exec_cfg.get("symbol_map") or {}
+                _aliases = _exec_cfg.get("broker_aliases") or {}
+                _br2an = {v: k for k, v in _sym_map.items()}
+                _asym = _aliases.get(symbol) or _br2an.get(symbol, symbol)
+                _tf_use = str(tf or cyc.get("armed_tf") or "5m")
+                _bars = _pss().recent(_asym, _tf_use, 60)
+                if _bars:
+                    _zones, _ = _shz(_asym, _tf_use, _bars)
+                    _bc = _bars[-1].ohlc.c
+                    _ratio = mid / _bc if _bc > 0 else 1.0
+                    _stored_f = float(cyc.get("fulcrum") or 0.0)
+                    _nlo_v = float(cyc.get("node_low") or 0.0)
+                    _nhi_v = float(cyc.get("node_high") or 0.0)
+                    _edge_side = str(cyc.get("edge") or "top")
+                    _node_w = _nhi_v - _nlo_v
+                    # find zone in Binance frame whose centre is closest to stored node centre
+                    _nc_b = ((_nlo_v + _nhi_v) / 2.0) / _ratio if _ratio else 0.0
+                    _best_zone, _best_d = None, float("inf")
+                    for _zlo, _zhi in _zones:
+                        _d = abs((_zlo + _zhi) / 2.0 - _nc_b)
+                        if _d < _best_d:
+                            _best_d, _best_zone = _d, (_zlo, _zhi)
+                    if _best_zone:
+                        _zlo, _zhi = _best_zone
+                        _new_e_b = _zhi if _edge_side == "top" else _zlo
+                        _new_f_v = round(_new_e_b * _ratio, 5)
+                        _step = float(cyc.get("step") or 0.0)
+                        _min_drift = max(_step * 0.5, 0.25) if _step > 0 else 0.25
+                        _drift = abs(_new_f_v - _stored_f)
+                        if _drift >= _min_drift:
+                            _new_nlo = round((_new_f_v - _node_w) if _edge_side == "top" else _new_f_v, 5)
+                            _new_nhi = round(_new_f_v if _edge_side == "top" else (_new_f_v + _node_w), 5)
+                            cls.set_last_arm(account, symbol, **{**cyc,
+                                "fulcrum": _new_f_v, "node_low": _new_nlo, "node_high": _new_nhi,
+                                "fulcrum_refresh_ts": t})
+                            cls.mark_emit(account, symbol, _new_f_v, magic=magic)
+                            LOG.info(f"[monitor] fulcrum drift {symbol} {_tf_use} magic={magic} "
+                                     f"{_stored_f:.2f}→{_new_f_v:.2f} (Δ{_drift:+.2f})")
+                            if positions == 0:
+                                # no fills — cancel stale pendings; emitter re-arms at next bar close
+                                cls.enqueue(account, CANCEL_PENDINGS, symbol, magic=magic,
+                                            comment=f"FB|fulcrum_drift|{_tf_use}", now=t)
+                                cls.clear_emit(account, symbol, magic=magic)
+                        else:
+                            cls.set_last_arm(account, symbol, **{**cyc, "fulcrum_refresh_ts": t})
+            except Exception as _fe:
+                LOG.debug(f"[monitor] fulcrum_drift check failed: {_fe}")
         base_target = float(grid_cfg.get("cycle_net_target_usd", 0.0) or 0.0)
         decay_pct = float(grid_cfg.get("cycle_hedge_decay_pct", 33.0) or 0.0)
         min_target = float(grid_cfg.get("cycle_min_target_usd", 0.20) or 0.0)
