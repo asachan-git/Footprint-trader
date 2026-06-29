@@ -526,7 +526,7 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     from pipeline.features.atr import atr_from_store
     from pipeline.features import day_type
     try:
-        from pipeline.features.vp_cache import get as vp_get
+        from pipeline.features.vp_cache import get_raw as vp_get
         daily_vp = vp_get(symbol, "daily")
         if daily_vp is not None:
             daily_vp = dict(daily_vp)

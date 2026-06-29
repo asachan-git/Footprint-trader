@@ -315,26 +315,54 @@ def _get_offset(sym: dict) -> float:
     return float(sym.get("venue_price_offset") or 0.0)
 
 
-def get(symbol: str, period: str) -> dict | None:
-    """Get cached VP for symbol + period (today / this week), venue-offset applied."""
+def get_offset(symbol: str) -> float:
+    """Return the stored venue offset for symbol (Vantage mid − Binance close). 0.0 if not set."""
     cache = _load()
-    sym = cache.get(symbol, {})
-    now_ts = int(time.time())
-    anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
-    offset = _get_offset(sym)
+    return _get_offset(cache.get(symbol, {}))
+
+
+def _get_vp(sym: dict, period: str, now_ts: int, anchor: "SessionAnchor") -> "dict | None":
     if period == "daily":
         key = _session_day_key(now_ts, anchor)
-        vp = sym.get("daily", {}).get(key)
-    elif period == "weekly":
+        return sym.get("daily", {}).get(key)
+    if period == "weekly":
         key = _week_key(now_ts)
-        vp = sym.get("weekly", {}).get(key)
-    else:
-        return None
+        return sym.get("weekly", {}).get(key)
+    return None
+
+
+def get_raw(symbol: str, period: str) -> "dict | None":
+    """Get cached VP in Binance/analysis frame — NO venue offset applied.
+    Use this for trigger detection and internal calculations where bars are also
+    in Binance space. Apply get_offset() manually when you need Vantage prices."""
+    cache = _load()
+    sym = cache.get(symbol, {})
+    anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
+    vp = _get_vp(sym, period, int(time.time()), anchor)
+    return dict(vp) if vp else None
+
+
+def get(symbol: str, period: str) -> "dict | None":
+    """Get cached VP with venue offset applied — use for chart display (EA zones)."""
+    cache = _load()
+    sym = cache.get(symbol, {})
+    anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
+    offset = _get_offset(sym)
+    vp = _get_vp(sym, period, int(time.time()), anchor)
     return _shift_vp(vp, offset) if vp else None
 
 
-def get_history(symbol: str, period: str, n: int = 5) -> list[dict]:
-    """Get last N cached VP snapshots (newest last), venue-offset applied."""
+def get_history_raw(symbol: str, period: str, n: int = 5) -> "list[dict]":
+    """Get last N VP snapshots in Binance/analysis frame — NO venue offset."""
+    cache = _load()
+    sym_cache = cache.get(symbol, {})
+    entries = sym_cache.get(period, {})
+    sorted_keys = sorted(entries.keys())[-n:]
+    return [{"period_key": k, **entries[k]} for k in sorted_keys]
+
+
+def get_history(symbol: str, period: str, n: int = 5) -> "list[dict]":
+    """Get last N cached VP snapshots with venue offset applied — use for chart display."""
     cache = _load()
     sym_cache = cache.get(symbol, {})
     offset = _get_offset(sym_cache)

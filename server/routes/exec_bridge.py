@@ -360,8 +360,9 @@ def exec_zones():
 
     zone_tf = str(body.get("tf") or "5m")
 
-    # HVN zones: use _session_hvn_zones (rolling intraday + cached prev-day) — the same
-    # source zone_triggers uses when deciding to arm. Drawn zones now match arm fulcrums.
+    # HVN zones: use _session_hvn_zones (rolling intraday + cached prev-day) — same
+    # source as trigger detection (Binance frame). Apply venue offset here so the EA
+    # draws zones aligned to Vantage XAUUSD.pc prices on the chart.
     from pipeline.features import vp_cache
     from pipeline.state_store import store as _store
     from execution.zone_triggers import _session_hvn_zones
@@ -371,9 +372,12 @@ def exec_zones():
     except Exception:
         session_zones = []
 
+    venue_offset = vp_cache.get_offset(symbol)
     zones = []
     for lo, hi in session_zones:
-        zones.append({"kind": "hvn", "lo": round(float(lo), 5), "hi": round(float(hi), 5)})
+        zones.append({"kind": "hvn",
+                      "lo": round(float(lo) + venue_offset, 5),
+                      "hi": round(float(hi) + venue_offset, 5)})
 
     # LVN zones still from daily VP (no rolling LVN source yet)
     daily = vp_cache.get(symbol, "daily") or {}

@@ -202,10 +202,10 @@ def _rolling_hvn(symbol: str, tf: str, bars: list[Bar]) -> list[tuple[float, flo
 
 
 def _cached_hvn(symbol: str) -> list[tuple[float, float]]:
-    """Stable cached-daily HVN zones (the session-anchored structural node)."""
+    """Stable cached-daily HVN zones in Binance/analysis frame (no venue offset)."""
     try:
-        from pipeline.features.vp_cache import get as vp_get
-        vp = vp_get(symbol, "daily") or {}
+        from pipeline.features.vp_cache import get_raw
+        vp = get_raw(symbol, "daily") or {}
         return [(float(z["low"]), float(z["high"])) for z in (vp.get("hvn_zones") or [])]
     except Exception:
         return []
@@ -227,10 +227,11 @@ def _merge_zone_tuples(zones: list[tuple[float, float]]) -> list[tuple[float, fl
 
 
 def _outside_daily_va(symbol: str, price: float) -> bool:
-    """True when price sits beyond today's cached value area (above VAH / below VAL)."""
+    """True when price sits beyond today's cached value area (above VAH / below VAL).
+    Uses raw Binance-frame zones — price is also Binance (bar close)."""
     try:
-        from pipeline.features.vp_cache import get as vp_get
-        vp = vp_get(symbol, "daily") or {}
+        from pipeline.features.vp_cache import get_raw
+        vp = get_raw(symbol, "daily") or {}
     except Exception:
         return False
     val, vah = vp.get("val"), vp.get("vah")
@@ -241,12 +242,10 @@ def _outside_daily_va(symbol: str, price: float) -> bool:
 
 def _prior_day_hvn(symbol: str, price: float) -> list[tuple[float, float]]:
     """Borrow HVN structure from the most recent PRIOR-DAY profile whose value area
-    still brackets `price`. When price has run into a thin tail outside today's value,
-    today's profile offers no node to straddle — but a previous session that traded
-    AROUND this price did build one. Venue-offset is already applied by get_history."""
+    still brackets `price`. Uses raw Binance-frame zones — price is Binance bar close."""
     try:
-        from pipeline.features.vp_cache import get_history
-        hist = get_history(symbol, "daily", n=5)
+        from pipeline.features.vp_cache import get_history_raw
+        hist = get_history_raw(symbol, "daily", n=5)
     except Exception:
         return []
     for e in reversed(hist):   # newest prior day first

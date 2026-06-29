@@ -495,7 +495,7 @@ def ingest():
     if bar.tf == primary_tf:
         try:
             from pipeline.features.big_trade import detect_events as _bt_detect, log_events as _bt_log
-            from pipeline.features.vp_cache import get as _vp_get
+            from pipeline.features.vp_cache import get_raw as _vp_get
             _recent = store().recent(bar.symbol, primary_tf, 30)
             _vp = _vp_get(bar.symbol, "daily") or {}
             _bt_events = _bt_detect(bar, _recent, _vp)
