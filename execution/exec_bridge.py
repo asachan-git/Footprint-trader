@@ -110,6 +110,8 @@ class Command:
     frac: float = 0.0         # fraction of that side's positions to close (CLOSE_SIDE)
     buy_tp: float = 0.0       # MODIFY_TP: new TP for buy positions/orders
     sell_tp: float = 0.0      # MODIFY_TP: new TP for sell positions/orders
+    buy_sl: float = 0.0       # MODIFY_SL: new SL for buy positions (0 = skip)
+    sell_sl: float = 0.0      # MODIFY_SL: new SL for sell positions (0 = skip)
     locked_pnl: float = 0.0
     status: str = PENDING
     ts_created: float = 0.0
@@ -126,6 +128,8 @@ class Command:
             d.update(side=self.side, frac=self.frac, comment=self.comment)
         elif self.type == "MODIFY_TP":
             d.update(buy_tp=self.buy_tp, sell_tp=self.sell_tp)
+        elif self.type == "MODIFY_SL":
+            d.update(buy_sl=self.buy_sl, sell_sl=self.sell_sl)
         return d
 
 
@@ -266,6 +270,72 @@ class ExecBridge:
         return out
 
 
+    # ── lvn_close FVG / engulf trailing helpers ────────────────────────────────
+
+    @staticmethod
+    def _lvn_fvg_trail(symbol: str, tf: str, lookback: int = 30) -> tuple[float, float]:
+        """Return (buy_fvg_sl, sell_fvg_sl) anchored to the most recent FVG.
+
+        Bullish FVG: bars[i].l > bars[i-2].h → buy_sl = bars[i-2].h - 0.3×ATR
+        Bearish FVG: bars[i].h < bars[i-2].l → sell_sl = bars[i-2].l + 0.3×ATR
+
+        The EA's MODIFY_SL only-improve guard rejects any SL that doesn't tighten
+        the broker position, so we just send the anchor and let the EA decide.
+        """
+        try:
+            from pipeline.state_store import store
+            bars = store().recent(symbol, tf, lookback + 3)
+            if len(bars) < 3:
+                return 0.0, 0.0
+            avg_range = sum(b.ohlc.h - b.ohlc.l for b in bars[-10:]) / max(1, min(10, len(bars)))
+            buf = avg_range * 0.3
+
+            buy_sl = sell_sl = 0.0
+            for i in range(len(bars) - 2, 1, -1):
+                cur     = bars[i]
+                gap_bar = bars[i - 2]
+                if buy_sl == 0.0 and cur.ohlc.l > gap_bar.ohlc.h:
+                    # Bullish FVG — trail buy SL to just below FVG bottom
+                    buy_sl = round(float(gap_bar.ohlc.h) - buf, 4)
+                if sell_sl == 0.0 and cur.ohlc.h < gap_bar.ohlc.l:
+                    # Bearish FVG — trail sell SL to just above FVG top
+                    sell_sl = round(float(gap_bar.ohlc.l) + buf, 4)
+                if buy_sl != 0.0 and sell_sl != 0.0:
+                    break
+            return buy_sl, sell_sl
+        except Exception:
+            return 0.0, 0.0
+
+    @staticmethod
+    def _lvn_candle_trail(symbol: str, tf: str) -> tuple[float, float]:
+        """Return (buy_sl, sell_sl) from the most recent sweep/engulfing candle.
+
+        Bullish displacement (big bull bar closing above prev high): buy_sl = bar.l - buf
+        Bearish displacement (big bear bar closing below prev low):  sell_sl = bar.h + buf
+        Uses bars[-2] (last fully closed bar).
+        """
+        try:
+            from pipeline.state_store import store
+            bars = store().recent(symbol, tf, 6)
+            if len(bars) < 3:
+                return 0.0, 0.0
+            cur  = bars[-2]
+            prev = bars[-3]
+            h, l, o, c = cur.ohlc.h, cur.ohlc.l, cur.ohlc.o, cur.ohlc.c
+            ph, pl = prev.ohlc.h, prev.ohlc.l
+            rng  = h - l
+            body = abs(c - o)
+            avg_range = sum(b.ohlc.h - b.ohlc.l for b in bars[-6:]) / max(1, len(bars[-6:]))
+            buf = avg_range * 0.3
+            buy_sl = sell_sl = 0.0
+            if c > o and body >= rng * 0.5 and c >= ph and rng >= avg_range * 0.8:
+                buy_sl = round(float(l) - buf, 4)
+            if c < o and body >= rng * 0.5 and c <= pl and rng >= avg_range * 0.8:
+                sell_sl = round(float(h) + buf, 4)
+            return buy_sl, sell_sl
+        except Exception:
+            return 0.0, 0.0
+
     # ── cycle monitor (server-side exit brain) ─────────────────────────────────
     @classmethod
     def monitor_cycle(cls, account: str, symbol: str, settings: dict | None, *,
@@ -393,6 +463,37 @@ class ExecBridge:
                             cls.set_last_arm(account, symbol, **cyc)
                             LOG.info(f"[trail] {symbol} magic={magic} tf={tf} bias={bias} "
                                      f"peak={peak:.2f} gave back >{gb_bias}% → CLOSE_SIDE frac={book_frac}")
+
+        # 0.7) lvn_close FVG / engulf trailing SL
+        # For lvn_close both-side grids: after fills start, trail each side's SL
+        # to just below the most recent bullish FVG (buys) or just above the most
+        # recent bearish FVG (sells) in this TF. Also fires on displacement/engulf
+        # candles. The EA's MODIFY_SL only-improve guard prevents the SL widening.
+        trigger_kind_early = str(cyc.get("trigger_kind", "") or "")
+        if trigger_kind_early == "lvn_close" and tf and mid > 0 and positions > 0:
+            fvg_buy,  fvg_sell  = cls._lvn_fvg_trail(symbol, tf)
+            cnd_buy,  cnd_sell  = cls._lvn_candle_trail(symbol, tf)
+            # tightest = highest buy SL / lowest sell SL across both detectors
+            new_buy_sl = max(x for x in (fvg_buy, cnd_buy) if x > 0) if (fvg_buy > 0 or cnd_buy > 0) else 0.0
+            if fvg_sell > 0 and cnd_sell > 0:
+                new_sell_sl = min(fvg_sell, cnd_sell)
+            else:
+                new_sell_sl = fvg_sell or cnd_sell
+            last_buy_sl  = float(cyc.get("fvg_buy_sl")  or 0.0)
+            last_sell_sl = float(cyc.get("fvg_sell_sl") or 0.0)
+            send_buy  = new_buy_sl  if (new_buy_sl  > 0 and new_buy_sl  > last_buy_sl)  else 0.0
+            send_sell = new_sell_sl if (new_sell_sl > 0 and (last_sell_sl == 0.0 or new_sell_sl < last_sell_sl)) else 0.0
+            if send_buy > 0 or send_sell > 0:
+                cls.enqueue(account, "MODIFY_SL", symbol, magic=magic,
+                            buy_sl=send_buy, sell_sl=send_sell,
+                            comment=f"FB|fvg_trail|{tf}", now=t)
+                if send_buy  > 0: cyc["fvg_buy_sl"]  = send_buy
+                if send_sell > 0: cyc["fvg_sell_sl"] = send_sell
+                cls.set_last_arm(account, symbol, **cyc)
+                LOG.info(f"[fvg_trail] {symbol} magic={magic} tf={tf} "
+                         f"buy_sl={send_buy:.4f} sell_sl={send_sell:.4f} "
+                         f"(fvg={fvg_buy:.4f}/{fvg_sell:.4f} "
+                         f"cnd={cnd_buy:.4f}/{cnd_sell:.4f})")
 
         reason: str | None = None
         detail: dict = {}
@@ -523,6 +624,7 @@ class ExecBridge:
                 price: float = 0.0, lot: float = 0.0, sl: float = 0.0, tp: float = 0.0,
                 comment: str = "", magic: int = 0, side: str = "", frac: float = 0.0,
                 buy_tp: float = 0.0, sell_tp: float = 0.0,
+                buy_sl: float = 0.0, sell_sl: float = 0.0,
                 locked_pnl: float = 0.0,
                 now: float | None = None) -> Command:
         cmd = Command(
@@ -531,6 +633,7 @@ class ExecBridge:
             sl=round(float(sl), 5), tp=round(float(tp), 5), comment=comment,
             magic=int(magic), side=side, frac=float(frac),
             buy_tp=round(float(buy_tp), 5), sell_tp=round(float(sell_tp), 5),
+            buy_sl=round(float(buy_sl), 5), sell_sl=round(float(sell_sl), 5),
             locked_pnl=round(float(locked_pnl), 2),
             ts_created=now if now is not None else time.time(),
         )
