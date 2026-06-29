@@ -110,11 +110,14 @@ def _t_imbalance(symbol: str, tf: str, current_price: float) -> Trigger | None:
     )
 
 
-def _t_hvn_edge(symbol: str, current_price: float) -> Trigger | None:
+def _t_hvn_edge(symbol: str, current_price: float,
+                touch_tol_pts: float = 0.0) -> Trigger | None:
     """Nearest HVN boundary edge. Node width (high-low) is the raw_range that
     sizes the grid: price reverts to the other edge or breaks to the next HVN.
     TP targets use the same HVN→HVN logic as hvn_inside_touch: nearest node top
-    above / node bottom below the tapped edge across all daily+weekly zones."""
+    above / node bottom below the tapped edge across all daily+weekly zones.
+
+    touch_tol_pts: max distance from edge to count as a touch. 0 = auto (width*0.5)."""
     try:
         from pipeline.features.vp_cache import get as vp_get
     except Exception:
@@ -138,6 +141,9 @@ def _t_hvn_edge(symbol: str, current_price: float) -> Trigger | None:
         return None
 
     _dist, edge, width, side = best
+    tol = touch_tol_pts if touch_tol_pts > 0 else (width * 0.5 if width > 0 else 0.0)
+    if tol > 0 and _dist > tol:
+        return None  # price not close enough to count as a touch
     proximity = 1.0 - min(1.0, _dist / width) if width > 0 else 0.0
     conf = min(0.9, 0.5 + 0.4 * proximity)
 
@@ -349,6 +355,76 @@ def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger |
                  "tp_up":        tp_up,        "tp_down":      tp_down,
                  "single_side":  single_side,  "sell_fulcrum": sell_fulcrum,
                  "buy_fulcrum":  buy_fulcrum,  "range_for_n":  range_for_n},
+    )
+
+
+def _t_lvn_close(symbol: str, tf: str, current_price: float) -> Trigger | None:
+    """Candle CLOSES INSIDE an LVN (low-volume vacuum) → both-side grid:
+    - BUY legs above lvn_hi, targeting near edge (lo) of next HVN above.
+    - SELL legs below lvn_lo, targeting near edge (hi) of next HVN below.
+    TP chain: nearest HVN edge → VP levels → BB 2.5σ (resolved by _resolve_tps).
+
+    Stateless / causal — uses daily VP for LVN zones and rolling HVN for targets.
+    """
+    from pipeline.state_store import store
+    from pipeline.features.vp_cache import get as vp_get
+
+    win = _VP_WIN.get(tf, 96)
+    bars = store().recent(symbol, tf, win + 5)
+    if len(bars) < 2:
+        return None
+
+    vp = vp_get(symbol, "daily") or {}
+    lvn_raw = vp.get("lvn_zones") or []
+    if not lvn_raw:
+        return None
+    lvn_zones = [(float(z["low"]), float(z["high"])) for z in lvn_raw]
+
+    cur = bars[-1]
+    c = cur.ohlc.c
+
+    # find the narrowest LVN the candle closed inside
+    best = None
+    for lo, hi in lvn_zones:
+        if lo < c < hi:
+            w = hi - lo
+            if best is None or w < best[2]:
+                best = (lo, hi, w)
+    if best is None:
+        return None
+
+    lvn_lo, lvn_hi, lvn_width = best
+
+    # HVN zones for TP targets
+    hvn_zones, sess = _session_hvn_zones(symbol, tf, bars)
+
+    # BUY TP: lo (near edge) of next HVN strictly above lvn_hi
+    tp_up   = min((lo for lo, hi in hvn_zones if lo > lvn_hi), default=0.0)
+    # SELL TP: hi (near edge) of next HVN strictly below lvn_lo
+    tp_down = max((hi for lo, hi in hvn_zones if hi < lvn_lo), default=0.0)
+
+    # range_for_n: max of the two leg spans (ATR fallback inside _size_grid)
+    range_buy  = (tp_up   - lvn_hi) if tp_up   > 0 else lvn_width * 4
+    range_sell = (lvn_lo  - tp_down) if tp_down > 0 else lvn_width * 4
+    range_for_n = max(range_buy, range_sell)
+
+    return Trigger(
+        kind="lvn_close",
+        fulcrum_price=round((lvn_lo + lvn_hi) / 2.0, 4),
+        raw_range=float(lvn_width),
+        confidence=0.65,
+        context={
+            "bias": "none",
+            "session": sess,
+            "lvn_lo":       float(lvn_lo),
+            "lvn_hi":       float(lvn_hi),
+            "tp_up":        float(tp_up),
+            "tp_down":      float(tp_down),
+            "buy_fulcrum":  float(lvn_hi),
+            "sell_fulcrum": float(lvn_lo),
+            "range_for_n":  float(range_for_n),
+            "single_side":  "",
+        },
     )
 
 
@@ -865,6 +941,7 @@ def detect_all(symbol: str, tf: str, current_price: float, regime,
         _t_imbalance(symbol, tf, current_price),
         _t_hvn_edge(symbol, current_price),
         _t_hvn_inside_touch(symbol, tf, current_price),
+        _t_lvn_close(symbol, tf, current_price),
         _t_anchor(symbol, current_price, atr, latest),
         _t_va(symbol, current_price, regime, daily_vp),
         _t_vp_level_touch(symbol, tf, current_price, daily_vp, atr, cfg),

@@ -80,12 +80,14 @@ class GridPlan:
 # only). The detector still runs but can never win the structural hint, so no VP-level
 # straddles arm. Re-add "vp_level_touch" here to revive it.
 _HINT_GROUPS = {
-    "structural": {"hvn_edge", "hvn_inside_touch", "squeeze"},
+    "structural": {"hvn_edge", "hvn_inside_touch", "squeeze", "lvn_close"},
     # LVN displacement: vp_level_touch is the only detector that arms on an LVN.
     # The planner narrows it to level_type=="lvn" (see plan_grid_levels) so only the
     # vacuum fires. Neutral straddle-in-vacuum: price sits in the LVN, leaves fast one
     # side, that leg fills + runs to the bounding HVN; the opposite leg never triggers.
     "lvn_displacement": {"vp_level_touch"},
+    # LVN candle-close: bar closed inside an LVN → both-side grid, buy above / sell below.
+    "lvn_close": {"lvn_close"},
     # VP-level setup (parallel setup #3): VAL/VAH reclaim-or-break-sustain (va) + POC /
     # VAH / VAL support-resistance touches (vp_level_touch). Each arms its own magic
     # (va=strat 7, vp=strat 3) so it runs parallel to hvn (1) and squeeze (2).
@@ -187,7 +189,8 @@ def _should_skip(trigger: Trigger | None, regime, fulcrum: float,
     # HVN-edge / inside-touch / VP-level triggers ARE meant to sit ON structure
     # (an HVN edge or a POC/VA/LVN line, which usually lives inside a node); only skip
     # other fulcrums that fall *inside* a node body.
-    if (trigger.kind not in ("hvn_edge", "hvn_inside_touch", "vp_level_touch", "squeeze")
+    if (trigger.kind not in ("hvn_edge", "hvn_inside_touch", "vp_level_touch", "squeeze",
+                              "lvn_close")
             and _price_inside_hvn(fulcrum, daily_vp)):
         return True, "chop:inside_hvn"
     if daily_vp and daily_vp.get("current_position") == "at_poc":
@@ -280,6 +283,15 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
     if trigger.kind == "hvn_inside_touch":
         # range_for_n: width of the HVN body (top-edge case) or distance to next lower
         # HVN top edge (bottom-edge breakout). Ensures legs span the trade's actual range.
+        range_for_n = float(trigger.context.get("range_for_n", 0.0) or trigger.raw_range)
+        step = (step_mult * atr) if atr > 0 else max(range_for_n / 8.0, 1e-6)
+        n = int(round(range_for_n / step)) if step > 0 else 2
+        n = max(2, min(hvn_max_legs, n))
+        return n, round(step, 4)
+
+    if trigger.kind == "lvn_close":
+        # range_for_n = max(distance lvn_hi→next_hvn_lo_above, lvn_lo→next_hvn_hi_below).
+        # ATR step; enough legs to span the distance to the TP HVN.
         range_for_n = float(trigger.context.get("range_for_n", 0.0) or trigger.raw_range)
         step = (step_mult * atr) if atr > 0 else max(range_for_n / 8.0, 1e-6)
         n = int(round(range_for_n / step)) if step > 0 else 2
@@ -609,7 +621,10 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     # Ladder-span gate: skip if price has run away from the grid origin.
     # For single-side grids the trigger has already verified price location; only run
     # the symmetric ladder check for neutral straddles.
-    if not single_side_ov and current_price > 0 and n > 0 and step > 0:
+    # hvn_edge: touch_tol (width×0.5) is the proximity gate — ladder check is redundant
+    # and would reject wide-node edges that are legitimately within the touch window.
+    if (fulcrum_t.kind != "hvn_edge"
+            and not single_side_ov and current_price > 0 and n > 0 and step > 0):
         ladder_half = n * step
         ref = sell_fulcrum_ov if sell_fulcrum_ov > 0 else (buy_fulcrum_ov if buy_fulcrum_ov > 0 else fulcrum)
         off = abs(current_price - ref)
@@ -685,6 +700,16 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     )
 
     # Re-anchor onto the execution venue's live price (if the EA supplied one).
+    # hvn_edge: fulcrum is an absolute structural level (HVN boundary) — the same
+    # price on both venues for gold. Multiplicative ratio (venue_mid / bar_close)
+    # drifts the fulcrum off the edge when bar_close ≠ edge. Skip ratio-rebase;
+    # stamp anchors only so the arm record is accurate.
     if venue_price and venue_price > 0:
-        plan = _rebase_to_venue(plan, current_price, venue_price)
+        if fulcrum_t.kind == "hvn_edge":
+            plan = replace(plan,
+                           analysis_anchor=round(fulcrum_t.fulcrum_price, 4),
+                           venue_anchor=round(venue_price, 4),
+                           rebased=False)
+        else:
+            plan = _rebase_to_venue(plan, current_price, venue_price)
     return plan

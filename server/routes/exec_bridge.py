@@ -204,7 +204,12 @@ def exec_emit_grid():
     # Freeze-aware step floor: clear the broker's min-stop distance (×1.5 margin) so the
     # innermost leg can't land inside the freeze band and get silently rejected.
     min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
-    plan = plan_grid_levels(symbol, tf, float(latest.ohlc.c),
+    # hvn_edge tick-mode: use live venue quote as current_price so detection + ladder
+    # checks both operate on the actual market price, not a potentially-stale bar close.
+    # For bar-close hints (squeeze, vp_levels) keep bar close as the analysis anchor.
+    analysis_price = (float(quote["mid"]) if trigger_hint == "hvn_edge"
+                      else float(latest.ohlc.c))
+    plan = plan_grid_levels(symbol, tf, analysis_price,
                             trigger_hint=trigger_hint, settings=settings,
                             venue_price=float(quote["mid"]), min_step_venue=min_step_venue)
     # Cycle state is keyed by MAGIC (strategy×TF) so independent setups (hvn / squeeze /

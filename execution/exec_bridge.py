@@ -110,6 +110,7 @@ class Command:
     frac: float = 0.0         # fraction of that side's positions to close (CLOSE_SIDE)
     buy_tp: float = 0.0       # MODIFY_TP: new TP for buy positions/orders
     sell_tp: float = 0.0      # MODIFY_TP: new TP for sell positions/orders
+    locked_pnl: float = 0.0
     status: str = PENDING
     ts_created: float = 0.0
     ts_sent: float = 0.0
