@@ -41,11 +41,11 @@ instrument:
 # Footprint-driven neutral-grid placement (/exec/emit_grid + FBExecBridge EA).
 # Planner reads these via .get() defaults — block is optional but canonical here.
 grid_levels:
-  base_lot: 0.25
-  lot_step: 0.25
+  base_lot: 0.35
+  lot_step: 0.35
   tp_atr_mult: 1.5
   hvn_max_legs: 6
-  max_lot_per_leg: 1.0            # per-leg lot cap (0 = uncapped)
+  max_lot_per_leg: 1.4            # per-leg lot cap (0 = uncapped)
   max_fulcrum_dist_pct: 0.05
   # Cycle exit (server-side cycle monitor). DEMO ONLY — strategy is -EV.
   # Net-profit-exit-only: place legs with NO per-order TP so the winning side can't book
@@ -73,7 +73,7 @@ grid_levels:
   htf_bias_enabled: true
   htf_bias_period: 20
   htf_bias_slope_bars: 3
-  htf_bias_map: {1m: "15m", 5m: "15m", 15m: "1h", 1h: "4h"}
+  htf_bias_map: {1m: "5m", 5m: "15m", 15m: "1h", 1h: "4h"}
   bb_edge_enabled: true
   bb_edge_sigma: 2.5
   cycle_net_target_usd: 5000.0      # base net floating-$ target; tune on demo (micro-lot swings are small)
@@ -127,6 +127,8 @@ grid_levels:
   squeeze_bbw_window: 100     # trailing window (bars) for the BBW percentile rank
   squeeze_magic: 770002      # distinct MT5 magic for squeeze grid legs (MUST match EA InpMagicSqueeze); 0 = default magic
   squeeze_min_on_bars: 6     # require ≥this consecutive compressed bars before a release fires
+  squeeze_expand_pct: 0.40  # current BBW must be ≥ this percentile rank to confirm expansion is underway
+                             # 0 = legacy (fire on first de-coil bar); 0.35–0.50 recommended
   squeeze_max_bars_since_release: 0   # bars allowed between coil-release and arm; 0 = NO limit
   squeeze_release_lookback: 120       # how far back to scan for the coil (bounded by history, not freshness)
   # Vol-compression GATE (applies to ALL triggers, not just squeeze): only arm a grid when

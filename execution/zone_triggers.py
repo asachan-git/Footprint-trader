@@ -311,28 +311,44 @@ def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger |
     _dist, edge, width, side, reject_frac = best
     conf = min(0.9, 0.55 + min(reject_frac, 0.3))   # cleaner/deeper rejection → higher
 
-    # HVN→HVN momentum targets (the thesis): upside TP = the first node-TOP above the
-    # tapped edge; downside TP = the first node-BOTTOM below it. When the edge is the
-    # NEAR side of its node this is the SAME node's opposite edge; when it's the FAR
-    # side, it's the NEXT HVN's far edge across the LVN between. None if none exists.
-    tops_above = [hi for lo, hi in zones if hi > edge]
-    bots_below = [lo for lo, hi in zones if lo < edge]
-    tp_up = min(tops_above) if tops_above else 0.0
-    tp_down = max(bots_below) if bots_below else 0.0
-
-    # the node whose edge was tapped (the "which HVN" the dashboard reports): the
-    # fulcrum is one edge, the body spans `width` on the inside of that edge.
+    # the node whose edge was tapped
     node_low  = (edge - width) if side == "top" else edge
     node_high = edge if side == "top" else (edge + width)
+
+    if side == "top":
+        # Price inside HVN, wick tested top resistance → SELL grid inside HVN toward lo.
+        # Sell legs: node_high - step, node_high - 2*step, ... → n legs fitting within width.
+        # TP = node_low (opposite / far edge of same HVN).
+        single_side  = "sell"
+        sell_fulcrum = float(node_high)
+        buy_fulcrum  = 0.0
+        tp_down      = float(node_low)   # target: low edge of same HVN
+        tp_up        = 0.0
+        range_for_n  = float(width)      # n = width / step → legs span the full HVN body
+    else:
+        # Price inside HVN, wick tested bottom support → SELL continuation below HVN.
+        # Sell legs: node_low - step, node_low - 2*step, ... targeting next lower HVN top.
+        # TP = top edge (hi) of the nearest HVN whose hi is strictly below node_low.
+        next_lower_hi = max((hi for lo_, hi in zones if hi < node_low), default=0.0)
+        dist_to_next  = (node_low - next_lower_hi) if next_lower_hi > 0 else width
+        single_side  = "sell"
+        sell_fulcrum = float(node_low)
+        buy_fulcrum  = 0.0
+        tp_down      = float(next_lower_hi)  # near edge of next lower HVN
+        tp_up        = 0.0
+        range_for_n  = float(dist_to_next)   # n = distance / step
+
     return Trigger(
         kind="hvn_inside_touch",
         fulcrum_price=float(edge),
         raw_range=float(width),
         confidence=float(conf),
-        context={"bias": "none", "edge": side, "session": sess,
+        context={"bias": "sell", "edge": side, "session": sess,
                  "reject_frac": round(reject_frac, 4),
                  "node_low": float(node_low), "node_high": float(node_high),
-                 "tp_up": float(tp_up), "tp_down": float(tp_down)},
+                 "tp_up":        tp_up,        "tp_down":      tp_down,
+                 "single_side":  single_side,  "sell_fulcrum": sell_fulcrum,
+                 "buy_fulcrum":  buy_fulcrum,  "range_for_n":  range_for_n},
     )
 
 
@@ -736,10 +752,18 @@ def _t_squeeze(symbol: str, tf: str, current_price: float, atr: float,
         rank = sum(1 for v in hist if v <= cur) / len(hist)
         return (rank <= bbw_pct), rank
 
+    expand_pct = float(cfg.get("squeeze_expand_pct", 0.0) or 0.0)  # 0 = original behaviour (any release fires)
+
     last = n - 1
-    on_now, _ = _on_at(last)
+    on_now, cur_rank = _on_at(last)
     if on_now:
         return None                          # still compressed → wait for the release
+    # Expansion confirmation gate: require current BBW to be visibly above the compression
+    # floor before arming. expand_pct=0 preserves the legacy "any release fires" behaviour.
+    # Recommended: 0.35–0.50 — BBW must have climbed into at least the mid-range of the
+    # trailing window, confirming expansion has started rather than just barely de-coiled.
+    if expand_pct > 0 and cur_rank < expand_pct:
+        return None                          # de-coiled but expansion not confirmed yet
 
     # Walk back through the post-release (OFF) bars to the END of the coil — the most
     # recent compressed bar. No 1-bar edge: the release may be several bars old and we

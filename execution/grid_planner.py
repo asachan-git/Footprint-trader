@@ -278,8 +278,11 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
     # its OWN cap (hvn_max_legs), not the regime chop cap — the skip-gate already
     # filters genuine chop, and width-driven count is the whole point here.
     if trigger.kind == "hvn_inside_touch":
-        step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
-        n = int(round(trigger.raw_range / step)) if step > 0 else 2
+        # range_for_n: width of the HVN body (top-edge case) or distance to next lower
+        # HVN top edge (bottom-edge breakout). Ensures legs span the trade's actual range.
+        range_for_n = float(trigger.context.get("range_for_n", 0.0) or trigger.raw_range)
+        step = (step_mult * atr) if atr > 0 else max(range_for_n / 8.0, 1e-6)
+        n = int(round(range_for_n / step)) if step > 0 else 2
         n = max(2, min(hvn_max_legs, n))
         return n, round(step, 4)
 
@@ -363,47 +366,94 @@ def _ladder(n: int, base_lot: float, lot_step: float, heavy_near_mid: bool,
 
 def _build_legs(fulcrum: float, n: int, step: float, skew: str,
                 base_lot: float, lot_step: float,
-                max_lot: float = 0.0) -> tuple[list[Leg], list[Leg]]:
-    """fulcrum ± i·step prices. Favoured side gets the heavier/longer ladder."""
-    buy_n = n
-    sell_n = n
-    # Skew adds one extra leg + heavier ladder to the favoured side.
-    if skew == "buy":
-        buy_n = n + 1
-    elif skew == "sell":
-        sell_n = n + 1
+                max_lot: float = 0.0,
+                buy_fulcrum: float = 0.0,
+                sell_fulcrum: float = 0.0,
+                single_side: str = "") -> tuple[list[Leg], list[Leg]]:
+    """fulcrum ± i·step prices. Favoured side gets the heavier/longer ladder.
+    buy_fulcrum / sell_fulcrum override the starting price for each side.
+    single_side="sell" suppresses buy legs; single_side="buy" suppresses sell legs.
+    For single-side inside-HVN grids, lots increase away from the fulcrum (heavier
+    at the far end = more conviction the deeper price goes)."""
+    buy_n  = n if single_side != "buy"  else n   # skew not applied to single-side
+    sell_n = n if single_side != "sell" else n
 
-    buy_lots = _ladder(buy_n, base_lot, lot_step, heavy_near_mid=(skew == "buy"), max_lot=max_lot)
-    sell_lots = _ladder(sell_n, base_lot, lot_step, heavy_near_mid=(skew == "sell"), max_lot=max_lot)
+    if single_side:
+        # Single-side: no skew extra leg; lots increase away from edge (heavy far end)
+        buy_lots  = _ladder(buy_n,  base_lot, lot_step, heavy_near_mid=False, max_lot=max_lot)
+        sell_lots = _ladder(sell_n, base_lot, lot_step, heavy_near_mid=False, max_lot=max_lot)
+    else:
+        if skew == "buy":
+            buy_n = n + 1
+        elif skew == "sell":
+            sell_n = n + 1
+        buy_lots  = _ladder(buy_n,  base_lot, lot_step, heavy_near_mid=(skew == "buy"),  max_lot=max_lot)
+        sell_lots = _ladder(sell_n, base_lot, lot_step, heavy_near_mid=(skew == "sell"), max_lot=max_lot)
 
-    buy_legs = [Leg(price=round(fulcrum + i * step, 4), lot=buy_lots[i - 1])
-                for i in range(1, buy_n + 1)]
-    sell_legs = [Leg(price=round(fulcrum - i * step, 4), lot=sell_lots[i - 1])
-                 for i in range(1, sell_n + 1)]
+    bf = buy_fulcrum  if buy_fulcrum  > 0 else fulcrum
+    sf = sell_fulcrum if sell_fulcrum > 0 else fulcrum
+
+    buy_legs  = [] if single_side == "sell" else [
+        Leg(price=round(bf + i * step, 4), lot=buy_lots[i - 1])
+        for i in range(1, buy_n + 1)]
+    sell_legs = [] if single_side == "buy" else [
+        Leg(price=round(sf - i * step, 4), lot=sell_lots[i - 1])
+        for i in range(1, sell_n + 1)]
     return buy_legs, sell_legs
 
 
 # ── TP snapping ─────────────────────────────────────────────────────────────
 
+def _bb_tp(symbol: str, tf: str, direction: str,
+           period: int = 20, mult: float = 2.5) -> float:
+    """BB MA ± mult·σ as last-resort TP when no structural level is available.
+    Returns 0.0 on any data error (caller treats 0 as "no level")."""
+    try:
+        from pipeline.state_store import store
+        bars = store().recent(symbol, tf, period + 1)
+        if len(bars) < period:
+            return 0.0
+        closes = [b.ohlc.c for b in bars[-period:]]
+        ma  = sum(closes) / period
+        sd  = (sum((c - ma) ** 2 for c in closes) / period) ** 0.5
+        return round(ma + mult * sd, 4) if direction == "buy" else round(ma - mult * sd, 4)
+    except Exception:
+        return 0.0
+
+
 def _resolve_tps(symbol: str, fulcrum: float, buy_legs: list[Leg],
-                 sell_legs: list[Leg], atr: float, tp_mult: float = 1.5) -> tuple[float, float]:
+                 sell_legs: list[Leg], atr: float, tp_mult: float = 1.5,
+                 tf: str = "") -> tuple[float, float]:
     """Snap TP beyond the outer leg to the nearest strong structural zone;
-    fallback outer_leg ± tp_mult·ATR."""
+    then BB 20MA±2.5σ; last resort outer_leg ± tp_mult·ATR."""
     top = max((l.price for l in buy_legs), default=fulcrum)
     bot = min((l.price for l in sell_legs), default=fulcrum)
-    buy_tp = top + tp_mult * atr
+    buy_tp  = top + tp_mult * atr
     sell_tp = bot - tp_mult * atr
+    found_above, found_below = False, False
     try:
         from execution.zone_collector import _all_zones
-        zones = [z for z in _all_zones(symbol) if z.strength >= 0.6]
-        above = [z.price for z in zones if z.price > top]
-        below = [z.price for z in zones if z.price < bot]
+        zones  = [z for z in _all_zones(symbol) if z.strength >= 0.6]
+        above  = [z.price for z in zones if z.price > top]
+        below  = [z.price for z in zones if z.price < bot]
         if above:
-            buy_tp = min(above)
+            buy_tp      = min(above)
+            found_above = True
         if below:
-            sell_tp = max(below)
+            sell_tp     = max(below)
+            found_below = True
     except Exception:
         pass
+    # BB 20MA±2.5σ fallback: no structural zone found on this side
+    if tf:
+        if not found_above and buy_legs:
+            bb = _bb_tp(symbol, tf, "buy")
+            if bb > top:
+                buy_tp = bb
+        if not found_below and sell_legs:
+            bb = _bb_tp(symbol, tf, "sell")
+            if bb < bot:
+                sell_tp = bb
     return round(buy_tp, 4), round(sell_tp, 4)
 
 
@@ -551,15 +601,18 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         if step < min_step_analysis:
             step = round(min_step_analysis, 4)
 
-    # Ladder-span gate: a neutral straddle only works if price sits INSIDE the ladder
-    # [fulcrum − n·step, fulcrum + n·step]. If the fulcrum is a level price has already
-    # run away from, the near-side stops land on the wrong side of market and the broker
-    # (EA freeze guard) rejects them → a one-sided grid. The %-gate above is span-agnostic
-    # (max_fulcrum_dist_pct 5% ≈ 3200pts at BTC vs a ~190pt ladder) so it can't catch this;
-    # gate here on the ACTUAL span now that n·step is final. Analysis frame throughout.
-    if current_price > 0 and n > 0 and step > 0:
+    # Per-side fulcrum + single-side flag from trigger context.
+    single_side_ov  = str(fulcrum_t.context.get("single_side",  "") or "")
+    buy_fulcrum_ov  = float(fulcrum_t.context.get("buy_fulcrum",  0.0) or 0.0)
+    sell_fulcrum_ov = float(fulcrum_t.context.get("sell_fulcrum", 0.0) or 0.0)
+
+    # Ladder-span gate: skip if price has run away from the grid origin.
+    # For single-side grids the trigger has already verified price location; only run
+    # the symmetric ladder check for neutral straddles.
+    if not single_side_ov and current_price > 0 and n > 0 and step > 0:
         ladder_half = n * step
-        off = abs(current_price - fulcrum)
+        ref = sell_fulcrum_ov if sell_fulcrum_ov > 0 else (buy_fulcrum_ov if buy_fulcrum_ov > 0 else fulcrum)
+        off = abs(current_price - ref)
         if off > ladder_half:
             return GridPlan(verdict="skip",
                             skip_reason=f"price_outside_ladder:{off:.4f}>{ladder_half:.4f}",
@@ -567,8 +620,11 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
                             atr=round(atr, 4), plan_id=plan_id)
 
     buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step,
-                                       max_lot=max_lot_per_leg)
-    buy_tp, sell_tp = _resolve_tps(symbol, fulcrum, buy_legs, sell_legs, atr, tp_mult)
+                                       max_lot=max_lot_per_leg,
+                                       buy_fulcrum=buy_fulcrum_ov,
+                                       sell_fulcrum=sell_fulcrum_ov,
+                                       single_side=single_side_ov)
+    buy_tp, sell_tp = _resolve_tps(symbol, fulcrum, buy_legs, sell_legs, atr, tp_mult, tf=tf)
 
     # Structural TP override: any trigger that pre-computed tp_up/tp_down (HVN
     # node edges for hvn_inside_touch; adjacent VP levels for vp_level_touch) targets
@@ -591,15 +647,16 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     # (tp_up/tp_down above). Only when POC sits beyond the inner leg on the fade side
     # (else it'd sit inside the ladder → keep the structural/ATR target).
     if (fulcrum_t.kind == "hvn_inside_touch"
-            and bool(grid_cfg.get("hvn_reversion_bias", True))):
+            and bool(grid_cfg.get("hvn_reversion_bias", True))
+            and not single_side_ov):   # POC override only for neutral straddles
         poc = float((daily_vp or {}).get("poc", 0.0) or 0.0)
         edge = fulcrum_t.context.get("edge", "")
         bot_leg = min((l.price for l in sell_legs), default=fulcrum)
         top_leg = max((l.price for l in buy_legs), default=fulcrum)
         if poc > 0:
-            if edge == "top" and poc < bot_leg:        # fade down to POC (sell side)
+            if edge == "top" and poc < bot_leg:
                 sell_tp = round(poc, 4)
-            elif edge == "bottom" and poc > top_leg:   # revert up to POC (buy side)
+            elif edge == "bottom" and poc > top_leg:
                 buy_tp = round(poc, 4)
 
     plan = GridPlan(

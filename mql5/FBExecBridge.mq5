@@ -61,7 +61,7 @@ input int    InpDashRowPad      = 14;            // Extra pixels between rows (i
 input color  InpDashColor       = clrWhite;      // Dashboard text colour
 input double InpEquityTarget    = -500.0;        // Equity drawdown hard-stop (local failsafe, 0 = off)
 
-struct HvnCycleEntry { double lo, hi; long magic; string tf, edge; };
+struct HvnCycleEntry { double lo, hi; long magic; string tf, edge, trigger_kind; };
 struct GridCycleEntry { long magic; string tf, kind; double net_target, trail_activate; bool squeeze_ok; };
 
 CTrade        trade;
@@ -1055,16 +1055,61 @@ void FetchAndDrawZones()
    ArrayResize(gHvnCycles, nhvc);
    for(int i = 0; i < nhvc; i++)
    {
-      gHvnCycles[i].lo    = JsonGetNumber(hvcs[i], "lo");
-      gHvnCycles[i].hi    = JsonGetNumber(hvcs[i], "hi");
-      gHvnCycles[i].magic = (long)JsonGetNumber(hvcs[i], "magic");
-      gHvnCycles[i].tf    = JsonGetString(hvcs[i], "tf");
-      gHvnCycles[i].edge  = JsonGetString(hvcs[i], "edge");
+      gHvnCycles[i].lo           = JsonGetNumber(hvcs[i], "lo");
+      gHvnCycles[i].hi           = JsonGetNumber(hvcs[i], "hi");
+      gHvnCycles[i].magic        = (long)JsonGetNumber(hvcs[i], "magic");
+      gHvnCycles[i].tf           = JsonGetString(hvcs[i], "tf");
+      gHvnCycles[i].edge         = JsonGetString(hvcs[i], "edge");
+      gHvnCycles[i].trigger_kind = JsonGetString(hvcs[i], "trigger_kind");
    }
+
+   DrawHvnTriggerEdges();
 
    if(InpVerbose && (n > 0 || nl > 0))
       Print("🟦 Drew ", n, " zones + ", nl, " VP levels | fulcrum ",
             DoubleToString(fulcrum, _Digits), " (", emitTF, " ", emitEdge, ")");
+}
+
+//--- Draw a bold HLINE at the exact edge of each armed HVN where the entry trigger fired.
+//    Armed zones (magic > 0) get a solid cyan line; unarmed HVN edges get a thin dotted
+//    line so you can see where triggers COULD fire before they do.
+void DrawHvnTriggerEdges()
+{
+   int dg = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   int nh = ArraySize(gHvnCycles);
+   for(int i = 0; i < nh; i++)
+   {
+      double lo = gHvnCycles[i].lo, hi = gHvnCycles[i].hi;
+      if(lo <= 0 || hi <= 0) continue;
+      bool armed = (gHvnCycles[i].magic > 0);
+
+      // The triggered edge (or both edges if not yet armed)
+      double edgePx = armed
+                      ? ((gHvnCycles[i].edge == "hi") ? hi : lo)
+                      : 0.0;
+
+      if(armed && edgePx > 0)
+      {
+         // "15m·close·hvn_touch·hi @ 2345.67"
+         string knd = (gHvnCycles[i].trigger_kind != "") ? gHvnCycles[i].trigger_kind : "hvn";
+         string label = gHvnCycles[i].tf + "·close·" + knd + "·" + gHvnCycles[i].edge
+                        + " " + DoubleToString(edgePx, dg);
+         IctHLine("hvntrig_" + IntegerToString(i), edgePx,
+                  clrAqua, STYLE_SOLID, 2, "▶ " + label);
+         if(InpShowZoneLabels)
+            ZoneText("hvntrigtxt_" + IntegerToString(i),
+                     TimeCurrent() + 22 * PeriodSeconds(PERIOD_CURRENT),
+                     edgePx, "▶ " + label, clrAqua);
+      }
+      else if(!armed)
+      {
+         // Thin dotted lines at both edges — potential future trigger points (bar-close)
+         IctHLine("hvntrig_lo" + IntegerToString(i), lo,
+                  clrDimGray, STYLE_DOT, 1, "HVN·close·lo " + DoubleToString(lo, dg));
+         IctHLine("hvntrig_hi" + IntegerToString(i), hi,
+                  clrDimGray, STYLE_DOT, 1, "HVN·close·hi " + DoubleToString(hi, dg));
+      }
+   }
 }
 
 //+------------------------------------------------------------------+

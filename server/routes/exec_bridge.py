@@ -184,19 +184,22 @@ def exec_emit_grid():
     symbol = broker_to_analysis.get(req_symbol, req_symbol)
     broker_symbol = symbol_map.get(symbol, req_symbol)
 
-    # venue quote the EA last reported (the rebase target)
-    quote = ExecBridge.get_quote(account, broker_symbol)
-    if not quote:
-        return jsonify({"ok": False, "verdict": "skip",
-                        "skip_reason": f"no venue quote cached for {account}/{broker_symbol} "
-                                       f"(EA must poll first)"}), 409
-
     from pipeline.state_store import store
     from execution.grid_planner import plan_grid_levels, _hint_set
     latest = store().latest(symbol, tf)
     if latest is None:
         return jsonify({"ok": False, "verdict": "skip",
                         "skip_reason": f"no bars stored for {symbol} {tf}"}), 404
+
+    # venue quote the EA last reported (the rebase target).
+    # Fallback: use the latest bar close as mid when the server just restarted and the
+    # EA hasn't polled yet. stops_dist=0 is safe — the EA-side freeze guard still fires.
+    quote = ExecBridge.get_quote(account, broker_symbol)
+    if not quote:
+        bar_mid = float(latest.ohlc.c)
+        quote = {"bid": bar_mid, "ask": bar_mid, "mid": bar_mid, "stops_dist": 0.0}
+        LOG.warning(f"[emit_grid] no EA quote for {account}/{broker_symbol} — "
+                    f"using bar close {bar_mid:.5f} as mid fallback")
 
     # Freeze-aware step floor: clear the broker's min-stop distance (×1.5 margin) so the
     # innermost leg can't land inside the freeze band and get silently rejected.
@@ -484,7 +487,8 @@ def exec_zones():
         lo, hi = float(c.get("node_low") or 0.0), float(c.get("node_high") or 0.0)
         if lo > 0 and hi > 0:
             hvn_cycles.append({"lo": lo, "hi": hi, "magic": c["magic"],
-                               "tf": tf, "edge": c.get("edge", "")})
+                               "tf": tf, "edge": c.get("edge", ""),
+                               "trigger_kind": c.get("trigger_kind", "")})
 
     return jsonify({"ok": True, "zones": zones, "levels": levels, "ict": ict_out,
                     "profile": profile, "vp_bin": vp_bin,

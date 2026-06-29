@@ -405,6 +405,35 @@ class ExecBridge:
             positions > 0 and pendings == 0 and max_seen > 0
             and ((_buys_n == 0) != (_sells_n == 0))  # exactly one side is flat
         )
+        # BB TP refresh: for hvn_inside_touch single-side grids, recompute the BB 20MA±2.5σ
+        # TP on every poll and send MODIFY_TP if it has shifted by more than one step.
+        # This keeps the target updated as volatility expands after the breakout.
+        trigger_kind = str(cyc.get("trigger_kind", "") or "")
+        single_side  = str(cyc.get("trigger_context", {}).get("single_side", "") or "")
+        if trigger_kind == "hvn_inside_touch" and single_side and tf:
+            try:
+                from execution.grid_planner import _bb_tp
+                cyc_step = float(cyc.get("step", 0.0) or 0.0)
+                shift_thr = max(cyc_step, float(grid_cfg.get("bb_tp_min_shift", 0.0) or 0.0))
+                new_buy_tp  = _bb_tp(symbol, tf, "buy")  if single_side == "buy"  else 0.0
+                new_sell_tp = _bb_tp(symbol, tf, "sell") if single_side == "sell" else 0.0
+                # Only send MODIFY_TP if the new level is meaningfully different from stored
+                stored_buy_tp  = float(cyc.get("buy_tp",  0.0) or 0.0)
+                stored_sell_tp = float(cyc.get("sell_tp", 0.0) or 0.0)
+                needs_update = (
+                    (new_buy_tp  > 0 and abs(new_buy_tp  - stored_buy_tp)  > shift_thr) or
+                    (new_sell_tp > 0 and abs(new_sell_tp - stored_sell_tp) > shift_thr)
+                )
+                if needs_update:
+                    cls.enqueue(account, "MODIFY_TP", symbol, magic=magic,
+                                buy_tp=new_buy_tp, sell_tp=new_sell_tp,
+                                comment=f"FB|bb_tp_refresh|{tf}", now=t)
+                    cyc["buy_tp"]  = new_buy_tp  if new_buy_tp  > 0 else stored_buy_tp
+                    cyc["sell_tp"] = new_sell_tp if new_sell_tp > 0 else stored_sell_tp
+                    cls.set_last_arm(account, symbol, **cyc)
+            except Exception:
+                pass
+
         if (0 < positions < max_seen and pendings > 0) or one_sided_remnant:
             tol = max(mid * 1e-4, 1e-6) if mid > 0 else 1e-6
             confirms = (tp_up > 0 and mid >= tp_up - tol) or (tp_down > 0 and 0 < mid <= tp_down + tol)
