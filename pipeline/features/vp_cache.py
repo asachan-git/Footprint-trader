@@ -259,7 +259,11 @@ def build_and_save(
 
         from typing import Any as _Any
         anchor: SessionAnchor = _normalize_anchor(session_cfg.get(symbol, 0))
-        bin_size: float | None = float(bin_cfg[symbol]) if symbol in bin_cfg else None
+        from .volume_profile import DEFAULT_BIN_SIZE as _DEFAULT_BIN_SIZE
+        bin_size: float | None = (
+            float(bin_cfg[symbol]) if symbol in bin_cfg
+            else _DEFAULT_BIN_SIZE.get(symbol)  # tick-aligned fallback
+        )
         cache.setdefault(symbol, {"daily": {}, "weekly": {}, "session_start_utc": _anchor_to_storage(anchor)})  # type: ignore[union-attr]
         sym_cache: dict[str, _Any] = cache[symbol]  # type: ignore[assignment]
         sym_cache["session_start_utc"] = _anchor_to_storage(anchor)
@@ -321,7 +325,11 @@ def refresh_today(symbol: str, primary_tf: str = "1m") -> bool:
     if sym_cache is None:
         return False
     anchor: SessionAnchor = _normalize_anchor(sym_cache.get("session_start_utc") or 0)
-    bin_size: float | None = float(sym_cache["bin_size"]) if "bin_size" in sym_cache else None
+    from .volume_profile import DEFAULT_BIN_SIZE as _DEFAULT_BIN_SIZE
+    bin_size: float | None = (
+        float(sym_cache["bin_size"]) if "bin_size" in sym_cache
+        else _DEFAULT_BIN_SIZE.get(symbol)  # tick-aligned fallback
+    )
 
     now_ts = int(time.time())
     date_key = _session_day_key(now_ts, anchor)

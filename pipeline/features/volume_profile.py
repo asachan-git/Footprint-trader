@@ -517,7 +517,15 @@ def compute(
     vah = round(p_min + (hi_idx + 1) * used_bin_size, 4)
 
     hvn = _find_hvn_zones(bins, used_bin_size, p_min)
-    lvn = _find_lvn_zones(bins, used_bin_size, p_min)
+    lvn_raw = _find_lvn_zones(bins, used_bin_size, p_min)
+    # Remove LVNs that overlap with any HVN — can't be both high- and low-volume.
+    # The Gaussian smoothing can produce a valley that is simultaneously inside a
+    # wide HVN peak; stripping it prevents contradictory zone labels on the chart.
+    if hvn and lvn_raw:
+        lvn = [z for z in lvn_raw
+               if not any(z["low"] < h["high"] and h["low"] < z["high"] for h in hvn)]
+    else:
+        lvn = lvn_raw
     shape = _classify_shape(bins, poc_idx, lo_idx, hi_idx, n)
 
     # Naked POC: prior-period POC not revisited by this period's bars
