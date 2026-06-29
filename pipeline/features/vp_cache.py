@@ -259,7 +259,11 @@ def build_and_save(
 
         from typing import Any as _Any
         anchor: SessionAnchor = _normalize_anchor(session_cfg.get(symbol, 0))
-        bin_size: float | None = float(bin_cfg[symbol]) if symbol in bin_cfg else None
+        from .volume_profile import DEFAULT_BIN_SIZE as _DEFAULT_BIN_SIZE
+        bin_size: float | None = (
+            float(bin_cfg[symbol]) if symbol in bin_cfg
+            else _DEFAULT_BIN_SIZE.get(symbol)  # tick-aligned fallback
+        )
         cache.setdefault(symbol, {"daily": {}, "weekly": {}, "session_start_utc": _anchor_to_storage(anchor)})  # type: ignore[union-attr]
         sym_cache: dict[str, _Any] = cache[symbol]  # type: ignore[assignment]
         sym_cache["session_start_utc"] = _anchor_to_storage(anchor)
@@ -306,6 +310,48 @@ def build_and_save(
 
     _save(cache)
     LOG.info(f"[vp_cache] saved → {CACHE_FILE}")
+
+
+def refresh_today(symbol: str, primary_tf: str = "1m") -> bool:
+    """Recompute only today's VP entry for one symbol. Fast path for 1m intraday refresh.
+
+    Skips the full 5-day loop and the 100k-bar reload that build_and_save does.
+    Returns True if the entry was updated, False if not enough bars (<30).
+    """
+    from pipeline.state_store import store as _store
+    from .volume_profile import compute
+    cache = _load()
+    sym_cache = cache.get(symbol)
+    if sym_cache is None:
+        return False
+    anchor: SessionAnchor = _normalize_anchor(sym_cache.get("session_start_utc") or 0)
+    from .volume_profile import DEFAULT_BIN_SIZE as _DEFAULT_BIN_SIZE
+    bin_size: float | None = (
+        float(sym_cache["bin_size"]) if "bin_size" in sym_cache
+        else _DEFAULT_BIN_SIZE.get(symbol)  # tick-aligned fallback
+    )
+
+    now_ts = int(time.time())
+    date_key = _session_day_key(now_ts, anchor)
+    start_ts, end_ts = _day_bounds(date_key, anchor)
+
+    s = _store()
+    today_bars = [b for b in s.recent(symbol, primary_tf, 1500)
+                  if start_ts <= b.close_ts < min(end_ts, now_ts)]
+    if len(today_bars) < 30:
+        return False
+
+    latest_close = today_bars[-1].ohlc.c
+    vp = compute(today_bars, "cached", latest_close, bin_size=bin_size)
+    if not vp:
+        return False
+
+    vp["price_range_high"] = round(max(b.ohlc.h for b in today_bars), 4)
+    vp["price_range_low"]  = round(min(b.ohlc.l for b in today_bars), 4)
+    sym_cache["daily"][date_key] = vp
+    _save(cache)
+    return True
+
 
 
 def _get_offset(sym: dict) -> float:
