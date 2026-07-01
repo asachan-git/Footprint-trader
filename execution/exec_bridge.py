@@ -77,6 +77,7 @@ _STRAT_CODE = {
     # Must be registered here so it gets its own isolated magic decade; otherwise unknown
     # trigger_kinds all fall to strat_code=0 and share the same cycle-state slot.
     "bb_expansion_touch": 11,
+    "candle_sweep": 12,
 }
 _TF_CODE = {"1m": 1, "5m": 2, "15m": 3, "1h": 4}
 _CODE_TF = {v: k for k, v in _TF_CODE.items()}
@@ -481,6 +482,21 @@ class ExecBridge:
                 cyc["sl_armed_sell"] = True
                 _cyc_dirty = True
             if _cyc_dirty:
+                cls.set_last_arm(account, symbol, **cyc)
+
+        # candle_sweep VWAP-BE: once the basket P&L ≥ the pre-computed be_distance_usd
+        # (≈ candle_hl × lot × contract_size), move all filled positions' SL to the
+        # session VWAP (stored as vwap in arm context). Fires once per arm (vwap_be_armed).
+        if (positions > 0
+                and cyc.get("trigger_kind") == "candle_sweep"
+                and not cyc.get("vwap_be_armed")
+                and pnl is not None):
+            _be_thresh = float(cyc.get("sweep_be_usd") or 0.0)
+            _vwap_sl   = float(cyc.get("sweep_vwap")  or 0.0)
+            if _be_thresh > 0 and _vwap_sl > 0 and float(pnl) >= _be_thresh:
+                cls.enqueue_modify_sl(account, symbol, magic, _vwap_sl,
+                                      side="", comment="FB|sweep_vwap_be")
+                cyc["vwap_be_armed"] = True
                 cls.set_last_arm(account, symbol, **cyc)
 
         if positions <= 0:

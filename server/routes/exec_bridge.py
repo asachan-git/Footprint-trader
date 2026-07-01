@@ -400,7 +400,9 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict) -> 
                             node_low=round(node_low, 5), node_high=round(node_high, 5),
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
                             max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
-                            squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank)
+                            squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank,
+                            sweep_be_usd=float(plan.trigger_context.get("sweep_be_usd") or 0.0),
+                            sweep_vwap=float(plan.trigger_context.get("sweep_vwap") or 0.0))
     ExecBridge.mark_emit(account, broker_symbol, plan.fulcrum, magic=leg_magic)
     _emit_audit({"account": account, "symbol": analysis, "broker_symbol": broker_symbol,
                  "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind, "edge": side,
@@ -792,6 +794,30 @@ def exec_emit_grid():
                                  "tp_up": new_tp_up, "tp_down": new_tp_down})
         except Exception:
             pass
+        # candle_sweep: trail SL to each bar close's low (buys) / high (sells).
+        # Runs every bar close so the stop walks with price on winning fills.
+        # Fires only when positions exist; pending orders keep their arm-time structural SL.
+        if arm.get("trigger_kind") == "candle_sweep":
+            try:
+                _trail_latest = store().latest(symbol, tf)
+                if _trail_latest:
+                    _ratio_t = float(quote.get("mid") or 0.0) / float(_trail_latest.ohlc.c) \
+                               if _trail_latest.ohlc.c else 1.0
+                    _trail_lo = round(float(_trail_latest.ohlc.l) * _ratio_t, 4)
+                    _trail_hi = round(float(_trail_latest.ohlc.h) * _ratio_t, 4)
+                    _pos_buys  = int(open_state.get("buys",  0) or 0)
+                    _pos_sells = int(open_state.get("sells", 0) or 0)
+                    if _pos_buys  > 0 and _trail_lo > 0:
+                        ExecBridge.enqueue_modify_sl(account, broker_symbol, leg_magic,
+                                                     _trail_lo, side="buy",
+                                                     comment="FB|sweep_trail|buy")
+                    if _pos_sells > 0 and _trail_hi > 0:
+                        ExecBridge.enqueue_modify_sl(account, broker_symbol, leg_magic,
+                                                     _trail_hi, side="sell",
+                                                     comment="FB|sweep_trail|sell")
+            except Exception:
+                pass
+
         _os_buys  = int(open_state.get("buys",     0) or 0)
         _os_sells = int(open_state.get("sells",    0) or 0)
         _os_pend  = int(open_state.get("pendings", 0) or 0)
@@ -868,7 +894,9 @@ def exec_emit_grid():
                             node_low=round(node_low, 5), node_high=round(node_high, 5),
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
                             max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
-                            squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank)
+                            squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank,
+                            sweep_be_usd=float(plan.trigger_context.get("sweep_be_usd") or 0.0),
+                            sweep_vwap=float(plan.trigger_context.get("sweep_vwap") or 0.0))
     ExecBridge.mark_emit(account, symbol, plan.fulcrum, magic=leg_magic)   # dedup: this fulcrum is now armed
     _emit_audit({"account": account, "symbol": symbol, "broker_symbol": broker_symbol,
                  "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind, "edge": edge,

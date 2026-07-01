@@ -205,6 +205,15 @@ grid_levels:
   bb_expansion_touch_lookback: 3      # scan last N bars for a band touch during the expansion
   bb_expansion_htf_gate: true         # upper touch needs HTF bearish; lower touch needs HTF bullish
   bb_expansion_fp_gate: true          # require close-failure absorption on the touch bar
+  # Candle sweep / engulf breakout grid
+  # Detects outside-bar sweeps (current bar engulfs prev high AND low, closes outside) or
+  # plain body engulfs (close beyond prev high/low). Buy grid above candle high, sell below
+  # candle low. Step = candle_hl / n (same zone-width logic as hvn_inside_touch).
+  # SL at arm: candle_low for buys, candle_high for sells (structural stop = whole candle).
+  # VWAP-BE: once P&L ≥ candle_hl × base_lot × contract_size, SL moves to session POC.
+  # Bar-close trail: SL trails to bar low (buys) / bar high (sells) each candle close.
+  candle_sweep_min_size: 3.0          # minimum candle HL in price units to qualify (filter tiny bars)
+  candle_sweep_contract_size: 100     # oz/lot for XAUUSD — used to compute be_distance_usd
   # Vol-compression GATE (applies to ALL triggers, not just squeeze): only arm a grid when
   # vol has coiled (BB 3σ compression now, or a ≥squeeze_min_on_bars coil that ended within
   # squeeze_gate_max_bars). A straddle pays on expansion FROM a coil → this filters the

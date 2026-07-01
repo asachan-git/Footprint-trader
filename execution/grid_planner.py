@@ -295,6 +295,16 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
                else max((step_mult * atr) if atr > 0 else 1.0, 1e-4)
         return n, round(step, 4)
 
+    # candle_sweep / engulf: same zone-width logic as hvn_inside_touch.
+    # n = hvn_max_legs (per TF); step = candle_hl / n so the ladder spans one candle
+    # range per side. buy legs start above candle_high; sell below candle_low.
+    if trigger.kind == "candle_sweep":
+        candle_hl = float(trigger.raw_range or 0.0)
+        n = max(2, hvn_max_legs)
+        step = round(candle_hl / n, 4) if (candle_hl > 0 and n > 0) \
+               else max((step_mult * atr) if atr > 0 else 1.0, 1e-4)
+        return n, round(step, 4)
+
     # bb_expansion_touch: ATR-based spacing, leg count from zone width / step.
     if trigger.kind == "bb_expansion_touch":
         step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
@@ -642,7 +652,9 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     # (EA freeze guard) rejects them → a one-sided grid. The %-gate above is span-agnostic
     # (max_fulcrum_dist_pct 5% ≈ 3200pts at BTC vs a ~190pt ladder) so it can't catch this;
     # gate here on the ACTUAL span now that n·step is final. Analysis frame throughout.
-    if current_price > 0 and n > 0 and step > 0:
+    # candle_sweep is exempt: buy legs are ALL above candle_high, sell legs ALL below
+    # candle_low — price at arm time is always between them (inside the candle's range).
+    if fulcrum_t.kind != "candle_sweep" and current_price > 0 and n > 0 and step > 0:
         ladder_half = n * step
         off = abs(current_price - fulcrum)
         if off > ladder_half:
@@ -651,7 +663,19 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
                             regime=getattr(regime, "type", "unknown"),
                             atr=round(atr, 4), plan_id=plan_id)
 
-    buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
+    # candle_sweep: buy legs anchor at candle_high, sell legs at candle_low (breakout grid).
+    # Both sides built outward from their respective edges — not from a single shared fulcrum.
+    if fulcrum_t.kind == "candle_sweep":
+        _ch = float((fulcrum_t.context or {}).get("candle_high", 0.0))
+        _cl = float((fulcrum_t.context or {}).get("candle_low",  0.0))
+        _buy_lots  = _ladder(n, base_lot, lot_step, heavy_near_mid=False)
+        _sell_lots = _ladder(n, base_lot, lot_step, heavy_near_mid=False)
+        buy_legs  = [Leg(price=round(_ch + i * step, 4), lot=_buy_lots[i - 1])
+                     for i in range(1, n + 1)]
+        sell_legs = [Leg(price=round(_cl - i * step, 4), lot=_sell_lots[i - 1])
+                     for i in range(1, n + 1)]
+    else:
+        buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
 
     # TP = next HVN FAR EDGE beyond the outermost leg — for EVERY setup, both sides.
     # buy side  → lowest HVN high  that clears the top leg + min_tp_dist (the next node up)
@@ -762,6 +786,17 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     # before the trade has had a chance to commit direction.
     buy_sl = sell_sl = 0.0
 
+    # candle_sweep: structural SL at arm time — buy stops below candle_low (the whole
+    # sweep candle is the thesis; if price falls below its low the setup failed), sell stops
+    # above candle_high. VWAP-BE then overrides these once the cycle moves ≥ candle_hl.
+    if fulcrum_t.kind == "candle_sweep":
+        _cs_ctx = fulcrum_t.context or {}
+        _cs_hi = float(_cs_ctx.get("candle_high") or 0.0)
+        _cs_lo = float(_cs_ctx.get("candle_low")  or 0.0)
+        if _cs_hi > 0 and _cs_lo > 0:
+            buy_sl  = round(_cs_lo, 4)   # buy stops: SL below sweep candle low
+            sell_sl = round(_cs_hi, 4)   # sell stops: SL above sweep candle high
+
     # HVN displacement keeps ONLY its SL override (counter-side = displacement candle
     # extreme); its TP now follows the unified next-HVN-far-edge rule above.
     if fulcrum_t.kind == "hvn_displacement":
@@ -789,6 +824,18 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
             elif bias_dir == "buy":
                 buy_sl  = 0.0
                 sell_sl = round(bb_mid_sl, 4)   # counter (sells): SL if price returns to BB mid
+
+    # candle_sweep: compute VWAP-BE threshold (= candle_hl × lot × contract_size ≈ P&L
+    # from moving one full candle range with the first filled leg) and store alongside the
+    # VWAP price so monitor_cycle can arm the BE without needing to re-read settings.
+    if fulcrum_t.kind == "candle_sweep":
+        _cs_hl  = float((fulcrum_t.context or {}).get("candle_hl") or 0.0)
+        _cs_vwap = float((fulcrum_t.context or {}).get("vwap") or 0.0)
+        _contract = float(grid_cfg.get("candle_sweep_contract_size",
+                           (settings.get("execution") or {}).get("contract_size", {}).get(symbol, 1.0) or 1.0))
+        _be_usd = round(_cs_hl * base_lot * _contract, 2) if _cs_hl > 0 else 0.0
+        fulcrum_t.context["sweep_be_usd"] = _be_usd
+        fulcrum_t.context["sweep_vwap"]   = _cs_vwap
 
     plan = GridPlan(
         verdict="arm",

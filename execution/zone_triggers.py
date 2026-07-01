@@ -1533,6 +1533,78 @@ def _t_hvn_displacement(symbol: str, tf: str, current_price: float,
     )
 
 
+# ── Candle sweep / engulf detector ──────────────────────────────────────────
+
+def _t_candle_sweep(symbol: str, tf: str, current_price: float,
+                    cfg: dict | None = None) -> "Trigger | None":
+    """Candle sweep or engulf against the previous bar.
+
+    SWEEP:   current bar's high > prev high AND low < prev low (outside bar),
+             THEN closes ABOVE prev high (bullish) or BELOW prev low (bearish).
+    ENGULF:  current close > prev high (bullish) or < prev low (bearish),
+             regardless of wicks — pure body engulf of prev range.
+
+    Grid arms as a breakout straddle: buy stops above candle_high, sell stops
+    below candle_low. The fulcrum is the candle midpoint (for dedup); the actual
+    leg anchor prices are stored in context as candle_high / candle_low.
+    """
+    cfg = cfg or {}
+    min_size = float(cfg.get("candle_sweep_min_size", 0.0) or 0.0)
+    try:
+        from pipeline.state_store import store as _store
+        bars = _store().recent(symbol, tf, 5)
+        if len(bars) < 2:
+            return None
+    except Exception:
+        return None
+
+    cur  = bars[-1]
+    prev = bars[-2]
+    ch, cl, cc = cur.ohlc.h,  cur.ohlc.l,  cur.ohlc.c
+    ph, pl     = prev.ohlc.h, prev.ohlc.l
+
+    outside_bar = ch > ph and cl < pl
+    sweep_bull  = outside_bar and cc > ph
+    sweep_bear  = outside_bar and cc < pl
+    engulf_bull = (not outside_bar) and cc > ph
+    engulf_bear = (not outside_bar) and cc < pl
+
+    if not (sweep_bull or sweep_bear or engulf_bull or engulf_bear):
+        return None
+
+    direction  = "bull" if (sweep_bull or engulf_bull) else "bear"
+    candle_hl  = ch - cl
+    if min_size > 0 and candle_hl < min_size:
+        return None
+
+    # VWAP proxy: session POC (most-traded price = fair value BE anchor).
+    vwap = 0.0
+    try:
+        from pipeline.features.vp_cache import get_prev_and_today as _gpat
+        _prev_d, _today_d = _gpat(symbol)
+        _dvp = _today_d or _prev_d or {}
+        vwap = float(_dvp.get("poc") or 0.0)
+    except Exception:
+        pass
+
+    is_sweep = sweep_bull or sweep_bear
+    conf = 0.75 if is_sweep else 0.60   # outside-bar sweep > plain engulf
+    return Trigger(
+        kind="candle_sweep",
+        fulcrum_price=float((ch + cl) / 2.0),
+        raw_range=float(candle_hl),
+        confidence=float(conf),
+        context={
+            "direction":   direction,
+            "candle_high": float(ch),
+            "candle_low":  float(cl),
+            "candle_hl":   float(candle_hl),
+            "is_sweep":    is_sweep,
+            "vwap":        float(vwap),
+        },
+    )
+
+
 # ── public entry ────────────────────────────────────────────────────────────
 
 def detect_all(symbol: str, tf: str, current_price: float, regime,
@@ -1560,6 +1632,7 @@ def detect_all(symbol: str, tf: str, current_price: float, regime,
         _t_squeeze(symbol, tf, current_price, atr, cfg),
         _t_bb_expansion_touch(symbol, tf, current_price, atr, cfg),
         _t_cvd_div(symbol, tf, current_price, latest),
+        _t_candle_sweep(symbol, tf, current_price, cfg),
     ):
         if t is not None:
             out.append(t)
