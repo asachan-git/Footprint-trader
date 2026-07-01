@@ -203,6 +203,24 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
         raw_tp_up   = _bb_up if raw_tp_up   == 0.0 else min(raw_tp_up,   _bb_up)
     if 0 < _bb_dn < _bot_leg:
         raw_tp_down = _bb_dn if raw_tp_down == 0.0 else max(raw_tp_down, _bb_dn)
+    # Runtime expansion upgrade: if expansion fires on a cycle that wasn't squeeze_ok at arm
+    # time, flip squeeze_ok=True so the 2x target/trail multipliers activate immediately.
+    # Condition: squeeze fully released (BBW not in/near compression) AND ATR expanding.
+    if not arm.get("squeeze_ok"):
+        from execution.zone_triggers import (squeeze_gate as _sq_gate,
+                                             session_atr_ratio as _sess_atr)
+        _grid_cfg = settings.get("grid_levels") or {}
+        _exp_thresh = float(_grid_cfg.get("expansion_atr_ratio", 1.5) or 1.5)
+        _atr_ratio = _sess_atr(_bb_bars)
+        if _atr_ratio >= _exp_thresh:
+            _sq_ok_now, _ = _sq_gate(analysis_symbol, tf, _grid_cfg)
+            if not _sq_ok_now:  # BBW fully expanded — not in or near compression
+                arm["squeeze_ok"] = True
+                arm["squeeze_expansion"] = True  # marks runtime upgrade vs arm-time coil
+                ExecBridge.set_last_arm(account, broker_symbol, **arm)
+                _emit_audit({"account": account, "symbol": analysis_symbol, "tf": tf,
+                             "verdict": "squeeze_expansion_upgrade", "magic": magic,
+                             "atr_ratio": round(_atr_ratio, 3)})
     # Guard: TP must lie strictly beyond the outermost leg or the grid can't profit on that
     # side — drop it to 0 (leave the existing TP untouched) rather than set an inside-ladder TP.
     if not (raw_tp_up   and raw_tp_up   > _top_leg):       raw_tp_up   = 0.0
@@ -306,14 +324,19 @@ def _cancel_orphan_on_hvn_gone(account: str, broker_symbol: str, analysis_symbol
     return True
 
 
-def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict) -> None:
+def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
+                  venue_mid: float | None = None) -> None:
     """Intrabar touch-arm for ONE touch-enabled TF, called each poll. Resolves the
     HVN edge live price is tapping, runs the tick-reversal confirm, and on confirm
     arms the same straddle the close-driven emit would — using the live edge as the
     fulcrum (no candle-close wait). Server stays the brain; the EA only reports price.
 
     No-ops unless: touch_arm_enabled, tf in touch_arm_tfs, a venue quote is cached,
-    the symbol is flat on this magic, and the fulcrum is a NEW episode (dedup)."""
+    the symbol is flat on this magic, and the fulcrum is a NEW episode (dedup).
+
+    venue_mid: live bid/ask midpoint from the EA's poll body. When provided this is
+    the actual intrabar price, not the last bar close — essential for catching edge
+    taps that happen mid-bar and resolve before bar close."""
     from execution.grid_planner import plan_grid_levels
     from execution.zone_triggers import touch_arm_trigger
     grid_cfg = settings.get("grid_levels") or {}
@@ -327,11 +350,14 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict) -> 
     analysis = broker_to_analysis.get(broker_symbol, broker_symbol)
 
     quote = ExecBridge.get_quote(account, broker_symbol)
-    if not quote or not quote.get("mid"):
-        return
-    venue_mid = float(quote["mid"])
+    # Prefer the poll-supplied live mid; fall back to cached quote.
+    if venue_mid is None:
+        if not quote or not quote.get("mid"):
+            return
+        venue_mid = float(quote["mid"])
 
-    # un-rebase venue mid → analysis frame so the edge lookup matches stored zones
+    # Un-rebase venue mid → analysis frame so edge lookup matches stored zones.
+    # Use the ratio derived from the latest bar close (stable reference).
     from pipeline.state_store import store
     latest = store().latest(analysis, tf)
     if latest is None or not latest.ohlc.c:
@@ -544,10 +570,13 @@ def exec_poll():
 
     # Intrabar touch-arm — check each touch-enabled TF against live price (this is the
     # only 1s-cadence hook). Gated off unless touch_arm_enabled; never breaks the poll.
+    # Pass the raw venue mid from this poll so touch_arm uses the LIVE intrabar price,
+    # not the last bar close (which would miss intrabar edge taps).
+    _poll_venue_mid = (float(bid) + float(ask)) / 2.0 if (bid and ask) else None
     if sym and not ExecBridge.daily_target_hit(account):
         for _tf in ((settings_cfg or {}).get("grid_levels", {}).get("touch_arm_tfs") or []):
             try:
-                _touch_arm_tf(account, sym, _tf, settings_cfg or {})
+                _touch_arm_tf(account, sym, _tf, settings_cfg or {}, venue_mid=_poll_venue_mid)
             except Exception:
                 LOG.exception("[exec] touch_arm error")  # never break the poll
 
@@ -1237,9 +1266,12 @@ def exec_zones():
         _tf_secs = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400,
                     "1d": 86400}.get(_cvd_tf, 900)
         _cvd_bars = _cvd_store().recent(symbol, _cvd_tf, 80)
+        _broker_utc_offset = int(
+            ((settings.get("execution") or {}).get("broker_utc_offset_hours") or 0) * 3600
+        )
         for _d in _cvd_scan(_cvd_bars, lookback=3):
             cvd_signals.append({
-                "bar_time": int(_d["ts"]) - _tf_secs,
+                "bar_time": int(_d["ts"]) - _tf_secs + _broker_utc_offset,
                 "price": _rebase_price(float(_d["price"])),
                 "direction": "bearish" if _d["type"] == "bear" else "bullish",
             })

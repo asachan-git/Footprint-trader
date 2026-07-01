@@ -69,6 +69,12 @@ grid_levels:
   squeeze_target_mult: 2.0       # multiply cycle_net_target when squeeze_ok
   squeeze_trail_mult: 2.0        # multiply bias_trail_activate when squeeze_ok
 
+  # Runtime expansion upgrade — flip squeeze_ok=True on a live cycle when expansion fires:
+  # BBW has fully left compression (squeeze_gate=False) AND ATR is expanding vs recent mean.
+  # Arms that were NOT coiled at entry get upgraded on the fly; arms that were already
+  # squeeze_ok=True skip this block entirely.
+  expansion_atr_ratio: 1.5       # session_atr_ratio threshold to confirm expansion
+
   # Arm filter
   require_squeeze_gate: false    # true = only arm when vol is coiled (structural setups exempt)
 
@@ -174,7 +180,7 @@ grid_levels:
   # poll (~1s). Filters breakouts via the tick-reversal confirm. Close-driven emit still
   # runs in parallel — touch-arm just gets in earlier when price reverses off an edge.
   touch_arm_enabled: true         # TOUCH ONLY: arm intrabar on edge tap, not on bar close
-  touch_arm_tfs: [5m]            # 5m only — zone-width grid
+  touch_arm_tfs: [1m, 5m, 15m]  # all active TFs — live price from poll used for intrabar touch
   touch_arm_confirm_ticks: 0.2   # price must revert this many $ back inside the edge to confirm
   # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
   triggers: [hvn_inside_touch]   # SIMPLE: only hvn_inside_touch (removed squeeze)
@@ -304,6 +310,7 @@ vp_cache:
 # Execution venue (Vantage MT5 via MetaApi)
 execution:
   broker: vantage_mt5
+  broker_utc_offset_hours: 3      # Vantage server time = UTC+3 (EET); used to shift CVD arrow timestamps
   tradable_symbols: [XAUTUSDT, BTCUSDT]
   symbol_map:
     XAUTUSDT: "XAUUSD+"          # Vantage MT5 standard USD account
