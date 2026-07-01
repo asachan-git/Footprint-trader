@@ -346,16 +346,58 @@ def _smooth(bins: np.ndarray, sigma_bins: float = 1.5) -> np.ndarray:
     return gaussian_filter1d(bins.astype(float), sigma=max(1.5, sigma_bins))
 
 
-def _merge_zones(zones: list[dict], merge_tol: float) -> list[dict]:
-    """Merge adjacent zones whose gap is ≤ merge_tol (Sierra/Bookmap cluster merging)."""
+def _peak_vol(bins: np.ndarray, zone: dict, price_min: float, bin_size: float) -> float:
+    """Max bin volume spanned by a zone's [low, high] price interval."""
+    a = max(0, int(math.floor((zone["low"] - price_min) / bin_size)))
+    b = min(len(bins) - 1, int(math.floor((zone["high"] - price_min) / bin_size)))
+    return float(bins[a: b + 1].max()) if b >= a else 0.0
+
+
+def _merge_zones(
+    zones: list[dict],
+    merge_tol: float,
+    prof: np.ndarray | None = None,
+    price_min: float = 0.0,
+    bin_size: float = 0.0,
+    trough_ratio: float = 0.0,
+    floor_tol: float | None = None,
+) -> list[dict]:
+    """Merge price-adjacent zones (Sierra/Bookmap cluster merging).
+    Input MUST be price-sorted (_zones_from_peaks sorts by low).
+
+    Two-tier gate:
+      • gap ≤ floor_tol (default = merge_tol): merge UNCONDITIONALLY (legacy 1-bin floor —
+        directly-adjacent zones are always one node; avoids un-merging what legacy merged).
+      • floor_tol < gap ≤ merge_tol: merge ONLY if the trough between the two peaks stays
+        shallow — ``min(trough) ≥ trough_ratio × min(peak_a, peak_b)`` — a shoulder, not a
+        real LVN vacuum. Deep trough → keep split.
+
+    `prof` MUST be the SAME array the peaks were detected on (the smoothed profile) so the
+    trough metric matches what the detector saw; raw bins have noisy deep troughs that would
+    spuriously block merges. Without prof/bin_size/trough_ratio it degrades to pure gap
+    merging up to merge_tol (LVN path / legacy)."""
     if not zones:
         return zones
+    if floor_tol is None:
+        floor_tol = merge_tol
+    valley_gate = prof is not None and trough_ratio > 0 and bin_size > 0
     merged = [dict(zones[0])]
     for z in zones[1:]:
-        if z["low"] - merged[-1]["high"] <= merge_tol:
-            merged[-1]["high"] = max(merged[-1]["high"], z["high"])
-        else:
-            merged.append(dict(z))
+        prev = merged[-1]
+        gap = z["low"] - prev["high"]
+        if gap <= merge_tol:
+            do_merge = True
+            if valley_gate and gap > floor_tol:
+                g0 = max(0, int(math.floor((prev["high"] - price_min) / bin_size)))
+                g1 = min(len(prof) - 1, int(math.ceil((z["low"] - price_min) / bin_size)))
+                trough = float(prof[g0: g1 + 1].min()) if g1 >= g0 else 0.0
+                pa = _peak_vol(prof, prev, price_min, bin_size)
+                pb = _peak_vol(prof, z, price_min, bin_size)
+                do_merge = trough >= trough_ratio * min(pa, pb)
+            if do_merge:
+                prev["high"] = max(prev["high"], z["high"])
+                continue
+        merged.append(dict(z))
     return merged
 
 
@@ -394,6 +436,34 @@ def _subtract_hvn_from_lvn(
     return sorted(out, key=lambda z: z["low"])
 
 
+_VP_MERGE_CACHE: tuple[float, float] | None = None
+
+
+def _vp_merge_cfg() -> tuple[float, float]:
+    """(gap_bins, trough_ratio) for HVN cluster merging. gap_bins = how many bin_size gaps
+    apart two HVN peaks may sit and still merge; trough_ratio = how shallow the valley between
+    them must stay (fraction of the smaller peak) to count as one node. Read once from
+    settings.grid_levels.vp_merge_gap_bins (default 20) / vp_merge_trough_ratio (default 0.55)."""
+    global _VP_MERGE_CACHE
+    if _VP_MERGE_CACHE is None:
+        gap, ratio = 20.0, 0.55
+        try:
+            import yaml as _yaml
+            import pathlib as _pl
+            _cfg = _yaml.safe_load(
+                (_pl.Path(__file__).resolve().parent.parent.parent / "config" / "settings.yaml").read_text()
+            ) or {}
+            gl = _cfg.get("grid_levels") or {}
+            gap = float(gl.get("vp_merge_gap_bins", 20))
+            ratio = float(gl.get("vp_merge_trough_ratio", 0.55))
+        except Exception:
+            gap, ratio = 20.0, 0.55
+        gap = gap if gap >= 1.0 else 1.0
+        ratio = ratio if 0.0 <= ratio <= 1.0 else 0.6
+        _VP_MERGE_CACHE = (gap, ratio)
+    return _VP_MERGE_CACHE
+
+
 _HVN_REL_HEIGHT_CACHE: float | None = None
 
 
@@ -423,7 +493,8 @@ def _find_hvn_zones(
     rel_height: float | None = None,
 ) -> list[dict]:
     """HVN via Gaussian-smoothed bins, prominence ≥ 0.5×avg, height ≥ avg.
-    Adjacent zones within 2×bin_size are merged (Sierra/Bookmap convention).
+    Adjacent zones within vp_merge_gap_bins×bin_size are merged IF the trough between them is
+    shallow (vp_merge_trough_ratio gate) — a deep valley = real LVN, kept split.
     `rel_height` (None → config vp_hvn_rel_height) sets how far down each peak its width is
     measured: lower = tighter nodes that don't blur adjacent peaks into one wide blob.
     """
@@ -442,7 +513,12 @@ def _find_hvn_zones(
     _rh = rel_height if rel_height is not None else _hvn_rel_height()
     _, _, left_ips, right_ips = peak_widths(smoothed, peaks, rel_height=_rh)
     zones = _zones_from_peaks(bins, peaks, left_ips, right_ips, bin_size, price_min, top_n=top_n * 2)
-    merged = _merge_zones(zones, merge_tol=bin_size)  # 1× bin_size gap = same cluster
+    gap_bins, trough_ratio = _vp_merge_cfg()
+    merged = _merge_zones(
+        zones, merge_tol=gap_bins * bin_size,
+        prof=smoothed, price_min=price_min, bin_size=bin_size,
+        trough_ratio=trough_ratio, floor_tol=bin_size,
+    )
     return merged[:top_n]
 
 

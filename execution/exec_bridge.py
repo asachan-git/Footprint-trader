@@ -252,7 +252,7 @@ class ExecBridge:
                 return False
             # new tap on this edge → record, await reversal
             cls._touch_state[key] = {"edge": edge, "side": side,
-                                     "tapped_px": live_price, "ts": t}
+                                     "tapped_px": live_price, "ts": t, "trig": None}
             return False
 
     @classmethod

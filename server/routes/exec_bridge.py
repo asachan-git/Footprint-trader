@@ -341,8 +341,10 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     from execution.zone_triggers import touch_arm_trigger
     grid_cfg = settings.get("grid_levels") or {}
     if not bool(grid_cfg.get("touch_arm_enabled", False)):
+        LOG.info(f"[touch_arm] {broker_symbol}/{tf} skip: touch_arm_enabled=False")
         return
     if tf not in (grid_cfg.get("touch_arm_tfs") or []):
+        LOG.info(f"[touch_arm] {broker_symbol}/{tf} skip: tf not in touch_arm_tfs")
         return
 
     symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
@@ -353,30 +355,51 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     # Prefer the poll-supplied live mid; fall back to cached quote.
     if venue_mid is None:
         if not quote or not quote.get("mid"):
+            LOG.info(f"[touch_arm] {broker_symbol}/{tf} skip: no venue_mid and no cached quote")
             return
         venue_mid = float(quote["mid"])
 
-    # Un-rebase venue mid → analysis frame so edge lookup matches stored zones.
-    # Use the ratio derived from the latest bar close (stable reference).
-    from pipeline.state_store import store
-    latest = store().latest(analysis, tf)
-    if latest is None or not latest.ohlc.c:
-        return
-    ratio = venue_mid / float(latest.ohlc.c) if latest.ohlc.c else 1.0
-    live_analysis = venue_mid / ratio if ratio else venue_mid
+    # For gold (XAUUSD+ / XAUTUSDT), venue and analysis are both USD/oz —
+    # use venue_mid directly as the live analysis price. No ratio conversion needed.
+    live_analysis = venue_mid
 
+    LOG.info(f"[touch_arm] {broker_symbol}/{tf} venue_mid={venue_mid:.4f} live_analysis={live_analysis:.4f}")
     trig = touch_arm_trigger(analysis, tf, live_analysis)
+    LOG.info(f"[touch_arm] {broker_symbol}/{tf} touch_arm_trigger→{trig.kind if trig else None} edge={trig.fulcrum_price if trig else '-'}")
     if trig is None:
-        ExecBridge.clear_touch_state(account, broker_symbol, tf)   # left the buffer → reset
-        return
-
-    edge = float(trig.fulcrum_price)
-    side = str(trig.context.get("edge", ""))
-    # confirm distance: tick-reversal back inside, in analysis-frame price units
-    confirm_ticks = float(grid_cfg.get("touch_arm_confirm_ticks", 0.2) or 0.2)
-    if not ExecBridge.touch_arm_check(account, broker_symbol, tf, live_analysis,
-                                      edge, side, confirm_ticks):
-        return   # tap recorded; awaiting reversal-back-inside (or it's a breakout)
+        # Price left the HVN — check if it exited THROUGH the tapped edge (breakout).
+        # A breakout through a tapped edge is a valid confirm: sell stops below fire on
+        # downward breakout, buy stops above fire on upward breakout.
+        _key = (str(account), broker_symbol, tf)
+        with ExecBridge._lock:
+            _tap = ExecBridge._touch_state.get(_key)
+        _breakout_trig = None
+        if _tap and _tap.get("trig") is not None:
+            _stored = _tap["trig"]
+            _tedge = float(_stored.fulcrum_price)
+            _tside = str(_stored.context.get("edge", ""))
+            # Exited through the tapped edge in the breakout direction
+            if _tside == "top" and live_analysis > _tedge:
+                _breakout_trig = _stored
+            elif _tside == "bottom" and live_analysis < _tedge:
+                _breakout_trig = _stored
+        ExecBridge.clear_touch_state(account, broker_symbol, tf)
+        if _breakout_trig is None:
+            return
+        trig = _breakout_trig   # proceed to arm using the stored trigger
+    else:
+        edge = float(trig.fulcrum_price)
+        side = str(trig.context.get("edge", ""))
+        # confirm distance: tick-reversal back inside, in analysis-frame price units
+        confirm_ticks = float(grid_cfg.get("touch_arm_confirm_ticks", 0.2) or 0.2)
+        if not ExecBridge.touch_arm_check(account, broker_symbol, tf, live_analysis,
+                                          edge, side, confirm_ticks):
+            # Tap recorded — store the trigger object so breakout-exit can use it
+            _key = (str(account), broker_symbol, tf)
+            with ExecBridge._lock:
+                if _key in ExecBridge._touch_state:
+                    ExecBridge._touch_state[_key]["trig"] = trig
+            return   # awaiting reversal-confirm or breakout-exit
 
     # confirmed mini-rejection → arm. Gate on flat + dedup (same as emit).
     leg_magic = magic_for("hvn_inside_touch", tf)
@@ -694,16 +717,30 @@ def exec_emit_grid():
     open_state = ExecBridge.get_open(account, broker_symbol, magic=leg_magic)
     force = bool(body.get("force", False))
     _live = int(open_state.get("positions", 0) or 0) > 0 or int(open_state.get("pendings", 0) or 0) > 0
-    # One concurrent cycle per TF for hvn_inside_touch: an ACTIVE arm occupies the magic even
-    # when MT5 momentarily reports flat (legs placed-but-unreported, or pendings mid-reanchor),
-    # so a subsequent touch can't stack/replace a second straddle on the same node. Re-anchoring
-    # while flat is owned by the poll-path _refresh_cycle_tps (MODIFY_PENDING) — no full re-arm
-    # needed. Re-arm frees only once the cycle retires (active→False). Other setups keep the
-    # active+flat re-arm fall-through below.
-    if not force and arm.get("active") and not _live and plan.trigger_kind == "hvn_inside_touch":
+    # One concurrent cycle per TF for hvn_inside_touch and candle_sweep: an ACTIVE arm
+    # occupies the magic even when MT5 momentarily reports flat (legs placed-but-unreported,
+    # or pendings mid-reanchor). candle_sweep must not re-arm on every bar close — orders
+    # need to survive until filled or the cycle retires (active→False). Re-arm frees only
+    # once the cycle retires. Other setups keep the active+flat re-arm fall-through below.
+    _once_per_tf_kinds = {"hvn_inside_touch", "candle_sweep"}
+    if not force and arm.get("active") and not _live and plan.trigger_kind in _once_per_tf_kinds:
         return jsonify({"ok": True, "verdict": "skip",
                         "skip_reason": "cycle_active(once_per_tf)",
                         "symbol": symbol, "broker_symbol": broker_symbol, "tf": tf})
+    # candle_sweep cooldown: even if the cycle was reaped (active→False after SL/manual close),
+    # don't immediately re-arm on the next bar. Hold off for N bars so the sweep either:
+    #   a) fills and is managed, or b) expires cleanly before a new sweep arm is allowed.
+    # cooldown = candle_sweep_cooldown_bars × tf_seconds (default 3 bars).
+    if not force and plan.trigger_kind == "candle_sweep" and arm.get("trigger_kind") == "candle_sweep":
+        import time as _time
+        _tf_secs = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}.get(tf, 60)
+        _cooldown_bars = int((settings.get("grid_levels") or {}).get("candle_sweep_cooldown_bars", 3) or 3)
+        _cooldown_secs = _cooldown_bars * _tf_secs
+        _last_arm_ts = float(arm.get("ts") or 0.0)
+        if _last_arm_ts > 0 and (_time.time() - _last_arm_ts) < _cooldown_secs:
+            return jsonify({"ok": True, "verdict": "skip",
+                            "skip_reason": f"sweep_cooldown({int(_time.time()-_last_arm_ts)}s/{_cooldown_secs}s)",
+                            "symbol": symbol, "broker_symbol": broker_symbol, "tf": tf})
     if not force and arm.get("active") and _live:
         # Refresh TP + pending order prices from latest HVN edges while cycle is live
         # (positions OR resting pendings) — ON CANDLE CLOSE (this route fires per bar),
@@ -823,10 +860,16 @@ def exec_emit_grid():
                                  "tp_up": new_tp_up, "tp_down": new_tp_down})
         except Exception:
             pass
-        # candle_sweep: trail SL to each bar close's low (buys) / high (sells).
-        # Runs every bar close so the stop walks with price on winning fills.
-        # Fires only when positions exist; pending orders keep their arm-time structural SL.
-        if arm.get("trigger_kind") == "candle_sweep":
+        # candle_sweep SL trail — ratcheting, only ever tightens. Engages ONLY after the
+        # VWAP-BE has fired (arm.vwap_be_armed) AND the side is >50% filled (matches the
+        # hvn_inside_touch deferred-SL threshold). Each bar close in the fill direction moves
+        # the stop to that candle's extreme, but only if that beats the current stop:
+        #   Buy  positions, GREEN candle (close >= open): SL up to candle LOW  (never down).
+        #   Sell positions, RED   candle (close <= open): SL down to candle HIGH (never up).
+        # Baseline is the POC the VWAP-BE parked the stop at (sweep_vwap), so the first trail
+        # only fires once a favourable candle clears breakeven. Trail level per side is
+        # persisted (trail_sl_buy / trail_sl_sell) so the ratchet survives across polls.
+        if arm.get("trigger_kind") == "candle_sweep" and arm.get("vwap_be_armed"):
             try:
                 _trail_latest = store().latest(symbol, tf)
                 if _trail_latest:
@@ -834,16 +877,35 @@ def exec_emit_grid():
                                if _trail_latest.ohlc.c else 1.0
                     _trail_lo = round(float(_trail_latest.ohlc.l) * _ratio_t, 4)
                     _trail_hi = round(float(_trail_latest.ohlc.h) * _ratio_t, 4)
+                    _is_green = _trail_latest.ohlc.c >= _trail_latest.ohlc.o
+                    _is_red   = _trail_latest.ohlc.c <= _trail_latest.ohlc.o
                     _pos_buys  = int(open_state.get("buys",  0) or 0)
                     _pos_sells = int(open_state.get("sells", 0) or 0)
-                    if _pos_buys  > 0 and _trail_lo > 0:
+                    _buy_n     = int(arm.get("buy_n")  or 0)
+                    _sell_n    = int(arm.get("sell_n") or 0)
+                    _be_px     = float(arm.get("sweep_vwap") or 0.0)  # POC = trail baseline
+                    _sl_buy    = float(arm.get("trail_sl_buy")  or _be_px)
+                    _sl_sell   = float(arm.get("trail_sl_sell") or _be_px)
+                    _dirty = False
+                    # Buy: majority-filled + green + candle low ABOVE current stop → tighten up.
+                    if (_pos_buys > 0 and _buy_n > 0 and _pos_buys > _buy_n / 2
+                            and _is_green and _trail_lo > 0 and _trail_lo > _sl_buy):
                         ExecBridge.enqueue_modify_sl(account, broker_symbol, leg_magic,
                                                      _trail_lo, side="buy",
                                                      comment="FB|sweep_trail|buy")
-                    if _pos_sells > 0 and _trail_hi > 0:
+                        arm["trail_sl_buy"] = _trail_lo
+                        _dirty = True
+                    # Sell: majority-filled + red + candle high BELOW current stop → tighten down.
+                    if (_pos_sells > 0 and _sell_n > 0 and _pos_sells > _sell_n / 2
+                            and _is_red and _trail_hi > 0
+                            and (_sl_sell <= 0 or _trail_hi < _sl_sell)):
                         ExecBridge.enqueue_modify_sl(account, broker_symbol, leg_magic,
                                                      _trail_hi, side="sell",
                                                      comment="FB|sweep_trail|sell")
+                        arm["trail_sl_sell"] = _trail_hi
+                        _dirty = True
+                    if _dirty:
+                        ExecBridge.set_last_arm(account, broker_symbol, **arm)
             except Exception:
                 pass
 

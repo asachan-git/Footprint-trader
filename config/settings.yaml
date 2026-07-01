@@ -116,7 +116,7 @@ grid_levels:
   # Wick proximity buffer for hvn_inside_touch: fire if wick came within this many price
   # units of the edge even without crossing it (e.g. 0.5pt catches near-misses on gold).
   # 0.0 = exact touch only (original behaviour). Edge is still the fulcrum price.
-  hvn_touch_buffer: 0.5
+  hvn_touch_buffer: 0.1
   # Width-relative buffer: a wide node's edge is unreachable with a flat 0.5pt buffer
   # (a 49pt node never gets a tap), so the effective buffer is max(hvn_touch_buffer,
   # node_width × hvn_touch_buffer_pct). 0.10 = a tap within 10% of the node width counts.
@@ -141,6 +141,16 @@ grid_levels:
   # symbols (BTC) stay at the legacy 1.5-bin floor; fine-bin XAU (0.25) gets more so single-bin
   # noise doesn't fragment into 1pt nodes. ≥1.0 re-blobs XAU into one wide node — keep ~0.5.
   vp_smooth_price: 0.7
+  # HVN cluster merging (fixes fragmentation: many HVNs a few bins apart). Two adjacent HVN
+  # peaks merge into one node when the gap ≤ vp_merge_gap_bins × bin_size AND the trough
+  # between them stays shallow: min(gap bin vol) ≥ vp_merge_trough_ratio × smaller peak.
+  # Deep trough (below ratio) = a REAL LVN vacuum → peaks kept split (LVN not erased).
+  # gap_bins ↑ = more aggressive merge; trough_ratio ↑ = stricter (only very shallow shoulders merge).
+  # Calibrated on XAU/BTC live cache: fragmented shoulders sit at trough≈0.55-0.62 of the smaller
+  # peak, genuine LVN vacuums at ≤0.5 → 0.55 merges shoulders, keeps real LVNs split. gap_bins=20
+  # spans the observed shoulder gaps (5-20 bins); trough gate is the real safety, gap just caps reach.
+  vp_merge_gap_bins: 20
+  vp_merge_trough_ratio: 0.55
   # Directional skew votes (skew-only — both sides still placed, favoured side heavier):
   # HTF Bollinger bias reads the NEXT TF up's 20-SMA (5m→15m, 15m→1h…) — price above a
   # rising 20MA = bull vote, below a falling one = bear. 2.5σ "edge" votes mean-reversion

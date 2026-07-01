@@ -1558,19 +1558,25 @@ def _t_candle_sweep(symbol: str, tf: str, current_price: float,
     except Exception:
         return None
 
-    cur  = bars[-1]
-    prev = bars[-2]
-    ch, cl, cc = cur.ohlc.h,  cur.ohlc.l,  cur.ohlc.c
-    ph, pl     = prev.ohlc.h, prev.ohlc.l
-
-    outside_bar = ch > ph and cl < pl
-    sweep_bull  = outside_bar and cc > ph
-    sweep_bear  = outside_bar and cc < pl
-    engulf_bull = (not outside_bar) and cc > ph
-    engulf_bear = (not outside_bar) and cc < pl
-
-    if not (sweep_bull or sweep_bear or engulf_bull or engulf_bear):
+    # Check the last 2 closed bars (lookback=2) so a sweep that closed one bar ago
+    # is still detected when the emitter fires just after the next bar opens.
+    best_pair: tuple | None = None
+    for i in range(len(bars) - 1, 0, -1):
+        _cur  = bars[i]
+        _prev = bars[i - 1]
+        _ch, _cl, _cc = _cur.ohlc.h, _cur.ohlc.l, _cur.ohlc.c
+        _ph, _pl       = _prev.ohlc.h, _prev.ohlc.l
+        _outside = _ch > _ph and _cl < _pl
+        _sb = _outside and _cc > _ph
+        _sw = _outside and _cc < _pl
+        _eb = (not _outside) and _cc > _ph
+        _ew = (not _outside) and _cc < _pl
+        if _sb or _sw or _eb or _ew:
+            best_pair = (_cur, _prev, _ch, _cl, _cc, _ph, _pl, _sb, _sw, _eb, _ew)
+            break  # most recent qualifying bar wins
+    if best_pair is None:
         return None
+    cur, prev, ch, cl, cc, ph, pl, sweep_bull, sweep_bear, engulf_bull, engulf_bear = best_pair
 
     direction  = "bull" if (sweep_bull or engulf_bull) else "bear"
     candle_hl  = ch - cl

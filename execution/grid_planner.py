@@ -670,10 +670,11 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         _cl = float((fulcrum_t.context or {}).get("candle_low",  0.0))
         _buy_lots  = _ladder(n, base_lot, lot_step, heavy_near_mid=False)
         _sell_lots = _ladder(n, base_lot, lot_step, heavy_near_mid=False)
-        buy_legs  = [Leg(price=round(_ch + i * step, 4), lot=_buy_lots[i - 1])
-                     for i in range(1, n + 1)]
-        sell_legs = [Leg(price=round(_cl - i * step, 4), lot=_sell_lots[i - 1])
-                     for i in range(1, n + 1)]
+        # First leg AT candle edge (i=0), subsequent legs spreading outward.
+        buy_legs  = [Leg(price=round(_ch + i * step, 4), lot=_buy_lots[i])
+                     for i in range(0, n)]
+        sell_legs = [Leg(price=round(_cl - i * step, 4), lot=_sell_lots[i])
+                     for i in range(0, n)]
     else:
         buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
 
