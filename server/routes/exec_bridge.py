@@ -815,6 +815,18 @@ def exec_emit_grid():
     if not arm.get("active") and not _live:
         ExecBridge.clear_emit(account, symbol, magic=leg_magic)
 
+    # Touch-only gate: when touch_arm_enabled, hvn_inside_touch is armed ONLY by the
+    # intrabar touch path (exec_poll → _touch_arm_tf). Bar-close still handles TP refresh
+    # for live cycles (handled above, returns cycle_live). This gate blocks NEW arms from a
+    # bar-close detector fire — price may have ended the bar near an edge without a real tap.
+    if (plan.trigger_kind == "hvn_inside_touch"
+            and bool((settings.get("grid_levels") or {}).get("touch_arm_enabled", False))):
+        _emit_audit({"account": account, "symbol": symbol, "tf": tf, "verdict": "skip",
+                     "skip_reason": "hvn_inside_touch:touch_only"})
+        return jsonify({"ok": True, "verdict": "skip",
+                        "skip_reason": "hvn_inside_touch:touch_only",
+                        "symbol": symbol, "broker_symbol": broker_symbol})
+
     # Fulcrum dedup: ONE grid per touched-level episode. Skip if the fulcrum hasn't
     # moved beyond tol since the last arm (prevents re-placing the identical straddle
     # every bar while price camps on a level). clear_emit (called on every skip above)

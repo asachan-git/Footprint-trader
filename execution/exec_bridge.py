@@ -455,6 +455,34 @@ class ExecBridge:
             except Exception:
                 pass  # never break the monitor on a snapshot failure
 
+        # Deferred SL arming for hvn_inside_touch: once >50% of a side's legs fill, set
+        # the structural SL (node_low for buys, node_high for sells) on all open positions
+        # on that side. Guard with sl_armed_{side} so it fires exactly once per cycle arm.
+        if (positions > 0
+                and cyc.get("trigger_kind") == "hvn_inside_touch"
+                and buys is not None and sells is not None):
+            _node_lo = float(cyc.get("node_low") or 0.0)
+            _node_hi = float(cyc.get("node_high") or 0.0)
+            _buy_n   = int(cyc.get("buy_n") or 0)
+            _sell_n  = int(cyc.get("sell_n") or 0)
+            _cyc_dirty = False
+            if (_node_lo > 0 and _buy_n > 0
+                    and int(buys) > _buy_n / 2
+                    and not cyc.get("sl_armed_buy")):
+                cls.enqueue_modify_sl(account, symbol, magic, _node_lo,
+                                      side="buy", comment="FB|sl_arm|buy")
+                cyc["sl_armed_buy"] = True
+                _cyc_dirty = True
+            if (_node_hi > 0 and _sell_n > 0
+                    and int(sells) > _sell_n / 2
+                    and not cyc.get("sl_armed_sell")):
+                cls.enqueue_modify_sl(account, symbol, magic, _node_hi,
+                                      side="sell", comment="FB|sl_arm|sell")
+                cyc["sl_armed_sell"] = True
+                _cyc_dirty = True
+            if _cyc_dirty:
+                cls.set_last_arm(account, symbol, **cyc)
+
         if positions <= 0:
             # UNFREEZE on full close. The VP freeze only exists to stop a morphing live
             # VP from false-fading an OPEN position; once the cycle is flat that risk is
@@ -759,8 +787,14 @@ class ExecBridge:
             out.append(cls.enqueue(account, clear_cmd, broker_symbol, magic=magic))
         buy_tp  = getattr(plan, "buy_tp",  0.0) if leg_tp else 0.0
         sell_tp = getattr(plan, "sell_tp", 0.0) if leg_tp else 0.0
-        buy_sl  = getattr(plan, "buy_sl",  0.0)
-        sell_sl = getattr(plan, "sell_sl", 0.0)
+        _trigger_kind = getattr(plan, "trigger_kind", "") or ""
+        # hvn_inside_touch: SL is deferred — armed by monitor_cycle once >50% of a side
+        # fills. Place orders without SL so early fills don't get stopped prematurely.
+        if _trigger_kind == "hvn_inside_touch":
+            buy_sl = sell_sl = 0.0
+        else:
+            buy_sl  = getattr(plan, "buy_sl",  0.0)
+            sell_sl = getattr(plan, "sell_sl", 0.0)
         # Breakout straddle: buy_stop ABOVE the trigger, sell_stop BELOW it — STOPS ONLY.
         # A buy leg the market has already risen above can't be a buy_stop (a stop below
         # market is invalid) and we do NOT flip it to a buy_limit (that would be a dip-buy,
@@ -859,6 +893,18 @@ class ExecBridge:
             return None
         return cls.enqueue(account, MODIFY_POSITION, broker_symbol,
                            magic=magic, tp=new_tp, side=side, comment=comment)
+
+    @classmethod
+    def enqueue_modify_sl(cls, account: str, broker_symbol: str, magic: int,
+                          new_sl: float, side: str = "",
+                          comment: str = "") -> "Command | None":
+        """Set SL on FILLED positions for `magic` on `side` (TP left unchanged).
+
+        Uses MODIFY_POSITION with sl set and tp=0; the EA keeps the existing TP when tp=0.
+        Bypasses the modify throttle — SL arming is a one-shot structural event, not a
+        recurring refresh. Returns the enqueued Command."""
+        return cls.enqueue(account, MODIFY_POSITION, broker_symbol,
+                           magic=magic, sl=new_sl, tp=0.0, side=side, comment=comment)
 
     # ── poll (EA pulls) ──────────────────────────────────────────────────────
     @classmethod

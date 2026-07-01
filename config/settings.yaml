@@ -44,9 +44,9 @@ grid_levels:
 
   # ── TUNING (adjust frequently based on account size / market conditions) ─────
   # Position sizing
-  base_lot: 0.25           # smallest leg lot; ladder scales up by lot_step per leg
-  lot_step: 0.25           # lot increment per leg (leg_i = base + i×step, capped at max_lots)
-  max_lots: 1.0           # hard cap per leg regardless of risk math
+  base_lot: 0.01           # smallest leg lot; ladder scales up by lot_step per leg
+  lot_step: 0.01           # lot increment per leg (leg_i = base + i×step, capped at max_lots)
+  max_lots: 0.1           # hard cap per leg regardless of risk math
 
   # Ladder shape
   hvn_max_legs_by_tf: {1m: 4, 5m: 5, 15m: 6, 1h: 7}   # legs per side per TF
@@ -55,12 +55,12 @@ grid_levels:
   # Cycle profit targets — primary basket exit (net floating ≥ target → CLOSE_ALL)
   # Values are in native account currency (USC cents for Vantage XAUUSD.pc cent account;
   # plain USD for a standard USD account). 1 USD = 100 USC on a cent account.
-  cycle_net_target_by_tf: {1m: 250.0, 5m: 750.0, 15m: 1500.0, 1h: 3000.0}
-  cycle_net_target_usd: 5000.0   # fallback when TF not in by_tf map (high backstop)
+  cycle_net_target_by_tf: {1m: 20.0, 5m: 50.0, 15m: 100.0, 1h: 200.0}
+  cycle_net_target_usd: 100.0   # fallback when TF not in by_tf map (high backstop)
 
   # Bias trail — arms when peak floating ≥ activate, fires on giveback% retrace.
   # Values are in native account currency (same note as cycle_net_target above).
-  bias_trail_activate_by_tf: {1m: 150.0, 5m: 400.0, 15m: 750.0, 1h: 1500.0}
+  bias_trail_activate_by_tf: {1m: 10, 5m: 25, 15m: 50, 1h: 100}
   bias_trail_giveback_pct: 35    # fire when floating retraces this % off the peak
   bias_book_frac: 0.5            # fraction of bias-side positions to close at trail trigger
 
@@ -73,8 +73,8 @@ grid_levels:
   require_squeeze_gate: false    # true = only arm when vol is coiled (structural setups exempt)
 
   # Safety
-  fullfill_be_enabled: true      # move filled side to BE when all legs fill; keeps cycle alive
-  fullfill_cancel_opposite: true
+  fullfill_be_enabled: false     # SIMPLE: no BE move — keep only net_target exit
+  fullfill_cancel_opposite: false
   # ─────────────────────────────────────────────────────────────────────────────
 
   tp_atr_mult: 1.5
@@ -106,7 +106,7 @@ grid_levels:
   # skew lots to the into-node side + target POC on that side (breakout side stays light,
   # far next-HVN target). Directional inventory → a net-profit exit price exists. false =
   # symmetric HVN→HVN straddle.
-  hvn_reversion_bias: true
+  hvn_reversion_bias: false        # SIMPLE: symmetric straddle, equal legs both sides
   # Wick proximity buffer for hvn_inside_touch: fire if wick came within this many price
   # units of the edge even without crossing it (e.g. 0.5pt catches near-misses on gold).
   # 0.0 = exact touch only (original behaviour). Edge is still the fulcrum price.
@@ -140,11 +140,11 @@ grid_levels:
   # rising 20MA = bull vote, below a falling one = bear. 2.5σ "edge" votes mean-reversion
   # when price is stretched ≥ bb_edge_sigma from the basis on the grid TF. (3.0σ stays the
   # squeeze.) Net vote sign skews the ladder → directional inventory → net-profit exit exists.
-  htf_bias_enabled: true
+  htf_bias_enabled: false         # SIMPLE: symmetric straddle, no directional skew
   htf_bias_period: 20
   htf_bias_slope_bars: 3
   htf_bias_map: {1m: "5m", 5m: "15m", 15m: "1h", 1h: "4h"}
-  bb_edge_enabled: true
+  bb_edge_enabled: false          # SIMPLE: no BB-edge skew vote
   bb_edge_sigma: 2.5
   # cycle_net_target_* and bias_trail_* moved to TUNING block at top of grid_levels
   cycle_hedge_decay_pct: 20      # effective target decays this % as the basket hedges to full
@@ -167,17 +167,17 @@ grid_levels:
   # that way), track its peak floating P&L; on a give-back from peak, BOOK a fraction of
   # that side and move the rest to breakeven (risk-free runner). Captures directional
   # profit the net-basket exit masks (a hedge leg drags net down → target never hits).
-  bias_trail_enabled: true
+  bias_trail_enabled: false      # SIMPLE: no trail — CLOSE_ALL only on net_target
   bias_trail_activate_usd: 5.0   # fallback when TF not in bias_trail_activate_by_tf
   # Intrabar touch-arm: arm the straddle the moment LIVE price taps an HVN edge and ticks
   # back inside (mini-rejection), without waiting for the candle to close. Checked every EA
   # poll (~1s). Filters breakouts via the tick-reversal confirm. Close-driven emit still
   # runs in parallel — touch-arm just gets in earlier when price reverses off an edge.
-  touch_arm_enabled: true
-  touch_arm_tfs: [5m, 15m]       # which TFs arm on touch (1m left close-only = too noisy)
+  touch_arm_enabled: true         # TOUCH ONLY: arm intrabar on edge tap, not on bar close
+  touch_arm_tfs: [5m]            # 5m only — zone-width grid
   touch_arm_confirm_ticks: 0.2   # price must revert this many $ back inside the edge to confirm
   # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
-  triggers: [hvn_inside_touch, squeeze]   # "structural" group the emitter arms (vp_level_touch disabled)
+  triggers: [hvn_inside_touch]   # SIMPLE: only hvn_inside_touch (removed squeeze)
   vp_fulcrum_levels: [poc, vah, val, naked_poc, lvn]   # which VP levels are fulcrums
   vp_tol_atr_mult: 0.25      # tap "test" band = max(this·ATR, vp_tol_pct·price)
   vp_tol_pct: 0.0005         # ATR-free floor for the tap band (replay safety)
@@ -186,7 +186,7 @@ grid_levels:
   # Volatility compression→expansion via Bollinger BANDWIDTH PERCENTILE (vol-regime
   # gate): compression = BBW in the bottom squeeze_bbw_pct of its trailing window; fire
   # on RELEASE after a run. Neutral straddle positions before the displacement.
-  squeeze_enabled: true
+  squeeze_enabled: false          # SIMPLE: disabled
   squeeze_bb_period: 20
   squeeze_bb_mult: 3.0        # Bollinger band = 3·stdev
   squeeze_bbw_pct: 0.15       # compression = BBW in bottom 15% of the trailing window
@@ -199,7 +199,7 @@ grid_levels:
   # Arms when: squeeze released → BB expanding → price taps the 2.5σ band
   # + HTF BB direction aligns (hard gate) + optional footprint absorption confirms.
   # Fulcrum = BB mid (20-SMA); counter-side SL = BB mid (answers the "SL at center" question).
-  bb_expansion_touch_enabled: true
+  bb_expansion_touch_enabled: false  # SIMPLE: disabled
   bb_expansion_post_squeeze_bars: 10  # max bars after squeeze release to be "post-squeeze"
   bb_expansion_touch_sigma: 2.5       # band edge σ to detect as a touch (2.0 = earlier, 3.0 = extreme)
   bb_expansion_touch_lookback: 3      # scan last N bars for a band touch during the expansion
@@ -297,15 +297,14 @@ execution:
   broker: vantage_mt5
   tradable_symbols: [XAUTUSDT, BTCUSDT]
   symbol_map:
-    XAUTUSDT: "XAUUSD.pc"        # VantageMarkets-Live USC cent account
+    XAUTUSDT: "XAUUSD+"          # Vantage MT5 standard USD account
     BTCUSDT:  "BTCUSD"
   # Risk-adjusted sizing: lots = (balance × risk_per_trade_pct) / (SL_distance × contract_size)
   # Set risk_per_trade_pct = 0 to disable; falls back to default_lots.
   risk_per_trade_pct: 0.0025    # 0.25% of equity per trade
   max_lots: 1.0                 # hard cap regardless of risk math
   default_lots:                 # fallback when risk math fails (no SL, etc.)
-    "XAUUSD.pc": 0.25            # live USC cent acct base lot
-    "XAUUSD+": 0.01              # demo fallback
+    "XAUUSD+": 0.01              # micro lot — USD standard account
     "BTCUSD": 0.001
   metaapi_timeout_s: 30
   order_comment_prefix: "FB"
@@ -320,7 +319,7 @@ execution:
     XAUTUSDT: 100
     BTCUSDT: 1
     "BTCUSD": 1
-    "XAUUSD.pc": 100
+    "XAUUSD+": 100
   # Pre-trade execution gates (live only — checked in MT5Adapter.submit_order)
   max_spread:                   # reject order if (ask-bid) exceeds, per broker symbol
     "XAUUSD.pc": 0.50

@@ -27,15 +27,25 @@ SYMBOL="${3:-XAUUSD+}"
 # on the HVN edge-touch you see on the chart — unlike hvn_inside_touch, which measures
 # the rolling-window VP and a stricter close-inside+wick-reject geometry.
 # Override per-TF with FB_SETUPS_1M / FB_SETUPS_5M / FB_SETUPS_15M env vars.
-SETUPS_1M=(${FB_SETUPS_1M:-hvn_inside_touch bb_expansion_touch})
-SETUPS_5M=(${FB_SETUPS_5M:-hvn_inside_touch squeeze hvn_displacement hvn_edge bb_expansion_touch})
-SETUPS_15M=(${FB_SETUPS_15M:-hvn_inside_touch squeeze hvn_displacement hvn_edge bb_expansion_touch})
-SETUPS_1H=(${FB_SETUPS_1H:-hvn_displacement})
+# Use ${VAR-default} (not :-) so an explicitly empty FB_SETUPS_* truly means "no setups"
+# for that TF. Pass FB_SETUPS_1M="" to disable 1m arming; omit the var to get the default.
+_1m_raw="${FB_SETUPS_1M-hvn_inside_touch bb_expansion_touch}"
+_5m_raw="${FB_SETUPS_5M-hvn_inside_touch squeeze hvn_displacement hvn_edge bb_expansion_touch}"
+_15m_raw="${FB_SETUPS_15M-hvn_inside_touch squeeze hvn_displacement hvn_edge bb_expansion_touch}"
+_1h_raw="${FB_SETUPS_1H-hvn_displacement}"
+read -ra SETUPS_1M  <<< "$_1m_raw"
+read -ra SETUPS_5M  <<< "$_5m_raw"
+read -ra SETUPS_15M <<< "$_15m_raw"
+read -ra SETUPS_1H  <<< "$_1h_raw"
 
 emit_loop() {
   local tf="$1" interval="$2" offset="$3"
   shift 3
   local setups=("$@")
+  if [[ ${#setups[@]} -eq 0 ]]; then
+    echo "[emit:$tf] disabled (no setups)"
+    return
+  fi
   echo "[emit:$tf] started — every ${interval}s (offset ${offset}s) → $SYMBOL acct $ACCOUNT setups=[${setups[*]}]"
   while true; do
     local now next sleep_s
@@ -89,13 +99,14 @@ except Exception: print('?')" 2>/dev/null || echo '?')
 
 # Each TF runs an INDEPENDENT parallel cycle, isolated by strategy×TF magic.
 # Offsets keep coincident closes off the same instant (avoids thundering-herd at :00).
-emit_loop 15m 900   8  "${SETUPS_15M[@]}" &
+# Use ${arr[@]+"${arr[@]}"} to avoid "unbound variable" on empty arrays under set -u (bash 3.2).
+emit_loop 15m 900   8  ${SETUPS_15M[@]+"${SETUPS_15M[@]}"} &
 P15=$!
-emit_loop 5m  300  12  "${SETUPS_5M[@]}" &
+emit_loop 5m  300  12  ${SETUPS_5M[@]+"${SETUPS_5M[@]}"} &
 P5=$!
-emit_loop 1m  60    3  "${SETUPS_1M[@]}" &
+emit_loop 1m  60    3  ${SETUPS_1M[@]+"${SETUPS_1M[@]}"} &
 P1=$!
-emit_loop 1h  3600 15  "${SETUPS_1H[@]}" &
+emit_loop 1h  3600 15  ${SETUPS_1H[@]+"${SETUPS_1H[@]}"} &
 P1H=$!
 refresh_loop &
 PR=$!

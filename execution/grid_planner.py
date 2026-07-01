@@ -285,9 +285,18 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
             (step_mult * atr) if atr > 0 else swing_range / 5.0, 1e-6)
         return n, round(step, 4)
 
-    # hvn_inside_touch / bb_expansion_touch: spacing is pure ATR-mult; leg count from
-    # raw_range / step (wider = more legs). Uses hvn_max_legs cap, not regime chop cap.
-    if trigger.kind in ("hvn_inside_touch", "bb_expansion_touch"):
+    # hvn_inside_touch: zone-width-driven sizing.
+    # n = hvn_max_legs (per-TF from settings); step = zone_width / n so all legs span
+    # exactly one zone width on each side. Wider zone → bigger step spacing (not more legs).
+    if trigger.kind == "hvn_inside_touch":
+        zone_width = float(trigger.raw_range or 0.0)
+        n = max(2, hvn_max_legs)
+        step = round(zone_width / n, 4) if (zone_width > 0 and n > 0) \
+               else max((step_mult * atr) if atr > 0 else 1.0, 1e-4)
+        return n, round(step, 4)
+
+    # bb_expansion_touch: ATR-based spacing, leg count from zone width / step.
+    if trigger.kind == "bb_expansion_touch":
         step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
         n = int(round(trigger.raw_range / step)) if step > 0 else 2
         n = max(2, min(hvn_max_legs, n))
@@ -746,9 +755,15 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
             if 0 < _ext_dn < sell_tp:
                 sell_tp = round(_ext_dn, 4)
 
+    # Structural SL for each setup.
+    # hvn_inside_touch: SL is DEFERRED — monitor_cycle arms it once >50% of a side fills.
+    # At placement time these stay 0; node_low/node_high are stored in the arm state for
+    # monitor_cycle to read. This prevents early fills from getting stopped prematurely
+    # before the trade has had a chance to commit direction.
+    buy_sl = sell_sl = 0.0
+
     # HVN displacement keeps ONLY its SL override (counter-side = displacement candle
     # extreme); its TP now follows the unified next-HVN-far-edge rule above.
-    buy_sl = sell_sl = 0.0
     if fulcrum_t.kind == "hvn_displacement":
         ctx = fulcrum_t.context
         direction = ctx.get("direction", "")

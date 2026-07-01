@@ -685,8 +685,10 @@ bool ExecModifyPosition(const string cmd, int &modified, string &err)
    string side  = JsonGetString(cmd, "side");
    int    digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
    double newTp = NormalizeDouble(JsonGetNumber(cmd, "tp"), digits);
+   double newSl = NormalizeDouble(JsonGetNumber(cmd, "sl"), digits);
    modified = 0; err = ""; bool allOk = true;
-   if(newTp <= 0) { err = "no tp"; return false; }
+   // Require at least one of tp or sl to be set.
+   if(newTp <= 0 && newSl <= 0) { err = "no tp or sl"; return false; }
 
    for(int i = 0; i < PositionsTotal(); i++)
    {
@@ -695,10 +697,13 @@ bool ExecModifyPosition(const string cmd, int &modified, string &err)
       bool isBuy = (posInfo.PositionType() == POSITION_TYPE_BUY);
       if(side == "buy"  && !isBuy) continue;
       if(side == "sell" &&  isBuy) continue;
+      double sl = (newSl > 0) ? newSl : posInfo.StopLoss();    // use cmd SL or keep existing
+      double tp = (newTp > 0) ? newTp : posInfo.TakeProfit();  // use cmd TP or keep existing
       double curTp = NormalizeDouble(posInfo.TakeProfit(), digits);
-      if(MathAbs(curTp - newTp) < SymbolInfoDouble(sym, SYMBOL_POINT)) continue;  // no-op
-      double sl = posInfo.StopLoss();   // keep existing SL
-      if(trade.PositionModify(posInfo.Ticket(), sl, newTp)) modified++;
+      double curSl = NormalizeDouble(posInfo.StopLoss(), digits);
+      double pt    = SymbolInfoDouble(sym, SYMBOL_POINT);
+      if(MathAbs(curTp - tp) < pt && MathAbs(curSl - sl) < pt) continue;  // no-op
+      if(trade.PositionModify(posInfo.Ticket(), sl, tp)) modified++;
       else { allOk = false; err = "modify fail #" + IntegerToString((long)posInfo.Ticket()); }
    }
    return allOk;
@@ -1073,6 +1078,11 @@ void DrawOneProfile(const string profJs, const int profIdx)
    {
       int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, (datetime)start_ts, false);
       t0 = (barIdx >= 0) ? iTime(_Symbol, PERIOD_CURRENT, barIdx) : (datetime)start_ts;
+      // If session open is to the left of the visible range, anchor at visible-range left so
+      // the histogram is always on screen.
+      int firstBar = (int)ChartGetInteger(0, CHART_FIRST_VISIBLE_BAR);
+      datetime visLeft = iTime(_Symbol, PERIOD_CURRENT, firstBar);
+      if(t0 < visLeft) t0 = visLeft;
    }
    else if(InpVPLeft)
    {
