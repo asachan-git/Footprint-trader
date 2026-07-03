@@ -510,7 +510,8 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
                                         close_first=True, clear_kind="cancel",
                                         magic=leg_magic,
-                                        leg_tp=not bool(grid_cfg.get("net_profit_exit_only", False)))
+                                        leg_tp=(not bool(grid_cfg.get("net_profit_exit_only", False))
+                                                or bool(grid_cfg.get("leg_tp_ceiling", False))))
     _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
     node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
     node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
@@ -1022,10 +1023,13 @@ def exec_emit_grid():
     # flatten a live position. The deliberate flatten is owned solely by monitor_cycle.
     # leg_magic (strategy × TF, computed above) identifies every leg in MT5 history AND
     # keys the per-(strategy×TF) cycle so independent setups run in parallel on one symbol.
-    # Basket net_target is the sole profit exit when net_profit_exit_only (config): legs
-    # placed tp=0 so nothing self-closes piecemeal. Otherwise each leg carries its own
-    # structural TP (HVN far-edge or POC) and can self-book.
-    leg_tp = not bool((settings.get("grid_levels") or {}).get("net_profit_exit_only", False))
+    # leg_tp policy: net_profit_exit_only places legs WITHOUT a per-order TP (net_target
+    # owns the exit); leg_tp_ceiling re-adds the structural TP as a FAR ceiling (visible
+    # target + runaway books at structure, net_target still primary as it's usually closer).
+    # leg_tp = (not net_profit_exit_only) OR leg_tp_ceiling — matches the BTC baseline.
+    _gl = (settings.get("grid_levels") or {})
+    leg_tp = (not bool(_gl.get("net_profit_exit_only", False))
+              or bool(_gl.get("leg_tp_ceiling", False)))
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
                                         close_first=close_first, clear_kind="cancel",
                                         magic=leg_magic, leg_tp=leg_tp)
