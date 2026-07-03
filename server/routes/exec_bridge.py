@@ -436,7 +436,8 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
 
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
                                         close_first=True, clear_kind="cancel",
-                                        magic=leg_magic, leg_tp=True)
+                                        magic=leg_magic,
+                                        leg_tp=not bool(grid_cfg.get("net_profit_exit_only", False)))
     _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
     node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
     node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
@@ -960,9 +961,10 @@ def exec_emit_grid():
     # flatten a live position. The deliberate flatten is owned solely by monitor_cycle.
     # leg_magic (strategy × TF, computed above) identifies every leg in MT5 history AND
     # keys the per-(strategy×TF) cycle so independent setups run in parallel on one symbol.
-    # Each leg carries its own structural TP (HVN far-edge or POC). Per-leg TP is the
-    # sole exit mechanism — no basket net_target. leg_tp always True.
-    leg_tp = True
+    # Basket net_target is the sole profit exit when net_profit_exit_only (config): legs
+    # placed tp=0 so nothing self-closes piecemeal. Otherwise each leg carries its own
+    # structural TP (HVN far-edge or POC) and can self-book.
+    leg_tp = not bool((settings.get("grid_levels") or {}).get("net_profit_exit_only", False))
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
                                         close_first=close_first, clear_kind="cancel",
                                         magic=leg_magic, leg_tp=leg_tp)
