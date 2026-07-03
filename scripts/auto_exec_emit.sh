@@ -29,9 +29,11 @@ SYMBOL="${3:-XAUUSD+}"
 # Override per-TF with FB_SETUPS_1M / FB_SETUPS_5M / FB_SETUPS_15M env vars.
 # Use ${VAR-default} (not :-) so an explicitly empty FB_SETUPS_* truly means "no setups"
 # for that TF. Pass FB_SETUPS_1M="" to disable 1m arming; omit the var to get the default.
-_1m_raw="${FB_SETUPS_1M-hvn_inside_touch bb_expansion_touch}"
-_5m_raw="${FB_SETUPS_5M-hvn_inside_touch squeeze hvn_displacement hvn_edge bb_expansion_touch}"
-_15m_raw="${FB_SETUPS_15M-hvn_inside_touch squeeze hvn_displacement hvn_edge bb_expansion_touch}"
+# BTC Jun22 regime: hvn_inside_touch + squeeze ONLY. Breakout/edge/displacement family
+# dropped — correlated with leg_closed_other losses. Override per-TF with FB_SETUPS_* env.
+_1m_raw="${FB_SETUPS_1M-hvn_inside_touch squeeze}"
+_5m_raw="${FB_SETUPS_5M-hvn_inside_touch squeeze}"
+_15m_raw="${FB_SETUPS_15M-hvn_inside_touch squeeze}"
 _1h_raw="${FB_SETUPS_1H-}"
 read -ra SETUPS_1M  <<< "$_1m_raw"
 read -ra SETUPS_5M  <<< "$_5m_raw"

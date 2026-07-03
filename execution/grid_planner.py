@@ -285,11 +285,20 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
             (step_mult * atr) if atr > 0 else swing_range / 5.0, 1e-6)
         return n, round(step, 4)
 
-    # hvn_inside_touch / hvn_edge: n fixed by TF (hvn_max_legs_by_tf), step = ATR × mult.
+    # hvn_edge: n fixed by TF (hvn_max_legs_by_tf), step = ATR × mult.
     # Step is TF-ATR-driven so spacing adapts to market volatility on the trigger TF.
-    if trigger.kind in ("hvn_inside_touch", "hvn_edge"):
+    if trigger.kind == "hvn_edge":
         n = max(2, hvn_max_legs)
         step = max((step_mult * atr) if atr > 0 else 1.0, 1e-4)
+        return n, round(step, 4)
+
+    # hvn_inside_touch: WIDTH-DRIVEN sizing (BTC Jun22 regime). step = ATR × mult; leg
+    # count = node_width / step so a WIDER node gets MORE legs (legs span the whole node),
+    # capped at hvn_max_legs (per-TF). raw_range = node width for this trigger.
+    if trigger.kind == "hvn_inside_touch":
+        step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
+        n = int(round(trigger.raw_range / step)) if step > 0 else 2
+        n = max(2, min(hvn_max_legs, n))
         return n, round(step, 4)
 
     # candle_sweep / engulf: same zone-width logic as hvn_inside_touch.
@@ -678,144 +687,40 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     else:
         buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
 
-    # TP = next HVN FAR EDGE beyond the outermost leg — for EVERY setup, both sides.
-    # buy side  → lowest HVN high  that clears the top leg + min_tp_dist (the next node up)
-    # sell side → highest HVN low  that clears the bot leg − min_tp_dist (the next node down)
-    # No POC-fade, no displacement dest/origin override: one rule everywhere. If no HVN sits
-    # beyond a leg, that side's TP stays 0 (compute_hvn_tps cascade is the only fallback, and
-    # only when there is literally no HVN out there). Refreshed every 15m as the HVN rebuilds.
-    from execution.zone_triggers import hvn_or_vp_tp as _hvn_or_vp_tp
-    from execution.zone_triggers import compute_hvn_tps as _compute_hvn_tps
+    # TP cascade — BTC Jun22 regime + min_tp_dist guard. STRUCTURE over ATR:
+    #   1) base    = outer leg ± tp_atr_mult·ATR, snapped to the nearest strong structural
+    #      zone beyond the outer leg (_resolve_tps → zone_collector zones, strength ≥ 0.6).
+    #   2) override = the trigger's pre-computed structural target (tp_up/tp_down: HVN node
+    #      edge or adjacent VP level) when it clears the outer leg by min_tp_dist — the
+    #      guard against the tiny-TP-into-own-node bug (a target closer than min_tp_dist is
+    #      ignored, keeping the ATR/zone base above).
+    #   3) hvn_inside_touch reversion → POC on the FADE side (hvn_reversion_bias): tapped
+    #      TOP fades DOWN to POC (sells), tapped BOTTOM reverts UP to POC (buys), only when
+    #      POC clears the inner leg by min_tp_dist. Breakout side keeps its structural target.
+    # Under net_profit_exit_only + leg_tp_ceiling these are a FAR CEILING; net_target is
+    # the primary exit. (Dropped: VP 1×/2×step refinement, BB 2.5σ/mid, session extension.)
     top_leg = max((l.price for l in buy_legs),  default=fulcrum)
     bot_leg = min((l.price for l in sell_legs), default=fulcrum)
     min_tp_dist = float(grid_cfg.get("min_tp_dist", 0.0) or 0.0)
-    # Use the already-merged daily_vp (prev-D + today) — same source the trigger used.
-    # Re-fetching vp_get("daily") here only returns ONE period, so if today's session is
-    # still sparse (no HVN zones yet) and the trigger fired on a prev-D node, _dz would
-    # be empty and every TP fallback produces 0. daily_vp is already in scope.
-    _dz = [(float(z["low"]), float(z["high"]))
-           for z in ((daily_vp or {}).get("hvn_zones") or [])]
-    # hvn_inside_touch arms INSIDE a node, so its TP must target the NEXT node's far edge,
-    # not the node price is already in. Use the SAME session zones the trigger armed on
-    # (rolling today + cached prev-D) and pass skip_node = the touched node's bounds so the
-    # bracketing node is excluded (Case 2 overshoot is bypassed too). Every other setup keeps
-    # the daily-zone next-far-edge-beyond-leg rule unchanged.
-    _skip_node = None
-    if fulcrum_t.kind == "hvn_inside_touch":
-        try:
-            _sz, _ = zone_triggers._session_hvn_zones(symbol, tf, bars)
-            if _sz:
-                _dz = [(float(lo), float(hi)) for lo, hi in _sz]
-        except Exception:
-            pass
-        _nlo = float((fulcrum_t.context or {}).get("node_low") or 0.0)
-        _nhi = float((fulcrum_t.context or {}).get("node_high") or 0.0)
-        if _nlo > 0 and _nhi > _nlo:
-            _skip_node = (_nlo, _nhi)
 
-    # hvn_edge: asymmetric TP.
-    #   Breakout side (continuation) → next HVN far edge (same as default).
-    #   Reversion side (back inside HVN) → opposite edge of the SAME HVN node.
-    # breakout_bias="buy" means bullish break: buy side is continuation, sell side is reversion.
-    if fulcrum_t.kind == "hvn_edge":
-        _nlo = float((fulcrum_t.context or {}).get("node_low") or 0.0)
-        _nhi = float((fulcrum_t.context or {}).get("node_high") or 0.0)
-        _bo_bias = str((fulcrum_t.context or {}).get("breakout_bias") or "")
-        # Reversion TP = opposite edge of this HVN (the far edge inside the node).
-        _rev_tp = round(_nlo, 4) if _bo_bias == "buy" else (round(_nhi, 4) if _bo_bias == "sell" else 0.0)
-        # Continuation TP = next HVN far edge beyond the leg (skip this node so we don't
-        # land back inside it — same logic as hvn_inside_touch skip_node).
-        if _nlo > 0 and _nhi > _nlo:
-            _skip_node = (_nlo, _nhi)
-        # Compute continuation side TP only (the rev side is already known).
-        _cont_tp, _ = _hvn_or_vp_tp(symbol, _dz, top_leg, bot_leg, step,
-                                     min_tp_dist=min_tp_dist, skip_node=_skip_node)
-        if _cont_tp == 0.0:
-            _cont_tp, _ = _compute_hvn_tps(symbol, fulcrum, _dz, min_dist=min_tp_dist,
-                                           top_leg=top_leg, bot_leg=bot_leg, skip_node=_skip_node)
-        if _bo_bias == "buy":
-            buy_tp  = round(_cont_tp, 4) if _cont_tp > top_leg else 0.0
-            sell_tp = _rev_tp if _rev_tp > 0 and _rev_tp < bot_leg else 0.0
-        elif _bo_bias == "sell":
-            _, _cont_dn = _hvn_or_vp_tp(symbol, _dz, top_leg, bot_leg, step,
-                                         min_tp_dist=min_tp_dist, skip_node=_skip_node)
-            if _cont_dn == 0.0:
-                _, _cont_dn = _compute_hvn_tps(symbol, fulcrum, _dz, min_dist=min_tp_dist,
-                                               top_leg=top_leg, bot_leg=bot_leg, skip_node=_skip_node)
-            sell_tp = round(_cont_dn, 4) if 0 < _cont_dn < bot_leg else 0.0
-            buy_tp  = _rev_tp if _rev_tp > top_leg else 0.0
-        else:
-            buy_tp, sell_tp = _hvn_or_vp_tp(symbol, _dz, top_leg, bot_leg, step,
-                                             min_tp_dist=min_tp_dist)
+    buy_tp, sell_tp = _resolve_tps(symbol, fulcrum, buy_legs, sell_legs, atr, tp_mult)
 
-    else:
-        # Next HVN far edge, with VP-level refinements (Case 1: VP within 1×step of the HVN edge
-        # → use VP; Case 2: HVN < 2×step from the leg → next VP beyond, else next HVN beyond).
-        buy_tp, sell_tp = _hvn_or_vp_tp(symbol, _dz, top_leg, bot_leg, step,
-                                        min_tp_dist=min_tp_dist, skip_node=_skip_node)
-        # Fallback ONLY when nothing structural sits beyond a leg: LVN/fib-ext cascade so the
-        # side still has a target rather than 0.
-        if buy_tp == 0.0 or sell_tp == 0.0:
-            _ctp_up, _ctp_dn = _compute_hvn_tps(symbol, fulcrum, _dz,
-                                                min_dist=min_tp_dist, top_leg=top_leg, bot_leg=bot_leg,
-                                                skip_node=_skip_node)
-            if buy_tp  == 0.0 and _ctp_up > top_leg:        buy_tp  = round(_ctp_up, 4)
-            if sell_tp == 0.0 and 0 < _ctp_dn < bot_leg:    sell_tp = round(_ctp_dn, 4)
+    tp_up   = float((fulcrum_t.context or {}).get("tp_up", 0.0) or 0.0)
+    tp_down = float((fulcrum_t.context or {}).get("tp_down", 0.0) or 0.0)
+    if tp_up > top_leg + min_tp_dist:
+        buy_tp = round(tp_up, 4)
+    if 0.0 < tp_down < bot_leg - min_tp_dist:
+        sell_tp = round(tp_down, 4)
 
-    # BB 2.5σ — compete with structural target: use whichever appears first (nearer to the
-    # outer leg). Falls back to BB when structural is 0. Uses the TF bars already fetched.
-    from execution.zone_triggers import bb_tp as _bb_tp
-    _bb_up, _bb_dn = _bb_tp(bars, cfg=grid_cfg)
-    if _bb_up > top_leg:
-        buy_tp  = round(min(buy_tp, _bb_up) if buy_tp  > top_leg    else _bb_up, 4)
-    if 0 < _bb_dn < bot_leg:
-        sell_tp = round(max(sell_tp, _bb_dn) if 0 < sell_tp < bot_leg else _bb_dn, 4)
-
-    # bb_expansion_touch: bias-side TP = BB mid (20-SMA mean reversion target).
-    # Overrides structural/BB-2.5σ fallback: the 2.5σ fallback targets the OPPOSITE band
-    # (too far), and next-HVN may lie outside min_tp_dist. The mid is the correct target —
-    # price just tapped 2.5σ and the thesis is reversion to the mean.
-    if fulcrum_t.kind == "bb_expansion_touch":
-        _bb_mid_tp = float((fulcrum_t.context or {}).get("bb_mid") or 0.0)
-        _bias      = (fulcrum_t.context or {}).get("bias", "")
-        if _bb_mid_tp > 0:
-            if _bias == "sell" and _bb_mid_tp < bot_leg:
-                sell_tp = round(_bb_mid_tp, 4)
-            elif _bias == "buy" and _bb_mid_tp > top_leg:
-                buy_tp  = round(_bb_mid_tp, 4)
-
-    # ATR ceiling — last-resort when all structural + BB lookups yield 0 for a side.
-    # Ensures every leg always carries a ceiling (avoids tp=0 orders at range extremes
-    # where no HVN sits above/below the ladder and BB is inside it). Uses tp_atr_mult
-    # measured from the outer leg, not the fulcrum.
-    _tp_atr_mult = float(grid_cfg.get("tp_atr_mult", 1.5) or 1.5)
-    if buy_tp  == 0.0 and atr > 0:
-        buy_tp  = round(top_leg + _tp_atr_mult * atr, 4)
-    if sell_tp == 0.0 and atr > 0:
-        sell_tp = round(bot_leg - _tp_atr_mult * atr, 4)
-
-    # Session-aware TP extension: during London/NY open, if ATR is expanding vs recent
-    # mean, skip the nearest HVN and target the next structural node beyond. CVD direction
-    # gates each side — extend buy TP only when session CVD is net-bullish, sell when bearish.
-    from execution.zone_triggers import (in_session_window as _in_sess,
-                                         session_atr_ratio as _sess_atr_ratio)
-    _sess_atr_thresh = float(grid_cfg.get("session_tp_atr_ratio", 1.6) or 1.6)
-    if _in_sess() and _sess_atr_ratio(bars) >= _sess_atr_thresh:
-        _sess_cvd = sum(float(getattr(b, "delta", 0) or 0) for b in bars)
-        _extend_buy  = _sess_cvd >= 0   # net buying → upside has momentum
-        _extend_sell = _sess_cvd <= 0   # net selling → downside has momentum
-        if _extend_buy and buy_tp > top_leg:
-            # Find the next structural node above the current buy_tp.
-            _ext_up, _ = _hvn_or_vp_tp(symbol, _dz, buy_tp, buy_tp - step,
-                                        step, min_tp_dist=step, skip_node=None)
-            if _ext_up > buy_tp:
-                buy_tp = round(_ext_up, 4)
-        if _extend_sell and 0 < sell_tp < bot_leg:
-            # Find the next structural node below the current sell_tp.
-            _, _ext_dn = _hvn_or_vp_tp(symbol, _dz, sell_tp + step, sell_tp,
-                                        step, min_tp_dist=step, skip_node=None)
-            if 0 < _ext_dn < sell_tp:
-                sell_tp = round(_ext_dn, 4)
+    if (fulcrum_t.kind == "hvn_inside_touch"
+            and bool(grid_cfg.get("hvn_reversion_bias", True))):
+        poc  = float((daily_vp or {}).get("poc", 0.0) or 0.0)
+        edge = (fulcrum_t.context or {}).get("edge", "")
+        if poc > 0:
+            if edge == "top" and poc < bot_leg - min_tp_dist:
+                sell_tp = round(poc, 4)
+            elif edge == "bottom" and poc > top_leg + min_tp_dist:
+                buy_tp = round(poc, 4)
 
     # Structural SL for each setup.
     # hvn_inside_touch: SL is DEFERRED — monitor_cycle arms it once >50% of a side fills.
