@@ -160,8 +160,8 @@ class Command:
             # price field carries price_delta; tp = new TP (0 = leave unchanged)
             d.update(price_delta=self.price, tp=self.tp, side=self.side)
         elif self.type == MODIFY_POSITION:
-            # tp = new TP for filled positions on `side`; SL left unchanged
-            d.update(tp=self.tp, side=self.side, comment=self.comment)
+            # sl=0 → EA keeps existing; sl>0 → EA sets it. tp=0 → EA keeps existing.
+            d.update(sl=self.sl, tp=self.tp, side=self.side, comment=self.comment)
         return d
 
 
@@ -425,11 +425,24 @@ class ExecBridge:
         # (so a never-filled cycle can be retired); both reset per arm.
         max_seen = int(cyc.get("max_pos_seen") or 0)
         pend_seen = int(cyc.get("pend_seen") or 0)
+        _cyc_hw_dirty = False
         if positions > max_seen or pendings > pend_seen:
             max_seen = max(max_seen, positions)
             pend_seen = max(pend_seen, pendings)
             cyc["max_pos_seen"] = max_seen
             cyc["pend_seen"] = pend_seen
+            _cyc_hw_dirty = True
+        # per-side high-water: needed to detect one-side TP (side drops from >0 to 0)
+        if buys is not None and sells is not None:
+            _mb = int(cyc.get("max_buys_seen") or 0)
+            _ms = int(cyc.get("max_sells_seen") or 0)
+            if int(buys) > _mb:
+                cyc["max_buys_seen"] = int(buys)
+                _cyc_hw_dirty = True
+            if int(sells) > _ms:
+                cyc["max_sells_seen"] = int(sells)
+                _cyc_hw_dirty = True
+        if _cyc_hw_dirty:
             cls.set_last_arm(account, symbol, **cyc)
 
         # FREEZE the VP/HVN structure on FIRST leg fill. Until a position opens the cycle
@@ -456,10 +469,17 @@ class ExecBridge:
             except Exception:
                 pass  # never break the monitor on a snapshot failure
 
+        # Deferred structural SL toggle (config): when False, a side that commits >50%
+        # is NOT given a fixed node-edge/fulcrum SL — net_target/full_hedge own the exit
+        # (grid-recovery thesis). Profit-trailing SL (candle_sweep/hvn_edge cont) unaffected.
+        _defer_sl = bool(((settings.get("grid_levels") or {}) if isinstance(settings, dict)
+                          else {}).get("defer_sl_on_half_fill", True))
+
         # Deferred SL arming for hvn_inside_touch: once >50% of a side's legs fill, set
         # the structural SL (node_low for buys, node_high for sells) on all open positions
         # on that side. Guard with sl_armed_{side} so it fires exactly once per cycle arm.
-        if (positions > 0
+        # tp guard: EA requires non-zero tp on MODIFY_POSITION; skip if no TP is known yet.
+        if (_defer_sl and positions > 0
                 and cyc.get("trigger_kind") == "hvn_inside_touch"
                 and buys is not None and sells is not None):
             _node_lo = float(cyc.get("node_low") or 0.0)
@@ -467,19 +487,62 @@ class ExecBridge:
             _buy_n   = int(cyc.get("buy_n") or 0)
             _sell_n  = int(cyc.get("sell_n") or 0)
             _cyc_dirty = False
-            if (_node_lo > 0 and _buy_n > 0
+            _tp_up   = float(cyc.get("tp_up")   or 0.0)
+            _tp_down = float(cyc.get("tp_down") or 0.0)
+            if (_node_lo > 0 and _buy_n > 0 and _tp_up > 0
                     and int(buys) > _buy_n / 2
                     and not cyc.get("sl_armed_buy")):
                 cls.enqueue_modify_sl(account, symbol, magic, _node_lo,
-                                      side="buy", comment="FB|sl_arm|buy")
+                                      side="buy", comment="FB|sl_arm|buy", tp=_tp_up)
                 cyc["sl_armed_buy"] = True
+                cyc["sl_buy"] = _node_lo   # persist so tp_refresh preserves the SL
                 _cyc_dirty = True
-            if (_node_hi > 0 and _sell_n > 0
+            if (_node_hi > 0 and _sell_n > 0 and _tp_down > 0
                     and int(sells) > _sell_n / 2
                     and not cyc.get("sl_armed_sell")):
                 cls.enqueue_modify_sl(account, symbol, magic, _node_hi,
-                                      side="sell", comment="FB|sl_arm|sell")
+                                      side="sell", comment="FB|sl_arm|sell", tp=_tp_down)
                 cyc["sl_armed_sell"] = True
+                cyc["sl_sell"] = _node_hi  # persist so tp_refresh preserves the SL
+                _cyc_dirty = True
+            if _cyc_dirty:
+                cls.set_last_arm(account, symbol, **cyc)
+
+        # Deferred SL arming for hvn_edge reversion side: once >50% of the reversion side
+        # fills, lock SL at the fulcrum (the HVN edge the breakout tapped). Runs every poll
+        # so it doesn't depend on candle close. One-shot per cycle (be_done_{side} guard).
+        # tp guard: EA requires non-zero tp on MODIFY_POSITION.
+        if (_defer_sl and positions > 0
+                and cyc.get("trigger_kind") == "hvn_edge"
+                and buys is not None and sells is not None):
+            _he_bias    = str(cyc.get("breakout_bias") or "")
+            _he_fulcrum = float(cyc.get("fulcrum") or 0.0)
+            _he_buy_n   = int(cyc.get("buy_n")  or 0)
+            _he_sell_n  = int(cyc.get("sell_n") or 0)
+            _he_tp_up   = float(cyc.get("tp_up")   or 0.0)
+            _he_tp_down = float(cyc.get("tp_down") or 0.0)
+            _cyc_dirty  = False
+            # Bull break → reversion = sells (inside HVN) → SL at fulcrum hi edge
+            if (_he_bias == "buy" and int(sells) > 0 and _he_sell_n > 0
+                    and int(sells) > _he_sell_n / 2
+                    and _he_fulcrum > 0 and _he_tp_down > 0
+                    and not cyc.get("be_done_sell")):
+                cls.enqueue_modify_sl(account, symbol, magic, _he_fulcrum,
+                                      side="sell", comment="FB|hvn_edge_rev_sl|sell",
+                                      tp=_he_tp_down)
+                cyc["be_done_sell"] = True
+                cyc["sl_sell"] = _he_fulcrum
+                _cyc_dirty = True
+            # Bear break → reversion = buys (inside HVN) → SL at fulcrum lo edge
+            if (_he_bias == "sell" and int(buys) > 0 and _he_buy_n > 0
+                    and int(buys) > _he_buy_n / 2
+                    and _he_fulcrum > 0 and _he_tp_up > 0
+                    and not cyc.get("be_done_buy")):
+                cls.enqueue_modify_sl(account, symbol, magic, _he_fulcrum,
+                                      side="buy", comment="FB|hvn_edge_rev_sl|buy",
+                                      tp=_he_tp_up)
+                cyc["be_done_buy"] = True
+                cyc["sl_buy"] = _he_fulcrum
                 _cyc_dirty = True
             if _cyc_dirty:
                 cls.set_last_arm(account, symbol, **cyc)
@@ -498,6 +561,28 @@ class ExecBridge:
                                       side="", comment="FB|sweep_vwap_be")
                 cyc["vwap_be_armed"] = True
                 cls.set_last_arm(account, symbol, **cyc)
+
+        # One-side TP close: when one side's positions drop to 0 (TP hit) while the other
+        # side still has live positions or resting pendings, close the entire cycle.
+        # max_buys_seen / max_sells_seen distinguish "never filled" (0 all along) from
+        # "TP'd" (was >0, now 0). Guard with tp_side_close_done so it fires once per arm.
+        if (buys is not None and sells is not None
+                and not cyc.get("tp_side_close_done")):
+            _cb = int(buys); _cs = int(sells)
+            _mb = int(cyc.get("max_buys_seen") or 0)
+            _ms = int(cyc.get("max_sells_seen") or 0)
+            _pend = int(open_state.get("pendings", 0) or 0)
+            _tp_reason = None
+            if _mb > 0 and _cb == 0 and (_cs > 0 or _pend > 0):
+                _tp_reason = "buy_tp"   # buy side TP'd, sell side still live
+            elif _ms > 0 and _cs == 0 and (_cb > 0 or _pend > 0):
+                _tp_reason = "sell_tp"  # sell side TP'd, buy side still live
+            if _tp_reason:
+                cls.enqueue(account, CLOSE_ALL, symbol,
+                             comment=f"FB|tp_side_close|{_tp_reason}", magic=magic, now=t)
+                cyc["tp_side_close_done"] = True
+                cls.set_last_arm(account, symbol, **cyc)
+                return f"tp_side_close|{_tp_reason}"
 
         if positions <= 0:
             # UNFREEZE on full close. The VP freeze only exists to stop a morphing live
@@ -811,53 +896,33 @@ class ExecBridge:
         else:
             buy_sl  = getattr(plan, "buy_sl",  0.0)
             sell_sl = getattr(plan, "sell_sl", 0.0)
-        # Breakout straddle: buy_stop ABOVE the trigger, sell_stop BELOW it — STOPS ONLY.
-        # A buy leg the market has already risen above can't be a buy_stop (a stop below
-        # market is invalid) and we do NOT flip it to a buy_limit (that would be a dip-buy,
-        # the opposite thesis). Same for a sell leg below market. Such behind-market legs
-        # are breakout levels price already cleared → SKIPPED (logged), not placed. When no
-        # live quote is cached, place all (the EA's own freeze guard is the backstop).
+        # Order type per leg based on current market price:
+        #   buy leg above ask  → buy_stop  (price must rise to trigger)
+        #   buy leg below ask  → buy_limit (price already above level → limit entry on pullback)
+        #   sell leg below bid → sell_stop (price must fall to trigger)
+        #   sell leg above bid → sell_limit (price already below level → limit entry on bounce)
+        # When no live quote is cached, default all to stops (EA freeze guard is backstop).
         _q = cls.get_quote(account, broker_symbol) or {}
         _ask = float(_q.get("ask") or 0.0)
         _bid = float(_q.get("bid") or 0.0)
-        _skipped_buy = _skipped_sell = 0
-        # Re-index lots for behind-market skips: if the nearest N legs are skipped,
-        # the placed legs get lots starting from index 1 (base_lot + 0·step, base_lot + 1·step…)
-        # rather than from their original position (which would put a 1.25-lot as the first entry).
-        _base_lot = float(getattr(plan, "base_lot", 0.0) or 0.0)
-        _lot_step = float(getattr(plan, "lot_step", 0.0) or 0.0)
-        _placed_buy = 0
         for i, leg in enumerate(getattr(plan, "buy_legs", []) or []):
-            if _ask > 0 and leg.price <= _ask:   # below market → not a valid buy_stop
-                _skipped_buy += 1
-                continue
-            lot = (round(_base_lot + _placed_buy * _lot_step, 2)
-                   if _base_lot > 0 and _skipped_buy > 0 else leg.lot)
+            if _ask > 0 and leg.price < _ask:
+                _otype = "buy_limit"
+            else:
+                _otype = "buy_stop"
             out.append(cls.enqueue(
-                account, PLACE_PENDING, broker_symbol, order_type="buy_stop",
-                price=leg.price, lot=lot, sl=buy_sl, tp=buy_tp,
+                account, PLACE_PENDING, broker_symbol, order_type=_otype,
+                price=leg.price, lot=leg.lot, sl=buy_sl, tp=buy_tp,
                 comment=f"FB|{tag}|{tf_tag}|b{i + 1}", magic=magic))
-            _placed_buy += 1
-        _placed_sell = 0
         for i, leg in enumerate(getattr(plan, "sell_legs", []) or []):
-            if _bid > 0 and leg.price >= _bid:    # above market → not a valid sell_stop
-                _skipped_sell += 1
-                continue
-            lot = (round(_base_lot + _placed_sell * _lot_step, 2)
-                   if _base_lot > 0 and _skipped_sell > 0 else leg.lot)
+            if _bid > 0 and leg.price > _bid:
+                _otype = "sell_limit"
+            else:
+                _otype = "sell_stop"
             out.append(cls.enqueue(
-                account, PLACE_PENDING, broker_symbol, order_type="sell_stop",
-                price=leg.price, lot=lot, sl=sell_sl, tp=sell_tp,
+                account, PLACE_PENDING, broker_symbol, order_type=_otype,
+                price=leg.price, lot=leg.lot, sl=sell_sl, tp=sell_tp,
                 comment=f"FB|{tag}|{tf_tag}|s{i + 1}", magic=magic))
-            _placed_sell += 1
-        if _skipped_buy or _skipped_sell:
-            import logging
-            _reindexed = (_base_lot > 0 and (_skipped_buy > 0 or _skipped_sell > 0))
-            logging.getLogger(__name__).info(
-                f"[exec] {broker_symbol} magic={magic}: skipped {_skipped_buy} buy + "
-                f"{_skipped_sell} sell leg(s) already behind market (bid={_bid} ask={_ask})"
-                + (f"; lots re-indexed from base_lot={_base_lot}" if _reindexed else "")
-                + " — breakout straddle places stops only")
         return out
 
     @classmethod
@@ -898,29 +963,29 @@ class ExecBridge:
 
     @classmethod
     def enqueue_modify_position(cls, account: str, broker_symbol: str, magic: int,
-                                new_tp: float, side: str = "",
-                                comment: str = "") -> "Command | None":
-        """Refresh TP on FILLED positions for `magic` on `side` (SL left unchanged).
+                                new_tp: float, side: str = "", comment: str = "",
+                                sl: float = 0.0) -> "Command | None":
+        """Refresh TP on FILLED positions for `magic` on `side`.
 
-        Complements enqueue_modify_pending: pending legs track the HVN via MODIFY_PENDING,
-        filled legs track it via this. side: "buy", "sell", or "" (both). Returns None when
-        throttled (broker-rate cap)."""
+        Pass `sl` = the arm's stored sl_buy/sl_sell to preserve a previously armed SL.
+        sl=0 → EA keeps posInfo.StopLoss() (existing SL, safe default).
+        side: "buy", "sell", or "" (both). Returns None when throttled."""
         if cls._modify_throttled(account, broker_symbol, magic, side, "pos_tp"):
             return None
         return cls.enqueue(account, MODIFY_POSITION, broker_symbol,
-                           magic=magic, tp=new_tp, side=side, comment=comment)
+                           magic=magic, tp=new_tp, sl=sl, side=side, comment=comment)
 
     @classmethod
     def enqueue_modify_sl(cls, account: str, broker_symbol: str, magic: int,
-                          new_sl: float, side: str = "",
-                          comment: str = "") -> "Command | None":
-        """Set SL on FILLED positions for `magic` on `side` (TP left unchanged).
+                          new_sl: float, side: str = "", comment: str = "",
+                          tp: float = 0.0) -> "Command | None":
+        """Set SL on FILLED positions for `magic` on `side`.
 
-        Uses MODIFY_POSITION with sl set and tp=0; the EA keeps the existing TP when tp=0.
-        Bypasses the modify throttle — SL arming is a one-shot structural event, not a
-        recurring refresh. Returns the enqueued Command."""
+        Pass `tp` = the arm's stored TP for that side so the EA gets a valid
+        (SL, TP) pair — MT5 rejects a modify where both are zero or TP is absent.
+        Bypasses the modify throttle — SL arming is a one-shot structural event."""
         return cls.enqueue(account, MODIFY_POSITION, broker_symbol,
-                           magic=magic, sl=new_sl, tp=0.0, side=side, comment=comment)
+                           magic=magic, sl=new_sl, tp=tp, side=side, comment=comment)
 
     # ── poll (EA pulls) ──────────────────────────────────────────────────────
     @classmethod

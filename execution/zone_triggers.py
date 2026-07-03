@@ -321,39 +321,107 @@ def hvn_or_vp_tp(symbol: str, zones: list[tuple[float, float]],
     return tp_up, tp_down
 
 
-def _t_hvn_edge(symbol: str, current_price: float) -> Trigger | None:
-    """Nearest HVN boundary edge. Node width (high-low) is the raw_range that
-    sizes the grid: price reverts to the other edge or breaks to the next HVN."""
+def _t_hvn_edge(symbol: str, tf: str, current_price: float,
+                cfg: dict | None = None) -> Trigger | None:
+    """HVN edge breakout-retest trigger.
+
+    Fires when two conditions are met on the last closed bar:
+      1. A prior bar (within hvn_edge_lookback bars) closed OUTSIDE an HVN zone on one side.
+      2. The last closed bar's wick tapped back INTO that edge (within hvn_edge_tap_buffer)
+         AND the bar closed back outside — a rejection confirming the edge as
+         support/resistance.
+
+    Two patterns covered:
+      • Immediate: breakout bar → next bar taps edge and closes back outside.
+      • Pullback:  breakout bar → moves away → returns after N bars → taps and rejects.
+
+    Bias is directional:
+      • Bullish break (closed above HVN top) → bias="buy"  fulcrum=HVN top edge
+      • Bearish break (closed below HVN bot) → bias="sell" fulcrum=HVN bottom edge
+    """
+    cfg = cfg or {}
+    lookback = int(cfg.get("hvn_edge_lookback", 20) or 20)
+    tap_buf = float(cfg.get("hvn_edge_tap_buffer", cfg.get("hvn_touch_buffer", 0.5)) or 0.5)
+
     try:
+        from pipeline.state_store import store as _store
         from pipeline.features.vp_cache import get as vp_get
     except Exception:
         return None
 
-    best: tuple[float, float, float] | None = None  # (dist, edge_price, node_width)
-    for period in ("daily", "weekly"):
-        vp = vp_get(symbol, period)
-        if not vp:
+    bars = _store().recent(symbol, tf, lookback + 2)
+    if len(bars) < 3:
+        return None
+
+    # Tap bar = last closed bar
+    tap = bars[-1]
+    tap_hi = float(tap.ohlc.h)
+    tap_lo = float(tap.ohlc.l)
+    tap_close = float(tap.ohlc.c)
+
+    # Daily VP for HVN zones (same source the chart uses)
+    vp = vp_get(symbol, "daily") or {}
+    hvn_zones = vp.get("hvn_zones") or []
+    if not hvn_zones:
+        return None
+
+    best: tuple[float, str, float, float] | None = None  # (confidence, bias, edge, width)
+
+    for hvn in hvn_zones:
+        lo, hi = float(hvn["low"]), float(hvn["high"])
+        width = hi - lo
+        if width <= 0:
             continue
-        for hvn in vp.get("hvn_zones") or []:
-            lo, hi = float(hvn["low"]), float(hvn["high"])
-            width = hi - lo
-            for edge in (lo, hi):
-                d = abs(edge - current_price)
-                if best is None or d < best[0]:
-                    best = (d, edge, width)
+
+        # ── bullish: wick tapped top edge from outside, closed back above ──
+        top_tapped = (tap_lo <= hi + tap_buf) and (tap_lo >= lo - tap_buf) and (tap_close > hi)
+        # ── bearish: wick tapped bottom edge from outside, closed back below ──
+        bot_tapped = (tap_hi >= lo - tap_buf) and (tap_hi <= hi + tap_buf) and (tap_close < lo)
+
+        if not top_tapped and not bot_tapped:
+            continue
+
+        bias = "buy" if top_tapped else "sell"
+        edge = hi if top_tapped else lo
+
+        # Must have a prior breakout close on the same side within lookback bars
+        breakout_found = False
+        for pb in bars[:-1]:  # all bars before the tap bar
+            pb_c = float(pb.ohlc.c)
+            if bias == "buy" and pb_c > hi:
+                breakout_found = True
+                break
+            if bias == "sell" and pb_c < lo:
+                breakout_found = True
+                break
+
+        if not breakout_found:
+            continue
+
+        # Prefer the zone whose edge the tap was tightest to
+        tap_dist = abs((tap_lo if top_tapped else tap_hi) - edge)
+        conf = 0.75 * (1.0 - min(1.0, tap_dist / max(tap_buf, 0.01)))
+        if best is None or conf > best[0]:
+            best = (conf, bias, edge, width)
+
     if best is None:
         return None
 
-    _dist, edge, width = best
-    # Confidence higher when price is genuinely AT the edge (within ~25% of width).
-    proximity = 1.0 - min(1.0, _dist / width) if width > 0 else 0.0
-    conf = min(0.9, 0.5 + 0.4 * proximity)
+    conf, bias, edge, width = best
+    # Recover the matched zone bounds for asymmetric TP in grid_planner
+    _matched_lo = edge - width if bias == "buy" else edge
+    _matched_hi = edge if bias == "buy" else edge + width
     return Trigger(
         kind="hvn_edge",
         fulcrum_price=float(edge),
         raw_range=float(width),
         confidence=float(conf),
-        context={"bias": "none"},
+        context={
+            "bias": "none",           # neutral straddle
+            "breakout_bias": bias,    # "buy" or "sell" — which side is continuation
+            "node_low": round(_matched_lo, 4),
+            "node_high": round(_matched_hi, 4),
+        },
     )
 
 
@@ -438,6 +506,114 @@ def _prior_day_hvn(symbol: str, price: float) -> list[tuple[float, float]]:
     return []
 
 
+# ── HVN zone stabilization (hysteresis) ──────────────────────────────────────
+# The rolling VP is recomputed stateless every call: the sliding window drops a bar,
+# find_peaks thresholds move with the recomputed average, peak_widths edges are
+# interpolated floats, and the merge trough gate sits near its calibrated shoulder.
+# Result: zone edges jitter and borderline nodes flicker in/out between recomputes,
+# which downstream turns into fulcrum shifts, TP modifies and false hvn_faded
+# flattens. This layer makes the output STICKY without hiding real structure:
+#   - edge snapping: keep the previous edge while the new one wiggles within tol
+#   - sticky deletion: a zone must be absent hvn_stab_del_n consecutive recomputes
+#     before it disappears (kills threshold flicker)
+#   - immediate appearance: genuinely new nodes pass through at once (triggers stay
+#     responsive); real migrations beyond tol are accepted at once too
+# State is in-process per (symbol, tf); restart reseeds from the next compute (benign
+# — per-cycle safety lives in the arm dict + fade strikes on the exec side).
+
+_ZONE_STAB: dict[tuple[str, str], dict] = {}
+_ZONE_STAB_LOCK = __import__("threading").Lock()
+_STAB_CFG_CACHE: dict[str, Any] = {"ts": 0.0, "cfg": {}}
+_TF_SECS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
+
+
+def _stab_cfg() -> dict:
+    """grid_levels config for the stabilizer, yaml-read cached for 30s."""
+    import time as _time
+    now = _time.time()
+    if now - float(_STAB_CFG_CACHE["ts"]) > 30.0:
+        try:
+            import yaml as _yaml
+            _cfg = _yaml.safe_load(
+                (__import__("pathlib").Path(__file__).resolve().parent.parent
+                 / "config" / "settings.yaml").read_text()) or {}
+            _STAB_CFG_CACHE["cfg"] = _cfg.get("grid_levels") or {}
+        except Exception:
+            pass
+        _STAB_CFG_CACHE["ts"] = now
+    return _STAB_CFG_CACHE["cfg"]
+
+
+def _stabilize_zones(symbol: str, tf: str, zones: list[tuple[float, float]],
+                     sess: str) -> list[tuple[float, float]]:
+    """Hysteresis over successive `_session_hvn_zones` outputs (see block comment)."""
+    cfg = _stab_cfg()
+    if not bool(cfg.get("hvn_stab_enabled", True)):
+        return zones
+    tol_frac = float(cfg.get("hvn_stab_edge_tol_frac", 0.25) or 0.25)
+    del_n = int(cfg.get("hvn_stab_del_n", 3) or 3)
+    try:
+        from pipeline.features.volume_profile import _resolve_bin_size
+        bin_size = float(_resolve_bin_size(symbol)) or 0.5
+    except Exception:
+        bin_size = 0.5
+    import time as _time
+    now = _time.time()
+    key = (symbol, tf)
+    with _ZONE_STAB_LOCK:
+        snap = _ZONE_STAB.get(key)
+        # Reseed on first call, session change (20:00 IST prev-D→today swap) or a stale
+        # snapshot (recompute cadence broke down — don't pin to dead structure).
+        if snap is None or snap.get("sess") != sess \
+           or now - float(snap.get("ts", 0.0)) > 5 * _TF_SECS.get(tf, 300):
+            _ZONE_STAB[key] = {"zones": [[lo, hi, 0] for lo, hi in zones],
+                               "sess": sess, "ts": now}
+            return zones
+        prev: list[list[float]] = snap["zones"]   # [lo, hi, miss_count]
+        out: list[list[float]] = []
+        used_prev: set[int] = set()
+        for lo, hi in zones:
+            # match by overlap; merge case = one new zone spanning several prev zones
+            matches = [i for i, (plo, phi, _m) in enumerate(prev)
+                       if not (hi < plo or lo > phi)]
+            if not matches:
+                # nearest-center fallback for a small non-overlapping drift
+                c = (lo + hi) / 2.0
+                best_i, best_d = -1, float("inf")
+                for i, (plo, phi, _m) in enumerate(prev):
+                    if i in used_prev:
+                        continue
+                    d = abs((plo + phi) / 2.0 - c)
+                    if d < best_d:
+                        best_d, best_i = d, i
+                if best_i >= 0 and best_d <= max(tol_frac * (hi - lo), 2 * bin_size):
+                    matches = [best_i]
+            if matches:
+                plo = min(prev[i][0] for i in matches)
+                phi = max(prev[i][1] for i in matches)
+                tol = max(tol_frac * max(phi - plo, bin_size), 2 * bin_size)
+                # snap each OUTER edge independently: keep the old edge while the new
+                # one wiggles within tol; accept it (real migration) beyond tol
+                new_lo = plo if abs(lo - plo) <= tol else lo
+                new_hi = phi if abs(hi - phi) <= tol else hi
+                if new_hi <= new_lo:      # degenerate snap (e.g. split shrank the span)
+                    new_lo, new_hi = lo, hi
+                out.append([new_lo, new_hi, 0])
+                used_prev.update(matches)
+            else:
+                out.append([lo, hi, 0])   # brand-new node → appears immediately
+        # sticky deletion: unmatched previous zones survive del_n-1 misses
+        for i, (plo, phi, miss) in enumerate(prev):
+            if i in used_prev:
+                continue
+            if miss + 1 < del_n:
+                out.append([plo, phi, miss + 1])
+        out.sort(key=lambda z: z[0])
+        snap["zones"] = out
+        snap["ts"] = now
+        return [(lo, hi) for lo, hi, _m in out]
+
+
 def _session_hvn_zones(symbol: str, tf: str, bars: list[Bar]) -> tuple[list[tuple[float, float]], str]:
     """HVN zones for the current session per `_SESSION_HVN_SRC`. Returns (zones, session)."""
     from pipeline.features.session import current_session
@@ -458,6 +634,9 @@ def _session_hvn_zones(symbol: str, tf: str, bars: list[Bar]) -> tuple[list[tupl
        and _outside_daily_va(symbol, price):
         zones = _merge_zone_tuples(zones + _prior_day_hvn(symbol, price))
 
+    # Hysteresis: sticky edges / sticky deletion so ALL consumers (triggers, poll
+    # refresh, bar-close refresh, orphan-cancel) see the same stable view.
+    zones = _stabilize_zones(symbol, tf, zones, sess)
     return zones, sess
 
 
@@ -1611,6 +1790,30 @@ def _t_candle_sweep(symbol: str, tf: str, current_price: float,
     )
 
 
+# ── trigger-list helpers ─────────────────────────────────────────────────────
+
+def _trigger_entry(cfg: dict | None, kind: str) -> dict | None:
+    """Return the trigger config dict for `kind` if enabled, else None."""
+    for entry in ((cfg or {}).get("triggers") or []):
+        if isinstance(entry, str):
+            if entry == kind:
+                return {"kind": kind}
+        elif isinstance(entry, dict) and entry.get("kind") == kind:
+            if entry.get("enabled", True):
+                return entry
+            return None
+    return None
+
+
+def _kind_active_for_tf(cfg: dict | None, kind: str, tf: str) -> bool:
+    """True if `kind` is enabled in the triggers list and `tf` is in its tfs."""
+    entry = _trigger_entry(cfg, kind)
+    if entry is None:
+        return False
+    tfs = entry.get("tfs")
+    return (not tfs) or (tf in tfs)
+
+
 # ── public entry ────────────────────────────────────────────────────────────
 
 def detect_all(symbol: str, tf: str, current_price: float, regime,
@@ -1629,8 +1832,8 @@ def detect_all(symbol: str, tf: str, current_price: float, regime,
     out: list[Trigger] = []
     for t in (
         _t_imbalance(symbol, tf, current_price),
-        _t_hvn_edge(symbol, current_price),
-        _t_hvn_inside_touch(symbol, tf, current_price),
+        _t_hvn_edge(symbol, tf, current_price, cfg),
+        _t_hvn_inside_touch(symbol, tf, current_price) if _kind_active_for_tf(cfg, "hvn_inside_touch", tf) else None,
         _t_hvn_displacement(symbol, tf, current_price, daily_vp),
         _t_anchor(symbol, current_price, atr, latest),
         _t_va(symbol, current_price, regime, daily_vp),
@@ -1638,7 +1841,7 @@ def detect_all(symbol: str, tf: str, current_price: float, regime,
         _t_squeeze(symbol, tf, current_price, atr, cfg),
         _t_bb_expansion_touch(symbol, tf, current_price, atr, cfg),
         _t_cvd_div(symbol, tf, current_price, latest),
-        _t_candle_sweep(symbol, tf, current_price, cfg),
+        _t_candle_sweep(symbol, tf, current_price, cfg) if _kind_active_for_tf(cfg, "candle_sweep", tf) else None,
     ):
         if t is not None:
             out.append(t)
