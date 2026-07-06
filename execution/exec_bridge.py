@@ -30,6 +30,7 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 _AUDIT_LOG = _ROOT / "data" / "exec_bridge.jsonl"
 _EMIT_LOG = _ROOT / "data" / "exec_emit.jsonl"   # ground-truth arm/exit decisions
+_LAST_ACCOUNT_FILE = _ROOT / "data" / "last_account.txt"   # detects an account switch across restarts
 
 from execution.arm_state_store import persist_arm, persist_emit, load as _load_arm_state  # noqa: E402
 
@@ -184,6 +185,61 @@ class ExecBridge:
     # intrabar touch-arm tick-reversal state — keyed by (account, broker_symbol, tf)
     # tracks an edge tap awaiting a reversal-back-inside confirm (touch-arm path)
     _touch_state: dict[tuple, dict] = {}           # → {edge, side, tapped_px, ts}
+    _last_seen_account: str | None = None   # cached from _LAST_ACCOUNT_FILE on first poll
+
+    # ── account-switch cleanup ──────────────────────────────────────────────────
+    @classmethod
+    def check_account_switch(cls, account: str) -> int:
+        """Detect the EA polling a DIFFERENT account than last seen (persisted across
+        restarts in _LAST_ACCOUNT_FILE) and retire every stale arm left over from the
+        old account — otherwise those ghost cycles keep re-arming/reaping forever
+        (they can never fill: the EA only executes for the account it's logged into).
+
+        Returns the number of arms retired (0 on no switch / first-ever poll)."""
+        account = str(account)
+        if cls._last_seen_account is None:
+            try:
+                cls._last_seen_account = _LAST_ACCOUNT_FILE.read_text().strip() or None
+            except Exception:
+                cls._last_seen_account = None
+        retired = 0
+        if cls._last_seen_account and cls._last_seen_account != account:
+            # sweep EVERY other account, not just the immediately-previous one —
+            # arms can accumulate across several past account switches.
+            retired = cls._retire_other_accounts(account)
+            import logging
+            logging.getLogger(__name__).info(
+                f"[exec] account switch {cls._last_seen_account} → {account}: "
+                f"retired {retired} stale arm(s) across other accounts")
+        if cls._last_seen_account != account:
+            cls._last_seen_account = account
+            try:
+                _LAST_ACCOUNT_FILE.parent.mkdir(parents=True, exist_ok=True)
+                _LAST_ACCOUNT_FILE.write_text(account)
+            except Exception:
+                pass
+        return retired
+
+    @classmethod
+    def _retire_other_accounts(cls, current_account: str) -> int:
+        """Mark every active arm NOT belonging to `current_account` inactive and clear
+        its emit cooldown, so it stops being polled/reaped. Persists via the normal
+        set_last_arm/clear_emit paths (each takes cls._lock itself — collect keys
+        under the lock, then release before calling them, since _lock is non-reentrant)."""
+        with cls._lock:
+            keys = [k for k, m in cls._last_arm.items()
+                    if k[0] != current_account and m.get("active")]
+        for (acc, sym, magic) in keys:
+            cyc = cls.get_last_arm(acc, sym, magic=magic) or {}
+            # magic= must come from the OUTER key, passed explicitly — a stale/legacy
+            # arm body can carry its own wrong/absent "magic" field (seen: 0 on old
+            # "recovered" stubs), and spreading that over the explicit kwarg would
+            # collide anyway. Strip it from the spread so the outer key always wins
+            # (see project_arm_magic_key_bug memory).
+            cyc.pop("magic", None)
+            cls.set_last_arm(acc, sym, magic=magic, **{**cyc, "active": False})
+            cls.clear_emit(acc, sym, magic=magic)
+        return len(keys)
 
     # ── daily P&L target ────────────────────────────────────────────────────────
     @classmethod
@@ -382,7 +438,8 @@ class ExecBridge:
                       pnl: float | None = None, buys: int | None = None,
                       sells: int | None = None, now: float | None = None,
                       tf: str = "", magic: int = 0,
-                      buy_pnl: float | None = None, sell_pnl: float | None = None) -> str | None:
+                      buy_pnl: float | None = None, sell_pnl: float | None = None,
+                      buy_lots: float | None = None, sell_lots: float | None = None) -> str | None:
         """Evaluate the active grid cycle on `(account, symbol, tf)` and, if any exit
         trigger fires, enqueue ONE CLOSE_ALL scoped to `magic` (flatten ONLY this TF's
         position pool — sibling TF cycles on the same symbol are untouched). Returns the
@@ -657,26 +714,35 @@ class ExecBridge:
                                       "squeeze_ok": cyc.get("squeeze_ok"),
                                       "squeeze_rank": cyc.get("squeeze_rank")})
 
-        # net-basket exit (which a hedge leg can mask). Gate: a side has ALL its legs
-        # filled (the move committed your way). Track that side's peak floating P&L; when
-        # it gives back ≥ giveback% from the peak, BOOK half that side and move the rest
-        # to breakeven (risk-free runner). Fires once per cycle (bias_booked guard).
+        # net-basket exit (which a hedge leg can mask). Gate: a side has a LOT-WEIGHTED
+        # MAJORITY of its planned exposure filled (>50% of buy_lots_total/sell_lots_total,
+        # not >50% of leg COUNT — the ladder's far legs carry more lot size than near ones,
+        # so a count-based gate under/over-states real commitment). Track that side's peak
+        # floating P&L; when it gives back ≥ giveback% from the peak, BOOK half that side
+        # and move the rest to breakeven (risk-free runner).
+        # Fires once per cycle — guarded by bias_trail_done, a PRIVATE one-shot flag
+        # (NOT bias_booked, which the flatten-rest suppression below resets one poll
+        # after booking; gating on bias_booked let the trail double/triple-fire within
+        # seconds of the first book, each time at a worse price).
         if (bool(grid_cfg.get("bias_trail_enabled", True))
-                and not cyc.get("bias_booked")
+                and not cyc.get("bias_trail_done")
                 and buy_pnl is not None and sell_pnl is not None):
-            buy_n = int(cyc.get("buy_n") or 0)
-            sell_n = int(cyc.get("sell_n") or 0)
+            buy_lots_total  = float(cyc.get("buy_lots_total")  or 0.0)
+            sell_lots_total = float(cyc.get("sell_lots_total") or 0.0)
             bias = ""
             _bias_peak_set = float(cyc.get("bias_peak") or 0.0) > 0.0
-            if buy_n > 0 and int(buys or 0) > 0 and (int(buys or 0) >= buy_n or _bias_peak_set):
+            if buy_lots_total > 0 and float(buy_lots or 0.0) > 0 \
+                    and (float(buy_lots or 0.0) > buy_lots_total / 2 or _bias_peak_set):
                 bias = "buy"
-            elif sell_n > 0 and int(sells or 0) > 0 and (int(sells or 0) >= sell_n or _bias_peak_set):
+            elif sell_lots_total > 0 and float(sell_lots or 0.0) > 0 \
+                    and (float(sell_lots or 0.0) > sell_lots_total / 2 or _bias_peak_set):
                 bias = "sell"
             if bias:
                 side_pnl = float(buy_pnl if bias == "buy" else sell_pnl)
                 peak = max(float(cyc.get("bias_peak") or 0.0), side_pnl)
-                if peak != float(cyc.get("bias_peak") or 0.0):
+                if peak != float(cyc.get("bias_peak") or 0.0) or cyc.get("bias_side") != bias:
                     cyc["bias_peak"] = peak
+                    cyc["bias_side"] = bias   # persisted so downstream (dashboard) doesn't re-derive
                     cls.set_last_arm(account, symbol, **cyc)
                 # Per-TF activate (mirrors cycle_net_target_by_tf): scale the trail-arm
                 # threshold to the TF so a big-target cycle isn't BE-locked on a tiny wiggle.
@@ -694,7 +760,10 @@ class ExecBridge:
                                 frac=book_frac, comment=f"FB|book|{bias}", now=t)
                     cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=bias,
                                 comment=f"FB|be|{bias}", now=t)
-                    cls.set_last_arm(account, symbol, **{**cyc, "bias_booked": True})
+                    # bias_trail_done = private one-shot (never reset while cycle lives);
+                    # bias_booked = flatten-rest suppression (reset by that block below).
+                    cls.set_last_arm(account, symbol, **{**cyc, "bias_booked": True,
+                                                         "bias_trail_done": True})
                     _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
                                       "tf": tf, "magic": magic, "exit_reason": "bias_book_trail",
                                       "bias": bias, "peak": round(peak, 2),

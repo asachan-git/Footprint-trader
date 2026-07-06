@@ -358,12 +358,41 @@ def _get_offset(sym: dict) -> float:
     return float(sym.get("venue_price_offset") or 0.0)
 
 
+def _union_zones_vp(primary: dict, secondary: dict) -> dict:
+    """Copy of `primary` whose hvn_zones/lvn_zones are the union of both profiles'
+    zones with overlapping/touching spans merged. Levels (poc/vah/val/ranges) stay
+    primary's — only the structural zone lists are widened."""
+    def _merge(key: str) -> list[dict]:
+        spans = sorted(
+            (float(z["low"]), float(z["high"]))
+            for z in (primary.get(key) or []) + (secondary.get(key) or [])
+        )
+        out: list[list[float]] = []
+        for lo, hi in spans:
+            if out and lo <= out[-1][1]:
+                out[-1][1] = max(out[-1][1], hi)
+            else:
+                out.append([lo, hi])
+        return [{"low": round(lo, 4), "high": round(hi, 4)} for lo, hi in out]
+
+    merged = dict(primary)
+    merged["hvn_zones"] = _merge("hvn_zones")
+    merged["lvn_zones"] = _merge("lvn_zones")
+    return merged
+
+
 def get(symbol: str, period: str) -> dict | None:
     """Get cached VP for symbol + period (today / this week), venue-offset applied.
 
-    For daily: before 20:00 IST (14:30 UTC) uses prev-D VP so Asia/London sessions
-    trade on a completed reference profile. At/after 20:00 IST switches to today's
-    accumulating VP (NY session reference). Falls back to prev-D if today not yet built.
+    For daily, three IST time bands:
+      < 09:00      → prev-D only (early Asia — today has too few bars to be structural)
+      09:00-19:59  → BOTH: levels (poc/vah/val) from today's accumulating VP,
+                     hvn_zones/lvn_zones = UNION of prev-D + today (overlaps merged) so
+                     completed structure is never dropped while the session forms
+      >= 20:00     → today only (NY reference). Price escaping today's structure is
+                     handled downstream by the prior-5-day vacuum fallback
+                     (zone_triggers._prior_day_hvn via get_history(n=5)).
+    Falls back to prev-D alone if today not yet built.
     """
     cache = _load()
     sym = cache.get(symbol, {})
@@ -372,16 +401,16 @@ def get(symbol: str, period: str) -> dict | None:
     offset = _get_offset(sym)
     if period == "daily":
         ist_now = datetime.fromtimestamp(now_ts, tz=_IST)
-        use_prev = ist_now.hour < 20  # before 20:00 IST → use prev-D completed profile
-        if use_prev:
-            prev_key = _session_day_key(now_ts - 86400, anchor)
-            vp = sym.get("daily", {}).get(prev_key)
+        prev_key = _session_day_key(now_ts - 86400, anchor)
+        today_key = _session_day_key(now_ts, anchor)
+        prev_vp = sym.get("daily", {}).get(prev_key)
+        today_vp = sym.get("daily", {}).get(today_key)
+        if ist_now.hour < 9:
+            vp = prev_vp
+        elif ist_now.hour < 20 and today_vp and prev_vp:
+            vp = _union_zones_vp(today_vp, prev_vp)
         else:
-            key = _session_day_key(now_ts, anchor)
-            vp = sym.get("daily", {}).get(key)
-            if vp is None:
-                prev_key = _session_day_key(now_ts - 86400, anchor)
-                vp = sym.get("daily", {}).get(prev_key)
+            vp = today_vp or prev_vp
     elif period == "weekly":
         key = _week_key(now_ts)
         vp = sym.get("weekly", {}).get(key)
@@ -433,7 +462,7 @@ def _profile_draw_cfg() -> dict:
     Read once from settings.grid_levels; decoupled from detection/grid bins."""
     global _PROFILE_CFG_CACHE
     if _PROFILE_CFG_CACHE is None:
-        cfg = {"bin": {}, "smooth": 0.0, "points": 150}
+        cfg = {"bin": {}, "smooth": 0.0, "points": 150, "days": 2}
         try:
             import yaml as _yaml
             import pathlib as _pl
@@ -446,6 +475,7 @@ def _profile_draw_cfg() -> dict:
             cfg["bin"] = _g.get("vp_profile_bin") or {}
             cfg["smooth"] = float(_g.get("vp_profile_smooth", 0.0) or 0.0)
             cfg["points"] = int(_g.get("vp_profile_points", 150) or 150)
+            cfg["days"] = int(_g.get("vp_profile_days", 2) or 2)
         except Exception:
             pass
         _PROFILE_CFG_CACHE = cfg
@@ -520,10 +550,12 @@ def period_profile(symbol: str, period: str) -> dict | None:
 
 
 def period_profiles_session(symbol: str) -> list[dict]:
-    """Return VP histograms for prev-D and today's sessions, each anchored at session start.
+    """Return VP histograms for the last `vp_profile_days` sessions plus today's
+    forming (rolling) session, each anchored at its own session start.
 
     Returns a list (oldest first) of {"bin", "profile", "start_ts"} dicts suitable for
-    the EA's session-anchored VP drawing. Entries are omitted if <30 bars are available."""
+    the EA's session-anchored VP drawing. Entries are omitted if <30 bars are available,
+    so thin/closed days simply drop out."""
     from pipeline.state_store import store as _store
     cache = _load()
     sym = cache.get(symbol, {})
@@ -533,13 +565,25 @@ def period_profiles_session(symbol: str) -> list[dict]:
     now_ts = int(time.time())
     _draw_cfg = _profile_draw_cfg()
     _draw_bin = float((_draw_cfg["bin"] or {}).get(symbol, 0.0) or 0.0) or (float(bin_cfg) if bin_cfg else None)
+    _days = int(_draw_cfg.get("days") or 2)
 
-    today_key = _session_day_key(now_ts, anchor)
-    prev_key = _session_day_key(now_ts - 86400, anchor)
+    # oldest → newest, ending at today's forming session (day 0 = rolling).
+    # Sat/Sun session days are SKIPPED (thin crypto-venue weekend trade — not structural);
+    # walk back extra calendar days until `_days` trading days are collected.
+    day_keys = []
+    i = 0
+    while len(day_keys) < _days and i < _days + 6:
+        k = _session_day_key(now_ts - i * 86400, anchor)
+        i += 1
+        if datetime.strptime(k, "%Y-%m-%d").weekday() >= 5:   # 5=Sat 6=Sun
+            continue
+        if k not in day_keys:
+            day_keys.append(k)
+    day_keys.reverse()
 
     all_bars = _store().recent(symbol, "1m", 100_000)
     results = []
-    for day_key in (prev_key, today_key):
+    for day_key in day_keys:
         st, en = _day_bounds(day_key, anchor)
         end = min(en, now_ts)
         bars = [b for b in all_bars if st <= b.close_ts < end]
@@ -548,6 +592,24 @@ def period_profiles_session(symbol: str) -> list[dict]:
             prof["start_ts"] = st
             results.append(prof)
     return results
+
+
+def rolling_profile(symbol: str, minutes: int = 1440) -> dict | None:
+    """Trailing-window VP histogram (default 24h of 1m bars) — the same window the
+    grid trigger's rolling VP (`_rolling_hvn`) sees, for chart parity. Venue-offset
+    applied; start_ts = first bar of the window. None if <30 bars."""
+    from pipeline.state_store import store as _store
+    cache = _load()
+    sym = cache.get(symbol, {})
+    offset = _get_offset(sym)
+    bin_cfg = sym.get("bin_size")
+    _draw_cfg = _profile_draw_cfg()
+    _draw_bin = float((_draw_cfg["bin"] or {}).get(symbol, 0.0) or 0.0) or (float(bin_cfg) if bin_cfg else None)
+    bars = _store().recent(symbol, "1m", minutes)
+    prof = _profile_from_bars(bars, _draw_cfg, _draw_bin, offset)
+    if prof:
+        prof["start_ts"] = int(bars[0].close_ts)
+    return prof
 
 
 def get_va_regime(

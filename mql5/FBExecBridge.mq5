@@ -93,7 +93,8 @@ HvnCycleEntry gHvnCycles[];   // flat: one row per (HVN, cycle) pair
 struct GridCycleInfo { long magic; string tf; string kind; double fulcrum;
                        double tp_up; double tp_down;
                        int buy_n; int sell_n;
-                       double net_target; double trail_activate; bool squeeze_ok; };
+                       double net_target; double trail_activate; bool squeeze_ok;
+                       string trail_status; double bias_peak; string bias_side; };
 GridCycleInfo gGridCycles[];   // active cycles from /exec/zones grid_cycles array
 
 //--- chart-overlay indicator handles (3σ Bollinger Bands + FBSqueeze BBW% subwindow)
@@ -475,7 +476,7 @@ string BuildMagicsJson()
 {
    long   mg[];
    int    buys[], sells[], pend[];
-   double buyPnl[], sellPnl[];
+   double buyPnl[], sellPnl[], buyLots[], sellLots[];
 
    for(int i = 0; i < PositionsTotal(); i++)
    {
@@ -488,11 +489,13 @@ string BuildMagicsJson()
          k = ArraySize(mg);
          ArrayResize(mg, k + 1); ArrayResize(buys, k + 1); ArrayResize(sells, k + 1);
          ArrayResize(pend, k + 1); ArrayResize(buyPnl, k + 1); ArrayResize(sellPnl, k + 1);
+         ArrayResize(buyLots, k + 1); ArrayResize(sellLots, k + 1);
          mg[k] = m; buys[k] = 0; sells[k] = 0; pend[k] = 0; buyPnl[k] = 0.0; sellPnl[k] = 0.0;
+         buyLots[k] = 0.0; sellLots[k] = 0.0;
       }
       double p = posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
-      if(posInfo.PositionType() == POSITION_TYPE_BUY) { buys[k]++;  buyPnl[k]  += p; }
-      else                                            { sells[k]++; sellPnl[k] += p; }
+      if(posInfo.PositionType() == POSITION_TYPE_BUY) { buys[k]++;  buyPnl[k]  += p; buyLots[k]  += posInfo.Volume(); }
+      else                                            { sells[k]++; sellPnl[k] += p; sellLots[k] += posInfo.Volume(); }
    }
    for(int i = 0; i < OrdersTotal(); i++)
    {
@@ -505,7 +508,9 @@ string BuildMagicsJson()
          k = ArraySize(mg);
          ArrayResize(mg, k + 1); ArrayResize(buys, k + 1); ArrayResize(sells, k + 1);
          ArrayResize(pend, k + 1); ArrayResize(buyPnl, k + 1); ArrayResize(sellPnl, k + 1);
+         ArrayResize(buyLots, k + 1); ArrayResize(sellLots, k + 1);
          mg[k] = m; buys[k] = 0; sells[k] = 0; pend[k] = 0; buyPnl[k] = 0.0; sellPnl[k] = 0.0;
+         buyLots[k] = 0.0; sellLots[k] = 0.0;
       }
       pend[k]++;
    }
@@ -514,9 +519,11 @@ string BuildMagicsJson()
    for(int k = 0; k < ArraySize(mg); k++)
       js += (k == 0 ? "" : ",") +
             StringFormat("{\"magic\":%I64d,\"buys\":%d,\"sells\":%d,\"pendings\":%d,"
-                         "\"pnl\":%.2f,\"buy_pnl\":%.2f,\"sell_pnl\":%.2f}",
+                         "\"pnl\":%.2f,\"buy_pnl\":%.2f,\"sell_pnl\":%.2f,"
+                         "\"buy_lots\":%.4f,\"sell_lots\":%.4f}",
                          mg[k], buys[k], sells[k], pend[k],
-                         buyPnl[k] + sellPnl[k], buyPnl[k], sellPnl[k]);
+                         buyPnl[k] + sellPnl[k], buyPnl[k], sellPnl[k],
+                         buyLots[k], sellLots[k]);
    return js;
 }
 
@@ -1271,6 +1278,9 @@ void DrawGridCycles()
       double cful = gGridCycles[i].fulcrum;
       double cnet = gGridCycles[i].net_target;
       bool   csq  = gGridCycles[i].squeeze_ok;
+      string ctrl = gGridCycles[i].trail_status;
+      double cpk  = gGridCycles[i].bias_peak;
+      string cbs  = gGridCycles[i].bias_side;
       // TF color: 1m=aqua 5m=lime 15m=gold 1h=orange else=silver
       color clr = clrSilver;
       if(ctf == "1m")       clr = clrAqua;
@@ -1314,14 +1324,20 @@ void DrawGridCycles()
       if(lbPx > 0)
       {
          datetime tR = TimeCurrent() + 20 * PeriodSeconds(PERIOD_CURRENT);
-         string lbtxt = ctf + " " + cknd + " net=" + DoubleToString(cnet, 0) + (csq ? " SQ" : "");
+         // trail suffix: "TRAIL armed buy@327" (peak tracking, watching giveback%) or
+         // "TRAIL BOOKED" (fired — half closed + rest moved to BE, one-shot per cycle)
+         string trailtxt = "";
+         if(ctrl == "booked")      trailtxt = " | TRAIL BOOKED";
+         else if(ctrl == "armed")  trailtxt = " | TRAIL armed " + cbs + "@" + DoubleToString(cpk, 0);
+         string lbtxt = ctf + " " + cknd + " net=" + DoubleToString(cnet, 0) + (csq ? " SQ" : "") + trailtxt;
+         color  lclr  = (ctrl == "booked") ? clrLime : (ctrl == "armed") ? clrYellow : clr;
          if(ObjectFind(0, lname) < 0) ObjectCreate(0, lname, OBJ_TEXT, 0, tR, lbPx);
          ObjectSetInteger(0, lname, OBJPROP_TIME,  0, tR);
          ObjectSetDouble (0, lname, OBJPROP_PRICE, 0, lbPx);
          ObjectSetString (0, lname, OBJPROP_TEXT,  " " + lbtxt);
          ObjectSetString (0, lname, OBJPROP_FONT,  "Consolas");
          ObjectSetInteger(0, lname, OBJPROP_FONTSIZE, 7);
-         ObjectSetInteger(0, lname, OBJPROP_COLOR, clr);
+         ObjectSetInteger(0, lname, OBJPROP_COLOR, lclr);
          ObjectSetInteger(0, lname, OBJPROP_ANCHOR, ANCHOR_LEFT);
          ObjectSetInteger(0, lname, OBJPROP_SELECTABLE, false);
          ObjectSetInteger(0, lname, OBJPROP_BACK,  false);
@@ -1468,6 +1484,9 @@ void FetchAndDrawZones()
       gGridCycles[i].net_target    = JsonGetNumber(gcs[i], "net_target");
       gGridCycles[i].trail_activate= JsonGetNumber(gcs[i], "trail_activate");
       gGridCycles[i].squeeze_ok    = (JsonGetNumber(gcs[i], "squeeze_ok") > 0.5);
+      gGridCycles[i].trail_status  = JsonGetString(gcs[i], "trail_status");
+      gGridCycles[i].bias_peak     = JsonGetNumber(gcs[i], "bias_peak");
+      gGridCycles[i].bias_side     = JsonGetString(gcs[i], "bias_side");
    }
    DrawGridCycles();
 

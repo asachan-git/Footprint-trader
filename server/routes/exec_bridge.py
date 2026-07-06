@@ -519,7 +519,9 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                             trigger_kind=plan.trigger_kind, venue_mid=venue_mid, magic=leg_magic,
                             n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
                             buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
-                            bias_peak=0.0, bias_booked=False,
+                            buy_lots_total=round(sum(l.lot for l in plan.buy_legs), 4),
+                            sell_lots_total=round(sum(l.lot for l in plan.sell_legs), 4),
+                            bias_peak=0.0, bias_booked=False, bias_trail_done=False,
                             be_done_buy=False, be_done_sell=False,
                             node_low=round(node_low, 5), node_high=round(node_high, 5),
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
@@ -545,6 +547,10 @@ def exec_poll():
     account = str(body.get("account") or "")
     if not account:
         return jsonify({"ok": False, "error": "missing account"}), 400
+    # Detect the EA polling a different account than last seen (persisted across
+    # restarts) and retire stale arms left over from the old one — they can never
+    # fill once the EA has switched accounts.
+    ExecBridge.check_account_switch(account)
     # The EA reports its live Vantage quote on each poll → cache it so the emitter
     # can rebase analysis-frame plans onto the venue price at build time.
     sym = body.get("symbol")
@@ -604,7 +610,9 @@ def exec_poll():
                 ExecBridge.monitor_cycle(account, sym, settings_cfg, tf=tf_m, magic=mg,
                                          pnl=float(m.get("pnl", 0.0)), buys=b, sells=s,
                                          buy_pnl=float(m.get("buy_pnl", 0.0)),
-                                         sell_pnl=float(m.get("sell_pnl", 0.0)))
+                                         sell_pnl=float(m.get("sell_pnl", 0.0)),
+                                         buy_lots=float(m.get("buy_lots", 0.0)),
+                                         sell_lots=float(m.get("sell_lots", 0.0)))
                 # NOTE: HVN-driven TP/entry refresh runs on CANDLE CLOSE only (in the
                 # /exec/emit_grid position_open path), NOT here on the 1s poll — by design,
                 # so orders re-target structure once per bar, not every tick.
@@ -698,6 +706,13 @@ def exec_ack():
     results = body.get("results") or []
     summary = ExecBridge.ack(results)
     LOG.info(f"[exec] ack account={body.get('account')} → {summary}")
+    # surface broker reject codes — an all-fail ack loop is invisible without them
+    _fails = [r for r in results if not r.get("ok")]
+    if _fails:
+        from collections import Counter as _Ctr
+        _codes = _Ctr(str(r.get("retcode", "?")) for r in _fails)
+        LOG.warning(f"[exec] ack FAILURES account={body.get('account')} "
+                    f"retcodes={dict(_codes)} sample={_fails[0]}")
     return jsonify({"ok": True, **summary})
 
 
@@ -1043,11 +1058,18 @@ def exec_emit_grid():
     from execution.exec_bridge import PLACE_PENDING as _PP
     _placed_buy  = sum(1 for c in cmds if c.type == _PP and c.order_type == "buy_stop")
     _placed_sell = sum(1 for c in cmds if c.type == _PP and c.order_type == "sell_stop")
+    # Planned lot totals per side (sum of each leg's lot, not leg COUNT) — bias_trail
+    # gates on lot-weighted fill fraction so a majority-of-LOTS fill (which is what
+    # actually commits the cycle's exposure) arms the trail, not just majority-of-legs
+    # (near-fulcrum legs are lighter under _ladder's far-side-heavy scaling).
+    _buy_lots_total  = round(sum(l.lot for l in plan.buy_legs), 4)
+    _sell_lots_total = round(sum(l.lot for l in plan.sell_legs), 4)
     ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum, edge=edge,
                             trigger_kind=plan.trigger_kind, venue_mid=quote["mid"], magic=leg_magic,
                             n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
                             buy_n=_placed_buy, sell_n=_placed_sell,
-                            bias_peak=0.0, bias_booked=False,
+                            buy_lots_total=_buy_lots_total, sell_lots_total=_sell_lots_total,
+                            bias_peak=0.0, bias_booked=False, bias_trail_done=False,
                             be_done_buy=False, be_done_sell=False,
                             node_low=round(node_low, 5), node_high=round(node_high, 5),
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
@@ -1230,14 +1252,15 @@ def exec_zones():
         return [(float(z["low"]), float(z["high"]))
                 for z in ((period.get(key) or []) if period else [])]
 
-    # Session-aware zone drawing:
-    #   Asia              → prev-D only (today barely started, prev-D = reference)
-    #   London / Overlap  → prev-D + today merged (both sessions in play)
-    #   NY                → today only; prev-D zones only where outside today's range
-    #   Off               → prev-D only (session closed)
+    # IST time-band zone drawing — mirrors vp_cache.get(daily) exactly so the chart shows
+    # the SAME structure the grid trades on:
+    #   < 09:00 IST     → prev-D only (early Asia — today not yet structural)
+    #   09:00-19:59 IST → prev-D as hvn/lvn + today as hvn_today/lvn_today (union in play)
+    #   >= 20:00 IST    → today primary; prev-D zones only where outside today's range
+    #                     (chart analog of the prior-day vacuum fallback)
     # Fallback: if the preferred source is empty, drop to whichever exists.
-    from pipeline.features.session import current_session as _cur_sess
-    _sess = _cur_sess(symbol=symbol).session   # Asia|London|Overlap|NY|Off
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    _ist_hour = _dt.now(tz=_tz(_td(hours=5, minutes=30))).hour
 
     zones = []
     if _draw_dual:
@@ -1250,32 +1273,27 @@ def exec_zones():
             zones.append({"kind": "hvn_today", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
         for lo, hi in _collect(_today_daily, "lvn_zones"):
             zones.append({"kind": "lvn_today", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-    elif _sess in ("Asia", "Off"):
-        # prev-D as primary reference; today's forming session overlaid as hvn_today/lvn_today.
-        # Fall back to today if prev-D not yet cached.
+    elif _ist_hour < 9:
+        # pre-09:00: prev-D only (fall back to today if prev-D not yet cached)
         _src = _prev_daily or _today_daily
         for lo, hi in _collect(_src, "hvn_zones"):
             zones.append({"kind": "hvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
         for lo, hi in _collect(_src, "lvn_zones"):
             zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-        # Also draw today's forming zones so the developing session structure is visible.
+    elif _ist_hour < 20:
+        # 09:00-19:59: both — prev-D as hvn/lvn, today distinct as hvn_today/lvn_today
+        _src = _prev_daily or _today_daily
+        for lo, hi in _collect(_src, "hvn_zones"):
+            zones.append({"kind": "hvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+        for lo, hi in _collect(_src, "lvn_zones"):
+            zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
         if _today_daily and _today_daily is not _src:
             for lo, hi in _collect(_today_daily, "hvn_zones"):
                 zones.append({"kind": "hvn_today", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
             for lo, hi in _collect(_today_daily, "lvn_zones"):
                 zones.append({"kind": "lvn_today", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-    elif _sess in ("London", "Overlap"):
-        # prev-D + today — today drawn with distinct color so overlap is visible
-        for lo, hi in _collect(_prev_daily, "hvn_zones"):
-            zones.append({"kind": "hvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-        for lo, hi in _collect(_prev_daily, "lvn_zones"):
-            zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-        for lo, hi in _collect(_today_daily, "hvn_zones"):
-            zones.append({"kind": "hvn_today", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-        for lo, hi in _collect(_today_daily, "lvn_zones"):
-            zones.append({"kind": "lvn_today", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
     else:
-        # NY: today's zones primary; add prev-D zones only outside today's price range
+        # >= 20:00: today's zones primary; add prev-D zones only outside today's price range
         _today_hvn = _collect(_today_daily, "hvn_zones")
         _today_lvn = _collect(_today_daily, "lvn_zones")
         _today_all = _today_hvn + _today_lvn
@@ -1325,6 +1343,11 @@ def exec_zones():
     # profile. Returns two sessions (prev-D + today) each with start_ts so the EA can
     # anchor each histogram at its session open rather than the visible-range edge.
     _sess_profs = vp_cache.period_profiles_session(symbol)
+    # current ROLLING 24h VP appended last — the window the grid trigger's rolling
+    # source actually sees (crosses the session boundary, unlike the day profiles).
+    _roll = vp_cache.rolling_profile(symbol)
+    if _roll:
+        _sess_profs = _sess_profs + [_roll]
     profiles = []
     for _sp in _sess_profs:
         _pb = round(float(_sp.get("bin", 0.0)) * _zone_ratio, 5) if _sp.get("bin") else 0.0
@@ -1440,6 +1463,19 @@ def exec_zones():
         if _cyc.get("squeeze_ok"):
             _net *= _gc_sq_tm
             _tr  *= _gc_sq_tr
+        # Trail status for the dashboard: "armed" once bias_peak has cleared the
+        # activate threshold (trail is live-tracking, watching for the giveback%),
+        # "booked" once it has fired (bias_trail_done, one-shot — see
+        # project_arm_magic_key_bug / the double-fire fix for why this is a
+        # separate flag from bias_booked), else "off".
+        _peak = float(_cyc.get("bias_peak") or 0.0)
+        if _cyc.get("bias_trail_done"):
+            _trail_status = "booked"
+        elif _tr > 0 and _peak >= _tr:
+            _trail_status = "armed"
+        else:
+            _trail_status = "off"
+        _bias_side = str(_cyc.get("bias_side") or "")   # persisted by monitor_cycle when peak is set
         grid_cycles.append({
             "magic": _mg, "tf": _tf,
             "kind": _cyc.get("trigger_kind", ""),
@@ -1450,6 +1486,9 @@ def exec_zones():
             "sell_n": _cyc.get("sell_n", 0),
             "net_target": round(_net, 2),
             "trail_activate": round(_tr, 2),
+            "trail_status": _trail_status,
+            "bias_peak": round(_peak, 2),
+            "bias_side": _bias_side,
             "squeeze_ok": bool(_cyc.get("squeeze_ok")),
         })
 

@@ -44,24 +44,24 @@ grid_levels:
 
   # ── TUNING (adjust frequently based on account size / market conditions) ─────
   # Position sizing
-  base_lot: 0.5          # smallest leg lot; ladder scales up by lot_step per leg
-  lot_step: 0.5           # lot increment per leg (leg_i = base + i×step, capped at max_lots)
-  max_lots: 2.5          # hard cap per leg regardless of risk math
+  base_lot: 0.75          # smallest leg lot; ladder scales up by lot_step per leg
+  lot_step: 0.75           # lot increment per leg (leg_i = base + i×step, capped at max_lots)
+  max_lots: 3          # hard cap per leg regardless of risk math
 
   # Ladder shape
-  hvn_max_legs_by_tf: {}     # BTC: no per-TF override → flat hvn_max_legs (8) all TFs
-  mean_rev_step_mult: 0.50   # BTC MEAN_REV_STEP_MULT: step = 0.50×ATR (range); trend uses 0.35 (code const)
-  mean_rev_step_mult_by_tf: {}   # BTC: no per-TF override → flat 0.50 all TFs
+  hvn_max_legs_by_tf: {1m: 4, 5m: 5, 15m: 6, 1h: 7}   # legs per side per TF (pre-BTC-replay tuning)
+  mean_rev_step_mult: 0.30   # step = this × ATR between legs (fallback when TF not in by_tf map)
+  mean_rev_step_mult_by_tf: {1m: 1, 5m: 0.40, 15m: 0.20, 1h: 0.10}   # per-TF override — tighter than BTC's flat 0.50
 
   # Cycle profit targets — primary basket exit (net floating ≥ target → CLOSE_ALL)
   # Values are in native account currency (USC cents for Vantage XAUUSD.pc cent account;
   # plain USD for a standard USD account). 1 USD = 100 USC on a cent account.
-  cycle_net_target_by_tf: {1m: 1000.0, 5m: 1500.0, 15m: 2000.0, 1h: 3000.0}   # per-TF (USC; real $10/$15/$20/$30)
-  cycle_net_target_usd: 5000.0   # fallback when TF not in by_tf map
+  cycle_net_target_by_tf: {1m: 1500.0, 5m: 2000.0, 15m: 3000.0, 1h: 3000.0}   # per-TF (USC; real $10/$15/$20/$30)
+  cycle_net_target_usd: 7500.0   # fallback when TF not in by_tf map
 
   # Bias trail — arms when peak floating ≥ activate, fires on giveback% retrace.
   # Values are in native account currency (same note as cycle_net_target above).
-  bias_trail_activate_by_tf: {1m: 500, 5m: 500, 15m: 500, 1h: 500}   # $5 (500 USC) every TF
+  bias_trail_activate_by_tf: {1m: 750, 5m: 750, 15m: 750, 1h: 750}   # $5 (500 USC) every TF
   bias_trail_giveback_pct: 40    # fire when floating retraces this % off the peak (Jun19: 40 — books sooner)
   bias_book_frac: 0.5            # fraction of bias-side positions to close at trail trigger (Jun19: 0.5 — keep a BE runner)
 
@@ -122,7 +122,7 @@ grid_levels:
   # Wick proximity buffer for hvn_inside_touch: fire if wick came within this many price
   # units of the edge even without crossing it (e.g. 0.5pt catches near-misses on gold).
   # 0.0 = exact touch only (original behaviour). Edge is still the fulcrum price.
-  hvn_touch_buffer: 0.1
+  hvn_touch_buffer: 0.02
   hvn_edge_lookback: 3           # bars to scan back for a prior breakout close outside HVN
   hvn_edge_tap_buffer: 0.3        # wick must come within this many $ of the HVN edge to qualify as a tap
   hvn_edge_min_step: 1.0          # minimum leg spacing ($); reduces n until step >= this (0 = no floor)
@@ -330,8 +330,10 @@ vp_cache:
   # The server smooths then downsamples to ≤256 points so fine bins stay performant on the EA.
   vp_profile_bin:
     XAUTUSDT: 0.1            # 0.1$ (full tick res) for a smooth gold profile; grid still uses 0.4
-  vp_profile_smooth: 1.0    # Gaussian (price units) — visible curve; 0 = raw bars, 1.5 over-blobs
-  vp_profile_points: 150    # number of histogram ROWS (bars). Volume is SUMMED per row, so fewer
+  vp_profile_smooth: 0    # Gaussian (price units) — 0 = raw bars (matches /dashboard); 1.0 curve, 1.5 over-blobs
+  vp_profile_days: 5       # how many TRADING-day VP histograms the EA draws (Sat/Sun sessions
+                           # skipped; each anchored at its session start; newest = today rolling)
+  vp_profile_points: 40    # number of histogram ROWS (bars). Volume is SUMMED per row, so fewer
                             # rows = chunkier TV-like bars without losing volume. ~50-200 typical.
   # Drawn HVN/LVN: merge prev-D ∪ today into ONE clean set; combine nodes within this gap ($)
   # so the chart isn't a cluttered interleave of two overlapping sets. 0 = overlaps only.
@@ -354,7 +356,7 @@ execution:
   broker_utc_offset_hours: 3      # Vantage server time = UTC+3 (EET); used to shift CVD arrow timestamps
   tradable_symbols: [XAUTUSDT, BTCUSDT]
   symbol_map:
-    XAUTUSDT: "XAUUSD.pc"        # Vantage MT5 USC cent account (26443422)
+    XAUTUSDT: "XAUUSD.pc"        # Vantage MT5 USC cent account (24678823; 26443422 algo-disabled by broker 2026-07-06)
     BTCUSDT:  "BTCUSD"
   # Risk-adjusted sizing: lots = (balance × risk_per_trade_pct) / (SL_distance × contract_size)
   # Set risk_per_trade_pct = 0 to disable; falls back to default_lots.
@@ -398,7 +400,7 @@ risk:
 # Daily floating P&L target — close all grid positions and block new arms for the day
 # once equity rises by this % above the session-open balance.
 # 0 = disabled. Example: 1.5 = close everything once up 1.5% on the day.
-daily_target_pct: 20.0
+daily_target_pct: 50.0
 
 # Dhan options trading configuration
 dhan:
