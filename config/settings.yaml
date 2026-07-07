@@ -154,6 +154,11 @@ grid_levels:
   # before CLOSE_ALL; a check that finds the anchor again resets the count.
   hvn_fade_confirm_n: 3
   hvn_fade_strike_min_gap_s: 240
+  # FROZEN-cycle pending re-anchor: once a leg fills the fulcrum is LOCKED for filled-leg
+  # management, but resting (unfilled) pendings re-track the live HVN/LVN edge each bar-close
+  # (pending-scoped, no fade-flatten, follows only a nearby edge ≤2×step). false = legs stay
+  # pinned at arm-time prices (pre-2026-07-07 behaviour).
+  reanchor_pending_when_frozen: true
   # ORDER-MODIFY NOISE FLOORS (fractions of the leg step; venue frame). Sub-step edge
   # wiggle must not reach the broker — modify rate is what Vantage flagged.
   hvn_shift_min_frac_step: 0.25   # fulcrum shift floor = max(frac×step, 0.1)

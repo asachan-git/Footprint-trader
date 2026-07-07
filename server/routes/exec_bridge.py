@@ -100,16 +100,57 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
     _open_buys = int((open_state.get("buys") or 0))
     _open_sells = int((open_state.get("sells") or 0))
 
+    _gcfg = settings.get("grid_levels") or {}
     # FROZEN cycle: once a leg filled, the VP/HVN structure was snapshotted (monitor_cycle).
-    # We manage against THAT frozen structure — fulcrum is LOCKED (no shift/re-anchor), no
-    # fade-flatten (morphing live VP is irrelevant; the entry's structure is fixed). TP is
-    # recomputed from the frozen zones (stable, since they don't change). Exits come from
-    # BE / bias-trail / net-target / price-hits-TP, never structure morph.
+    # We manage the FILLED legs against THAT frozen structure — fulcrum is LOCKED for TP /
+    # bias-trail / net-target, no fade-flatten (morphing live VP is irrelevant to inventory
+    # already justified by the entry). TP is recomputed from the frozen zones (stable).
     _frozen = arm.get("vp_frozen") and arm.get("frozen_zones")
     if _frozen:
         _raw_zones = [(float(lo), float(hi)) for lo, hi in arm.get("frozen_zones") or []]
-        best_edge = edge_raw          # fulcrum locked — no shift
-        # fall straight through to the TP recompute below (no drift/fade branch)
+        best_edge = edge_raw          # fulcrum LOCKED for filled-leg management + TP — no shift
+        # PENDING-ONLY RE-ANCHOR: the filled legs stay managed against the frozen entry, but
+        # resting (unfilled) pendings may re-track the LIVE HVN/LVN edge each bar-close so they
+        # sit on current structure instead of a stale arm-time price. Pending-scoped only
+        # (MODIFY_PENDING never touches filled positions); NEVER fade-flattens (freeze holds).
+        # Gated to the bar-close caller (include_positions → once per TF candle) + a config flag.
+        # Tracks a SEPARATE pending_edge; the frozen `fulcrum` is untouched. Only follows a
+        # NEARBY edge (≤ 2×step) — chasing a distant node is a pre-fill re-anchor decision.
+        if include_positions and bool(_gcfg.get("reanchor_pending_when_frozen", True)):
+            try:
+                _rz_bars = store().recent(analysis_symbol, tf, 120)
+                if _is_lvn:
+                    from execution.zone_triggers import _session_lvn_zones as _szf
+                else:
+                    from execution.zone_triggers import _session_hvn_zones as _szf
+                _live_zones, _ = _szf(analysis_symbol, tf, _rz_bars)
+            except Exception:
+                _live_zones = []
+            _stepv = float(arm.get("step") or 0.0)
+            _stepr = _stepv / ratio if ratio else _stepv
+            if _live_zones and _stepr > 0:
+                _pa_venue = float(arm.get("pending_edge") or old_fulcrum_venue)
+                _pa_raw = _pa_venue / ratio if ratio else _pa_venue
+                _pd, _te = float("inf"), _pa_raw
+                for _lo, _hi in _live_zones:
+                    for _cand in (_lo, _hi):
+                        _d = abs(_cand - _pa_raw)
+                        if _d < _pd:
+                            _pd, _te = _d, _cand
+                _cap = 2.0 * _stepr
+                _floor = max(float(_gcfg.get("hvn_shift_min_frac_step", 0.25) or 0.25) * _stepv, 0.1)
+                _vdelta = round((_te - _pa_raw) * ratio, 4)
+                if abs(_vdelta) > _floor and _pd <= _cap:
+                    if ExecBridge.enqueue_modify_pending(account, broker_symbol, magic,
+                                                         price_delta=_vdelta) is not None:
+                        arm = {**arm, "pending_edge": round(_pa_venue + _vdelta, 4)}
+                        ExecBridge.set_last_arm(account, broker_symbol, **arm)
+                        _emit_audit({"account": account, "symbol": analysis_symbol, "tf": tf,
+                                     "verdict": "pending_reanchor_frozen", "magic": magic,
+                                     "poll": True, "old_pending_edge": _pa_venue,
+                                     "new_pending_edge": round(_pa_venue + _vdelta, 4),
+                                     "delta": _vdelta, "frozen_fulcrum": old_fulcrum_venue})
+        # fall through to the TP recompute below (no drift/fade branch)
     else:
         # Live (pending-only, pre-fill) cycle: zone source MUST match what the trigger armed
         # against — session zones (rolling today + cached prev-D), NOT daily-only (which omits
@@ -139,7 +180,6 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
     #   DRIFT  — nearest edge moved ≤ 2×step          → shift pendings to track it
     #   RE-ANCHOR — edge moved > 2×step BUT a node still brackets the fulcrum (merge/split)
     #   FADED  — no node brackets AND nearest edge > 2×step → premise gone → flatten+retire
-    _gcfg = settings.get("grid_levels") or {}
     if not _frozen:
         _step_venue = float(arm.get("step") or 0.0)
         _step_raw = _step_venue / ratio if ratio else _step_venue
