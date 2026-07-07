@@ -568,7 +568,8 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         atr = 0.0
 
     try:
-        regime = day_type.get_regime(symbol, "1m")
+        # regime read from the cycle TF's next-higher TF (HTF context) — see _REGIME_TF.
+        regime = day_type.get_regime(symbol, tf)
     except Exception:
         regime = None
 

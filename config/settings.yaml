@@ -48,10 +48,14 @@ grid_levels:
   lot_step: 0.75           # lot increment per leg (leg_i = base + i×step, capped at max_lots)
   max_lots: 3          # hard cap per leg regardless of risk math
 
-  # Ladder shape
-  hvn_max_legs_by_tf: {1m: 4, 5m: 5, 15m: 6, 1h: 7}   # legs per side per TF (pre-BTC-replay tuning)
-  mean_rev_step_mult: 0.30   # step = this × ATR between legs (fallback when TF not in by_tf map)
-  mean_rev_step_mult_by_tf: {1m: 1, 5m: 0.40, 15m: 0.20, 1h: 0.10}   # per-TF override — tighter than BTC's flat 0.50
+  # Ladder shape — step is BTC Jun22 flat 0.50×ATR (consistent ~3×ATR span, scales with each
+  # TF's own ATR). Leg count is per-TF: a CAP for width-driven strats (hvn_inside_touch,
+  # lvn_edge_touch, bb_expansion_touch — n = node_width/step clamped here) and the EXACT
+  # count for fixed-n strats (hvn_edge, candle_sweep). Step stays flat (do NOT re-add the
+  # inverted per-TF step map — it over-compressed higher TFs → full_hedge).
+  hvn_max_legs_by_tf: {1m: 4, 5m: 5, 15m: 6, 1h: 7}   # per-TF leg count (cap for touch strats, exact for edge/sweep)
+  mean_rev_step_mult: 0.50    # step = this × ATR between legs (BTC Jun22 flat value)
+  mean_rev_step_mult_by_tf: {}   # empty → flat 0.50 all TFs (was inverted per-TF, over-tight on higher TFs)
 
   # Cycle profit targets — primary basket exit (net floating ≥ target → CLOSE_ALL)
   # Values are in native account currency (USC cents for Vantage XAUUSD.pc cent account;
@@ -90,7 +94,7 @@ grid_levels:
   # ─────────────────────────────────────────────────────────────────────────────
 
   tp_atr_mult: 1.5
-  hvn_max_legs: 8            # BTC cap: n = node_width/step, clamped 2..8
+  hvn_max_legs: 6            # BTC Jun22 cap: n = node_width/step, clamped 2..6 (× flat 0.50 mult = ~3×ATR ladder half-span)
   # Minimum TP distance ($) beyond the outermost leg — a structural level closer than
   # this is skipped (keep walking out to the next). Stops the tiny-TP-into-own-node bug
   # (a fulcrum on an HVN edge had its into-node TP land ~2pt away). 0 = no floor.

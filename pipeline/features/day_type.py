@@ -46,17 +46,18 @@ class DayType:
     grid_mode: str        # derived from type
 
 
-def _ib_stats(session_bars) -> tuple[float, float, float, float, float]:
+def _ib_stats(session_bars, ib_bars: int = IB_BARS) -> tuple[float, float, float, float, float]:
     """Return (ib_high, ib_low, ib_range, max_expansion, expansion_pct).
 
-    IB is defined as the high/low of the first IB_BARS 1m bars.
+    IB is the high/low of the first `ib_bars` bars (~1h of real time — scaled per TF
+    by the caller so a 5m/15m regime read uses a comparable initial-balance window).
     Expansion measures the furthest price has moved beyond either IB edge
     across ALL session bars so far.
     """
-    if len(session_bars) < IB_BARS:
+    if len(session_bars) < ib_bars:
         return 0.0, 0.0, 0.0, 0.0, 0.0
 
-    ib = session_bars[:IB_BARS]
+    ib = session_bars[:ib_bars]
     ib_high = max(b.ohlc.h for b in ib)
     ib_low = min(b.ohlc.l for b in ib)
     ib_range = ib_high - ib_low
@@ -133,7 +134,7 @@ def _va_rotation(session_bars, vah: float | None, val: float | None) -> bool:
     return edge_tests >= 2 and returns_inside >= 1
 
 
-def classify(session_bars, daily_vp=None) -> DayType:
+def classify(session_bars, daily_vp=None, ib_bars: int = IB_BARS) -> DayType:
     """Classify current session as range, trend, or uncertain.
 
     Args:
@@ -155,7 +156,7 @@ def classify(session_bars, daily_vp=None) -> DayType:
     reasons: list[str] = []
 
     # 1 — IB expansion
-    _, _, ib_range, ib_expansion, exp_pct = _ib_stats(session_bars)
+    _, _, ib_range, ib_expansion, exp_pct = _ib_stats(session_bars, ib_bars=ib_bars)
     if ib_range > 0:
         if exp_pct >= 1.0:
             trend_score += 2.5
@@ -167,10 +168,17 @@ def classify(session_bars, daily_vp=None) -> DayType:
             range_score += 1.5
             reasons.append(f"price contained within IB (expansion {exp_pct:.1f}×)")
 
-    # 2 — Developing VP shape
-    shape = daily_vp.shape if daily_vp else None
-    vah = daily_vp.vah if daily_vp else None
-    val = daily_vp.val if daily_vp else None
+    # 2 — Developing VP shape. daily_vp is a DICT (vp_cache.get) — use .get(), not attribute
+    # access. The old `daily_vp.shape` raised AttributeError on every real call, which
+    # get_regime's bare except swallowed → regime silently ALWAYS "uncertain" in production
+    # whenever daily_vp was present. Fixed 2026-07-07. Tolerate a rare object caller too.
+    def _vp_attr(v, key):
+        if v is None:
+            return None
+        return v.get(key) if isinstance(v, dict) else getattr(v, key, None)
+    shape = _vp_attr(daily_vp, "shape")
+    vah = _vp_attr(daily_vp, "vah")
+    val = _vp_attr(daily_vp, "val")
 
     if shape == "D":
         range_score += 2.0
@@ -264,8 +272,20 @@ def classify(session_bars, daily_vp=None) -> DayType:
 from typing import Literal as _Literal
 
 
-def get_regime(symbol: str, primary_tf: str = "1m", session_bars_n: int = 100) -> DayType:
-    """Fetch day_type for symbol from current session bars. Returns uncertain DayType on error."""
+# A cycle's regime is read from its NEXT-HIGHER TF (HTF sets the context an LTF entry
+# trades within — standard multi-TF confluence): 1m→5m, 5m→15m, 15m→1h, 1h→1h.
+_REGIME_TF = {"1m": "5m", "5m": "15m", "15m": "1h", "1h": "1h"}
+# IB (~1h real time) in bars of the REGIME TF, so the initial-balance window is comparable
+# regardless of TF. 5m:12, 15m:4, 1h:1→3 (1 bar can't form an IB; floor at 3 ≈ 3h context).
+_IB_BARS_BY_TF = {"1m": 60, "5m": 12, "15m": 4, "1h": 3}
+# Session window (bars of the regime TF) ≈ a full session on each.
+_SESSION_N_BY_TF = {"1m": 100, "5m": 100, "15m": 96, "1h": 48}
+
+
+def get_regime(symbol: str, primary_tf: str = "1m", session_bars_n: int | None = None) -> DayType:
+    """Fetch day_type for symbol. `primary_tf` is the CYCLE's TF — the regime is read from
+    its next-higher TF (_REGIME_TF), with IB/session windows scaled to that TF so the
+    1m-tuned classifier gets comparable structure. Returns uncertain DayType on error."""
     _null = DayType(
         type="uncertain", confidence=0.0, ib_range=0.0, ib_expansion=0.0,
         ib_expansion_pct=0.0, reason="no_data",
@@ -274,11 +294,14 @@ def get_regime(symbol: str, primary_tf: str = "1m", session_bars_n: int = 100) -
     try:
         from pipeline.state_store import store
         from pipeline.features.vp_cache import get as vp_get
-        bars = store().recent(symbol, primary_tf, session_bars_n)
+        regime_tf = _REGIME_TF.get(primary_tf, primary_tf)
+        ib_bars = _IB_BARS_BY_TF.get(regime_tf, IB_BARS)
+        n = session_bars_n if session_bars_n is not None else _SESSION_N_BY_TF.get(regime_tf, 100)
+        bars = store().recent(symbol, regime_tf, n)
         if not bars:
             return _null
         daily_vp = vp_get(symbol, "daily")
-        return classify(bars, daily_vp=daily_vp)
+        return classify(bars, daily_vp=daily_vp, ib_bars=ib_bars)
     except Exception:
         return _null
 

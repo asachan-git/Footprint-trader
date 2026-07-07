@@ -1881,12 +1881,12 @@ def _t_hvn_displacement(symbol: str, tf: str, current_price: float,
 
 def _t_candle_sweep(symbol: str, tf: str, current_price: float,
                     cfg: dict | None = None) -> "Trigger | None":
-    """Candle sweep or engulf against the previous bar.
+    """HL SWEEP against the previous bar (engulf variant removed — sweep-only).
 
-    SWEEP:   current bar's high > prev high AND low < prev low (outside bar),
-             THEN closes ABOVE prev high (bullish) or BELOW prev low (bearish).
-    ENGULF:  current close > prev high (bullish) or < prev low (bearish),
-             regardless of wicks — pure body engulf of prev range.
+    SWEEP:   current bar's high > prev high AND low < prev low (OUTSIDE bar — swept
+             BOTH prev extremes / took liquidity both sides), THEN closes ABOVE prev
+             high (bullish) or BELOW prev low (bearish). A plain body engulf that did
+             NOT take out both wicks no longer qualifies.
 
     Grid arms as a breakout straddle: buy stops above candle_high, sell stops
     below candle_low. The fulcrum is the candle midpoint (for dedup); the actual
@@ -1910,19 +1910,17 @@ def _t_candle_sweep(symbol: str, tf: str, current_price: float,
         _prev = bars[i - 1]
         _ch, _cl, _cc = _cur.ohlc.h, _cur.ohlc.l, _cur.ohlc.c
         _ph, _pl       = _prev.ohlc.h, _prev.ohlc.l
-        _outside = _ch > _ph and _cl < _pl
-        _sb = _outside and _cc > _ph
-        _sw = _outside and _cc < _pl
-        _eb = (not _outside) and _cc > _ph
-        _ew = (not _outside) and _cc < _pl
-        if _sb or _sw or _eb or _ew:
-            best_pair = (_cur, _prev, _ch, _cl, _cc, _ph, _pl, _sb, _sw, _eb, _ew)
+        _outside = _ch > _ph and _cl < _pl        # swept BOTH prev extremes
+        _sb = _outside and _cc > _ph              # sweep bull: closed above prev high
+        _sw = _outside and _cc < _pl              # sweep bear: closed below prev low
+        if _sb or _sw:
+            best_pair = (_cur, _prev, _ch, _cl, _cc, _ph, _pl, _sb, _sw)
             break  # most recent qualifying bar wins
     if best_pair is None:
         return None
-    cur, prev, ch, cl, cc, ph, pl, sweep_bull, sweep_bear, engulf_bull, engulf_bear = best_pair
+    cur, prev, ch, cl, cc, ph, pl, sweep_bull, sweep_bear = best_pair
 
-    direction  = "bull" if (sweep_bull or engulf_bull) else "bear"
+    direction  = "bull" if sweep_bull else "bear"
     candle_hl  = ch - cl
     if min_size > 0 and candle_hl < min_size:
         return None
@@ -1937,8 +1935,8 @@ def _t_candle_sweep(symbol: str, tf: str, current_price: float,
     except Exception:
         pass
 
-    is_sweep = sweep_bull or sweep_bear
-    conf = 0.75 if is_sweep else 0.60   # outside-bar sweep > plain engulf
+    is_sweep = True   # sweep-only detector; engulf variant removed
+    conf = 0.75       # outside-bar liquidity sweep
     return Trigger(
         kind="candle_sweep",
         fulcrum_price=float((ch + cl) / 2.0),
