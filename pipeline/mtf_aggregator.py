@@ -72,14 +72,20 @@ def maybe_emit(store_recent: list[Bar], primary_tf: str, target_tf: str) -> Bar 
     """
     if not store_recent:
         return None
-    latest = store_recent[-1]
-    if latest.tf != primary_tf:
+    # Ignore forming/sentinel bars (a partial-bar placeholder is stored with a max ts like
+    # 9999999999 so it sorts last). Such a bar as store_recent[-1] made the boundary check
+    # `close_ts % target_sec` never hit 0 → maybe_emit returned None forever → 5m/15m
+    # aggregation silently froze while 1m kept flowing (observed 2026-07-07: 5m stuck ~2h,
+    # detector ran on stale zones, sweeps never seen). Aggregate off CLOSED bars only.
+    _closed = [b for b in store_recent if b.tf == primary_tf and b.close_ts < 9_999_999_990]
+    if not _closed:
         return None
+    latest = _closed[-1]
     target_sec = tf_seconds(target_tf)
     if (latest.close_ts % target_sec) != 0:
         return None
     bucket_start = latest.close_ts - target_sec
-    bucket = [b for b in store_recent if bucket_start < b.close_ts <= latest.close_ts]
+    bucket = [b for b in _closed if bucket_start < b.close_ts <= latest.close_ts]
     if not bucket:
         return None
     return _merge(bucket, target_tf)
