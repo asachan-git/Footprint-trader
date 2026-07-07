@@ -191,8 +191,12 @@ def _should_skip(trigger: Trigger | None, regime, fulcrum: float,
     # HVN-edge / inside-touch / VP-level triggers ARE meant to sit ON structure
     # (an HVN edge or a POC/VA/LVN line, which usually lives inside a node); only skip
     # other fulcrums that fall *inside* a node body.
+    # candle_sweep is a BREAKOUT straddle — legs sit OUTSIDE the candle (above high /
+    # below low), and its fulcrum midpoint is used only for dedup, not leg placement. The
+    # chop gate guards a mean-reversion straddle from oscillating through both ladders
+    # inside a node; that failure mode doesn't apply here. Fully exempt from all 3 checks.
     if (trigger.kind not in ("hvn_edge", "hvn_inside_touch", "hvn_displacement",
-                             "vp_level_touch", "squeeze", "bb_expansion_touch")
+                             "vp_level_touch", "squeeze", "bb_expansion_touch", "candle_sweep")
             and _price_inside_hvn(fulcrum, daily_vp)):
         return True, "chop:inside_hvn"
     if daily_vp and daily_vp.get("current_position") == "at_poc":
@@ -202,7 +206,7 @@ def _should_skip(trigger: Trigger | None, regime, fulcrum: float,
         _poc_ok = (trigger.kind == "vp_level_touch"
                    and trigger.context.get("level_type") in ("poc", "naked_poc"))
         _structural = trigger.kind in ("hvn_inside_touch", "hvn_displacement",
-                                       "bb_expansion_touch")
+                                       "bb_expansion_touch", "candle_sweep")
         if not (_poc_ok or _structural):
             return True, "chop:at_poc"
     # Genuine balance/chop = regime is uncertain AND there IS initial-balance data
@@ -211,7 +215,7 @@ def _should_skip(trigger: Trigger | None, regime, fulcrum: float,
     rtype = getattr(regime, "type", "uncertain")
     ib_range = getattr(regime, "ib_range", 0.0) or 0.0
     _is_structural = trigger.kind in ("hvn_inside_touch", "hvn_displacement",
-                                      "bb_expansion_touch")
+                                      "bb_expansion_touch", "candle_sweep")
     if (not _is_structural and rtype == "uncertain" and ib_range > 0
             and getattr(regime, "ib_expansion_pct", 0.0) < 0.5):
         return True, "chop:uncertain_no_expansion"
@@ -625,7 +629,11 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     # far cached-HVN edge). Measured in the ANALYSIS frame, before any rebase. Such a
     # fulcrum both rebases to a garbage offset and places stops far off the venue's
     # market. Catches the stale-HVN bug the honest sim labeler exposed.
-    if not skip and fulcrum_t is not None and current_price > 0 and max_fulcrum_dist_pct > 0:
+    # candle_sweep exempt: its fulcrum is the just-formed candle's midpoint (always near
+    # spot) and legs anchor off the candle extremes, not the fulcrum — the stale-far-HVN
+    # failure this gate catches can't occur. Never skip a candle_sweep here.
+    if (not skip and fulcrum_t is not None and fulcrum_t.kind != "candle_sweep"
+            and current_price > 0 and max_fulcrum_dist_pct > 0):
         dist_pct = abs(fulcrum_t.fulcrum_price - current_price) / current_price
         if dist_pct > max_fulcrum_dist_pct:
             skip, reason = True, f"fulcrum_too_far:{dist_pct:.3f}>{max_fulcrum_dist_pct}"
