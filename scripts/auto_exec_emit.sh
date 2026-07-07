@@ -19,6 +19,26 @@ FLASK="${1:-http://127.0.0.1:5000}"
 ACCOUNT="${2:?account login required (e.g. 25230425)}"
 SYMBOL="${3:-XAUUSD+}"
 
+# ── Singleton guard ─────────────────────────────────────────────────────────
+# Five copies of this script once ran at once → the same grid was POSTed to
+# /exec/emit_grid 5× per bar (server dedup is PER-PROCESS memory, so it can't
+# see sibling processes) → a broker order swarm. Atomic mkdir lock, keyed by
+# ACCOUNT+SYMBOL, prevents a second instance for the SAME target (distinct
+# account/symbol pairs still allowed). No `flock` dependency (absent on macOS).
+_lock_key=$(echo "${ACCOUNT}_${SYMBOL}" | tr -c 'A-Za-z0-9_' '_')
+_LOCKDIR="${TMPDIR:-/tmp}/fb_auto_exec_emit_${_lock_key}.lock"
+if ! mkdir "$_LOCKDIR" 2>/dev/null; then
+    _owner=$(cat "$_LOCKDIR/pid" 2>/dev/null || echo "?")
+    if kill -0 "$_owner" 2>/dev/null; then
+        echo "auto_exec_emit already running for ${ACCOUNT}/${SYMBOL} (pid $_owner) — exiting" >&2
+        exit 0
+    fi
+    # stale lock (owner dead) — reclaim it
+    rmdir "$_LOCKDIR" 2>/dev/null; mkdir "$_LOCKDIR" 2>/dev/null || { echo "lock race — exiting" >&2; exit 0; }
+fi
+echo "$$" > "$_LOCKDIR/pid"
+trap 'rm -f "$_LOCKDIR/pid" 2>/dev/null; rmdir "$_LOCKDIR" 2>/dev/null' EXIT INT TERM
+
 # Per-TF setup lists:
 #   1m  — hvn_inside_touch + bb_expansion_touch
 #   5m  — hvn_inside_touch + squeeze + hvn_displacement + hvn_edge + bb_expansion_touch

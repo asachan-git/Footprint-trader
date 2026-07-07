@@ -29,7 +29,7 @@ input int    InpPollMs      = 1000;                    // Poll interval (ms)
 input int    InpTimeoutMs   = 4000;                    // WebRequest timeout (ms)
 input string InpToken       = "";                      // X-FB-Token (must match server FB_EXEC_TOKEN; blank = none)
 input int    InpMagic       = 770000;                  // Magic BASE; server sends base+strat*10+tf (1m/5m/15m/1H × strategy)
-input int    InpMagicRange   = 110;                    // EA owns magics [InpMagic, InpMagic+InpMagicRange)
+input int    InpMagicRange   = 150;                    // EA owns magics [InpMagic, InpMagic+InpMagicRange) — covers strat decades 0-13 (lvn_edge_touch=13 needs up to 770134)
 input int    InpSlippage    = 20;                      // Deviation (points)
 input bool   InpVerbose     = true;                    // Log every command
 
@@ -37,8 +37,10 @@ input group "=== HVN/LVN zone drawing ==="
 input bool   InpDrawZones      = true;          // Draw HVN/LVN zones on the chart
 input string InpZoneTF         = "15m";         // TF whose VP zones to draw (5m|15m)
 input int    InpZoneRefreshSec = 30;            // Zone redraw interval (s)
-input color  InpHVNColor       = clrSteelBlue;  // HVN zone fill
-input color  InpLVNColor       = clrSandyBrown; // LVN zone fill
+input color  InpHVNColor       = clrSteelBlue;  // HVN zone fill (coarse detection VP)
+input color  InpLVNColor       = clrSandyBrown; // LVN zone fill (coarse detection VP)
+input color  InpHVNFineColor   = clrMagenta;    // HVN zone outline (fine tick VP — A/B compare)
+input color  InpLVNFineColor   = clrAqua;       // LVN zone outline (fine tick VP — A/B compare)
 input bool   InpShowZoneLabels = true;          // Label zones/levels with name + value
 input bool   InpDrawVP         = true;          // Draw computed volume profile
 input int    InpVPMaxBars      = 50;            // VP histogram max width (bars)
@@ -475,7 +477,7 @@ int FindMagic(long &mg[], long m)
 string BuildMagicsJson()
 {
    long   mg[];
-   int    buys[], sells[], pend[];
+   int    buys[], sells[], pend[], buyPend[], sellPend[];
    double buyPnl[], sellPnl[], buyLots[], sellLots[];
 
    for(int i = 0; i < PositionsTotal(); i++)
@@ -490,8 +492,9 @@ string BuildMagicsJson()
          ArrayResize(mg, k + 1); ArrayResize(buys, k + 1); ArrayResize(sells, k + 1);
          ArrayResize(pend, k + 1); ArrayResize(buyPnl, k + 1); ArrayResize(sellPnl, k + 1);
          ArrayResize(buyLots, k + 1); ArrayResize(sellLots, k + 1);
+         ArrayResize(buyPend, k + 1); ArrayResize(sellPend, k + 1);
          mg[k] = m; buys[k] = 0; sells[k] = 0; pend[k] = 0; buyPnl[k] = 0.0; sellPnl[k] = 0.0;
-         buyLots[k] = 0.0; sellLots[k] = 0.0;
+         buyLots[k] = 0.0; sellLots[k] = 0.0; buyPend[k] = 0; sellPend[k] = 0;
       }
       double p = posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
       if(posInfo.PositionType() == POSITION_TYPE_BUY) { buys[k]++;  buyPnl[k]  += p; buyLots[k]  += posInfo.Volume(); }
@@ -509,10 +512,14 @@ string BuildMagicsJson()
          ArrayResize(mg, k + 1); ArrayResize(buys, k + 1); ArrayResize(sells, k + 1);
          ArrayResize(pend, k + 1); ArrayResize(buyPnl, k + 1); ArrayResize(sellPnl, k + 1);
          ArrayResize(buyLots, k + 1); ArrayResize(sellLots, k + 1);
+         ArrayResize(buyPend, k + 1); ArrayResize(sellPend, k + 1);
          mg[k] = m; buys[k] = 0; sells[k] = 0; pend[k] = 0; buyPnl[k] = 0.0; sellPnl[k] = 0.0;
-         buyLots[k] = 0.0; sellLots[k] = 0.0;
+         buyLots[k] = 0.0; sellLots[k] = 0.0; buyPend[k] = 0; sellPend[k] = 0;
       }
       pend[k]++;
+      ENUM_ORDER_TYPE ot = orderInfo.OrderType();
+      if(ot == ORDER_TYPE_BUY_STOP || ot == ORDER_TYPE_BUY_LIMIT)   buyPend[k]++;
+      else                                                          sellPend[k]++;
    }
 
    string js = "";
@@ -520,10 +527,11 @@ string BuildMagicsJson()
       js += (k == 0 ? "" : ",") +
             StringFormat("{\"magic\":%I64d,\"buys\":%d,\"sells\":%d,\"pendings\":%d,"
                          "\"pnl\":%.2f,\"buy_pnl\":%.2f,\"sell_pnl\":%.2f,"
-                         "\"buy_lots\":%.4f,\"sell_lots\":%.4f}",
+                         "\"buy_lots\":%.4f,\"sell_lots\":%.4f,"
+                         "\"buy_pendings\":%d,\"sell_pendings\":%d}",
                          mg[k], buys[k], sells[k], pend[k],
                          buyPnl[k] + sellPnl[k], buyPnl[k], sellPnl[k],
-                         buyLots[k], sellLots[k]);
+                         buyLots[k], sellLots[k], buyPend[k], sellPend[k]);
    return js;
 }
 
@@ -535,6 +543,7 @@ bool ExecCancelPendings(const string cmd, int &cancelled, string &err)
 {
    string sym = JsonGetString(cmd, "symbol");
    long   cmdMagic = (long)JsonGetNumber(cmd, "magic");   // >0 → scope to this cycle only
+   string side = JsonGetString(cmd, "side");              // "buy","sell","" = both
    cancelled = 0; err = "";
    bool allOk = true;
 
@@ -543,6 +552,11 @@ bool ExecCancelPendings(const string cmd, int &cancelled, string &err)
       if(orderInfo.SelectByIndex(i))
          if(MagicMatch(orderInfo.Magic(), cmdMagic) && (sym == "" || orderInfo.Symbol() == sym))
          {
+            ENUM_ORDER_TYPE ot = orderInfo.OrderType();
+            bool isBuy  = (ot == ORDER_TYPE_BUY_STOP  || ot == ORDER_TYPE_BUY_LIMIT);
+            bool isSell = (ot == ORDER_TYPE_SELL_STOP || ot == ORDER_TYPE_SELL_LIMIT);
+            if(side == "buy"  && !isBuy)  continue;
+            if(side == "sell" && !isSell) continue;
             int n = ArraySize(pend); ArrayResize(pend, n + 1); pend[n] = orderInfo.Ticket();
          }
    for(int i = 0; i < ArraySize(pend); i++)
@@ -885,6 +899,14 @@ void DrawLevel(const string kind, double price)
    else if(kind == "naked_poc") clr = clrOrangeRed;
    else if(kind == "poc_today") clr = clrYellow;
    else if(kind == "vah_today" || kind == "val_today") clr = clrDeepSkyBlue;
+   // fine tick-VP levels (A/B vs coarse): distinct hues so overlap/offset is obvious
+   else if(kind == "poc_fine")  clr = clrMagenta;
+   else if(kind == "vah_fine" || kind == "val_fine") clr = clrAqua;
+   else if(kind == "naked_poc_fine") clr = clrHotPink;
+   // tick-VP levels (count-weighted): lime/orange, distinct from volume-VP
+   else if(kind == "poc_tick")  clr = clrLime;
+   else if(kind == "vah_tick" || kind == "val_tick") clr = clrOrange;
+   else if(kind == "naked_poc_tick") clr = clrTomato;
    if(ObjectFind(0, name) < 0)
       ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
    ObjectSetDouble (0, name, OBJPROP_PRICE, 0, price);
@@ -899,7 +921,15 @@ void DrawLevel(const string kind, double price)
    {
       string lbl = (kind == "poc_today") ? "POC·D"
                  : (kind == "vah_today") ? "VAH·D"
-                 : (kind == "val_today") ? "VAL·D" : kind; StringToUpper(lbl);
+                 : (kind == "val_today") ? "VAL·D"
+                 : (kind == "poc_fine")  ? "POC·F"
+                 : (kind == "vah_fine")  ? "VAH·F"
+                 : (kind == "val_fine")  ? "VAL·F"
+                 : (kind == "naked_poc_fine") ? "nPOC·F"
+                 : (kind == "poc_tick")  ? "POC·T"
+                 : (kind == "vah_tick")  ? "VAH·T"
+                 : (kind == "val_tick")  ? "VAL·T"
+                 : (kind == "naked_poc_tick") ? "nPOC·T" : kind; StringToUpper(lbl);
       ZoneText("lvltxt_" + kind, TimeCurrent() + 20 * PeriodSeconds(PERIOD_CURRENT),
                price, lbl + " " + DoubleToString(price, _Digits), clr);
    }
@@ -934,6 +964,10 @@ void DrawZone(int idx, const string kind, double lo, double hi)
    else if(kind == "lvn")   { clr = InpLVNColor;      fill = false; }
    else if(kind == "hvn_today") { clr = clrCornflowerBlue; fill = true;  }
    else if(kind == "lvn_today") { clr = clrPeachPuff;      fill = false; }
+   else if(kind == "hvn_fine")  { clr = InpHVNFineColor; fill = false; }  // fine VOLUME-VP HVN (outline)
+   else if(kind == "lvn_fine")  { clr = InpLVNFineColor; fill = false; }  // fine VOLUME-VP LVN (outline)
+   else if(kind == "hvn_tick")  { clr = clrLime;         fill = false; }  // TICK-VP HVN (count-weighted)
+   else if(kind == "lvn_tick")  { clr = clrOrange;       fill = false; }  // TICK-VP LVN (count-weighted)
    else                     { clr = InpHVNColor;      fill = false; }
 
    if(ObjectFind(0, name) < 0)
@@ -962,6 +996,10 @@ void DrawZone(int idx, const string kind, double lo, double hi)
       else if(kind == "lvn")    lbl_prefix = "LVN ";
       else if(kind == "hvn_today") lbl_prefix = "HVN·D ";
       else if(kind == "lvn_today") lbl_prefix = "LVN·D ";
+      else if(kind == "hvn_fine") lbl_prefix = "HVN·F ";
+      else if(kind == "lvn_fine") lbl_prefix = "LVN·F ";
+      else if(kind == "hvn_tick") lbl_prefix = "HVN·T ";
+      else if(kind == "lvn_tick") lbl_prefix = "LVN·T ";
       else                      lbl_prefix = "ZONE ";
       ZoneText("ztxt_" + IntegerToString(idx), tR, hi,
                lbl_prefix + DoubleToString(lo, _Digits) + "–" + DoubleToString(hi, _Digits), clr);

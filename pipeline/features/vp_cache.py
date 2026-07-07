@@ -358,59 +358,16 @@ def _get_offset(sym: dict) -> float:
     return float(sym.get("venue_price_offset") or 0.0)
 
 
-def _union_zones_vp(primary: dict, secondary: dict) -> dict:
-    """Copy of `primary` whose hvn_zones/lvn_zones are the union of both profiles'
-    zones with overlapping/touching spans merged. Levels (poc/vah/val/ranges) stay
-    primary's — only the structural zone lists are widened."""
-    def _merge(key: str) -> list[dict]:
-        spans = sorted(
-            (float(z["low"]), float(z["high"]))
-            for z in (primary.get(key) or []) + (secondary.get(key) or [])
-        )
-        out: list[list[float]] = []
-        for lo, hi in spans:
-            if out and lo <= out[-1][1]:
-                out[-1][1] = max(out[-1][1], hi)
-            else:
-                out.append([lo, hi])
-        return [{"low": round(lo, 4), "high": round(hi, 4)} for lo, hi in out]
-
-    merged = dict(primary)
-    merged["hvn_zones"] = _merge("hvn_zones")
-    merged["lvn_zones"] = _merge("lvn_zones")
-    return merged
-
-
 def get(symbol: str, period: str) -> dict | None:
-    """Get cached VP for symbol + period (today / this week), venue-offset applied.
-
-    For daily, three IST time bands:
-      < 09:00      → prev-D only (early Asia — today has too few bars to be structural)
-      09:00-19:59  → BOTH: levels (poc/vah/val) from today's accumulating VP,
-                     hvn_zones/lvn_zones = UNION of prev-D + today (overlaps merged) so
-                     completed structure is never dropped while the session forms
-      >= 20:00     → today only (NY reference). Price escaping today's structure is
-                     handled downstream by the prior-5-day vacuum fallback
-                     (zone_triggers._prior_day_hvn via get_history(n=5)).
-    Falls back to prev-D alone if today not yet built.
-    """
+    """Get cached VP for symbol + period (today / this week), venue-offset applied."""
     cache = _load()
     sym = cache.get(symbol, {})
     now_ts = int(time.time())
     anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
     offset = _get_offset(sym)
     if period == "daily":
-        ist_now = datetime.fromtimestamp(now_ts, tz=_IST)
-        prev_key = _session_day_key(now_ts - 86400, anchor)
-        today_key = _session_day_key(now_ts, anchor)
-        prev_vp = sym.get("daily", {}).get(prev_key)
-        today_vp = sym.get("daily", {}).get(today_key)
-        if ist_now.hour < 9:
-            vp = prev_vp
-        elif ist_now.hour < 20 and today_vp and prev_vp:
-            vp = _union_zones_vp(today_vp, prev_vp)
-        else:
-            vp = today_vp or prev_vp
+        key = _session_day_key(now_ts, anchor)
+        vp = sym.get("daily", {}).get(key)
     elif period == "weekly":
         key = _week_key(now_ts)
         vp = sym.get("weekly", {}).get(key)
@@ -419,11 +376,24 @@ def get(symbol: str, period: str) -> dict | None:
     return _shift_vp(vp, offset) if vp else None
 
 
+def _prev_trading_day_key(now_ts: int, anchor: SessionAnchor) -> str:
+    """Session day key for the most recent REAL trading day before today — walks back
+    past Saturday/Sunday. The real gold market is closed weekends; Binance's XAUT feed
+    keeps posting (thin, crypto-venue) bars anyway, so a literal "yesterday" can land on
+    a Sat/Sun session with no genuine structure. Same skip rule as period_profiles_session."""
+    for i in range(1, 8):
+        k = _session_day_key(now_ts - i * 86400, anchor)
+        if datetime.strptime(k, "%Y-%m-%d").weekday() < 5:   # 0-4 = Mon-Fri
+            return k
+    return _session_day_key(now_ts - 86400, anchor)   # unreachable in practice
+
+
 def get_prev_and_today(symbol: str) -> tuple[dict | None, dict | None]:
     """Return (prev_day_vp, today_vp) for daily period, both venue-offset applied.
 
     Used by /exec/zones to overlay both periods: prev-D completed profile and the
-    forming today session. Either may be None if not yet cached.
+    forming today session. Either may be None if not yet cached. prev-D skips
+    Saturday/Sunday (see _prev_trading_day_key).
     """
     cache = _load()
     sym = cache.get(symbol, {})
@@ -432,7 +402,7 @@ def get_prev_and_today(symbol: str) -> tuple[dict | None, dict | None]:
     offset = _get_offset(sym)
 
     today_key = _session_day_key(now_ts, anchor)
-    prev_key = _session_day_key(now_ts - 86400, anchor)
+    prev_key = _prev_trading_day_key(now_ts, anchor)
     daily = sym.get("daily", {})
 
     today_vp = _shift_vp(daily[today_key], offset) if today_key in daily else None

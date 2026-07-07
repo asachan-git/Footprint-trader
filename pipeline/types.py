@@ -12,6 +12,7 @@ Source = Literal["live", "replay"]
 class Level:
     price: float
     vol: float
+    cnt: float = 0.0   # trade/tick COUNT at this price (tick-VP); 0 on legacy/aggregated bars
 
 
 @dataclass(frozen=True)

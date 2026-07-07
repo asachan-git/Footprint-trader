@@ -61,7 +61,7 @@ grid_levels:
 
   # Bias trail — arms when peak floating ≥ activate, fires on giveback% retrace.
   # Values are in native account currency (same note as cycle_net_target above).
-  bias_trail_activate_by_tf: {1m: 750, 5m: 750, 15m: 750, 1h: 750}   # $5 (500 USC) every TF
+  bias_trail_activate_by_tf: {}   # empty → BTC Jun22 exact: flat bias_trail_activate_usd (5.0) for all TFs
   bias_trail_giveback_pct: 40    # fire when floating retraces this % off the peak (Jun19: 40 — books sooner)
   bias_book_frac: 0.5            # fraction of bias-side positions to close at trail trigger (Jun19: 0.5 — keep a BE runner)
 
@@ -77,7 +77,7 @@ grid_levels:
   expansion_atr_ratio: 1.5       # session_atr_ratio threshold to confirm expansion
 
   # Arm filter
-  require_squeeze_gate: false    # true = only arm when vol is coiled (structural setups exempt)
+  require_squeeze_gate: false    # OFF — data (2026-07-07): squeeze_ok arms net-NEGATIVE on 1m/5m (5m sqOK -733 avg / 20.8% full_hedge vs noSQ +433 / 9.1%); gate only helped 15m. Not earning its keep. Use per-side loss-cap / regime instead.
 
   # Safety
   fullfill_be_enabled: false     # SIMPLE: no BE move — keep only net_target exit
@@ -122,9 +122,9 @@ grid_levels:
   # Wick proximity buffer for hvn_inside_touch: fire if wick came within this many price
   # units of the edge even without crossing it (e.g. 0.5pt catches near-misses on gold).
   # 0.0 = exact touch only (original behaviour). Edge is still the fulcrum price.
-  hvn_touch_buffer: 0.02
+  hvn_touch_buffer: 0.2
   hvn_edge_lookback: 3           # bars to scan back for a prior breakout close outside HVN
-  hvn_edge_tap_buffer: 0.3        # wick must come within this many $ of the HVN edge to qualify as a tap
+  hvn_edge_tap_buffer: 0.05        # wick must come within this many $ of the HVN edge to qualify as a tap
   hvn_edge_min_step: 1.0          # minimum leg spacing ($); reduces n until step >= this (0 = no floor)
   # Width-relative buffer: a wide node's edge is unreachable with a flat 0.5pt buffer
   # (a 49pt node never gets a tap), so the effective buffer is max(hvn_touch_buffer,
@@ -208,7 +208,7 @@ grid_levels:
   # that side and move the rest to breakeven (risk-free runner). Captures directional
   # profit the net-basket exit masks (a hedge leg drags net down → target never hits).
   bias_trail_enabled: true      # SIMPLE: no trail — CLOSE_ALL only on net_target
-  bias_trail_activate_usd: 5.0   # fallback when TF not in bias_trail_activate_by_tf
+  bias_trail_activate_usd: 750   # fallback when TF not in bias_trail_activate_by_tf (BTC's $5 → 750 USC equivalent)
   # ── Active trigger list — single source of truth for which strategies run and on which TFs.
   # Each entry: kind (required), tfs (required), enabled (default true), touch_only (default false).
   # touch_only=true → arm via intrabar price tap only (not bar-close emit).
@@ -219,11 +219,21 @@ grid_levels:
       touch_only: true           # arm on candle close (bar-close emit)
     - kind: hvn_edge
       tfs: [5m, 15m]             # breakout-retest: prior close outside HVN + bar tap + rejection close
-      enabled: true
+      enabled: false
     - kind: candle_sweep
       tfs: [5m, 15m]
-      enabled: false
-  touch_arm_confirm_ticks: 0.2   # reversal distance ($) for hvn_inside_touch tap confirm
+      enabled: true             # ON
+    - kind: lvn_edge_touch
+      tfs: [5m, 15m]             # 1m dropped — tightest step (~0.3) + most re-arms, biggest density source
+      touch_only: true           # arm via intrabar price tap only, same as hvn_inside_touch
+      enabled: true             # ON — EA recompiled (InpMagicRange=150), magics 770131-133 owned
+  touch_arm_confirm_ticks: 0.02   # reversal distance ($) for hvn_inside_touch tap confirm
+  # lvn_edge_touch tap tolerances — mirror hvn_touch_buffer/_pct/hvn_lookback_bars but
+  # independently tunable. 0.10 = tap within 10% of node width counts (same width-relative
+  # logic as HVN).
+  lvn_touch_buffer: 0.02
+  lvn_touch_buffer_pct: 0.05
+  lvn_lookback_bars: 3
   # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
   vp_fulcrum_levels: [poc, vah, val, naked_poc, lvn]   # which VP levels are fulcrums
   vp_tol_atr_mult: 0.25      # tap "test" band = max(this·ATR, vp_tol_pct·price)
@@ -233,7 +243,7 @@ grid_levels:
   # Volatility compression→expansion via Bollinger BANDWIDTH PERCENTILE (vol-regime
   # gate): compression = BBW in the bottom squeeze_bbw_pct of its trailing window; fire
   # on RELEASE after a run. Neutral straddle positions before the displacement.
-  squeeze_enabled: false          # SIMPLE: disabled
+  squeeze_enabled: false          # OFF — squeeze_ok arms net-negative on 1m/5m (see require_squeeze_gate note)
   squeeze_bb_period: 20
   squeeze_bb_mult: 3.0        # Bollinger band = 3·stdev
   squeeze_bbw_pct: 0.15       # compression = BBW in bottom 15% of the trailing window
@@ -333,8 +343,8 @@ vp_cache:
   vp_profile_smooth: 0    # Gaussian (price units) — 0 = raw bars (matches /dashboard); 1.0 curve, 1.5 over-blobs
   vp_profile_days: 5       # how many TRADING-day VP histograms the EA draws (Sat/Sun sessions
                            # skipped; each anchored at its session start; newest = today rolling)
-  vp_profile_points: 40    # number of histogram ROWS (bars). Volume is SUMMED per row, so fewer
-                            # rows = chunkier TV-like bars without losing volume. ~50-200 typical.
+  vp_profile_points: 200   # rows: 200 renders the 0.1$ tick-res bins as a fine TV-style profile
+                            # (was 40 = chunky). Chart-draw only — detection/grid bins unaffected.
   # Drawn HVN/LVN: merge prev-D ∪ today into ONE clean set; combine nodes within this gap ($)
   # so the chart isn't a cluttered interleave of two overlapping sets. 0 = overlaps only.
   vp_zone_merge_gap: 0.0

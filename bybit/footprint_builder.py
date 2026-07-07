@@ -34,6 +34,9 @@ class _AccumBar:
     close_ts: int
     bid_at_price: dict[float, float] = field(default_factory=lambda: defaultdict(float))
     ask_at_price: dict[float, float] = field(default_factory=lambda: defaultdict(float))
+    # Per-price TRADE COUNT (tick-VP): trades at each price, size-agnostic.
+    bid_cnt_at_price: dict[float, float] = field(default_factory=lambda: defaultdict(float))
+    ask_cnt_at_price: dict[float, float] = field(default_factory=lambda: defaultdict(float))
     first_price: float | None = None
     last_price: float | None = None
     high: float = float("-inf")
@@ -58,13 +61,17 @@ class _AccumBar:
         self.trades += 1
         if side == "Buy":
             self.ask_at_price[price] += size
+            self.ask_cnt_at_price[price] += 1.0
         else:  # "Sell"
             self.bid_at_price[price] += size
+            self.bid_cnt_at_price[price] += 1.0
 
     def to_payload(self) -> dict:
         prices = set(self.bid_at_price) | set(self.ask_at_price)
-        bid_ladder = [{"price": p, "vol": self.bid_at_price.get(p, 0.0)} for p in sorted(prices)]
-        ask_ladder = [{"price": p, "vol": self.ask_at_price.get(p, 0.0)} for p in sorted(prices)]
+        bid_ladder = [{"price": p, "vol": self.bid_at_price.get(p, 0.0),
+                       "cnt": self.bid_cnt_at_price.get(p, 0.0)} for p in sorted(prices)]
+        ask_ladder = [{"price": p, "vol": self.ask_at_price.get(p, 0.0),
+                       "cnt": self.ask_cnt_at_price.get(p, 0.0)} for p in sorted(prices)]
         total_bid = sum(self.bid_at_price.values())
         total_ask = sum(self.ask_at_price.values())
         delta = total_ask - total_bid

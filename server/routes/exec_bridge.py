@@ -84,6 +84,7 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
     arm = ExecBridge.get_last_arm(account, broker_symbol, magic=magic)
     if not arm or not arm.get("active"):
         return
+    _is_lvn = arm.get("trigger_kind") == "lvn_edge_touch"
     quote = ExecBridge.get_quote(account, broker_symbol) or {}
     venue_mid = float(quote.get("mid") or 0.0)
     if venue_mid <= 0:
@@ -111,17 +112,23 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
         # fall straight through to the TP recompute below (no drift/fade branch)
     else:
         # Live (pending-only, pre-fill) cycle: zone source MUST match what the trigger armed
-        # against — session HVNs (rolling today + cached prev-D), NOT daily-only (which omits
-        # the forming hvn_today node and false-faded). Re-anchor pendings cheaply while flat.
+        # against — session zones (rolling today + cached prev-D), NOT daily-only (which omits
+        # the forming today node and false-faded). Re-anchor pendings cheaply while flat.
+        # lvn_edge_touch cycles use the LVN-equivalent session source instead.
         try:
-            from execution.zone_triggers import _session_hvn_zones
             _sbars = store().recent(analysis_symbol, tf, 120)
-            _raw_zones, _ = _session_hvn_zones(analysis_symbol, tf, _sbars)
+            if _is_lvn:
+                from execution.zone_triggers import _session_lvn_zones
+                _raw_zones, _ = _session_lvn_zones(analysis_symbol, tf, _sbars)
+            else:
+                from execution.zone_triggers import _session_hvn_zones
+                _raw_zones, _ = _session_hvn_zones(analysis_symbol, tf, _sbars)
         except Exception:
             _raw_zones = []
         if not _raw_zones:
             _dvp = vp_get(analysis_symbol, "daily") or {}
-            _raw_zones = [(float(z["low"]), float(z["high"])) for z in (_dvp.get("hvn_zones") or [])]
+            _zone_key = "lvn_zones" if _is_lvn else "hvn_zones"
+            _raw_zones = [(float(z["low"]), float(z["high"])) for z in (_dvp.get(_zone_key) or [])]
         if not _raw_zones:
             return
 
@@ -166,23 +173,25 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
                 arm = {**arm, "fade_strikes": _strikes, "fade_last_strike_ts": _now}
                 ExecBridge.set_last_arm(account, broker_symbol, **arm)
                 _emit_audit({"account": account, "symbol": analysis_symbol, "tf": tf,
-                             "verdict": "hvn_fade_strike", "magic": magic, "poll": True,
+                             "verdict": "lvn_fade_strike" if _is_lvn else "hvn_fade_strike",
+                             "magic": magic, "poll": True,
                              "strikes": _strikes, "confirm_n": _confirm_n,
                              "old_fulcrum": old_fulcrum_venue,
                              "nearest_edge_dist": round(best_dist, 4)})
             if _strikes < _confirm_n:
                 return   # suspect edge — don't chase it (skip shift/TP this check)
-            # CONFIRMED FADED — anchor HVN dissolved before any fill. Premise gone → flatten.
+            # CONFIRMED FADED — anchor node dissolved before any fill. Premise gone → flatten.
             ExecBridge.enqueue(account, "CLOSE_ALL", broker_symbol, magic=magic,
-                               comment="FB|hvn_faded")
+                               comment="FB|lvn_faded" if _is_lvn else "FB|hvn_faded")
             _cyc = ExecBridge.get_last_arm(account, broker_symbol, magic=magic) or {}
             _cyc.pop("magic", None)
             ExecBridge.set_last_arm(account, broker_symbol, magic=magic,
                                     **{**_cyc, "active": False, "flatten_ts": __import__("time").time()})
             ExecBridge.clear_emit(account, broker_symbol, magic=magic)
             _emit_audit({"account": account, "symbol": analysis_symbol, "tf": tf,
-                         "verdict": "hvn_faded_flatten", "magic": magic, "poll": True,
-                         "exit_reason": "hvn_faded", "strikes": _strikes,
+                         "verdict": "lvn_faded_flatten" if _is_lvn else "hvn_faded_flatten",
+                         "magic": magic, "poll": True,
+                         "exit_reason": "lvn_faded" if _is_lvn else "hvn_faded", "strikes": _strikes,
                          "old_fulcrum": old_fulcrum_venue, "nearest_edge_dist": round(best_dist, 4)})
             return   # cycle retired — nothing more to refresh
         elif int(arm.get("fade_strikes") or 0):
@@ -230,22 +239,36 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
     _stp_raw   = _stp_venue / ratio if ratio else _stp_venue
     _top_leg = best_edge + _buy_n  * _stp_raw if (_buy_n  > 0 and _stp_raw > 0) else best_edge
     _bot_leg = best_edge - _sell_n * _stp_raw if (_sell_n > 0 and _stp_raw > 0) else best_edge
-    # Unified TP rule (matches arm-time): next HVN far edge + VP refinements (Case 1: VP
-    # within 1×step of HVN edge → VP; Case 2: HVN < 2×step from leg → next VP/HVN beyond).
-    # Refreshed each poll; HVN rebuilds every 15m so the target re-targets on that cadence.
-    # hvn_inside_touch: target the NEXT node's far edge — exclude the node the fulcrum
-    # sits in (arm-time bounds stored venue-frame → un-rebase to analysis/raw via /ratio).
-    _skip_node = None
-    if arm.get("trigger_kind") == "hvn_inside_touch" and ratio:
-        _nlo_v = float(arm.get("node_low") or 0.0)
-        _nhi_v = float(arm.get("node_high") or 0.0)
-        if _nlo_v > 0 and _nhi_v > _nlo_v:
-            _skip_node = (_nlo_v / ratio, _nhi_v / ratio)
-    from execution.zone_triggers import hvn_or_vp_tp as _hvn_or_vp_tp
-    raw_tp_up, raw_tp_down = _hvn_or_vp_tp(analysis_symbol, _raw_zones, _top_leg, _bot_leg,
-                                           _stp_raw, min_tp_dist=_min_tp_raw, skip_node=_skip_node)
-    # Cascade fallback ONLY when nothing structural sits beyond the leg (LVN→fib).
-    if raw_tp_up == 0.0 or raw_tp_down == 0.0:
+    if _is_lvn:
+        # lvn_edge_touch: target the NEXT HVN's NEAR edge (compute_lvn_edge_tps) — the
+        # candidate pool is daily HVN zones (the magnet structure), NOT _raw_zones (which
+        # are LVN zones here, used only for the fulcrum drift/fade classification above).
+        # No skip_node: the fulcrum is an LVN edge, not inside an HVN to exclude.
+        from execution.zone_triggers import compute_lvn_edge_tps as _lvn_edge_tps
+        _dvp_hvn = vp_get(analysis_symbol, "daily") or {}
+        _daily_hvn_zones = [(float(z["low"]), float(z["high"]))
+                            for z in (_dvp_hvn.get("hvn_zones") or [])]
+        raw_tp_up, raw_tp_down = _lvn_edge_tps(analysis_symbol, best_edge, _daily_hvn_zones,
+                                               min_dist=_min_tp_raw, top_leg=_top_leg, bot_leg=_bot_leg)
+    else:
+        # Unified TP rule (matches arm-time): next HVN far edge + VP refinements (Case 1: VP
+        # within 1×step of HVN edge → VP; Case 2: HVN < 2×step from leg → next VP/HVN beyond).
+        # Refreshed each poll; HVN rebuilds every 15m so the target re-targets on that cadence.
+        # hvn_inside_touch: target the NEXT node's far edge — exclude the node the fulcrum
+        # sits in (arm-time bounds stored venue-frame → un-rebase to analysis/raw via /ratio).
+        _skip_node = None
+        if ratio:
+            _nlo_v = float(arm.get("node_low") or 0.0)
+            _nhi_v = float(arm.get("node_high") or 0.0)
+            if _nlo_v > 0 and _nhi_v > _nlo_v:
+                _skip_node = (_nlo_v / ratio, _nhi_v / ratio)
+        from execution.zone_triggers import hvn_or_vp_tp as _hvn_or_vp_tp
+        raw_tp_up, raw_tp_down = _hvn_or_vp_tp(analysis_symbol, _raw_zones, _top_leg, _bot_leg,
+                                               _stp_raw, min_tp_dist=_min_tp_raw, skip_node=_skip_node)
+    # Cascade fallback ONLY when nothing structural sits beyond the leg (LVN→fib). Not
+    # applicable to the lvn_edge_touch path — compute_lvn_edge_tps already has its own
+    # fallback cascade built in.
+    if not _is_lvn and (raw_tp_up == 0.0 or raw_tp_down == 0.0):
         _c_up, _c_dn = compute_hvn_tps(analysis_symbol, best_edge, _raw_zones, skip_node=_skip_node,
                                        min_dist=_min_tp_raw, top_leg=_top_leg, bot_leg=_bot_leg)
         if raw_tp_up   == 0.0: raw_tp_up   = _c_up
@@ -365,7 +388,9 @@ def _cancel_orphan_on_hvn_gone(account: str, broker_symbol: str, analysis_symbol
     ratio = venue_mid / float(latest.ohlc.c) if latest.ohlc.c else 1.0
 
     _dvp = vp_get(analysis_symbol, "daily") or {}
-    zones = [(float(z["low"]), float(z["high"])) for z in (_dvp.get("hvn_zones") or [])]
+    _is_lvn = arm.get("trigger_kind") == "lvn_edge_touch"
+    _zone_key = "lvn_zones" if _is_lvn else "hvn_zones"
+    zones = [(float(z["low"]), float(z["high"])) for z in (_dvp.get(_zone_key) or [])]
     if not zones:
         return False   # no VP yet → don't fabricate "gone"; wait for a real profile
 
@@ -377,11 +402,14 @@ def _cancel_orphan_on_hvn_gone(account: str, broker_symbol: str, analysis_symbol
     tol = float(gcfg.get("hvn_gone_tol_usd", 0.0) or 0.0) / ratio if ratio else 0.0
     in_hvn = any(lo - tol <= fulcrum_raw <= hi + tol for lo, hi in zones)
     if in_hvn:
-        return False   # fulcrum HVN still present → keep the pending armed
+        return False   # fulcrum node still present → keep the pending armed
 
     ExecBridge.enqueue(account, "CANCEL_PENDINGS", broker_symbol, magic=magic,
-                       comment="FB|orphan|hvn_gone")
-    ExecBridge.set_last_arm(account, broker_symbol, **{**arm, "active": False})
+                       comment="FB|orphan|lvn_gone" if _is_lvn else "FB|orphan|hvn_gone")
+    # magic= passed explicitly and stripped from the spread: arm's own embedded "magic"
+    # field is not authoritative after a restart (see project_arm_magic_key_bug memory).
+    _arm_body = {k: v for k, v in arm.items() if k != "magic"}
+    ExecBridge.set_last_arm(account, broker_symbol, magic=magic, **{**_arm_body, "active": False})
     _emit_audit({"account": account, "symbol": analysis_symbol, "broker_symbol": broker_symbol,
                  "tf": tf, "verdict": "orphan_cancel_hvn_gone", "magic": magic, "poll": True,
                  "fulcrum_raw": round(fulcrum_raw, 5), "pendings": pendings,
@@ -435,7 +463,7 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
         # Price left the HVN — check if it exited THROUGH the tapped edge (breakout).
         # A breakout through a tapped edge is a valid confirm: sell stops below fire on
         # downward breakout, buy stops above fire on upward breakout.
-        _key = (str(account), broker_symbol, tf)
+        _key = (str(account), broker_symbol, tf, "hvn_inside_touch")
         with ExecBridge._lock:
             _tap = ExecBridge._touch_state.get(_key)
         _breakout_trig = None
@@ -468,7 +496,7 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
         if not ExecBridge.touch_arm_check(account, broker_symbol, tf, live_analysis,
                                           edge, side, confirm_ticks):
             # Tap recorded — store the trigger object so breakout-exit can use it
-            _key = (str(account), broker_symbol, tf)
+            _key = (str(account), broker_symbol, tf, "hvn_inside_touch")
             with ExecBridge._lock:
                 if _key in ExecBridge._touch_state:
                     ExecBridge._touch_state[_key]["trig"] = trig
@@ -477,15 +505,69 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     # confirmed mini-rejection → arm. Gate on flat + dedup (same as emit).
     leg_magic = magic_for("hvn_inside_touch", tf)
     open_state = ExecBridge.get_open(account, broker_symbol, magic=leg_magic) or {}
-    if int(open_state.get("positions", 0) or 0) > 0 or int(open_state.get("pendings", 0) or 0) > 0:
-        return   # cycle already live on this magic
+    buy_live  = int(open_state.get("buys",  0) or 0) > 0 or int(open_state.get("buy_pendings",  0) or 0) > 0
+    sell_live = int(open_state.get("sells", 0) or 0) > 0 or int(open_state.get("sell_pendings", 0) or 0) > 0
+    _cyc = ExecBridge.get_last_arm(account, broker_symbol, magic=leg_magic) or {}
+
+    if buy_live and sell_live:
+        return   # cycle fully occupied on this magic — nothing free to arm
+
+    if (buy_live or sell_live) and _cyc.get("active"):
+        # SIDE-ONLY RE-ARM: one side of this active cycle exited flat (e.g. sells booked
+        # profit) while the other is still live. A fresh touch now backfills ONLY the
+        # flat side's ladder at the new edge — the still-live side's positions/pendings/
+        # TP/bias-trail state are never touched. No same-fulcrum dedup here: this isn't
+        # "re-arming the same level", it's replacing the side that just closed.
+        flat_side = "sell" if buy_live else "buy"
+        min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
+        plan = plan_grid_levels(analysis, tf, live_analysis,
+                                trigger_hint="hvn_inside_touch", settings=settings,
+                                venue_price=venue_mid, min_step_venue=min_step_venue,
+                                force_trigger=trig)
+        if plan.verdict != "arm" or plan.trigger_kind != "hvn_inside_touch":
+            _emit_audit({"account": account, "symbol": analysis, "tf": tf, "verdict": "skip",
+                         "skip_reason": f"touch_arm_side:{plan.skip_reason or 'no_plan'}",
+                         "touch_armed": True, "side": flat_side})
+            return
+        _side_legs = plan.buy_legs if flat_side == "buy" else plan.sell_legs
+        if not _side_legs:
+            return
+        cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
+                                            close_first=True, clear_kind="cancel",
+                                            magic=leg_magic, sides={flat_side},
+                                            leg_tp=(not bool(grid_cfg.get("net_profit_exit_only", False))
+                                                    or bool(grid_cfg.get("leg_tp_ceiling", False))))
+        _side_lots = round(sum(l.lot for l in _side_legs), 4)
+        _side_tp = plan.buy_tp if flat_side == "buy" else plan.sell_tp
+        _update = {f"{flat_side}_n": len(_side_legs),
+                   f"{flat_side}_lots_total": _side_lots,
+                   f"tp_{'up' if flat_side == 'buy' else 'down'}": _side_tp,
+                   f"be_done_{flat_side}": False}
+        # Everything else (the live side's counts/lots/TP, bias_peak/bias_booked/
+        # bias_trail_done, max_*_seen, fulcrum, node_low/high) is left exactly as-is —
+        # that state belongs to the still-open side and must survive this backfill.
+        # magic= passed explicitly and stripped from the spread: _cyc's own embedded
+        # "magic" field is not authoritative (see project_arm_magic_key_bug memory).
+        _cyc_body = {k: v for k, v in _cyc.items() if k != "magic"}
+        ExecBridge.set_last_arm(account, broker_symbol, magic=leg_magic,
+                                **{**_cyc_body, **_update})
+        _emit_audit({"account": account, "symbol": analysis, "broker_symbol": broker_symbol,
+                     "tf": tf, "verdict": "arm_side", "trigger_kind": plan.trigger_kind,
+                     "edge": side, "side": flat_side, "fulcrum": plan.fulcrum,
+                     "venue_mid": venue_mid, "touch_armed": True,
+                     "n": len(_side_legs), "lots_total": _side_lots, "tp": _side_tp})
+        LOG.info(f"[exec] TOUCH-ARM-SIDE {account} {broker_symbol} {tf} → backfilled "
+                 f"{flat_side} [edge={side} fulcrum={plan.fulcrum}], {len(cmds)} command(s)")
+        return
+
+    # Both sides flat — full straddle path.
+    if _cyc.get("active"):
+        return
     # One concurrent cycle per TF: an ACTIVE arm occupies this magic even when MT5 momentarily
     # reports flat (legs placed but not yet reported back, or pendings mid-reanchor). Without
     # this, a subsequent touch could stack a second straddle on the same node before the first
     # cycle's legs surface. Re-arm is freed only when the cycle retires (active→False on
     # completion / reap / fade). Subsequent touches → only ONE grid per TF.
-    if (ExecBridge.get_last_arm(account, broker_symbol, magic=leg_magic) or {}).get("active"):
-        return
     # Completed-cycle release: we got here flat AND with no active arm → any cycle that armed
     # at this fulcrum is fully closed. Its stale dedup mark would otherwise block re-arm at the
     # same edge forever while price camps there. Drop it so a fresh touch can take orders again.
@@ -537,6 +619,340 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                  "buy_tp": plan.buy_tp, "sell_tp": plan.sell_tp})
     LOG.info(f"[exec] TOUCH-ARM {account} {broker_symbol} {tf} → armed "
              f"[edge={side} fulcrum={plan.fulcrum}], {len(cmds)} command(s)")
+
+
+def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
+                      venue_mid: float | None = None) -> None:
+    """Intrabar touch-arm for lvn_edge_touch — mirrors _touch_arm_tf exactly (side-only
+    re-arm, dedup, tick-reversal confirm, breakout-exit-through-tapped-edge), swapped to
+    the LVN detector/magic. Touch-state is kept isolated from hvn_inside_touch's via the
+    kind="lvn_edge_touch" tag on every _touch_state/touch_arm_check call — without that
+    tag the two triggers would corrupt each other's pending-tap state on shared TFs."""
+    from execution.grid_planner import plan_grid_levels
+    from execution.zone_triggers import lvn_touch_arm_trigger
+    grid_cfg = settings.get("grid_levels") or {}
+    if tf not in _trigger_tfs(grid_cfg, "lvn_edge_touch"):
+        return
+
+    symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
+    broker_to_analysis = {v: k for k, v in symbol_map.items()}
+    analysis = broker_to_analysis.get(broker_symbol, broker_symbol)
+
+    quote = ExecBridge.get_quote(account, broker_symbol)
+    if venue_mid is None:
+        if not quote or not quote.get("mid"):
+            LOG.info(f"[touch_arm_lvn] {broker_symbol}/{tf} skip: no venue_mid and no cached quote")
+            return
+        venue_mid = float(quote["mid"])
+
+    live_analysis = venue_mid
+    ratio = 1.0
+
+    trig = lvn_touch_arm_trigger(analysis, tf, live_analysis)
+    LOG.info(f"[touch_arm_lvn] {broker_symbol}/{tf} lvn_touch_arm_trigger→{trig.kind if trig else None} edge={trig.fulcrum_price if trig else '-'}")
+    if trig is None:
+        _key = (str(account), broker_symbol, tf, "lvn_edge_touch")
+        with ExecBridge._lock:
+            _tap = ExecBridge._touch_state.get(_key)
+        _breakout_trig = None
+        if _tap and _tap.get("trig") is not None:
+            _stored = _tap["trig"]
+            _tedge = float(_stored.fulcrum_price)
+            _tside = str(_stored.context.get("edge", ""))
+            if _tside == "top" and live_analysis > _tedge:
+                _breakout_trig = _stored
+            elif _tside == "bottom" and live_analysis < _tedge:
+                _breakout_trig = _stored
+        _has_pending_confirm = _tap is not None and _tap.get("trig") is None
+        if not _has_pending_confirm:
+            ExecBridge.clear_touch_state(account, broker_symbol, tf, kind="lvn_edge_touch")
+        if _breakout_trig is None:
+            return
+        trig = _breakout_trig
+        edge = float(trig.fulcrum_price)
+        side = str(trig.context.get("edge", ""))
+    else:
+        edge = float(trig.fulcrum_price)
+        side = str(trig.context.get("edge", ""))
+        confirm_ticks = float(grid_cfg.get("touch_arm_confirm_ticks", 0.2) or 0.2)
+        if not ExecBridge.touch_arm_check(account, broker_symbol, tf, live_analysis,
+                                          edge, side, confirm_ticks, kind="lvn_edge_touch"):
+            _key = (str(account), broker_symbol, tf, "lvn_edge_touch")
+            with ExecBridge._lock:
+                if _key in ExecBridge._touch_state:
+                    ExecBridge._touch_state[_key]["trig"] = trig
+            return
+
+    leg_magic = magic_for("lvn_edge_touch", tf)
+    open_state = ExecBridge.get_open(account, broker_symbol, magic=leg_magic) or {}
+    buy_live  = int(open_state.get("buys",  0) or 0) > 0 or int(open_state.get("buy_pendings",  0) or 0) > 0
+    sell_live = int(open_state.get("sells", 0) or 0) > 0 or int(open_state.get("sell_pendings", 0) or 0) > 0
+    _cyc = ExecBridge.get_last_arm(account, broker_symbol, magic=leg_magic) or {}
+
+    if buy_live and sell_live:
+        return
+
+    if (buy_live or sell_live) and _cyc.get("active"):
+        flat_side = "sell" if buy_live else "buy"
+        min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
+        plan = plan_grid_levels(analysis, tf, live_analysis,
+                                trigger_hint="lvn_edge_touch", settings=settings,
+                                venue_price=venue_mid, min_step_venue=min_step_venue,
+                                force_trigger=trig)
+        if plan.verdict != "arm" or plan.trigger_kind != "lvn_edge_touch":
+            _emit_audit({"account": account, "symbol": analysis, "tf": tf, "verdict": "skip",
+                         "skip_reason": f"touch_arm_lvn_side:{plan.skip_reason or 'no_plan'}",
+                         "touch_armed": True, "side": flat_side})
+            return
+        _side_legs = plan.buy_legs if flat_side == "buy" else plan.sell_legs
+        if not _side_legs:
+            return
+        cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
+                                            close_first=True, clear_kind="cancel",
+                                            magic=leg_magic, sides={flat_side},
+                                            leg_tp=(not bool(grid_cfg.get("net_profit_exit_only", False))
+                                                    or bool(grid_cfg.get("leg_tp_ceiling", False))))
+        _side_lots = round(sum(l.lot for l in _side_legs), 4)
+        _side_tp = plan.buy_tp if flat_side == "buy" else plan.sell_tp
+        _update = {f"{flat_side}_n": len(_side_legs),
+                   f"{flat_side}_lots_total": _side_lots,
+                   f"tp_{'up' if flat_side == 'buy' else 'down'}": _side_tp,
+                   f"be_done_{flat_side}": False}
+        _cyc_body = {k: v for k, v in _cyc.items() if k != "magic"}
+        ExecBridge.set_last_arm(account, broker_symbol, magic=leg_magic,
+                                **{**_cyc_body, **_update})
+        _emit_audit({"account": account, "symbol": analysis, "broker_symbol": broker_symbol,
+                     "tf": tf, "verdict": "arm_side", "trigger_kind": plan.trigger_kind,
+                     "edge": side, "side": flat_side, "fulcrum": plan.fulcrum,
+                     "venue_mid": venue_mid, "touch_armed": True,
+                     "n": len(_side_legs), "lots_total": _side_lots, "tp": _side_tp})
+        LOG.info(f"[exec] TOUCH-ARM-SIDE-LVN {account} {broker_symbol} {tf} → backfilled "
+                 f"{flat_side} [edge={side} fulcrum={plan.fulcrum}], {len(cmds)} command(s)")
+        return
+
+    if _cyc.get("active"):
+        return
+    ExecBridge.clear_emit(account, broker_symbol, magic=leg_magic)
+    dedup_pct = float(grid_cfg.get("emit_dedup_pct", 0.0007) or 0.0)
+    dedup_tol = venue_mid * dedup_pct
+    fulcrum_venue = round(edge * ratio, 4)
+    if not ExecBridge.should_emit(account, broker_symbol, fulcrum_venue, dedup_tol, magic=leg_magic):
+        return
+
+    min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
+    plan = plan_grid_levels(analysis, tf, live_analysis,
+                            trigger_hint="lvn_edge_touch", settings=settings,
+                            venue_price=venue_mid, min_step_venue=min_step_venue,
+                            force_trigger=trig)
+    if plan.verdict != "arm" or plan.trigger_kind != "lvn_edge_touch":
+        _emit_audit({"account": account, "symbol": analysis, "tf": tf, "verdict": "skip",
+                     "skip_reason": f"touch_arm_lvn:{plan.skip_reason or 'no_plan'}",
+                     "touch_armed": True})
+        return
+
+    cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
+                                        close_first=True, clear_kind="cancel",
+                                        magic=leg_magic,
+                                        leg_tp=(not bool(grid_cfg.get("net_profit_exit_only", False))
+                                                or bool(grid_cfg.get("leg_tp_ceiling", False))))
+    _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
+    node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
+    node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
+    ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum, edge=side,
+                            trigger_kind=plan.trigger_kind, venue_mid=venue_mid, magic=leg_magic,
+                            n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
+                            buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
+                            buy_lots_total=round(sum(l.lot for l in plan.buy_legs), 4),
+                            sell_lots_total=round(sum(l.lot for l in plan.sell_legs), 4),
+                            bias_peak=0.0, bias_booked=False, bias_trail_done=False,
+                            be_done_buy=False, be_done_sell=False,
+                            node_low=round(node_low, 5), node_high=round(node_high, 5),
+                            active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
+                            max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
+                            squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank,
+                            sweep_be_usd=float(plan.trigger_context.get("sweep_be_usd") or 0.0),
+                            sweep_vwap=float(plan.trigger_context.get("sweep_vwap") or 0.0))
+    ExecBridge.mark_emit(account, broker_symbol, plan.fulcrum, magic=leg_magic)
+    _emit_audit({"account": account, "symbol": analysis, "broker_symbol": broker_symbol,
+                 "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind, "edge": side,
+                 "fulcrum": plan.fulcrum, "venue_mid": venue_mid, "touch_armed": True,
+                 "n_per_side": plan.n_per_side, "step": plan.step,
+                 "buy_tp": plan.buy_tp, "sell_tp": plan.sell_tp})
+    LOG.info(f"[exec] TOUCH-ARM-LVN {account} {broker_symbol} {tf} → armed "
+             f"[edge={side} fulcrum={plan.fulcrum}], {len(cmds)} command(s)")
+
+
+# Last bar close_ts a candle_sweep was evaluated per (account, symbol, tf) — gates the
+# bar-close detector to fire ONCE per new bar (not every 1s poll). Module-level so it
+# survives across polls within a server run (reset on restart is fine — cooldown + the
+# active-cycle gate still prevent duplicate arms).
+_SWEEP_LAST_BAR: dict = {}
+
+
+def _sweep_trail(account: str, broker_symbol: str, symbol: str, tf: str,
+                 leg_magic: int, arm: dict, open_state: dict, quote: dict) -> None:
+    """candle_sweep ratcheting SL trail — only ever tightens. Engages ONLY after VWAP-BE
+    fired (arm.vwap_be_armed) AND the side is >50% filled. Each bar close in the fill
+    direction moves the stop to that candle's extreme, but only if it beats the current
+    stop: Buy+GREEN → SL up to candle LOW; Sell+RED → SL down to candle HIGH. Baseline is
+    the POC the VWAP-BE parked at (sweep_vwap). Shared by /exec/emit_grid and the poll-loop
+    new-bar path so an armed sweep trails identically regardless of what drove the bar."""
+    if arm.get("trigger_kind") != "candle_sweep" or not arm.get("vwap_be_armed"):
+        return
+    try:
+        _latest = store().latest(symbol, tf)
+        if not _latest:
+            return
+        _ratio_t = float(quote.get("mid") or 0.0) / float(_latest.ohlc.c) if _latest.ohlc.c else 1.0
+        _trail_lo = round(float(_latest.ohlc.l) * _ratio_t, 4)
+        _trail_hi = round(float(_latest.ohlc.h) * _ratio_t, 4)
+        _is_green = _latest.ohlc.c >= _latest.ohlc.o
+        _is_red   = _latest.ohlc.c <= _latest.ohlc.o
+        _pos_buys  = int(open_state.get("buys",  0) or 0)
+        _pos_sells = int(open_state.get("sells", 0) or 0)
+        _buy_n     = int(arm.get("buy_n")  or 0)
+        _sell_n    = int(arm.get("sell_n") or 0)
+        _be_px     = float(arm.get("sweep_vwap") or 0.0)
+        _sl_buy    = float(arm.get("trail_sl_buy")  or _be_px)
+        _sl_sell   = float(arm.get("trail_sl_sell") or _be_px)
+        _arm_tp_up   = float(arm.get("tp_up")   or 0.0)
+        _arm_tp_down = float(arm.get("tp_down") or 0.0)
+        _dirty = False
+        if (_pos_buys > 0 and _buy_n > 0 and _pos_buys > _buy_n / 2
+                and _is_green and _trail_lo > 0 and _trail_lo > _sl_buy):
+            ExecBridge.enqueue_modify_sl(account, broker_symbol, leg_magic, _trail_lo,
+                                         side="buy", comment="FB|sweep_trail|buy", tp=_arm_tp_up)
+            arm["trail_sl_buy"] = _trail_lo
+            _dirty = True
+        if (_pos_sells > 0 and _sell_n > 0 and _pos_sells > _sell_n / 2
+                and _is_red and _trail_hi > 0 and (_sl_sell <= 0 or _trail_hi < _sl_sell)):
+            ExecBridge.enqueue_modify_sl(account, broker_symbol, leg_magic, _trail_hi,
+                                         side="sell", comment="FB|sweep_trail|sell", tp=_arm_tp_down)
+            arm["trail_sl_sell"] = _trail_hi
+            _dirty = True
+        if _dirty:
+            # strip magic before spread — a stale arm body can carry its own wrong magic
+            # (see project_arm_magic_key_bug); the outer leg_magic must always win.
+            _body = {k: v for k, v in arm.items() if k != "magic"}
+            ExecBridge.set_last_arm(account, broker_symbol, magic=leg_magic, **_body)
+    except Exception:
+        pass
+
+
+def _sweep_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
+                  venue_mid: float | None = None) -> None:
+    """Bar-close arm for candle_sweep — INDEPENDENT of the _score_and_pick competition.
+    Mirrors _lvn_touch_arm_tf's forced-arm shape (own magic, force_trigger bypasses the
+    scorer) but is driven on a NEW BAR CLOSE, not an intrabar tap: candle_sweep is a
+    bar-close pattern (outside/engulf bar). Fires at most once per bar per TF; the
+    active-cycle gate + candle_sweep_cooldown_bars prevent stacking. This is why a sweep
+    can arm even when hvn/imbalance also fired that bar — no strategy blocks another."""
+    from execution.grid_planner import plan_grid_levels
+    from execution.zone_triggers import _t_candle_sweep
+    from pipeline.state_store import store as _store
+    grid_cfg = settings.get("grid_levels") or {}
+    if tf not in _trigger_tfs(grid_cfg, "candle_sweep"):
+        return
+
+    symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
+    broker_to_analysis = {v: k for k, v in symbol_map.items()}
+    analysis = broker_to_analysis.get(broker_symbol, broker_symbol)
+
+    # New-bar gate: only evaluate once per closed bar (the detector reads closed bars).
+    try:
+        _bars = _store().recent(analysis, tf, 5)
+    except Exception:
+        return
+    if len(_bars) < 2:
+        return
+    _last_ts = getattr(_bars[-1], "close_ts", None) or getattr(_bars[-1], "ts", None)
+    _key = (str(account), broker_symbol, tf)
+    if _last_ts is not None and _SWEEP_LAST_BAR.get(_key) == _last_ts:
+        return   # already evaluated this bar
+
+    quote = ExecBridge.get_quote(account, broker_symbol)
+    if venue_mid is None:
+        if not quote or not quote.get("mid"):
+            return
+        venue_mid = float(quote["mid"])
+    live_analysis = venue_mid
+
+    trig = _t_candle_sweep(analysis, tf, live_analysis, grid_cfg)
+    # Stamp this bar as evaluated regardless of detect result — no re-scan until next bar.
+    if _last_ts is not None:
+        _SWEEP_LAST_BAR[_key] = _last_ts
+    if trig is None:
+        return
+
+    leg_magic = magic_for("candle_sweep", tf)
+    _cyc = ExecBridge.get_last_arm(account, broker_symbol, magic=leg_magic) or {}
+
+    # One concurrent cycle per (candle_sweep × TF): don't re-arm while a cycle is live —
+    # but DO run the bar-close TP refresh + ratcheting SL trail (this new-bar tick is the
+    # only bar-close hook now that the external emit_grid caller is gone).
+    if _cyc.get("active"):
+        try:
+            _refresh_cycle_tps(account, broker_symbol, analysis, tf, leg_magic, settings,
+                               include_positions=True)
+            _cyc = ExecBridge.get_last_arm(account, broker_symbol, magic=leg_magic) or _cyc
+            if _cyc.get("active"):
+                _open = ExecBridge.get_open(account, broker_symbol, magic=leg_magic) or {}
+                _sweep_trail(account, broker_symbol, analysis, tf, leg_magic, _cyc, _open,
+                             quote or {})
+        except Exception:
+            LOG.exception("[exec] sweep active-cycle refresh/trail error")
+        return
+
+    # Cooldown: after a cycle closed (active→False), hold candle_sweep_cooldown_bars
+    # before a fresh sweep arm — matches the /exec/emit_grid cooldown gate.
+    if _cyc.get("trigger_kind") == "candle_sweep":
+        _tf_secs = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}.get(tf, 60)
+        _cd_bars = int(grid_cfg.get("candle_sweep_cooldown_bars", 3) or 3)
+        _last_arm_ts = float(_cyc.get("ts") or 0.0)
+        if _last_arm_ts > 0 and (time.time() - _last_arm_ts) < _cd_bars * _tf_secs:
+            return
+
+    ExecBridge.clear_emit(account, broker_symbol, magic=leg_magic)
+    min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5 if quote else 0.0
+    plan = plan_grid_levels(analysis, tf, live_analysis,
+                            trigger_hint="candle_sweep", settings=settings,
+                            venue_price=venue_mid, min_step_venue=min_step_venue,
+                            force_trigger=trig)
+    if plan.verdict != "arm" or plan.trigger_kind != "candle_sweep":
+        _emit_audit({"account": account, "symbol": analysis, "tf": tf, "verdict": "skip",
+                     "skip_reason": f"sweep_arm:{plan.skip_reason or 'no_plan'}"})
+        return
+
+    cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
+                                        close_first=True, clear_kind="cancel",
+                                        magic=leg_magic,
+                                        leg_tp=(not bool(grid_cfg.get("net_profit_exit_only", False))
+                                                or bool(grid_cfg.get("leg_tp_ceiling", False))))
+    _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
+    node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
+    node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
+    ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum, edge="",
+                            trigger_kind=plan.trigger_kind, venue_mid=venue_mid, magic=leg_magic,
+                            n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
+                            buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
+                            buy_lots_total=round(sum(l.lot for l in plan.buy_legs), 4),
+                            sell_lots_total=round(sum(l.lot for l in plan.sell_legs), 4),
+                            bias_peak=0.0, bias_booked=False, bias_trail_done=False,
+                            be_done_buy=False, be_done_sell=False,
+                            node_low=round(node_low, 5), node_high=round(node_high, 5),
+                            active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
+                            max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
+                            squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank,
+                            sweep_be_usd=float(plan.trigger_context.get("sweep_be_usd") or 0.0),
+                            sweep_vwap=float(plan.trigger_context.get("sweep_vwap") or 0.0))
+    ExecBridge.mark_emit(account, broker_symbol, plan.fulcrum, magic=leg_magic)
+    _emit_audit({"account": account, "symbol": analysis, "broker_symbol": broker_symbol,
+                 "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind,
+                 "fulcrum": plan.fulcrum, "venue_mid": venue_mid,
+                 "n_per_side": plan.n_per_side, "step": plan.step,
+                 "buy_tp": plan.buy_tp, "sell_tp": plan.sell_tp})
+    LOG.info(f"[exec] SWEEP-ARM {account} {broker_symbol} {tf} → armed "
+             f"[fulcrum={plan.fulcrum}], {len(cmds)} command(s)")
 
 
 @bp.post("/exec/poll")
@@ -606,7 +1022,9 @@ def exec_poll():
                     continue
                 b = int(m.get("buys", 0)); s = int(m.get("sells", 0))
                 ExecBridge.set_open(account, sym, b + s, int(m.get("pendings", 0)),
-                                    tf=tf_m, magic=mg, buys=b, sells=s)
+                                    tf=tf_m, magic=mg, buys=b, sells=s,
+                                    buy_pendings=int(m.get("buy_pendings", 0)),
+                                    sell_pendings=int(m.get("sell_pendings", 0)))
                 ExecBridge.monitor_cycle(account, sym, settings_cfg, tf=tf_m, magic=mg,
                                          pnl=float(m.get("pnl", 0.0)), buys=b, sells=s,
                                          buy_pnl=float(m.get("buy_pnl", 0.0)),
@@ -686,6 +1104,20 @@ def exec_poll():
                 _touch_arm_tf(account, sym, _tf, settings_cfg or {}, venue_mid=_poll_venue_mid)
             except Exception:
                 LOG.exception("[exec] touch_arm error")  # never break the poll
+        _lvn_touch_tfs = _trigger_tfs((settings_cfg or {}).get("grid_levels", {}), "lvn_edge_touch")
+        for _tf in _lvn_touch_tfs:
+            try:
+                _lvn_touch_arm_tf(account, sym, _tf, settings_cfg or {}, venue_mid=_poll_venue_mid)
+            except Exception:
+                LOG.exception("[exec] lvn touch_arm error")  # never break the poll
+        # candle_sweep — bar-close arm on its OWN magic, independent of the scorer so it
+        # arms even when hvn/imbalance also fired that bar (no strategy blocks another).
+        _sweep_tfs = _trigger_tfs((settings_cfg or {}).get("grid_levels", {}), "candle_sweep")
+        for _tf in _sweep_tfs:
+            try:
+                _sweep_arm_tf(account, sym, _tf, settings_cfg or {}, venue_mid=_poll_venue_mid)
+            except Exception:
+                LOG.exception("[exec] sweep_arm error")  # never break the poll
 
     commands = ExecBridge.poll(account)
     if commands:
@@ -857,58 +1289,9 @@ def exec_emit_grid():
         if not arm.get("active"):
             return jsonify({"ok": True, "verdict": "skip", "skip_reason": "hvn_faded",
                             "symbol": symbol, "broker_symbol": broker_symbol, "tf": tf})
-        # candle_sweep SL trail — ratcheting, only ever tightens. Engages ONLY after the
-        # VWAP-BE has fired (arm.vwap_be_armed) AND the side is >50% filled (matches the
-        # hvn_inside_touch deferred-SL threshold). Each bar close in the fill direction moves
-        # the stop to that candle's extreme, but only if that beats the current stop:
-        #   Buy  positions, GREEN candle (close >= open): SL up to candle LOW  (never down).
-        #   Sell positions, RED   candle (close <= open): SL down to candle HIGH (never up).
-        # Baseline is the POC the VWAP-BE parked the stop at (sweep_vwap), so the first trail
-        # only fires once a favourable candle clears breakeven. Trail level per side is
-        # persisted (trail_sl_buy / trail_sl_sell) so the ratchet survives across polls.
-        if arm.get("trigger_kind") == "candle_sweep" and arm.get("vwap_be_armed"):
-            try:
-                _trail_latest = store().latest(symbol, tf)
-                if _trail_latest:
-                    _ratio_t = float(quote.get("mid") or 0.0) / float(_trail_latest.ohlc.c) \
-                               if _trail_latest.ohlc.c else 1.0
-                    _trail_lo = round(float(_trail_latest.ohlc.l) * _ratio_t, 4)
-                    _trail_hi = round(float(_trail_latest.ohlc.h) * _ratio_t, 4)
-                    _is_green = _trail_latest.ohlc.c >= _trail_latest.ohlc.o
-                    _is_red   = _trail_latest.ohlc.c <= _trail_latest.ohlc.o
-                    _pos_buys  = int(open_state.get("buys",  0) or 0)
-                    _pos_sells = int(open_state.get("sells", 0) or 0)
-                    _buy_n     = int(arm.get("buy_n")  or 0)
-                    _sell_n    = int(arm.get("sell_n") or 0)
-                    _be_px     = float(arm.get("sweep_vwap") or 0.0)  # POC = trail baseline
-                    _sl_buy    = float(arm.get("trail_sl_buy")  or _be_px)
-                    _sl_sell   = float(arm.get("trail_sl_sell") or _be_px)
-                    _arm_tp_up   = float(arm.get("tp_up")   or 0.0)
-                    _arm_tp_down = float(arm.get("tp_down") or 0.0)
-                    _dirty = False
-                    # Buy: majority-filled + green + candle low ABOVE current stop → tighten up.
-                    if (_pos_buys > 0 and _buy_n > 0 and _pos_buys > _buy_n / 2
-                            and _is_green and _trail_lo > 0 and _trail_lo > _sl_buy):
-                        ExecBridge.enqueue_modify_sl(account, broker_symbol, leg_magic,
-                                                     _trail_lo, side="buy",
-                                                     comment="FB|sweep_trail|buy",
-                                                     tp=_arm_tp_up)
-                        arm["trail_sl_buy"] = _trail_lo
-                        _dirty = True
-                    # Sell: majority-filled + red + candle high BELOW current stop → tighten down.
-                    if (_pos_sells > 0 and _sell_n > 0 and _pos_sells > _sell_n / 2
-                            and _is_red and _trail_hi > 0
-                            and (_sl_sell <= 0 or _trail_hi < _sl_sell)):
-                        ExecBridge.enqueue_modify_sl(account, broker_symbol, leg_magic,
-                                                     _trail_hi, side="sell",
-                                                     comment="FB|sweep_trail|sell",
-                                                     tp=_arm_tp_down)
-                        arm["trail_sl_sell"] = _trail_hi
-                        _dirty = True
-                    if _dirty:
-                        ExecBridge.set_last_arm(account, broker_symbol, **arm)
-            except Exception:
-                pass
+        # candle_sweep ratcheting SL trail (extracted to _sweep_trail, shared with the
+        # poll-loop new-bar path so an armed sweep trails identically either way).
+        _sweep_trail(account, broker_symbol, symbol, tf, leg_magic, arm, open_state, quote)
 
         # hvn_edge SL trail — continuation side only, gated on squeeze_ok (arm-time coil
         # OR runtime expansion upgrade). Trails buy SL to candle low on green bars when
@@ -1008,18 +1391,18 @@ def exec_emit_grid():
     if not arm.get("active") and not _live:
         ExecBridge.clear_emit(account, symbol, magic=leg_magic)
 
-    # Touch-only gate: when hvn_inside_touch has touch_only=true in the triggers list,
-    # it is armed ONLY by the intrabar touch path (exec_poll → _touch_arm_tf). Bar-close
-    # still handles TP refresh for live cycles (handled above). This gate blocks NEW arms
-    # from a bar-close detector fire — price may have ended the bar near an edge without
-    # a real tap.
-    _hit_entry = _trigger_entry((settings.get("grid_levels") or {}), "hvn_inside_touch")
-    if (plan.trigger_kind == "hvn_inside_touch"
+    # Touch-only gate: when a trigger kind has touch_only=true in the triggers list, it is
+    # armed ONLY by the intrabar touch path (exec_poll → _touch_arm_tf / _lvn_touch_arm_tf).
+    # Bar-close still handles TP refresh for live cycles (handled above). This gate blocks
+    # NEW arms from a bar-close detector fire — price may have ended the bar near an edge
+    # without a real tap. Applies to both hvn_inside_touch and lvn_edge_touch.
+    _hit_entry = _trigger_entry((settings.get("grid_levels") or {}), plan.trigger_kind)
+    if (plan.trigger_kind in ("hvn_inside_touch", "lvn_edge_touch")
             and bool((_hit_entry or {}).get("touch_only", False))):
         _emit_audit({"account": account, "symbol": symbol, "tf": tf, "verdict": "skip",
-                     "skip_reason": "hvn_inside_touch:touch_only"})
+                     "skip_reason": f"{plan.trigger_kind}:touch_only"})
         return jsonify({"ok": True, "verdict": "skip",
-                        "skip_reason": "hvn_inside_touch:touch_only",
+                        "skip_reason": f"{plan.trigger_kind}:touch_only",
                         "symbol": symbol, "broker_symbol": broker_symbol})
 
     # Fulcrum dedup: ONE grid per touched-level episode. Skip if the fulcrum hasn't
@@ -1321,6 +1704,49 @@ def exec_zones():
             for lo, hi in _collect(_prev_daily, "lvn_zones"):
                 zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
 
+    # Fine-resolution HVN/LVN (tick-bin vp_profile_bin, e.g. 0.1) computed over the last
+    # session's bars and drawn as kind hvn_fine / lvn_fine — a TradingView-style A/B
+    # overlay vs the coarse (0.4) detection zones above, so node LOCATIONS can be compared
+    # directly on the chart. Cosmetic only: never feeds the grid, never breaks the payload.
+    _fine_levels = []   # fine-VP POC/VAH/VAL/naked-POC, appended to `levels` below
+    try:
+        from pipeline.features.volume_profile import compute as _vp_compute
+        _fine_bin = float((_vpc.get("vp_profile_bin") or {}).get(symbol, 0.0) or 0.0)
+        if _fine_bin > 0:
+            _fbars = _store().recent(symbol, "1m", 1440)   # ~1 session of 1m bars
+            if _fbars:
+                _fvp = _vp_compute(_fbars, "daily", float(_fbars[-1].ohlc.c), bin_size=_fine_bin)
+                for z in (_fvp.hvn_zones or []):
+                    zones.append({"kind": "hvn_fine", "lo": _rebase_price(float(z["low"])),
+                                  "hi": _rebase_price(float(z["high"]))})
+                for z in (_fvp.lvn_zones or []):
+                    zones.append({"kind": "lvn_fine", "lo": _rebase_price(float(z["low"])),
+                                  "hi": _rebase_price(float(z["high"]))})
+                # Fine VP point-levels (same node set, tick resolution) for A/B vs coarse.
+                for _sk, _ok in (("poc", "poc_fine"), ("vah", "vah_fine"),
+                                 ("val", "val_fine"), ("naked_poc", "naked_poc_fine")):
+                    _v = getattr(_fvp, _sk, None)
+                    if isinstance(_v, (int, float)) and _v > 0:
+                        _fine_levels.append({"kind": _ok, "price": _rebase_price(float(_v))})
+                # TICK VP: SAME bars + SAME fine bin, weighted by per-price trade COUNT
+                # (weight="cnt") not volume — isolates the volume-vs-tick axis (bin held
+                # constant). Forward-only: empty until bars carry counts.
+                _tvp = _vp_compute(_fbars, "daily", float(_fbars[-1].ohlc.c),
+                                   bin_size=_fine_bin, weight="cnt")
+                for z in (_tvp.hvn_zones or []):
+                    zones.append({"kind": "hvn_tick", "lo": _rebase_price(float(z["low"])),
+                                  "hi": _rebase_price(float(z["high"]))})
+                for z in (_tvp.lvn_zones or []):
+                    zones.append({"kind": "lvn_tick", "lo": _rebase_price(float(z["low"])),
+                                  "hi": _rebase_price(float(z["high"]))})
+                for _sk, _ok in (("poc", "poc_tick"), ("vah", "vah_tick"),
+                                 ("val", "val_tick"), ("naked_poc", "naked_poc_tick")):
+                    _v = getattr(_tvp, _sk, None)
+                    if isinstance(_v, (int, float)) and _v > 0:
+                        _fine_levels.append({"kind": _ok, "price": _rebase_price(float(_v))})
+    except Exception:
+        pass  # fine A/B zones/levels are cosmetic — never break the zones payload
+
     # VP point-levels the grid actually TRIGGERS on (vp_level_touch fulcrums), drawn as
     # labeled lines — only the levels enabled in grid_levels.vp_fulcrum_levels. Same
     # venue-shifted daily VP, so they line up with the zones above and the dashboard.
@@ -1338,6 +1764,11 @@ def exec_zones():
             _v = _today_daily.get(_src_k)
             if isinstance(_v, (int, float)) and _v > 0:
                 levels.append({"kind": _out_k, "price": _rebase_price(float(_v))})
+    # Fine-VP levels (tick resolution) for A/B vs the coarse levels above — same enabled
+    # set as the coarse levels so the comparison is apples-to-apples.
+    for _fl in _fine_levels:
+        if _fl["kind"].replace("_fine", "").replace("_tick", "") in enabled:
+            levels.append(_fl)
 
     # Computed volume-at-price histogram (venue-shifted) for the EA to draw as a sideways
     # profile. Returns two sessions (prev-D + today) each with start_ts so the EA can
@@ -1670,8 +2101,12 @@ def exec_fix_tps():
 
         # hvn_inside_touch: use the SAME session zones the trigger armed on (not daily) and
         # target the NEXT node beyond the touched node, so this repair can't re-clobber the
-        # TP back to the node price already sits in. Every other setup keeps daily zones.
+        # TP back to the node price already sits in. lvn_edge_touch: session LVN zones as
+        # the fulcrum reference, but the TP CANDIDATE pool is still daily HVN zones (the
+        # near-edge magnet), matching compute_lvn_edge_tps' convention. Every other setup
+        # keeps daily HVN zones.
         _is_inside = arm.get("trigger_kind") == "hvn_inside_touch"
+        _is_lvn = arm.get("trigger_kind") == "lvn_edge_touch"
         hvn_zones = []
         if _is_inside:
             try:
@@ -1699,15 +2134,19 @@ def exec_fix_tps():
         ratio = (bybit_mid / venue_mid) if venue_mid > 0 and bybit_mid > 0 else 1.0
         analysis_price = price * ratio
 
-        # skip_node = touched node bounds (stored venue-frame → analysis via *ratio here,
-        # since analysis = venue * ratio in this endpoint's frame convention).
-        _skip_node = None
-        if _is_inside:
-            _nlo_v = float(arm.get("node_low") or 0.0)
-            _nhi_v = float(arm.get("node_high") or 0.0)
-            if _nlo_v > 0 and _nhi_v > _nlo_v:
-                _skip_node = (_nlo_v * ratio, _nhi_v * ratio)
-        tp_up, tp_down = compute_hvn_tps(analysis_sym, analysis_price, hvn_zones, skip_node=_skip_node)
+        if _is_lvn:
+            from execution.zone_triggers import compute_lvn_edge_tps as _lvn_edge_tps
+            tp_up, tp_down = _lvn_edge_tps(analysis_sym, analysis_price, hvn_zones)
+        else:
+            # skip_node = touched node bounds (stored venue-frame → analysis via *ratio here,
+            # since analysis = venue * ratio in this endpoint's frame convention).
+            _skip_node = None
+            if _is_inside:
+                _nlo_v = float(arm.get("node_low") or 0.0)
+                _nhi_v = float(arm.get("node_high") or 0.0)
+                if _nlo_v > 0 and _nhi_v > _nlo_v:
+                    _skip_node = (_nlo_v * ratio, _nhi_v * ratio)
+            tp_up, tp_down = compute_hvn_tps(analysis_sym, analysis_price, hvn_zones, skip_node=_skip_node)
 
         # pick which TP applies to this order side
         is_buy = "buy" in order_type.lower()

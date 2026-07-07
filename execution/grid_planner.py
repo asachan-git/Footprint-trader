@@ -301,6 +301,15 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
         n = max(2, min(hvn_max_legs, n))
         return n, round(step, 4)
 
+    # lvn_edge_touch: same width-driven sizing as hvn_inside_touch — reuses the same
+    # hvn_max_legs/mean_rev_step_mult knobs (no separate LVN sizing config), per the
+    # "like hvn_inside_touch position management" design.
+    if trigger.kind == "lvn_edge_touch":
+        step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
+        n = int(round(trigger.raw_range / step)) if step > 0 else 2
+        n = max(2, min(hvn_max_legs, n))
+        return n, round(step, 4)
+
     # candle_sweep / engulf: same zone-width logic as hvn_inside_touch.
     # n = hvn_max_legs (per TF); step = candle_hl / n so the ladder spans one candle
     # range per side. buy legs start above candle_high; sell below candle_low.

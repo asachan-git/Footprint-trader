@@ -14,8 +14,9 @@ Detectors (v1):
   hvn_edge         — nearest HVN boundary; node width sizes the grid (REUSE vp_cache)
   hvn_inside_touch — candle CLOSED INSIDE an HVN, then (≤2 bars) TOUCHED an edge →
                      straddle the touched edge; node width sizes the grid. HVN source
-                     is session-aware (NY=rolling, London/Overlap=rolling+cached,
-                     Asia/Off=cached).
+                     blends rolling + cached-daily for every session (see
+                     _SESSION_HVN_SRC — per-session differentiation is available but
+                     currently unused; all sessions use the same superset).
   anchor           — high-vol+high-delta anchor candle retest (REUSE anchor_bar)
   va               — VAL/VAH reclaim-or-break-sustain, regime-aware (NEW interpretation)
   cvd_div          — CVD divergence pivot (REUSE delta_divergence + cvd_div_state)
@@ -44,10 +45,11 @@ def _hvn_dbg(msg: str) -> None:
 # ~24h trailing VP window per TF (matches reversal_hvn / continuation_hvn).
 _VP_WIN = {"15m": 96, "5m": 288, "1m": 1440, "1h": 24}
 
-# Which HVN source(s) feed the inside-touch trigger, per session. London/Overlap
-# (deep, two-sided liquidity) use BOTH the price-tracking rolling profile and the
-# stable cached-daily node; NY trusts the rolling profile; the thin Asia/Off books
-# use only the cached structural node.
+# Which HVN source(s) feed the inside-touch trigger, per session. Every session
+# currently blends BOTH the price-tracking rolling profile and the stable
+# cached-daily node — the safe superset. Per-session differentiation (e.g.
+# NY=rolling-only, thin Asia=cached-only) is intentionally NOT enabled: it was
+# never validated on live data. Tune per session here only after A/B evidence.
 _SESSION_HVN_SRC = {
     "NY":      ("rolling", "cached"),
     "London":  ("rolling", "cached"),
@@ -195,6 +197,77 @@ def compute_hvn_tps(symbol: str, edge: float,
 
     tp_up   = _hvn_target(up_zones, up_ref, +1)
     tp_down = _hvn_target(dn_zones, dn_ref, -1)
+
+    if tp_up == 0.0 or tp_down == 0.0:
+        from pipeline.features.vp_cache import get as vp_get
+        _dvp   = vp_get(symbol, "daily") or {}
+        _vah   = float(_dvp.get("vah") or 0.0)
+        _val   = float(_dvp.get("val") or 0.0)
+        _poc   = float(_dvp.get("poc") or 0.0)
+        _lvns  = [(float(z["low"]), float(z["high"]))
+                  for z in (_dvp.get("lvn_zones") or [])]
+
+        if tp_up == 0.0:
+            if _vah > up_ref + min_dist:
+                tp_up = _vah
+            else:
+                lvn_above = [lo for lo, hi in _lvns if lo > up_ref + min_dist]
+                if lvn_above:
+                    tp_up = min(lvn_above)
+            if tp_up == 0.0 and _poc > up_ref + min_dist:
+                tp_up = _poc
+            if tp_up == 0.0:
+                tp_up = _fib_ext_tp(edge, zones, "up")
+
+        if tp_down == 0.0:
+            if _val > 0 and _val < dn_ref - min_dist:
+                tp_down = _val
+            else:
+                lvn_below = [hi for lo, hi in _lvns if hi < dn_ref - min_dist]
+                if lvn_below:
+                    tp_down = max(lvn_below)
+            if tp_down == 0.0 and 0 < _poc < dn_ref - min_dist:
+                tp_down = _poc
+            if tp_down == 0.0:
+                tp_down = _fib_ext_tp(edge, zones, "down")
+
+    return tp_up, tp_down
+
+
+def compute_lvn_edge_tps(symbol: str, edge: float,
+                         zones: list[tuple[float, float]],
+                         min_dist: float = 0.0,
+                         top_leg: float = 0.0,
+                         bot_leg: float = 0.0) -> tuple[float, float]:
+    """Recompute (tp_up, tp_down) for lvn_edge_touch — same zone-walk as
+    compute_hvn_tps, but targets the NEAR edge of an intermediate qualifying HVN (the
+    boundary facing back toward the LVN) instead of the far edge — a more conservative
+    target than hvn_inside_touch's "punch through the whole node" convention, since
+    there's no directional/reversion thesis here to justify assuming a full pass-through.
+    Extreme (outermost) node still targets its CENTER, same rule as compute_hvn_tps.
+    No skip_node: the fulcrum is an LVN edge, not inside an HVN, so there's no bracketing
+    node to exclude. Same VAH/VAL/LVN/POC/fib fallback cascade as compute_hvn_tps when no
+    HVN qualifies at all."""
+    up_ref  = top_leg if top_leg > 0 else edge
+    dn_ref  = bot_leg if bot_leg > 0 else edge
+
+    up_zones = sorted([(lo, hi) for lo, hi in zones if hi > up_ref + min_dist], key=lambda z: z[1])
+    dn_zones = sorted([(lo, hi) for lo, hi in zones if lo < dn_ref - min_dist], key=lambda z: -z[0])
+
+    # NEAR edge for an intermediate node (opposite of compute_hvn_tps's far edge);
+    # CENTER for the extreme (outermost) node — same magnet rule as compute_hvn_tps.
+    def _near_target(zs: list, ref: float, sign: int) -> float:
+        if not zs:
+            return 0.0
+        z = zs[0]
+        near_edge = z[0] if sign > 0 else z[1]
+        if len(zs) == 1:   # extreme node → center (fall back to near edge if mid doesn't clear)
+            center = (z[0] + z[1]) / 2.0
+            return center if sign * (center - ref) > min_dist else near_edge
+        return near_edge
+
+    tp_up   = _near_target(up_zones, up_ref, +1)
+    tp_down = _near_target(dn_zones, dn_ref, -1)
 
     if tp_up == 0.0 or tp_down == 0.0:
         from pipeline.features.vp_cache import get as vp_get
@@ -445,12 +518,17 @@ def _rolling_hvn(symbol: str, tf: str, bars: list[Bar]) -> list[tuple[float, flo
 
 
 def _cached_hvn(symbol: str) -> list[tuple[float, float]]:
-    """HVN zones from both prev-day and today's cached daily VP."""
+    """HVN zones from the cached daily VP. From 20:00 IST (NY reference — matches the
+    /exec/zones chart band) today's session is structural enough on its own: use TODAY
+    ONLY. Before that, merge prev-day + today (today may still be too thin alone)."""
     try:
-        from pipeline.features.vp_cache import get as vp_get, get_prev_and_today
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        from pipeline.features.vp_cache import get_prev_and_today
         prev_vp, today_vp = get_prev_and_today(symbol)
+        ist_hour = _dt.now(tz=_tz(_td(hours=5, minutes=30))).hour
+        sources = (today_vp,) if ist_hour >= 20 else (prev_vp, today_vp)
         zones: list[tuple[float, float]] = []
-        for vp in (prev_vp, today_vp):
+        for vp in sources:
             if vp:
                 zones += [(float(z["low"]), float(z["high"])) for z in (vp.get("hvn_zones") or [])]
         return zones
@@ -464,8 +542,14 @@ def _merge_zone_tuples(zones: list[tuple[float, float]]) -> list[tuple[float, fl
     collapse them so the grid straddles ONE fulcrum, not two near-duplicate edges."""
     if not zones:
         return zones
-    out: list[list[float]] = [list(zones[0])]
-    for lo, hi in sorted(zones):
+    # Seed from the SORTED list, not the unsorted zones[0]. Seeding with an arbitrary
+    # (possibly high) first element made the merge walk compare the lowest sorted zone
+    # against a higher seed: lo <= out[-1][1] was spuriously True, so the lowest zone got
+    # absorbed into the seed and its low silently discarded (observed: LVN 4130-4134
+    # swallowed by rolling's 4146.8 seed → price sat inside a real LVN with no arm).
+    ordered = sorted(zones)
+    out: list[list[float]] = [list(ordered[0])]
+    for lo, hi in ordered[1:]:
         if lo <= out[-1][1]:                       # overlap or touch
             out[-1][1] = max(out[-1][1], hi)
         else:
@@ -506,114 +590,6 @@ def _prior_day_hvn(symbol: str, price: float) -> list[tuple[float, float]]:
     return []
 
 
-# ── HVN zone stabilization (hysteresis) ──────────────────────────────────────
-# The rolling VP is recomputed stateless every call: the sliding window drops a bar,
-# find_peaks thresholds move with the recomputed average, peak_widths edges are
-# interpolated floats, and the merge trough gate sits near its calibrated shoulder.
-# Result: zone edges jitter and borderline nodes flicker in/out between recomputes,
-# which downstream turns into fulcrum shifts, TP modifies and false hvn_faded
-# flattens. This layer makes the output STICKY without hiding real structure:
-#   - edge snapping: keep the previous edge while the new one wiggles within tol
-#   - sticky deletion: a zone must be absent hvn_stab_del_n consecutive recomputes
-#     before it disappears (kills threshold flicker)
-#   - immediate appearance: genuinely new nodes pass through at once (triggers stay
-#     responsive); real migrations beyond tol are accepted at once too
-# State is in-process per (symbol, tf); restart reseeds from the next compute (benign
-# — per-cycle safety lives in the arm dict + fade strikes on the exec side).
-
-_ZONE_STAB: dict[tuple[str, str], dict] = {}
-_ZONE_STAB_LOCK = __import__("threading").Lock()
-_STAB_CFG_CACHE: dict[str, Any] = {"ts": 0.0, "cfg": {}}
-_TF_SECS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
-
-
-def _stab_cfg() -> dict:
-    """grid_levels config for the stabilizer, yaml-read cached for 30s."""
-    import time as _time
-    now = _time.time()
-    if now - float(_STAB_CFG_CACHE["ts"]) > 30.0:
-        try:
-            import yaml as _yaml
-            _cfg = _yaml.safe_load(
-                (__import__("pathlib").Path(__file__).resolve().parent.parent
-                 / "config" / "settings.yaml").read_text()) or {}
-            _STAB_CFG_CACHE["cfg"] = _cfg.get("grid_levels") or {}
-        except Exception:
-            pass
-        _STAB_CFG_CACHE["ts"] = now
-    return _STAB_CFG_CACHE["cfg"]
-
-
-def _stabilize_zones(symbol: str, tf: str, zones: list[tuple[float, float]],
-                     sess: str) -> list[tuple[float, float]]:
-    """Hysteresis over successive `_session_hvn_zones` outputs (see block comment)."""
-    cfg = _stab_cfg()
-    if not bool(cfg.get("hvn_stab_enabled", True)):
-        return zones
-    tol_frac = float(cfg.get("hvn_stab_edge_tol_frac", 0.25) or 0.25)
-    del_n = int(cfg.get("hvn_stab_del_n", 3) or 3)
-    try:
-        from pipeline.features.volume_profile import _resolve_bin_size
-        bin_size = float(_resolve_bin_size(symbol)) or 0.5
-    except Exception:
-        bin_size = 0.5
-    import time as _time
-    now = _time.time()
-    key = (symbol, tf)
-    with _ZONE_STAB_LOCK:
-        snap = _ZONE_STAB.get(key)
-        # Reseed on first call, session change (20:00 IST prev-D→today swap) or a stale
-        # snapshot (recompute cadence broke down — don't pin to dead structure).
-        if snap is None or snap.get("sess") != sess \
-           or now - float(snap.get("ts", 0.0)) > 5 * _TF_SECS.get(tf, 300):
-            _ZONE_STAB[key] = {"zones": [[lo, hi, 0] for lo, hi in zones],
-                               "sess": sess, "ts": now}
-            return zones
-        prev: list[list[float]] = snap["zones"]   # [lo, hi, miss_count]
-        out: list[list[float]] = []
-        used_prev: set[int] = set()
-        for lo, hi in zones:
-            # match by overlap; merge case = one new zone spanning several prev zones
-            matches = [i for i, (plo, phi, _m) in enumerate(prev)
-                       if not (hi < plo or lo > phi)]
-            if not matches:
-                # nearest-center fallback for a small non-overlapping drift
-                c = (lo + hi) / 2.0
-                best_i, best_d = -1, float("inf")
-                for i, (plo, phi, _m) in enumerate(prev):
-                    if i in used_prev:
-                        continue
-                    d = abs((plo + phi) / 2.0 - c)
-                    if d < best_d:
-                        best_d, best_i = d, i
-                if best_i >= 0 and best_d <= max(tol_frac * (hi - lo), 2 * bin_size):
-                    matches = [best_i]
-            if matches:
-                plo = min(prev[i][0] for i in matches)
-                phi = max(prev[i][1] for i in matches)
-                tol = max(tol_frac * max(phi - plo, bin_size), 2 * bin_size)
-                # snap each OUTER edge independently: keep the old edge while the new
-                # one wiggles within tol; accept it (real migration) beyond tol
-                new_lo = plo if abs(lo - plo) <= tol else lo
-                new_hi = phi if abs(hi - phi) <= tol else hi
-                if new_hi <= new_lo:      # degenerate snap (e.g. split shrank the span)
-                    new_lo, new_hi = lo, hi
-                out.append([new_lo, new_hi, 0])
-                used_prev.update(matches)
-            else:
-                out.append([lo, hi, 0])   # brand-new node → appears immediately
-        # sticky deletion: unmatched previous zones survive del_n-1 misses
-        for i, (plo, phi, miss) in enumerate(prev):
-            if i in used_prev:
-                continue
-            if miss + 1 < del_n:
-                out.append([plo, phi, miss + 1])
-        out.sort(key=lambda z: z[0])
-        snap["zones"] = out
-        snap["ts"] = now
-        return [(lo, hi) for lo, hi, _m in out]
-
-
 def _session_hvn_zones(symbol: str, tf: str, bars: list[Bar]) -> tuple[list[tuple[float, float]], str]:
     """HVN zones for the current session per `_SESSION_HVN_SRC`. Returns (zones, session)."""
     from pipeline.features.session import current_session
@@ -634,9 +610,53 @@ def _session_hvn_zones(symbol: str, tf: str, bars: list[Bar]) -> tuple[list[tupl
        and _outside_daily_va(symbol, price):
         zones = _merge_zone_tuples(zones + _prior_day_hvn(symbol, price))
 
-    # Hysteresis: sticky edges / sticky deletion so ALL consumers (triggers, poll
-    # refresh, bar-close refresh, orphan-cancel) see the same stable view.
-    zones = _stabilize_zones(symbol, tf, zones, sess)
+    return zones, sess
+
+
+def _rolling_lvn(symbol: str, tf: str, bars: list[Bar]) -> list[tuple[float, float]]:
+    """Price-tracking rolling-VP LVN zones over the ~24h window for `tf`. Mirrors
+    _rolling_hvn exactly — same VP compute call, reads lvn_zones instead of hvn_zones."""
+    win = _VP_WIN.get(tf, 96)
+    if len(bars) < win:
+        return []
+    try:
+        from pipeline.features.volume_profile import compute as vp_compute, _resolve_bin_size
+        vp = vp_compute(bars[-win:], "daily", bars[-1].ohlc.c,
+                        bin_size=_resolve_bin_size(symbol))
+        return [(float(z["low"]), float(z["high"])) for z in (vp.lvn_zones or [])]
+    except Exception:
+        return []
+
+
+def _cached_lvn(symbol: str) -> list[tuple[float, float]]:
+    """LVN zones from the cached daily VP. Mirrors _cached_hvn's ≥20:00 IST today-only
+    rule for consistency (same reference session both draw from)."""
+    try:
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        from pipeline.features.vp_cache import get_prev_and_today
+        prev_vp, today_vp = get_prev_and_today(symbol)
+        ist_hour = _dt.now(tz=_tz(_td(hours=5, minutes=30))).hour
+        sources = (today_vp,) if ist_hour >= 20 else (prev_vp, today_vp)
+        zones: list[tuple[float, float]] = []
+        for vp in sources:
+            if vp:
+                zones += [(float(z["low"]), float(z["high"])) for z in (vp.get("lvn_zones") or [])]
+        return zones
+    except Exception:
+        return []
+
+
+def _session_lvn_zones(symbol: str, tf: str, bars: list[Bar]) -> tuple[list[tuple[float, float]], str]:
+    """LVN zones for the current session — rolling ∪ cached, merged. Mirrors
+    _session_hvn_zones minus the vacuum fallback (that borrows HVN structure when price
+    is stranded outside range; not applicable when price is deliberately inside an LVN)."""
+    from pipeline.features.session import current_session
+    ts = bars[-1].close_ts if bars else None
+    sess = current_session(ts, symbol).session
+    zones: list[tuple[float, float]] = []
+    zones += _rolling_lvn(symbol, tf, bars)
+    zones += _cached_lvn(symbol)
+    zones = _merge_zone_tuples(zones)
     return zones, sess
 
 
@@ -826,6 +846,167 @@ def touch_arm_trigger(symbol: str, tf: str, live_price: float) -> Trigger | None
         fulcrum_price=float(edge),
         raw_range=float(width),
         confidence=0.6,   # touch-armed: no close-rejection depth, fixed mid confidence
+        context={"bias": "none", "edge": side, "session": sess,
+                 "touch_armed": True,
+                 "node_low": float(node_low), "node_high": float(node_high),
+                 "tp_up": float(tp_up), "tp_down": float(tp_down)},
+    )
+
+
+def _t_lvn_edge_touch(symbol: str, tf: str, current_price: float) -> Trigger | None:
+    """A recent candle CLOSES INSIDE an LVN (low-volume vacuum) *and* TAPS one of its
+    edges — geometrically identical to _t_hvn_inside_touch, reading LVN zone bounds
+    instead of HVN. No fade-side/breakout-side asymmetry (no reversion thesis) — TP for
+    both directions comes from compute_lvn_edge_tps' near-edge-of-next-HVN rule.
+    Stateless / causal."""
+    import yaml as _yaml
+    from pipeline.state_store import store
+    try:
+        _cfg = _yaml.safe_load(
+            (__import__("pathlib").Path(__file__).resolve().parent.parent / "config" / "settings.yaml").read_text()
+        ) or {}
+        _gcfg = _cfg.get("grid_levels") or {}
+        _buf = float(_gcfg.get("lvn_touch_buffer", 0.0))
+        _buf_pct = float(_gcfg.get("lvn_touch_buffer_pct", 0.0))
+        _lookback = int(_gcfg.get("lvn_lookback_bars", 3))
+    except Exception:
+        _buf = 0.0
+        _buf_pct = 0.0
+        _lookback = 3
+
+    win = _VP_WIN.get(tf, 96)
+    bars = store().recent(symbol, tf, win + 5)
+    if len(bars) < 2:
+        return None
+    zones, sess = _session_lvn_zones(symbol, tf, bars)
+    if not zones:
+        return None
+
+    candidate_bars = bars[-(1 + _lookback):-1]
+    candidate_bars = list(reversed(candidate_bars))
+
+    best_trigger = None
+    for bar_idx, cur in enumerate(candidate_bars):
+        c, h, lo_p = cur.ohlc.c, cur.ohlc.h, cur.ohlc.l
+        best = None
+        for lo, hi in zones:
+            width = hi - lo
+            if width <= 0:
+                continue
+            if not (lo < c < hi):
+                continue
+            _buf_eff = max(_buf, width * _buf_pct)
+            touch_top = h >= hi - _buf_eff
+            touch_bot = lo_p <= lo + _buf_eff
+            if not (touch_top or touch_bot):
+                continue
+            if touch_top and touch_bot:
+                edge, side = (hi, "top") if abs(hi - c) <= abs(lo - c) else (lo, "bottom")
+            else:
+                edge, side = (hi, "top") if touch_top else (lo, "bottom")
+            poke = (h - hi) if side == "top" else (lo - lo_p)
+            reject_frac = max(0.0, poke) / width
+            dist = abs(edge - c)
+            if best is None or dist < best[0]:
+                best = (dist, edge, width, side, reject_frac)
+        if best is not None:
+            _dist, edge, width, side, reject_frac = best
+            conf = min(0.9, 0.55 + min(reject_frac, 0.3)) * (1.0 - bar_idx * 0.05)
+            best_trigger = (edge, width, side, reject_frac, conf, sess)
+            break
+
+    if best_trigger is None:
+        return None
+
+    edge, width, side, reject_frac, conf, sess = best_trigger
+
+    try:
+        from pipeline.features.vp_cache import get as vp_get
+        _dvp_d = vp_get(symbol, "daily") or {}
+        _daily_hvn_zones = [(float(z["low"]), float(z["high"]))
+                            for z in (_dvp_d.get("hvn_zones") or [])]
+    except Exception:
+        _daily_hvn_zones = []
+    tp_up, tp_down = compute_lvn_edge_tps(symbol, edge, _daily_hvn_zones)
+
+    node_low  = (edge - width) if side == "top" else edge
+    node_high = edge if side == "top" else (edge + width)
+    return Trigger(
+        kind="lvn_edge_touch",
+        fulcrum_price=float(edge),
+        raw_range=float(width),
+        confidence=float(conf),
+        context={"bias": "none", "edge": side, "session": sess,
+                 "reject_frac": round(reject_frac, 4),
+                 "node_low": float(node_low), "node_high": float(node_high),
+                 "tp_up": float(tp_up), "tp_down": float(tp_down)},
+    )
+
+
+def lvn_touch_arm_trigger(symbol: str, tf: str, live_price: float) -> Trigger | None:
+    """INTRABAR variant of _t_lvn_edge_touch — arm on LIVE price tapping an LVN edge
+    without waiting for the candle to close. Mirrors touch_arm_trigger exactly, reading
+    LVN zone bounds instead of HVN. Caller owns the tick-reversal confirm."""
+    import yaml as _yaml
+    from pipeline.state_store import store
+    try:
+        _cfg = _yaml.safe_load(
+            (__import__("pathlib").Path(__file__).resolve().parent.parent / "config" / "settings.yaml").read_text()
+        ) or {}
+        _gcfg2 = _cfg.get("grid_levels") or {}
+        _buf = float(_gcfg2.get("lvn_touch_buffer", 0.0))
+        _buf_pct = float(_gcfg2.get("lvn_touch_buffer_pct", 0.0))
+    except Exception:
+        _buf = 0.0
+        _buf_pct = 0.0
+
+    win = _VP_WIN.get(tf, 96)
+    bars = store().recent(symbol, tf, win + 5)
+    if len(bars) < 2 or live_price <= 0:
+        return None
+    zones, sess = _session_lvn_zones(symbol, tf, bars)
+    if not zones:
+        return None
+
+    best = None
+    for lo, hi in zones:
+        width = hi - lo
+        if width <= 0:
+            continue
+        if not (lo <= live_price <= hi):
+            continue
+        _buf_eff = max(_buf, width * _buf_pct)
+        touch_top = live_price >= hi - _buf_eff
+        touch_bot = live_price <= lo + _buf_eff
+        if not (touch_top or touch_bot):
+            continue
+        if touch_top and touch_bot:
+            edge, side = (hi, "top") if abs(hi - live_price) <= abs(lo - live_price) else (lo, "bottom")
+        else:
+            edge, side = (hi, "top") if touch_top else (lo, "bottom")
+        dist = abs(edge - live_price)
+        if best is None or dist < best[0]:
+            best = (dist, edge, width, side)
+    if best is None:
+        return None
+    _dist, edge, width, side = best
+
+    try:
+        from pipeline.features.vp_cache import get as vp_get
+        _dvp_d = vp_get(symbol, "daily") or {}
+        _daily_hvn_zones = [(float(z["low"]), float(z["high"]))
+                            for z in (_dvp_d.get("hvn_zones") or [])]
+    except Exception:
+        _daily_hvn_zones = []
+    tp_up, tp_down = compute_lvn_edge_tps(symbol, edge, _daily_hvn_zones)
+
+    node_low  = (edge - width) if side == "top" else edge
+    node_high = edge if side == "top" else (edge + width)
+    return Trigger(
+        kind="lvn_edge_touch",
+        fulcrum_price=float(edge),
+        raw_range=float(width),
+        confidence=0.6,
         context={"bias": "none", "edge": side, "session": sess,
                  "touch_armed": True,
                  "node_low": float(node_low), "node_high": float(node_high),
@@ -1139,22 +1320,6 @@ def bb_tp(bars: list, cfg: dict | None = None) -> tuple[float, float]:
 
 
 # London open (07:30–10:00 UTC) and NY open (13:30–16:00 UTC).
-_SESSION_WINDOWS_UTC: list[tuple[int, int, int, int]] = [
-    (7, 30, 10, 0),
-    (13, 30, 16, 0),
-]
-
-
-def in_session_window(now_utc=None) -> bool:
-    """True when current UTC time is inside a London or NY open momentum window."""
-    from datetime import datetime, timezone
-    if now_utc is None:
-        now_utc = datetime.now(timezone.utc)
-    t = now_utc.hour * 60 + now_utc.minute
-    return any(h0 * 60 + m0 <= t < h1 * 60 + m1
-               for h0, m0, h1, m1 in _SESSION_WINDOWS_UTC)
-
-
 def session_atr_ratio(bars, window: int = 20) -> float:
     """Ratio of smoothed-recent bar range to rolling-mean range.
     Uses the last 3 bars as 'current' (avoids single-bar spikes) vs the preceding
@@ -1834,6 +1999,7 @@ def detect_all(symbol: str, tf: str, current_price: float, regime,
         _t_imbalance(symbol, tf, current_price),
         _t_hvn_edge(symbol, tf, current_price, cfg),
         _t_hvn_inside_touch(symbol, tf, current_price) if _kind_active_for_tf(cfg, "hvn_inside_touch", tf) else None,
+        _t_lvn_edge_touch(symbol, tf, current_price) if _kind_active_for_tf(cfg, "lvn_edge_touch", tf) else None,
         _t_hvn_displacement(symbol, tf, current_price, daily_vp),
         _t_anchor(symbol, current_price, atr, latest),
         _t_va(symbol, current_price, regime, daily_vp),

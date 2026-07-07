@@ -98,6 +98,7 @@ def _build_bins(
     bars,
     bin_size: float | None = None,
     num_bins: int = NUM_BINS,
+    weight: str = "vol",
 ) -> tuple[np.ndarray, np.ndarray, float, float, float] | None:
     """Aggregate ladder volume into a tick-aligned bin grid.
 
@@ -155,18 +156,24 @@ def _build_bins(
     def _bin_of(price: float) -> int:
         return max(0, min(n - 1, int((price - p_min) / bin_size)))
 
+    # weight="cnt" builds a TICK VP (per-price trade COUNT) instead of a volume VP.
+    # cnt is 0 on legacy/aggregated bars, so a tick VP is meaningful only once bars
+    # carry counts (forward-only). No delta-fallback for cnt (ladder-less → no count).
+    _cnt_mode = (weight == "cnt")
     for bar in bars:
         has_ladder = bool(bar.bid_ladder) or bool(bar.ask_ladder)
         if has_ladder:
-            # True orderflow: aggregate exact-price ladder volumes
+            # True orderflow: aggregate exact-price ladder weights (volume or count)
             for lvl in bar.bid_ladder:
-                if lvl.vol > 0:
-                    bins[_bin_of(lvl.price)] += lvl.vol
+                w = getattr(lvl, "cnt", 0.0) if _cnt_mode else lvl.vol
+                if w > 0:
+                    bins[_bin_of(lvl.price)] += w
             for lvl in bar.ask_ladder:
-                if lvl.vol > 0:
-                    bins[_bin_of(lvl.price)] += lvl.vol
-        else:
-            # Fallback for ladder-less bars (degenerate synthetic data)
+                w = getattr(lvl, "cnt", 0.0) if _cnt_mode else lvl.vol
+                if w > 0:
+                    bins[_bin_of(lvl.price)] += w
+        elif not _cnt_mode:
+            # Fallback for ladder-less bars (degenerate synthetic data) — volume only
             v = abs(bar.delta or 0.0)
             if v <= 0 or bar.ohlc.h <= bar.ohlc.l:
                 continue
@@ -315,192 +322,32 @@ def _zones_from_peaks(
     return sorted(result, key=lambda z: z["low"])
 
 
-_HVN_SMOOTH_PRICE_CACHE: float | None = None
+def _smooth(bins: np.ndarray, n_bins: int) -> np.ndarray:
+    """Gaussian smoothing — sigma fixed at 1.5 bins (just enough to merge tick noise)."""
+    return gaussian_filter1d(bins.astype(float), sigma=1.5)
 
 
-def _hvn_smooth_price() -> float:
-    """Gaussian smoothing WIDTH in PRICE units (settings.grid_levels.vp_smooth_price,
-    default 1.5). The per-call sigma is max(1.5 bins, this / bin_size) — so the smoothing
-    covers a constant price width regardless of bin: coarse-bin symbols stay at the legacy
-    1.5-bin floor (unchanged), fine-bin symbols (e.g. XAU @0.25) get proportionally MORE
-    smoothing so single-bin noise doesn't fragment into spurious 1pt nodes. Cached once."""
-    global _HVN_SMOOTH_PRICE_CACHE
-    if _HVN_SMOOTH_PRICE_CACHE is None:
-        val = 1.5
-        try:
-            import yaml as _yaml
-            import pathlib as _pl
-            _cfg = _yaml.safe_load(
-                (_pl.Path(__file__).resolve().parent.parent.parent / "config" / "settings.yaml").read_text()
-            ) or {}
-            val = float((_cfg.get("grid_levels") or {}).get("vp_smooth_price", 1.5))
-        except Exception:
-            val = 1.5
-        _HVN_SMOOTH_PRICE_CACHE = val if val > 0 else 1.5
-    return _HVN_SMOOTH_PRICE_CACHE
-
-
-def _smooth(bins: np.ndarray, sigma_bins: float = 1.5) -> np.ndarray:
-    """Gaussian smoothing. sigma_bins floored at 1.5 (legacy) — see _hvn_smooth_price for
-    the price-constant scaling that callers compute from bin_size."""
-    return gaussian_filter1d(bins.astype(float), sigma=max(1.5, sigma_bins))
-
-
-def _peak_vol(bins: np.ndarray, zone: dict, price_min: float, bin_size: float) -> float:
-    """Max bin volume spanned by a zone's [low, high] price interval."""
-    a = max(0, int(math.floor((zone["low"] - price_min) / bin_size)))
-    b = min(len(bins) - 1, int(math.floor((zone["high"] - price_min) / bin_size)))
-    return float(bins[a: b + 1].max()) if b >= a else 0.0
-
-
-def _merge_zones(
-    zones: list[dict],
-    merge_tol: float,
-    prof: np.ndarray | None = None,
-    price_min: float = 0.0,
-    bin_size: float = 0.0,
-    trough_ratio: float = 0.0,
-    floor_tol: float | None = None,
-) -> list[dict]:
-    """Merge price-adjacent zones (Sierra/Bookmap cluster merging).
-    Input MUST be price-sorted (_zones_from_peaks sorts by low).
-
-    Two-tier gate:
-      • gap ≤ floor_tol (default = merge_tol): merge UNCONDITIONALLY (legacy 1-bin floor —
-        directly-adjacent zones are always one node; avoids un-merging what legacy merged).
-      • floor_tol < gap ≤ merge_tol: merge ONLY if the trough between the two peaks stays
-        shallow — ``min(trough) ≥ trough_ratio × min(peak_a, peak_b)`` — a shoulder, not a
-        real LVN vacuum. Deep trough → keep split.
-
-    `prof` MUST be the SAME array the peaks were detected on (the smoothed profile) so the
-    trough metric matches what the detector saw; raw bins have noisy deep troughs that would
-    spuriously block merges. Without prof/bin_size/trough_ratio it degrades to pure gap
-    merging up to merge_tol (LVN path / legacy)."""
+def _merge_zones(zones: list[dict], merge_tol: float) -> list[dict]:
+    """Merge adjacent zones whose gap is ≤ merge_tol (Sierra/Bookmap cluster merging)."""
     if not zones:
         return zones
-    if floor_tol is None:
-        floor_tol = merge_tol
-    valley_gate = prof is not None and trough_ratio > 0 and bin_size > 0
     merged = [dict(zones[0])]
     for z in zones[1:]:
-        prev = merged[-1]
-        gap = z["low"] - prev["high"]
-        if gap <= merge_tol:
-            do_merge = True
-            if valley_gate and gap > floor_tol:
-                g0 = max(0, int(math.floor((prev["high"] - price_min) / bin_size)))
-                g1 = min(len(prof) - 1, int(math.ceil((z["low"] - price_min) / bin_size)))
-                trough = float(prof[g0: g1 + 1].min()) if g1 >= g0 else 0.0
-                pa = _peak_vol(prof, prev, price_min, bin_size)
-                pb = _peak_vol(prof, z, price_min, bin_size)
-                do_merge = trough >= trough_ratio * min(pa, pb)
-            if do_merge:
-                prev["high"] = max(prev["high"], z["high"])
-                continue
-        merged.append(dict(z))
+        if z["low"] - merged[-1]["high"] <= merge_tol:
+            merged[-1]["high"] = max(merged[-1]["high"], z["high"])
+        else:
+            merged.append(dict(z))
     return merged
 
 
-def _subtract_hvn_from_lvn(
-    lvn: list[dict], hvn: list[dict], bin_size: float
-) -> list[dict]:
-    """Clip HVN spans out of LVN spans.
-
-    HVN and LVN are detected independently (peaks vs valleys on the same smoothed
-    array), so their half-height boundaries can spatially overlap — a price bin
-    ends up claimed as BOTH high- and low-volume, which is meaningless. An LVN is
-    by definition the vacuum *between* HVNs, so any overlap is the HVN's. Subtract
-    every HVN interval from each LVN interval (one LVN can split into pieces), then
-    drop sub-bin slivers left behind.
-    """
-    if not lvn or not hvn:
-        return lvn
-    hvn_sorted = sorted(hvn, key=lambda z: z["low"])
-    out: list[dict] = []
-    for z in lvn:
-        segs = [(z["low"], z["high"])]
-        for h in hvn_sorted:
-            nxt: list[tuple[float, float]] = []
-            for lo, hi in segs:
-                if h["high"] <= lo or h["low"] >= hi:   # no overlap → keep whole
-                    nxt.append((lo, hi))
-                    continue
-                if h["low"] > lo:                        # surviving piece left of HVN
-                    nxt.append((lo, h["low"]))
-                if h["high"] < hi:                       # surviving piece right of HVN
-                    nxt.append((h["high"], hi))
-            segs = nxt
-        for lo, hi in segs:
-            if hi - lo >= bin_size:                      # drop sub-bin slivers
-                out.append({"low": round(lo, 4), "high": round(hi, 4)})
-    return sorted(out, key=lambda z: z["low"])
-
-
-_VP_MERGE_CACHE: tuple[float, float] | None = None
-
-
-def _vp_merge_cfg() -> tuple[float, float]:
-    """(gap_bins, trough_ratio) for HVN cluster merging. gap_bins = how many bin_size gaps
-    apart two HVN peaks may sit and still merge; trough_ratio = how shallow the valley between
-    them must stay (fraction of the smaller peak) to count as one node. Read once from
-    settings.grid_levels.vp_merge_gap_bins (default 20) / vp_merge_trough_ratio (default 0.55)."""
-    global _VP_MERGE_CACHE
-    if _VP_MERGE_CACHE is None:
-        gap, ratio = 20.0, 0.55
-        try:
-            import yaml as _yaml
-            import pathlib as _pl
-            _cfg = _yaml.safe_load(
-                (_pl.Path(__file__).resolve().parent.parent.parent / "config" / "settings.yaml").read_text()
-            ) or {}
-            gl = _cfg.get("grid_levels") or {}
-            gap = float(gl.get("vp_merge_gap_bins", 20))
-            ratio = float(gl.get("vp_merge_trough_ratio", 0.55))
-        except Exception:
-            gap, ratio = 20.0, 0.55
-        gap = gap if gap >= 1.0 else 1.0
-        ratio = ratio if 0.0 <= ratio <= 1.0 else 0.6
-        _VP_MERGE_CACHE = (gap, ratio)
-    return _VP_MERGE_CACHE
-
-
-_HVN_REL_HEIGHT_CACHE: float | None = None
-
-
-def _hvn_rel_height() -> float:
-    """HVN peak-width measurement height (scipy peak_widths rel_height). LOWER = tighter
-    nodes (width measured nearer the peak tip), separating adjacent peaks that blur into one
-    wide blob at 0.5. Read once from settings.grid_levels.vp_hvn_rel_height (default 0.5 =
-    legacy). Cached so the (cheap) yaml read happens once per process."""
-    global _HVN_REL_HEIGHT_CACHE
-    if _HVN_REL_HEIGHT_CACHE is None:
-        val = 0.5
-        try:
-            import yaml as _yaml
-            import pathlib as _pl
-            _cfg = _yaml.safe_load(
-                (_pl.Path(__file__).resolve().parent.parent.parent / "config" / "settings.yaml").read_text()
-            ) or {}
-            val = float((_cfg.get("grid_levels") or {}).get("vp_hvn_rel_height", 0.5))
-        except Exception:
-            val = 0.5
-        _HVN_REL_HEIGHT_CACHE = val if 0.0 < val <= 1.0 else 0.5
-    return _HVN_REL_HEIGHT_CACHE
-
-
 def _find_hvn_zones(
-    bins: np.ndarray, bin_size: float, price_min: float, top_n: int = 8,
-    rel_height: float | None = None,
+    bins: np.ndarray, bin_size: float, price_min: float, top_n: int = 8
 ) -> list[dict]:
     """HVN via Gaussian-smoothed bins, prominence ≥ 0.5×avg, height ≥ avg.
-    Adjacent zones within vp_merge_gap_bins×bin_size are merged IF the trough between them is
-    shallow (vp_merge_trough_ratio gate) — a deep valley = real LVN, kept split.
-    `rel_height` (None → config vp_hvn_rel_height) sets how far down each peak its width is
-    measured: lower = tighter nodes that don't blur adjacent peaks into one wide blob.
+    Adjacent zones within 2×bin_size are merged (Sierra/Bookmap convention).
     """
     n = len(bins)
-    # price-constant smoothing: sigma = price_width / bin_size (floored at 1.5 bins in _smooth)
-    smoothed = _smooth(bins, _hvn_smooth_price() / bin_size if bin_size else 1.5)
+    smoothed = _smooth(bins, n)
     active = bins[bins > 0]
     if len(active) == 0:
         return []
@@ -510,15 +357,9 @@ def _find_hvn_zones(
     if len(peaks) == 0:
         return []
 
-    _rh = rel_height if rel_height is not None else _hvn_rel_height()
-    _, _, left_ips, right_ips = peak_widths(smoothed, peaks, rel_height=_rh)
+    _, _, left_ips, right_ips = peak_widths(smoothed, peaks, rel_height=0.5)
     zones = _zones_from_peaks(bins, peaks, left_ips, right_ips, bin_size, price_min, top_n=top_n * 2)
-    gap_bins, trough_ratio = _vp_merge_cfg()
-    merged = _merge_zones(
-        zones, merge_tol=gap_bins * bin_size,
-        prof=smoothed, price_min=price_min, bin_size=bin_size,
-        trough_ratio=trough_ratio, floor_tol=bin_size,
-    )
+    merged = _merge_zones(zones, merge_tol=bin_size)  # 1× bin_size gap = same cluster
     return merged[:top_n]
 
 
@@ -529,7 +370,7 @@ def _find_lvn_zones(
     Adjacent valleys within 2×bin_size are merged.
     """
     n = len(bins)
-    smoothed = _smooth(bins, _hvn_smooth_price() / bin_size if bin_size else 1.5)
+    smoothed = _smooth(bins, n)
     active_idxs = np.where(bins > 0)[0]
     if len(active_idxs) == 0:
         return []
@@ -617,9 +458,10 @@ def _hvn_lvn(vol_map: dict[float, float]) -> tuple[list[dict], list[dict]]:
     for p, v in vol_map.items():
         idx = max(0, min(NUM_BINS - 1, int((p - p_min) / bin_size)))
         bins[idx] += v
-    hvn = _find_hvn_zones(bins, bin_size, p_min)
-    lvn = _subtract_hvn_from_lvn(_find_lvn_zones(bins, bin_size, p_min), hvn, bin_size)
-    return hvn, lvn
+    return (
+        _find_hvn_zones(bins, bin_size, p_min),
+        _find_lvn_zones(bins, bin_size, p_min),
+    )
 
 
 def _current_position(close: float, poc: float, vah: float, val: float) -> str:
@@ -641,6 +483,7 @@ def compute(
     prev_poc: float | None = None,
     *,
     bin_size: float | None = None,
+    weight: str = "vol",
 ) -> VolumeProfilePeriod:
     """Compute VolumeProfilePeriod from a list of Bar objects for the period.
 
@@ -648,7 +491,7 @@ def compute(
     provided, POC/VAH/VAL land on exact multiples. When None, falls back to
     legacy range/NUM_BINS=68 binning.
     """
-    built = _build_bins(bars, bin_size=bin_size)
+    built = _build_bins(bars, bin_size=bin_size, weight=weight)
     if built is None:
         return VolumeProfilePeriod(
             period=period, poc=None, vah=None, val=None,
@@ -676,7 +519,6 @@ def compute(
 
     hvn = _find_hvn_zones(bins, used_bin_size, p_min)
     lvn = _find_lvn_zones(bins, used_bin_size, p_min)
-    lvn = _subtract_hvn_from_lvn(lvn, hvn, used_bin_size)   # resolve HVN/LVN overlap
     shape = _classify_shape(bins, poc_idx, lo_idx, hi_idx, n)
 
     # Naked POC: prior-period POC not revisited by this period's bars
