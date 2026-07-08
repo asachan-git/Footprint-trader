@@ -301,22 +301,19 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
         step = max((step_mult * atr) if atr > 0 else 1.0, 1e-4)
         return n, round(step, 4)
 
-    # hvn_inside_touch: WIDTH-DRIVEN sizing (BTC Jun22 regime). step = ATR × mult; leg
-    # count = node_width / step so a WIDER node gets MORE legs (legs span the whole node),
-    # capped at hvn_max_legs (per-TF). raw_range = node width for this trigger.
+    # hvn_inside_touch: n fixed at hvn_max_legs (per-TF); step = ATR × mult. Legs may
+    # extend beyond node width on a narrow node — n is no longer width-scaled.
     if trigger.kind == "hvn_inside_touch":
         step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
-        n = int(round(trigger.raw_range / step)) if step > 0 else 2
-        n = max(2, min(hvn_max_legs, n))
+        n = max(2, hvn_max_legs)
         return n, round(step, 4)
 
-    # lvn_edge_touch: same width-driven sizing as hvn_inside_touch — reuses the same
+    # lvn_edge_touch: same fixed-max sizing as hvn_inside_touch — reuses the same
     # hvn_max_legs/mean_rev_step_mult knobs (no separate LVN sizing config), per the
     # "like hvn_inside_touch position management" design.
     if trigger.kind == "lvn_edge_touch":
         step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
-        n = int(round(trigger.raw_range / step)) if step > 0 else 2
-        n = max(2, min(hvn_max_legs, n))
+        n = max(2, hvn_max_legs)
         return n, round(step, 4)
 
     # candle_sweep / engulf: same zone-width logic as hvn_inside_touch.
@@ -329,11 +326,10 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
                else max((step_mult * atr) if atr > 0 else 1.0, 1e-4)
         return n, round(step, 4)
 
-    # bb_expansion_touch: ATR-based spacing, leg count from zone width / step.
+    # bb_expansion_touch: ATR-based spacing, n fixed at hvn_max_legs.
     if trigger.kind == "bb_expansion_touch":
         step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
-        n = int(round(trigger.raw_range / step)) if step > 0 else 2
-        n = max(2, min(hvn_max_legs, n))
+        n = max(2, hvn_max_legs)
         return n, round(step, 4)
 
     step = step_mult * atr if atr > 0 else max(trigger.raw_range / 4.0, 1e-6)
