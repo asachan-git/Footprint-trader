@@ -321,6 +321,26 @@ bool ExecPlacePending(const string cmd, ulong &ticket, int &retcode, string &err
 }
 
 //+------------------------------------------------------------------+
+//| Descending selection-sort of a (ticket, volume) pair by volume.   |
+//| Small arrays (leg counts, not thousands) — O(n^2) is fine.        |
+//+------------------------------------------------------------------+
+void SortTicketsByVolumeDesc(ulong &tickets[], double &vols[])
+{
+   int n = ArraySize(tickets);
+   for(int i = 0; i < n - 1; i++)
+   {
+      int maxIdx = i;
+      for(int j = i + 1; j < n; j++)
+         if(vols[j] > vols[maxIdx]) maxIdx = j;
+      if(maxIdx != i)
+      {
+         double tv = vols[i];    vols[i] = vols[maxIdx];    vols[maxIdx] = tv;
+         ulong  tt = tickets[i]; tickets[i] = tickets[maxIdx]; tickets[maxIdx] = tt;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Execute CLOSE_ALL for a symbol: close positions + cancel pendings|
 //| belonging to this magic. Returns true if no failures.            |
 //+------------------------------------------------------------------+
@@ -345,14 +365,16 @@ bool ExecCloseAll(const string cmd, int &closed, int &cancelled, string &err)
       else { allOk = false; err = "cancel fail #" + IntegerToString((long)pend[i]); }
    }
 
-   //--- snapshot position tickets, then close
-   ulong pos[];
+   //--- snapshot position tickets + lots, sort biggest-lot-first, then close
+   ulong pos[]; double posVol[];
    for(int i = 0; i < PositionsTotal(); i++)
       if(posInfo.SelectByIndex(i))
          if(MagicMatch(posInfo.Magic(), cmdMagic) && (sym == "" || posInfo.Symbol() == sym))
          {
-            int n = ArraySize(pos); ArrayResize(pos, n + 1); pos[n] = posInfo.Ticket();
+            int n = ArraySize(pos); ArrayResize(pos, n + 1); ArrayResize(posVol, n + 1);
+            pos[n] = posInfo.Ticket(); posVol[n] = posInfo.Volume();
          }
+   SortTicketsByVolumeDesc(pos, posVol);
    for(int i = 0; i < ArraySize(pos); i++)
    {
       if(trade.PositionClose(pos[i], InpSlippage)) closed++;
@@ -580,14 +602,16 @@ bool ExecCloseSide(const string cmd, int &closed, string &err)
    ENUM_POSITION_TYPE want = (side == "buy") ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
    closed = 0; err = ""; bool allOk = true;
 
-   ulong tk[];
+   ulong tk[]; double tkVol[];
    for(int i = 0; i < PositionsTotal(); i++)
       if(posInfo.SelectByIndex(i))
          if(posInfo.Magic() == magic && posInfo.Symbol() == sym
             && posInfo.PositionType() == want)
          {
-            int n = ArraySize(tk); ArrayResize(tk, n + 1); tk[n] = posInfo.Ticket();
+            int n = ArraySize(tk); ArrayResize(tk, n + 1); ArrayResize(tkVol, n + 1);
+            tk[n] = posInfo.Ticket(); tkVol[n] = posInfo.Volume();
          }
+   SortTicketsByVolumeDesc(tk, tkVol);   // biggest lots booked first; smallest survive as BE runner
    int total   = ArraySize(tk);
    int toClose = (int)MathCeil(total * frac);
    for(int i = 0; i < toClose && i < total; i++)

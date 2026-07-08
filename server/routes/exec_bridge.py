@@ -23,6 +23,11 @@ from execution.exec_bridge import ExecBridge, magic_for, tf_from_magic
 bp = Blueprint("exec_bridge", __name__)
 _EMIT_LOG = Path(__file__).resolve().parent.parent.parent / "data" / "exec_emit.jsonl"
 
+# Vantage TICK-VP cache: (account, broker_symbol) → {hvn:[(lo,hi)], lvn:[...], poc, vah,
+# val, naked_poc, ts}. Populated by /exec/tick_profile (EA CopyTicks histogram → server
+# HVN/LVN/level compute); read by /exec/zones to draw the *_tick overlay. Venue-frame.
+_TICK_VP_CACHE: dict = {}
+
 
 def _emit_audit(row: dict) -> None:
     """Append one emit decision (arm or skip) — ground truth for diagnostics."""
@@ -1768,9 +1773,12 @@ def exec_zones():
                     _v = getattr(_fvp, _sk, None)
                     if isinstance(_v, (int, float)) and _v > 0:
                         _fine_levels.append({"kind": _ok, "price": _rebase_price(float(_v))})
-                # TICK VP: SAME bars + SAME fine bin, weighted by per-price trade COUNT
-                # (weight="cnt") not volume — isolates the volume-vs-tick axis (bin held
-                # constant). Forward-only: empty until bars carry counts.
+                # TICK VP — Binance aggTrade COUNT per price (weight="cnt"), SAME bars +
+                # SAME fine bin as the volume VP above → true apples-to-apples: identical
+                # window, instrument and detection math, differing ONLY in vol vs count.
+                # (Binance chosen over Vantage: same trades as the volume VP, no venue
+                # offset, and stored history. cnt is forward-only from the binance_v1
+                # parser fix — empty until count-bearing bars accrue.)
                 _tvp = _vp_compute(_fbars, "daily", float(_fbars[-1].ohlc.c),
                                    bin_size=_fine_bin, weight="cnt")
                 for z in (_tvp.hvn_zones or []):
@@ -1785,7 +1793,7 @@ def exec_zones():
                     if isinstance(_v, (int, float)) and _v > 0:
                         _fine_levels.append({"kind": _ok, "price": _rebase_price(float(_v))})
     except Exception:
-        pass  # fine A/B zones/levels are cosmetic — never break the zones payload
+        pass  # fine/tick A/B zones/levels are cosmetic — never break the zones payload
 
     # VP point-levels the grid actually TRIGGERS on (vp_level_touch fulcrums), drawn as
     # labeled lines — only the levels enabled in grid_levels.vp_fulcrum_levels. Same
@@ -2211,3 +2219,51 @@ def exec_fix_tps():
         fixed += 1
 
     return jsonify({"ok": True, "fixed": fixed, "skipped": skipped})
+
+
+@bp.post("/exec/tick_profile")
+def exec_tick_profile():
+    """Vantage TICK VP intake: the EA POSTs a per-price tick-COUNT histogram built from
+    MT5 CopyTicks on the venue symbol. Server runs the SAME HVN/LVN + POC/VAH/VAL math
+    as the volume VP (count fed as the bin weight via a synthetic ladder bar) and caches
+    the result for /exec/zones to draw as the *_tick overlay. Venue-frame prices — no rebase.
+
+    Body: {account, symbol(broker), bin, profile:[{price, cnt}, ...]}.
+    """
+    if not _auth_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    body = request.get_json(force=True, silent=True) or {}
+    account = str(body.get("account") or "")
+    broker_symbol = str(body.get("symbol") or "")
+    bin_size = float(body.get("bin", 0.0) or 0.0)
+    prof = body.get("profile") or []
+    if not account or not broker_symbol or bin_size <= 0 or not prof:
+        return jsonify({"ok": False, "error": "need account, symbol, bin>0, profile[]"}), 400
+    try:
+        from pipeline.features.volume_profile import compute as _vp_compute
+        from pipeline.types import Bar, OHLC, Level
+        pts = [(float(p["price"]), float(p.get("cnt", 0.0))) for p in prof if float(p.get("cnt", 0.0)) > 0]
+        if not pts:
+            _TICK_VP_CACHE.pop((account, broker_symbol), None)
+            return jsonify({"ok": True, "zones": 0, "note": "empty profile"})
+        prices = [p for p, _ in pts]
+        lo, hi = min(prices), max(prices)
+        # Synthetic single bar: tick COUNT carried as ladder vol → compute() bins it exactly
+        # like a volume VP, so HVN/LVN/VA use identical detection. All on the ask side (side
+        # is irrelevant for a count profile).
+        ladder = tuple(Level(price=p, vol=c) for p, c in pts)
+        bar = Bar(bar_id="tickvp", symbol=broker_symbol, tf="tick", close_ts=0, source="vantage_ticks",
+                  ohlc=OHLC(o=lo, h=hi, l=lo, c=hi), bid_ladder=tuple(), ask_ladder=ladder,
+                  poc=None, delta=0.0)
+        vp = _vp_compute([bar], "daily", hi, bin_size=bin_size)
+        _TICK_VP_CACHE[(account, broker_symbol)] = {
+            "hvn": [(float(z["low"]), float(z["high"])) for z in (vp.hvn_zones or [])],
+            "lvn": [(float(z["low"]), float(z["high"])) for z in (vp.lvn_zones or [])],
+            "poc": vp.poc, "vah": vp.vah, "val": vp.val, "naked_poc": vp.naked_poc,
+            "ts": time.time(),
+        }
+        return jsonify({"ok": True, "hvn": len(vp.hvn_zones or []), "lvn": len(vp.lvn_zones or []),
+                        "poc": vp.poc, "vah": vp.vah, "val": vp.val})
+    except Exception as e:
+        LOG.exception("[tick_profile] compute failed")
+        return jsonify({"ok": False, "error": str(e)}), 500

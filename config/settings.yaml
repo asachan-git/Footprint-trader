@@ -53,15 +53,15 @@ grid_levels:
   # lvn_edge_touch, bb_expansion_touch — n = node_width/step clamped here) and the EXACT
   # count for fixed-n strats (hvn_edge, candle_sweep). Step stays flat (do NOT re-add the
   # inverted per-TF step map — it over-compressed higher TFs → full_hedge).
-  hvn_max_legs_by_tf: {1m: 4, 5m: 5, 15m: 6, 1h: 7}   # per-TF leg count (cap for touch strats, exact for edge/sweep)
+  hvn_max_legs_by_tf: {1m: 5, 5m: 7, 15m: 9, 1h: 7}   # per-TF leg count (cap for touch strats, exact for edge/sweep)
   mean_rev_step_mult: 0.50    # step = this × ATR between legs (BTC Jun22 flat value)
   mean_rev_step_mult_by_tf: {}   # empty → flat 0.50 all TFs (was inverted per-TF, over-tight on higher TFs)
 
   # Cycle profit targets — primary basket exit (net floating ≥ target → CLOSE_ALL)
   # Values are in native account currency (USC cents for Vantage XAUUSD.pc cent account;
   # plain USD for a standard USD account). 1 USD = 100 USC on a cent account.
-  cycle_net_target_by_tf: {1m: 1500.0, 5m: 2000.0, 15m: 3000.0, 1h: 3000.0}   # per-TF (USC; real $10/$15/$20/$30)
-  cycle_net_target_usd: 7500.0   # fallback when TF not in by_tf map
+  cycle_net_target_by_tf: {1m: 1500.0, 5m: 3000.0, 15m: 5000.0, 1h: 3000.0}   # per-TF (USC; real $10/$15/$20/$30)
+  cycle_net_target_usd: 10500.0   # fallback when TF not in by_tf map
 
   # Bias trail — arms when peak floating ≥ activate, fires on giveback% retrace.
   # Values are in native account currency (same note as cycle_net_target above).
@@ -72,7 +72,7 @@ grid_levels:
   # Squeeze multiplier — when a cycle was armed on a confirmed squeeze (squeeze_ok=True),
   # scale up targets so the system holds the runner longer into the expansion move.
   squeeze_target_mult: 1.0       # multiply cycle_net_target when squeeze_ok (Jun19: no mult — 2.0 stranded winners e.g. 1m +1000 vs target 2000)
-  squeeze_trail_mult: 1.0        # multiply bias_trail_activate when squeeze_ok
+  squeeze_trail_mult: 1.6        # multiply bias_trail_activate when squeeze_ok
 
   # Runtime expansion upgrade — flip squeeze_ok=True on a live cycle when expansion fires:
   # BBW has fully left compression (squeeze_gate=False) AND ATR is expanding vs recent mean.
@@ -139,10 +139,11 @@ grid_levels:
   hvn_touch_buffer_pct: 0.10
   hvn_lookback_bars: 3          # candle-close trigger scans last N bars (restart recovery)
   # BROKER ORDER-RATE THROTTLE: min seconds between MODIFY_PENDING/MODIFY_POSITION per
-  # (cycle, side). The HVN-tracking refresh used to re-modify every ~60s × many cycles =
-  # ~1500 modifications/hr, which trips broker HFT-abuse limits. 300 = pendings/TPs re-track
-  # the HVN at most every 5 min per side. 0 = no throttle (old behaviour).
-  modify_cooldown_s: 100
+  # (cycle, side). Built for Vantage's HFT-abuse limit (account 26443422 got algo-trading
+  # disabled over ~1500 mods/hr). Account is now direct MT5 — throttle kept as a safety
+  # margin, not because MT5 polices mod-rate the same way. 60 = re-track at most once/min
+  # per side. 0 = no throttle.
+  modify_cooldown_s: 60
   # HVN ZONE STABILIZATION (hysteresis on _session_hvn_zones output, zone_triggers.
   # _stabilize_zones). Rolling-VP recomputes are stateless → edges jitter and borderline
   # nodes flicker in/out, which downstream became fulcrum shifts / TP modifies / false
@@ -419,7 +420,7 @@ risk:
 # Daily floating P&L target — close all grid positions and block new arms for the day
 # once equity rises by this % above the session-open balance.
 # 0 = disabled. Example: 1.5 = close everything once up 1.5% on the day.
-daily_target_pct: 50.0
+daily_target_pct: 20.0
 
 # Dhan options trading configuration
 dhan:

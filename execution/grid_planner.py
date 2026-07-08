@@ -195,8 +195,13 @@ def _should_skip(trigger: Trigger | None, regime, fulcrum: float,
     # below low), and its fulcrum midpoint is used only for dedup, not leg placement. The
     # chop gate guards a mean-reversion straddle from oscillating through both ladders
     # inside a node; that failure mode doesn't apply here. Fully exempt from all 3 checks.
+    # lvn_edge_touch is ALSO exempt: same intrabar edge-tap signal as hvn_inside_touch,
+    # just on the opposite (low-volume) node type — an LVN can legitimately sit inside a
+    # wider daily HVN band, and the touch itself is still the real setup, not chop
+    # (confirmed 2026-07-08: 13 genuine touch_armed=True taps blanket-skipped here).
     if (trigger.kind not in ("hvn_edge", "hvn_inside_touch", "hvn_displacement",
-                             "vp_level_touch", "squeeze", "bb_expansion_touch", "candle_sweep")
+                             "vp_level_touch", "squeeze", "bb_expansion_touch", "candle_sweep",
+                             "lvn_edge_touch")
             and _price_inside_hvn(fulcrum, daily_vp)):
         return True, "chop:inside_hvn"
     if daily_vp and daily_vp.get("current_position") == "at_poc":
