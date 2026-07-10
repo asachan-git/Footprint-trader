@@ -829,19 +829,7 @@ class ExecBridge:
         if reason is None and 0 < positions < max_seen and pendings > 0 and not bias_booked:
             tol = max(mid * 1e-4, 1e-6) if mid > 0 else 1e-6
             confirms = (tp_up > 0 and mid >= tp_up - tol) or (tp_down > 0 and 0 < mid <= tp_down + tol)
-            # NET-NEGATIVE GUARD (2026-07-10, fixes the leg_closed_other/leg_tp bleed —
-            # project_leg_closed_other_bleed): a single leg dropping (its TP tapped on a
-            # retrace, OR any other close) used to fire CLOSE_ALL on the WHOLE basket
-            # regardless of net P&L. When price ran hard against the ladder, a far outer
-            # big-lot leg's TP fired on a small bounce while 4+ legs sat deep red → the
-            # flatten dumped the underwater basket at market (15m: leg_tp −9750 in one cycle,
-            # −16.7k across 3). Only flatten-rest when the basket is net ≥ 0 (a genuine
-            # "winner leg closed, lock the rest"). Net-negative → HOLD: let survivors ride to
-            # net_target (recovery thesis) or bias_trail; full_hedge is the only loss-cut.
-            if pnl is not None and float(pnl) < 0:
-                pass   # underwater — do NOT flatten on a leg drop; hold for recovery/target
-            else:
-                reason = "leg_tp" if confirms else "leg_closed_other"
+            reason = "leg_tp" if confirms else "leg_closed_other"
 
         # 3) full-hedge backstop (delta-neutral → cut to free margin; realizes a loss)
         if reason is None and close_on_full_hedge and n > 0 \

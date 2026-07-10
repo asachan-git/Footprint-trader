@@ -17,7 +17,7 @@
 //|    POST {InpBridgeURL}/exec/ack   {account, results:[...]}        |
 //+------------------------------------------------------------------+
 #property copyright "Aniket"
-#property version   "1.04"
+#property version   "1.05"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -38,7 +38,7 @@ input bool   InpDrawZones      = true;          // Draw HVN/LVN zones on the cha
 input string InpZoneTF         = "15m";         // TF whose VP zones to draw (5m|15m)
 input int    InpZoneRefreshSec = 30;            // Zone redraw interval (s)
 input color  InpHVNColor       = clrSteelBlue;  // HVN zone fill (coarse detection VP)
-input color  InpLVNColor       = clrSandyBrown; // LVN zone fill (coarse detection VP)
+input color  InpLVNColor       = C'255,228,196'; // LVN zone fill — pale/washed-out (reads as transparent; MQL5 rectangles have no true alpha channel)
 input color  InpHVNFineColor   = clrMagenta;    // HVN zone outline (fine tick VP — A/B compare)
 input color  InpLVNFineColor   = clrAqua;       // LVN zone outline (fine tick VP — A/B compare)
 input bool   InpShowZoneLabels = true;          // Label zones/levels with name + value
@@ -557,6 +557,31 @@ string BuildMagicsJson()
    return js;
 }
 
+//--- CLOSED Vantage bars for one TF (last `count`, OLDEST-FIRST) as a JSON array —
+//    lets candle_sweep detect directly on the EXECUTION venue's own OHLC instead of
+//    the analysis-feed (Binance/Bybit) candle, then rebasing. `start=1` skips the
+//    forming bar so every emitted bar is closed.
+//    ORDER FIX (2026-07-09): a non-series MqlRates array from CopyRates is OLDEST-FIRST
+//    (rates[0] = oldest of the requested range). The old `copied-1 downto 0` loop
+//    REVERSED that → emitted newest-first, and the Python sweep detector (which reads
+//    bars[i-1]=prev, bars[i]=cur, i.e. oldest-first) saw inverted pairs → NEVER detected
+//    a real Vantage sweep. Emit ascending (i=0..copied-1) so JSON is truly oldest-first.
+string BuildBarsJson(ENUM_TIMEFRAMES period, int count)
+{
+   MqlRates rates[];
+   int copied = CopyRates(_Symbol, period, 1, count, rates);   // start=1 skips forming bar
+   if(copied <= 0) return "";
+   string js = "";
+   for(int i = 0; i < copied; i++)   // rates[] is oldest-first; emit in the same order
+   {
+      js += (i == 0 ? "" : ",") +
+            StringFormat("{\"ts\":%I64d,\"o\":%.5f,\"h\":%.5f,\"l\":%.5f,\"c\":%.5f}",
+                         (long)rates[i].time, rates[i].open, rates[i].high,
+                         rates[i].low, rates[i].close);
+   }
+   return js;
+}
+
 //+------------------------------------------------------------------+
 //| Cancel this EA's pending orders ONLY (leave positions). The safe   |
 //| re-arm clear — can never flatten a live position.                  |
@@ -772,12 +797,18 @@ void PollAndExecute()
    // stops_pts/point let the server floor the grid step so no leg lands inside the freeze.
    double acctBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    double acctEquity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   // Vantage-native closed bars for candle_sweep detection (5m/15m) — avoids rebasing
+   // the analysis-feed candle onto this venue; the sweep pattern is checked on the
+   // SAME OHLC the broker will fill against.
+   string bars5m  = BuildBarsJson(PERIOD_M5,  10);
+   string bars15m = BuildBarsJson(PERIOD_M15, 10);
    string pollBody = StringFormat(
       "{\"account\":\"%s\",\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f,"
       "\"positions\":%d,\"pendings\":%d,\"buys\":%d,\"sells\":%d,\"pnl\":%.2f,"
-      "\"stops_pts\":%d,\"point\":%.5f,\"balance\":%.2f,\"equity\":%.2f,\"magics\":[%s]}",
+      "\"stops_pts\":%d,\"point\":%.5f,\"balance\":%.2f,\"equity\":%.2f,\"magics\":[%s],"
+      "\"bars_5m\":[%s],\"bars_15m\":[%s]}",
       gAccount, _Symbol, bid, ask, buys + sells, CountMyPendings(), buys, sells, SumMyPnL(),
-      (int)stopsPts, point, acctBalance, acctEquity, magicsJson);
+      (int)stopsPts, point, acctBalance, acctEquity, magicsJson, bars5m, bars15m);
    string resp;
    int code = HttpPost(InpBridgeURL + "/exec/poll", pollBody, resp);
    if(code != 200) return;
@@ -975,7 +1006,18 @@ void DrawTouchLine(int idx, const string side, double price)
    ObjectSetString (0, name, OBJPROP_TEXT, "tap-arm " + side);
 }
 
-void DrawZone(int idx, const string kind, double lo, double hi)
+//--- True when a zone (matched by lo/hi) has a live cycle armed against it
+//    (gHvnCycles entry with magic > 0). Small array, linear scan is fine.
+bool IsZoneActive(double lo, double hi)
+{
+   int nh = ArraySize(gHvnCycles);
+   for(int i = 0; i < nh; i++)
+      if(gHvnCycles[i].magic > 0 && gHvnCycles[i].lo == lo && gHvnCycles[i].hi == hi)
+         return true;
+   return false;
+}
+
+void DrawZone(int idx, const string kind, double lo, double hi, bool isActive = false)
 {
    string name  = ZONE_PREFIX + IntegerToString(idx);
    int    secs  = PeriodSeconds(PERIOD_CURRENT);
@@ -985,7 +1027,7 @@ void DrawZone(int idx, const string kind, double lo, double hi)
    color  clr;
    bool   fill;
    if(kind == "hvn")        { clr = InpHVNColor;      fill = true;  }
-   else if(kind == "lvn")   { clr = InpLVNColor;      fill = false; }
+   else if(kind == "lvn")   { clr = InpLVNColor;      fill = true;  }  // filled + pale color reads as translucent
    else if(kind == "hvn_today") { clr = clrCornflowerBlue; fill = true;  }
    else if(kind == "lvn_today") { clr = clrPeachPuff;      fill = false; }
    else if(kind == "hvn_fine")  { clr = InpHVNFineColor; fill = false; }  // fine VOLUME-VP HVN (outline)
@@ -1009,9 +1051,10 @@ void DrawZone(int idx, const string kind, double lo, double hi)
       ObjectSetDouble (0, name, OBJPROP_PRICE, 1, hi);
    }
    ObjectSetInteger(0, name, OBJPROP_FILL,    fill);
-   ObjectSetInteger(0, name, OBJPROP_COLOR,   clr);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,   isActive ? clrGold : clr);   // ACTIVE zone: bright gold border
    ObjectSetInteger(0, name, OBJPROP_BGCOLOR, clr);
-   ObjectSetInteger(0, name, OBJPROP_WIDTH,   1);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH,   isActive ? 3 : 1);           // ACTIVE zone: thicker border
+   ObjectSetInteger(0, name, OBJPROP_STYLE,   STYLE_SOLID);
 
    if(InpShowZoneLabels)
    {
@@ -1416,6 +1459,35 @@ void FetchAndDrawZones()
    int code = HttpPost(InpBridgeURL + "/exec/zones", body, resp);
    if(code != 200) return;
 
+   //--- parse hvn_cycle_map BEFORE drawing zones so DrawZone can mark a zone as
+   //    ACTIVE (has a live cycle armed against it) with a distinct border.
+   //    [{lo, hi, cycles:[{magic, tf, edge, ...}]}] flattened into gHvnCycles[].
+   ArrayResize(gHvnCycles, 0);
+   string hcm[];
+   int nhcm = JsonSplitArray(resp, "hvn_cycle_map", hcm);
+   for(int i = 0; i < nhcm; i++)
+   {
+      double hlo = JsonGetNumber(hcm[i], "lo");
+      double hhi = JsonGetNumber(hcm[i], "hi");
+      string cycs[];
+      int nc = JsonSplitArray(hcm[i], "cycles", cycs);
+      if(nc == 0)
+      {
+         int idx = ArraySize(gHvnCycles); ArrayResize(gHvnCycles, idx + 1);
+         gHvnCycles[idx].lo = hlo; gHvnCycles[idx].hi = hhi;
+         gHvnCycles[idx].magic = 0; gHvnCycles[idx].tf = ""; gHvnCycles[idx].edge = "";
+      }
+      for(int j = 0; j < nc; j++)
+      {
+         int idx = ArraySize(gHvnCycles); ArrayResize(gHvnCycles, idx + 1);
+         gHvnCycles[idx].lo    = hlo;
+         gHvnCycles[idx].hi    = hhi;
+         gHvnCycles[idx].magic = (long)JsonGetNumber(cycs[j], "magic");
+         gHvnCycles[idx].tf    = JsonGetString(cycs[j], "tf");
+         gHvnCycles[idx].edge  = JsonGetString(cycs[j], "edge");
+      }
+   }
+
    string zs[];
    int n = JsonSplitArray(resp, "zones", zs);
    ClearZones();
@@ -1424,7 +1496,7 @@ void FetchAndDrawZones()
       string kind = JsonGetString(zs[i], "kind");
       double lo   = JsonGetNumber(zs[i], "lo");
       double hi   = JsonGetNumber(zs[i], "hi");
-      if(lo > 0 && hi > 0) DrawZone(i, kind, lo, hi);
+      if(lo > 0 && hi > 0) DrawZone(i, kind, lo, hi, IsZoneActive(lo, hi));
    }
 
    //--- draw the VP point-levels the grid triggers on (POC/VAH/VAL/naked-POC)
@@ -1461,36 +1533,6 @@ void FetchAndDrawZones()
       string atf = JsonGetString(an[i], "tf");
       string aed = JsonGetString(an[i], "edge");
       if(alo > 0 && ahi > 0) DrawArmedNode(i, atf, aed, alo, ahi, af);
-   }
-
-   //--- parse hvn_cycle_map: [{lo, hi, cycles:[{magic, tf, edge, ...}]}]
-   //    flatten into gHvnCycles[] so UpdateDashboard can display which TF armed each HVN.
-   ArrayResize(gHvnCycles, 0);
-   string hcm[];
-   int nhcm = JsonSplitArray(resp, "hvn_cycle_map", hcm);
-   for(int i = 0; i < nhcm; i++)
-   {
-      double hlo = JsonGetNumber(hcm[i], "lo");
-      double hhi = JsonGetNumber(hcm[i], "hi");
-      // parse the inner cycles array inside this HVN entry
-      string cycs[];
-      int nc = JsonSplitArray(hcm[i], "cycles", cycs);
-      if(nc == 0)
-      {
-         // HVN with no active cycle — still record it so dashboard shows "—"
-         int idx = ArraySize(gHvnCycles); ArrayResize(gHvnCycles, idx + 1);
-         gHvnCycles[idx].lo = hlo; gHvnCycles[idx].hi = hhi;
-         gHvnCycles[idx].magic = 0; gHvnCycles[idx].tf = ""; gHvnCycles[idx].edge = "";
-      }
-      for(int j = 0; j < nc; j++)
-      {
-         int idx = ArraySize(gHvnCycles); ArrayResize(gHvnCycles, idx + 1);
-         gHvnCycles[idx].lo    = hlo;
-         gHvnCycles[idx].hi    = hhi;
-         gHvnCycles[idx].magic = (long)JsonGetNumber(cycs[j], "magic");
-         gHvnCycles[idx].tf    = JsonGetString(cycs[j], "tf");
-         gHvnCycles[idx].edge  = JsonGetString(cycs[j], "edge");
-      }
    }
 
    //--- draw the last-armed grid's fulcrum (the touched edge the straddle anchors on)
@@ -1816,7 +1858,7 @@ int OnInit()
    bool tradeAllowed = TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) &&
                        MQLInfoInteger(MQL_TRADE_ALLOWED);
    Print("─────────────────────────────────────────────");
-   Print("✅ FBExecBridge v1.04 — executor + labels + VP histogram + BB/squeeze pane + black panel");
+   Print("✅ FBExecBridge v1.05 — executor + labels + VP histogram + BB/squeeze pane + black panel (bars_5m/15m oldest-first fix)");
    Print("    Account:   ", gAccount);
    Print("    Bridge:    ", InpBridgeURL, "  (poll ", InpPollMs, "ms)");
    Print("    Magic:     ", InpMagic, "..", InpMagic + InpMagicRange - 1, " (strategy×TF range)");

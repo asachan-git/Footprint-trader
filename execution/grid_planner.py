@@ -301,35 +301,41 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
         step = max((step_mult * atr) if atr > 0 else 1.0, 1e-4)
         return n, round(step, 4)
 
-    # hvn_inside_touch: n fixed at hvn_max_legs (per-TF); step = ATR × mult. Legs may
-    # extend beyond node width on a narrow node — n is no longer width-scaled.
+    # hvn_inside_touch: WIDTH-DRIVEN sizing (BTC Jun22 regime). step = ATR × mult; leg
+    # count = node_width / step so a WIDER node gets MORE legs (legs span the whole node),
+    # capped at hvn_max_legs (per-TF). raw_range = node width for this trigger.
     if trigger.kind == "hvn_inside_touch":
         step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
-        n = max(2, hvn_max_legs)
+        n = int(round(trigger.raw_range / step)) if step > 0 else 2
+        n = max(2, min(hvn_max_legs, n))
         return n, round(step, 4)
 
-    # lvn_edge_touch: same fixed-max sizing as hvn_inside_touch — reuses the same
+    # lvn_edge_touch: same width-driven sizing as hvn_inside_touch — reuses the same
     # hvn_max_legs/mean_rev_step_mult knobs (no separate LVN sizing config), per the
     # "like hvn_inside_touch position management" design.
     if trigger.kind == "lvn_edge_touch":
         step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
-        n = max(2, hvn_max_legs)
+        n = int(round(trigger.raw_range / step)) if step > 0 else 2
+        n = max(2, min(hvn_max_legs, n))
         return n, round(step, 4)
 
-    # candle_sweep / engulf: same zone-width logic as hvn_inside_touch.
-    # n = hvn_max_legs (per TF); step = candle_hl / n so the ladder spans one candle
-    # range per side. buy legs start above candle_high; sell below candle_low.
+    # candle_sweep / engulf: WIDTH-DRIVEN sizing (matches hvn_inside_touch/lvn_edge_touch).
+    # step = ATR × mult (volatility-consistent spacing); leg count = candle_hl / step so
+    # a BIGGER sweep candle gets MORE legs, capped at hvn_max_legs (per-TF) rather than
+    # always placing the config max regardless of candle size. buy legs start above
+    # candle_high; sell below candle_low.
     if trigger.kind == "candle_sweep":
         candle_hl = float(trigger.raw_range or 0.0)
-        n = max(2, hvn_max_legs)
-        step = round(candle_hl / n, 4) if (candle_hl > 0 and n > 0) \
-               else max((step_mult * atr) if atr > 0 else 1.0, 1e-4)
+        step = (step_mult * atr) if atr > 0 else max(candle_hl / 8.0, 1e-6)
+        n = int(round(candle_hl / step)) if step > 0 else 2
+        n = max(2, min(hvn_max_legs, n))
         return n, round(step, 4)
 
-    # bb_expansion_touch: ATR-based spacing, n fixed at hvn_max_legs.
+    # bb_expansion_touch: ATR-based spacing, leg count from zone width / step.
     if trigger.kind == "bb_expansion_touch":
         step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
-        n = max(2, hvn_max_legs)
+        n = int(round(trigger.raw_range / step)) if step > 0 else 2
+        n = max(2, min(hvn_max_legs, n))
         return n, round(step, 4)
 
     step = step_mult * atr if atr > 0 else max(trigger.raw_range / 4.0, 1e-6)
@@ -648,7 +654,9 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         # Structural HVN setups arm on a node edge/touch, not on a vol coil — exempt
         # them from the squeeze gate. hvn_edge reads the same daily/weekly VP the chart
         # draws, so it should arm on the visible edge-touch regardless of squeeze.
-        _structural_kinds = ("hvn_inside_touch", "hvn_displacement", "hvn_edge")
+        # candle_sweep is a structural signal (swept a level), not a coil→expansion play —
+        # arm on the sweep regardless of squeeze. Gate stays ON for the vol-coil strats.
+        _structural_kinds = ("hvn_inside_touch", "hvn_displacement", "hvn_edge", "candle_sweep")
         is_structural = ((fulcrum_t is not None and fulcrum_t.kind in _structural_kinds)
                          or any(k in trigger_hint for k in _structural_kinds))
         if bool(grid_cfg.get("require_squeeze_gate", False)) and not sq_ok and not is_structural:
