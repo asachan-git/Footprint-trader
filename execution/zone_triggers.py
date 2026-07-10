@@ -699,7 +699,22 @@ def _filter_lvn_zones_by_hvn_context(
         fully_inside = any(h_lo <= lo and hi <= h_hi for h_lo, h_hi in hvn_zones)
         if fully_inside:
             continue
-        allowed.append((lo, hi))
+        # PARTIAL overlap (2026-07-10): the LVN straddles an HVN edge — its overlapping
+        # portion sits INSIDE the node (a fake vacuum edge there). CLIP the LVN to the HVN
+        # boundary so ONLY the genuine vacuum OUTSIDE the node survives as an arm anchor.
+        # Keeps the real vacuum, kills the false inside-edge (concern: LVN edge inside HVN).
+        clo, chi = lo, hi
+        for h_lo, h_hi in hvn_zones:
+            if chi <= h_lo or clo >= h_hi:
+                continue   # no overlap with this HVN
+            # overlap on the LOW side of the LVN (LVN bottom inside HVN) → lift clo to h_hi
+            if clo < h_hi <= chi and clo >= h_lo:
+                clo = h_hi
+            # overlap on the HIGH side (LVN top inside HVN) → drop chi to h_lo
+            elif clo <= h_lo < chi and chi <= h_hi:
+                chi = h_lo
+        if chi - clo > 0:
+            allowed.append((clo, chi))
     return allowed
 
 

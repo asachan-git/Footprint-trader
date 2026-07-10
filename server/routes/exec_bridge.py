@@ -2090,10 +2090,14 @@ def exec_zones():
     # overlay vs the coarse (0.4) detection zones above, so node LOCATIONS can be compared
     # directly on the chart. Cosmetic only: never feeds the grid, never breaks the payload.
     _fine_levels = []   # fine-VP POC/VAH/VAL/naked-POC, appended to `levels` below
+    # Overlays (hvn_fine/lvn_fine/hvn_tick/lvn_tick + their levels) are cosmetic A/B lines
+    # drawn INSIDE the coarse zones → clutter. OFF by default (2026-07-10, user). Set
+    # vp_cache.vp_draw_overlays: true to restore the tick-res comparison overlay.
+    _draw_overlays = bool(_vpc.get("vp_draw_overlays", False))
     try:
         from pipeline.features.volume_profile import compute as _vp_compute
         _fine_bin = float((_vpc.get("vp_profile_bin") or {}).get(symbol, 0.0) or 0.0)
-        if _fine_bin > 0:
+        if _draw_overlays and _fine_bin > 0:
             _fbars = _store().recent(symbol, "1m", 1440)   # ~1 session of 1m bars
             if _fbars:
                 _fvp = _vp_compute(_fbars, "daily", float(_fbars[-1].ohlc.c), bin_size=_fine_bin)
@@ -2141,9 +2145,9 @@ def exec_zones():
             v = daily.get(k)
             if isinstance(v, (int, float)) and v > 0:
                 levels.append({"kind": k, "price": _rebase_price(float(v))})
-    # Today's forming session POC + value area (VAH/VAL) as distinct levels so the user
-    # can see the developing session value, separate from the prev-D vah/val above.
-    if _today_daily:
+    # Today's forming-session POC/VAH/VAL as distinct lines — also overlay clutter inside the
+    # zones. Gated with the fine/tick overlays (2026-07-10). Enable via vp_draw_overlays.
+    if _draw_overlays and _today_daily:
         for _src_k, _out_k in (("poc", "poc_today"), ("vah", "vah_today"), ("val", "val_today")):
             _v = _today_daily.get(_src_k)
             if isinstance(_v, (int, float)) and _v > 0:
