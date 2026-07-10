@@ -44,9 +44,9 @@ grid_levels:
 
   # ── TUNING (adjust frequently based on account size / market conditions) ─────
   # Position sizing
-  base_lot: 0.75          # smallest leg lot; ladder scales up by lot_step per leg
-  lot_step: 0.75           # lot increment per leg (leg_i = base + i×step, capped at max_lots)
-  max_lots: 3          # hard cap per leg regardless of risk math
+  base_lot: 1.0          # smallest leg lot; ladder scales up by lot_step per leg
+  lot_step: 1.0           # lot increment per leg (leg_i = base + i×step, capped at max_lots)
+  max_lots: 5          # hard cap per leg regardless of risk math
 
   # Ladder shape — step is BTC Jun22 flat 0.50×ATR (consistent ~3×ATR span, scales with each
   # TF's own ATR). Leg count is per-TF: a CAP for width-driven strats (hvn_inside_touch,
@@ -60,8 +60,8 @@ grid_levels:
   # Cycle profit targets — primary basket exit (net floating ≥ target → CLOSE_ALL)
   # Values are in native account currency (USC cents for Vantage XAUUSD.pc cent account;
   # plain USD for a standard USD account). 1 USD = 100 USC on a cent account.
-  cycle_net_target_by_tf: {1m: 1500.0, 5m: 3000.0, 15m: 5000.0, 1h: 3000.0}   # per-TF (USC; real $10/$15/$20/$30)
-  cycle_net_target_usd: 10500.0   # fallback when TF not in by_tf map
+  cycle_net_target_by_tf: {1m: 2000.0, 5m: 4000.0, 15m: 7500.0, 1h: 3000.0}   # per-TF (USC; real $10/$15/$20/$30)
+  cycle_net_target_usd: 10000.0   # fallback when TF not in by_tf map
 
   # Bias trail — arms when peak floating ≥ activate, fires on giveback% retrace.
   # Values are in native account currency (same note as cycle_net_target above).
@@ -72,7 +72,7 @@ grid_levels:
   # Squeeze multiplier — when a cycle was armed on a confirmed squeeze (squeeze_ok=True),
   # scale up targets so the system holds the runner longer into the expansion move.
   squeeze_target_mult: 1.0       # multiply cycle_net_target when squeeze_ok (Jun19: no mult — 2.0 stranded winners e.g. 1m +1000 vs target 2000)
-  squeeze_trail_mult: 1.6        # multiply bias_trail_activate when squeeze_ok
+  squeeze_trail_mult: 1.0        # multiply bias_trail_activate when squeeze_ok
 
   # Runtime expansion upgrade — flip squeeze_ok=True on a live cycle when expansion fires:
   # BBW has fully left compression (squeeze_gate=False) AND ATR is expanding vs recent mean.
@@ -80,8 +80,19 @@ grid_levels:
   # squeeze_ok=True skip this block entirely.
   expansion_atr_ratio: 1.5       # session_atr_ratio threshold to confirm expansion
 
+  # HTF-expansion gate for 1m hvn_inside_touch (2026-07-10, user): only ARM the 1m
+  # hvn_inside_touch cycle while the 5m TF is in EXPANSION (5m squeeze_gate = not coiled).
+  # Once 5m re-enters a squeeze (coiled), STOP arming fresh 1m cycles — a live 1m cycle
+  # keeps riding to its normal exit (gate blocks new entries only). Thesis: trade the fast
+  # 1m mean-revert straddle only while the higher TF is actively expanding, not when it coils.
+  htf_expansion_gate:
+    enabled: true
+    kinds: [hvn_inside_touch]    # which touch strats the gate applies to
+    tfs: [1m]                    # which entry TFs are gated (only 1m for now)
+    htf: 5m                      # the higher TF whose squeeze_gate defines expansion/squeeze
+
   # Arm filter
-  require_squeeze_gate: false    # OFF — data (2026-07-07): squeeze_ok arms net-NEGATIVE on 1m/5m (5m sqOK -733 avg / 20.8% full_hedge vs noSQ +433 / 9.1%); gate only helped 15m. Not earning its keep. Use per-side loss-cap / regime instead.
+  require_squeeze_gate: false    # OFF (2026-07-09, user relaxed) — data (2026-07-07): squeeze_ok arms net-NEGATIVE on 1m/5m (5m sqOK -733 avg / 20.8% full_hedge vs noSQ +433 / 9.1%); gate only helped 15m. Not earning its keep. Use per-side loss-cap / regime instead.
 
   # Safety
   fullfill_be_enabled: false     # SIMPLE: no BE move — keep only net_target exit
@@ -190,11 +201,11 @@ grid_levels:
   # rising 20MA = bull vote, below a falling one = bear. 2.5σ "edge" votes mean-reversion
   # when price is stretched ≥ bb_edge_sigma from the basis on the grid TF. (3.0σ stays the
   # squeeze.) Net vote sign skews the ladder → directional inventory → net-profit exit exists.
-  htf_bias_enabled: false         # SIMPLE: symmetric straddle, no directional skew
+  htf_bias_enabled: true          # ON (2026-07-10, Jun22 restore) — HTF-20MA vote skews ladder → directional inventory
   htf_bias_period: 20
   htf_bias_slope_bars: 3
   htf_bias_map: {1m: "5m", 5m: "15m", 15m: "1h", 1h: "4h"}
-  bb_edge_enabled: false          # SIMPLE: no BB-edge skew vote
+  bb_edge_enabled: true           # ON (2026-07-10, Jun22 restore) — 2.5σ mean-rev edge vote
   bb_edge_sigma: 2.5
   # cycle_net_target_* and bias_trail_* moved to TUNING block at top of grid_levels
   cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full (Jun19: 33 — hedged basket finds green exit sooner)
@@ -218,31 +229,32 @@ grid_levels:
   # that side and move the rest to breakeven (risk-free runner). Captures directional
   # profit the net-basket exit masks (a hedge leg drags net down → target never hits).
   bias_trail_enabled: true      # SIMPLE: no trail — CLOSE_ALL only on net_target
-  bias_trail_activate_usd: 750   # fallback when TF not in bias_trail_activate_by_tf (BTC's $5 → 750 USC equivalent)
+  bias_trail_activate_usd: 1000   # fallback when TF not in bias_trail_activate_by_tf (BTC's $5 → 750 USC equivalent)
   # ── Active trigger list — single source of truth for which strategies run and on which TFs.
   # Each entry: kind (required), tfs (required), enabled (default true), touch_only (default false).
   # touch_only=true → arm via intrabar price tap only (not bar-close emit).
   # To disable a kind without removing it: set enabled: false.
   triggers:
     - kind: hvn_inside_touch
-      tfs: [1m, 5m, 15m]
+      tfs: [1m, 5m, 15m]         # 1m added 2026-07-10 — gated by htf_expansion_gate below
       touch_only: true           # arm on candle close (bar-close emit)
     - kind: hvn_edge
       tfs: [5m, 15m]             # breakout-retest: prior close outside HVN + bar tap + rejection close
-      enabled: false
+      enabled: true
     - kind: candle_sweep
       tfs: [5m, 15m]
-      enabled: true             # ON
+      enabled: true              # ON
     - kind: lvn_edge_touch
-      tfs: [5m, 15m]             # 1m dropped — tightest step (~0.3) + most re-arms, biggest density source
+      tfs: [1m, 5m, 15m]             # 1m dropped — tightest step (~0.3) + most re-arms, biggest density source
       touch_only: true           # arm via intrabar price tap only, same as hvn_inside_touch
       enabled: true             # ON — EA recompiled (InpMagicRange=150), magics 770131-133 owned
+  candle_sweep_cooldown_bars: 0   # 0 = NO post-arm cooldown (2026-07-09: user "no cooldown"); default was 3 → 45min lockout on 15m suppressed fresh sweeps
   touch_arm_confirm_ticks: 0.02   # reversal distance ($) for hvn_inside_touch tap confirm
   # lvn_edge_touch tap tolerances — mirror hvn_touch_buffer/_pct/hvn_lookback_bars but
   # independently tunable. 0.10 = tap within 10% of node width counts (same width-relative
   # logic as HVN).
-  lvn_touch_buffer: 0.02
-  lvn_touch_buffer_pct: 0.05
+  lvn_touch_buffer: 0.01      # 1¢ floor — "at the edge" tolerating tick granularity (2026-07-09: user "no buffer")
+  lvn_touch_buffer_pct: 0.0   # width-relative buffer OFF — tap must be AT the drawn edge, not X% into the node
   lvn_lookback_bars: 3
   # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
   vp_fulcrum_levels: [poc, vah, val, naked_poc, lvn]   # which VP levels are fulcrums
@@ -253,7 +265,7 @@ grid_levels:
   # Volatility compression→expansion via Bollinger BANDWIDTH PERCENTILE (vol-regime
   # gate): compression = BBW in the bottom squeeze_bbw_pct of its trailing window; fire
   # on RELEASE after a run. Neutral straddle positions before the displacement.
-  squeeze_enabled: false          # OFF — squeeze_ok arms net-negative on 1m/5m (see require_squeeze_gate note)
+  squeeze_enabled: true           # ON (2026-07-09, user override) — see require_squeeze_gate note
   squeeze_bb_period: 20
   squeeze_bb_mult: 3.0        # Bollinger band = 3·stdev
   squeeze_bbw_pct: 0.15       # compression = BBW in bottom 15% of the trailing window
@@ -289,7 +301,7 @@ grid_levels:
   # each tagged squeeze_ok in the arm + exit audits (data/exec_emit.jsonl) so outcomes can
   # be bucketed squeeze-pass vs squeeze-fail. Flip to true to ENFORCE (skip uncoiled) once
   # the data favours the gate. The label is stamped either way.
-  squeeze_gate_max_bars: 10  # how stale a just-ended coil may be and still pass the gate
+  squeeze_gate_max_bars: 20  # how stale a just-ended coil may be and still pass the gate
 
 # Startup preflight — server REFUSES to start unless footprint + VP data are present.
 startup_check:
@@ -300,8 +312,10 @@ startup_check:
   stale_warn_hours: 6        # WARN (not block) if newest footprint bar older than this
   min_density_pct: 0.5       # WARN if <50% of expected bars in the window (gaps)
   # symbols / tfs default to vp_cache.symbols and instrument.timeframes
-  symbols: [BTCUSDT, XAUTUSDT]   # both live (gold reopened 2026-06-22). Weekend BTC-only
-                                 # was for the gold-closed XAU-thin-VP boot block.
+  symbols: [XAUTUSDT]   # GOLD-ONLY preflight gate (2026-07-10): BTC's just-opened daily VP
+                        # period goes thin at IST day-roll (no HVN yet) → was hard-blocking
+                        # boot while gold is the live target. BTC is analysis-only backup;
+                        # still INGESTED (vp_cache.symbols unchanged), just not a boot gate.
 
 claude:
   mode: restricted           # full | restricted | off
@@ -325,12 +339,10 @@ vp_cache:
   # Per-symbol daily session anchor. Two forms accepted:
   #   <int>             — static UTC hour (DST-naive; fine for 24/7 crypto)
   #   {tz, hour}        — local-time anchor, automatically DST-adjusted via zoneinfo
-  # XAUTUSDT uses CME Gold's 18:00 ET session open:
-  #   EDT (Mar–Nov): 18:00 ET = 22:00 UTC = 03:30 IST next day
-  #   EST (Nov–Mar): 18:00 ET = 23:00 UTC = 04:30 IST next day
+  # XAUTUSDT anchor moved off CME's 18:00 ET open (22:00 UTC) to midnight UTC 2026-07-08.
   session_start_utc:
     BTCUSDT: 0      # UTC 00:00 = IST 05:30 → session 05:30 IST – 05:29 IST (24h)
-    XAUTUSDT: 22    # UTC 22:00 = IST 03:30 → session 03:30 IST – 02:30 IST next day (23h, CME EDT)
+    XAUTUSDT: 0     # UTC 00:00 = IST 05:30 → session 05:30 IST – 05:29 IST (24h)
   # Tick-aligned VP bin width (institutional convention).
   # Falls back to range/68 if symbol not declared. Set in floats matching tick:
   #   XAU tick = 0.1 → 0.5 = 5-tick bins
@@ -420,7 +432,7 @@ risk:
 # Daily floating P&L target — close all grid positions and block new arms for the day
 # once equity rises by this % above the session-open balance.
 # 0 = disabled. Example: 1.5 = close everything once up 1.5% on the day.
-daily_target_pct: 20.0
+daily_target_pct: 100.0
 
 # Dhan options trading configuration
 dhan:

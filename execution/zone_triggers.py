@@ -50,12 +50,16 @@ _VP_WIN = {"15m": 96, "5m": 288, "1m": 1440, "1h": 24}
 # cached-daily node — the safe superset. Per-session differentiation (e.g.
 # NY=rolling-only, thin Asia=cached-only) is intentionally NOT enabled: it was
 # never validated on live data. Tune per session here only after A/B evidence.
+# CACHED-ONLY (2026-07-10): arm on the HVNs VISIBLE on the MT5 chart (get_prev_and_today
+# daily VP via /exec/zones), NOT a rolling per-TF window that adds nodes the chart never
+# draws. Mirrors the LVN switch made 2026-07-09 (_session_lvn_zones cached-only). Re-add
+# "rolling" here to restore the hybrid (drawn≠armed) behaviour.
 _SESSION_HVN_SRC = {
-    "NY":      ("rolling", "cached"),
-    "London":  ("rolling", "cached"),
-    "Overlap": ("rolling", "cached"),
-    "Asia":    ("rolling", "cached"),
-    "Off":     ("rolling", "cached"),
+    "NY":      ("cached",),
+    "London":  ("cached",),
+    "Overlap": ("cached",),
+    "Asia":    ("cached",),
+    "Off":     ("cached",),
 }
 
 
@@ -647,17 +651,43 @@ def _cached_lvn(symbol: str) -> list[tuple[float, float]]:
 
 
 def _session_lvn_zones(symbol: str, tf: str, bars: list[Bar]) -> tuple[list[tuple[float, float]], str]:
-    """LVN zones for the current session — rolling ∪ cached, merged. Mirrors
-    _session_hvn_zones minus the vacuum fallback (that borrows HVN structure when price
-    is stranded outside range; not applicable when price is deliberately inside an LVN)."""
+    """LVN zones for the current session — CACHED DAILY VP ONLY (the exact source the EA
+    chart draws via /exec/zones get_prev_and_today). The rolling per-TF LVN was dropped
+    2026-07-09: user wants to arm on the LVNs VISIBLE on the chart, not a rolling-window
+    edge that sits ~3-4pt off the drawn rectangle. _cached_lvn already mirrors the chart's
+    prev-D/today IST-band union, so trigger LVN == chart LVN now. (HVN path keeps its
+    rolling∪cached merge — this change is LVN-only.)"""
     from pipeline.features.session import current_session
     ts = bars[-1].close_ts if bars else None
     sess = current_session(ts, symbol).session
-    zones: list[tuple[float, float]] = []
-    zones += _rolling_lvn(symbol, tf, bars)
-    zones += _cached_lvn(symbol)
-    zones = _merge_zone_tuples(zones)
+    zones = _merge_zone_tuples(_cached_lvn(symbol))
     return zones, sess
+
+
+def _filter_lvn_zones_by_hvn_context(
+    zones: list[tuple[float, float]], hvn_zones: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """LVN edge-touch policy: exclude an LVN ONLY if it is FULLY CONTAINED (surrounded)
+    within a single HVN — that's the true "not a real vacuum, just smoothing noise inside a
+    high-volume node" case. A PARTIAL overlap is allowed: an LVN that pokes into an HVN edge
+    (or straddles it) still carries a genuine vacuum on its non-overlapping side and is a
+    valid edge-touch anchor.
+
+    Rationale (2026-07-10 fix): the old rule dropped ANY LVN that overlapped an HVN at all.
+    When the daily HVN is WIDE/thin (e.g. day-roll VP with one broad node), a sliver overlap
+    (~2pt of a 13pt LVN) nuked the LVN sitting right where price was → lvn_edge_touch armed
+    NOTHING. Fully-inside is the real exclusion; slivers survive.
+    """
+    if not hvn_zones or not zones:
+        return zones
+    allowed = []
+    for lo, hi in zones:
+        # Fully engulfed by a SINGLE HVN → smoothing noise inside a node, drop it.
+        fully_inside = any(h_lo <= lo and hi <= h_hi for h_lo, h_hi in hvn_zones)
+        if fully_inside:
+            continue
+        allowed.append((lo, hi))
+    return allowed
 
 
 def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger | None:
@@ -771,7 +801,8 @@ def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger |
     )
 
 
-def touch_arm_trigger(symbol: str, tf: str, live_price: float) -> Trigger | None:
+def touch_arm_trigger(symbol: str, tf: str, live_price: float,
+                      zone_shift: float = 0.0) -> Trigger | None:
     """INTRABAR variant of _t_hvn_inside_touch — arm on LIVE price tapping an HVN edge
     without waiting for the candle to close. Caller (the poll handler) owns the
     tick-reversal confirm; this just resolves which edge live_price is tapping and
@@ -779,7 +810,11 @@ def touch_arm_trigger(symbol: str, tf: str, live_price: float) -> Trigger | None
 
     Returns None if live_price isn't inside any session HVN within hvn_touch_buffer of
     an edge. Same TP/node geometry as the close-driven path so downstream sizing is
-    identical — only the trigger moment differs (touch vs close)."""
+    identical — only the trigger moment differs (touch vs close).
+
+    zone_shift: additive offset (venue − analysis) added to every analysis-frame zone edge
+    (HVN zones AND the daily-VP TP candidates) so they are compared against — and returned
+    in — the VENUE frame the live_price and the EA orders use. 0.0 = frames identical."""
     import yaml as _yaml
     from pipeline.state_store import store
     try:
@@ -800,6 +835,11 @@ def touch_arm_trigger(symbol: str, tf: str, live_price: float) -> Trigger | None
     zones, sess = _session_hvn_zones(symbol, tf, bars)
     if not zones:
         return None
+    # Frame: zones are analysis-frame; live_price arrives venue-frame. Bring live_price into
+    # analysis frame for the tap comparison (−zone_shift). Everything returned (edge, node,
+    # TP) STAYS analysis-frame — plan_grid_levels + the caller's edge*ratio rebase it to venue
+    # downstream. This keeps the detector's output frame identical to the pre-rebase contract.
+    live_price = live_price - zone_shift
 
     # Tap must come FROM INSIDE the HVN body: live price sits within the node [lo,hi] AND
     # within hvn_touch_buffer of an edge — an edge-rejection from within value. An OUTSIDE
@@ -834,7 +874,7 @@ def touch_arm_trigger(symbol: str, tf: str, live_price: float) -> Trigger | None
         from pipeline.features.vp_cache import get as vp_get
         _dvp_d = vp_get(symbol, "daily") or {}
         _daily_zones = [(float(z["low"]), float(z["high"]))
-                        for z in (_dvp_d.get("hvn_zones") or [])]
+                        for z in (_dvp_d.get("hvn_zones") or [])]   # analysis frame (edge is too)
     except Exception:
         _daily_zones = list(zones)
     tp_up, tp_down = compute_hvn_tps(symbol, edge, _daily_zones or list(zones))
@@ -881,6 +921,16 @@ def _t_lvn_edge_touch(symbol: str, tf: str, current_price: float) -> Trigger | N
     zones, sess = _session_lvn_zones(symbol, tf, bars)
     if not zones:
         return None
+    try:
+        from pipeline.features.vp_cache import get as _vp_get_hvn
+        _dvp_ctx = _vp_get_hvn(symbol, "daily") or {}
+        _ctx_hvn_zones = [(float(z["low"]), float(z["high"]))
+                          for z in (_dvp_ctx.get("hvn_zones") or [])]
+        zones = _filter_lvn_zones_by_hvn_context(zones, _ctx_hvn_zones)
+    except Exception:
+        pass
+    if not zones:
+        return None
 
     candidate_bars = bars[-(1 + _lookback):-1]
     candidate_bars = list(reversed(candidate_bars))
@@ -893,11 +943,11 @@ def _t_lvn_edge_touch(symbol: str, tf: str, current_price: float) -> Trigger | N
             width = hi - lo
             if width <= 0:
                 continue
-            if not (lo < c < hi):
-                continue
+            # Edge proximity only — no close-inside-zone gate. A bar whose wick reaches
+            # an LVN edge (from either side) is a valid tap; the close needn't sit inside.
             _buf_eff = max(_buf, width * _buf_pct)
-            touch_top = h >= hi - _buf_eff
-            touch_bot = lo_p <= lo + _buf_eff
+            touch_top = (h >= hi - _buf_eff) and (lo_p <= hi + _buf_eff)
+            touch_bot = (lo_p <= lo + _buf_eff) and (h >= lo - _buf_eff)
             if not (touch_top or touch_bot):
                 continue
             if touch_top and touch_bot:
@@ -943,10 +993,22 @@ def _t_lvn_edge_touch(symbol: str, tf: str, current_price: float) -> Trigger | N
     )
 
 
-def lvn_touch_arm_trigger(symbol: str, tf: str, live_price: float) -> Trigger | None:
+def lvn_touch_arm_trigger(symbol: str, tf: str, live_price: float,
+                          lookback_bars: int = 1, zone_shift: float = 0.0) -> Trigger | None:
     """INTRABAR variant of _t_lvn_edge_touch — arm on LIVE price tapping an LVN edge
     without waiting for the candle to close. Mirrors touch_arm_trigger exactly, reading
-    LVN zone bounds instead of HVN. Caller owns the tick-reversal confirm."""
+    LVN zone bounds instead of HVN. Caller owns the tick-reversal confirm.
+
+    lookback_bars: after checking the current LIVE price, also check the last N
+    CLOSED bars' high/low against each zone edge. A wick can tap an edge and reverse
+    before the next intrabar poll catches it — since this trigger is touch_only (the
+    bar-close detector's confirmation of that same wick is otherwise discarded), a
+    short lookback recovers a touch that already happened and passed. 0 = live-price
+    only (original behavior).
+
+    zone_shift: additive offset (venue − analysis) added to every zone edge so analysis-
+    frame LVN zones register taps from — and return prices in — the venue frame the live
+    price and EA orders use. 0.0 = frames identical. See touch_arm_trigger."""
     import yaml as _yaml
     from pipeline.state_store import store
     try:
@@ -967,26 +1029,54 @@ def lvn_touch_arm_trigger(symbol: str, tf: str, live_price: float) -> Trigger | 
     zones, sess = _session_lvn_zones(symbol, tf, bars)
     if not zones:
         return None
+    try:
+        from pipeline.features.vp_cache import get as _vp_get_hvn
+        _dvp_ctx = _vp_get_hvn(symbol, "daily") or {}
+        _ctx_hvn_zones = [(float(z["low"]), float(z["high"]))
+                          for z in (_dvp_ctx.get("hvn_zones") or [])]
+        zones = _filter_lvn_zones_by_hvn_context(zones, _ctx_hvn_zones)
+    except Exception:
+        pass
+    if not zones:
+        return None
+
+    # Candidate prices to test against each edge: live price first (closest/most
+    # relevant), then each recent CLOSED bar's high AND low (a wick either side could
+    # have tapped an edge). bars[-1] is itself the most recently CLOSED bar (the store
+    # holds only closed bars) — distinct from `live_price`, the current in-progress
+    # tick — so it's included, not excluded. First candidate that qualifies wins —
+    # live price is tried first so an active tap is still preferred over a stale one.
+    # Frame: zones + recent bars are analysis-frame; live_price is venue-frame. Bring
+    # live_price into analysis frame (−zone_shift) so all candidates compare against the
+    # analysis-frame zones consistently; the resulting edge is shifted back to venue on return.
+    _recent = bars[-max(0, lookback_bars):] if lookback_bars > 0 else []
+    candidates = [live_price - zone_shift]   # venue → analysis
+    for _b in reversed(_recent):   # most recent bar's wicks first (already analysis-frame)
+        candidates.append(float(_b.ohlc.h))
+        candidates.append(float(_b.ohlc.l))
 
     best = None
-    for lo, hi in zones:
-        width = hi - lo
-        if width <= 0:
-            continue
-        if not (lo <= live_price <= hi):
-            continue
-        _buf_eff = max(_buf, width * _buf_pct)
-        touch_top = live_price >= hi - _buf_eff
-        touch_bot = live_price <= lo + _buf_eff
-        if not (touch_top or touch_bot):
-            continue
-        if touch_top and touch_bot:
-            edge, side = (hi, "top") if abs(hi - live_price) <= abs(lo - live_price) else (lo, "bottom")
-        else:
-            edge, side = (hi, "top") if touch_top else (lo, "bottom")
-        dist = abs(edge - live_price)
-        if best is None or dist < best[0]:
-            best = (dist, edge, width, side)
+    for _px in candidates:
+        for lo, hi in zones:
+            width = hi - lo
+            if width <= 0:
+                continue
+            # Edge proximity only — no inside-zone gate. Price tapping an LVN edge from
+            # OUTSIDE the vacuum is just as valid a straddle anchor as from inside.
+            _buf_eff = max(_buf, width * _buf_pct)
+            touch_top = abs(_px - hi) <= _buf_eff
+            touch_bot = abs(_px - lo) <= _buf_eff
+            if not (touch_top or touch_bot):
+                continue
+            if touch_top and touch_bot:
+                edge, side = (hi, "top") if abs(hi - _px) <= abs(lo - _px) else (lo, "bottom")
+            else:
+                edge, side = (hi, "top") if touch_top else (lo, "bottom")
+            dist = abs(edge - _px)
+            if best is None or dist < best[0]:
+                best = (dist, edge, width, side)
+        if best is not None:
+            break   # this candidate price qualified — don't fall through to staler ones
     if best is None:
         return None
     _dist, edge, width, side = best
@@ -1000,6 +1090,9 @@ def lvn_touch_arm_trigger(symbol: str, tf: str, live_price: float) -> Trigger | 
         _daily_hvn_zones = []
     tp_up, tp_down = compute_lvn_edge_tps(symbol, edge, _daily_hvn_zones)
 
+    # edge/TP stay ANALYSIS-frame (candidates were brought into analysis via −zone_shift
+    # above). plan_grid_levels + the caller's edge*ratio rebase to venue downstream — same
+    # contract as touch_arm_trigger. Do NOT shift back here (would double-rebase).
     node_low  = (edge - width) if side == "top" else edge
     node_high = edge if side == "top" else (edge + width)
     return Trigger(
@@ -1880,27 +1973,40 @@ def _t_hvn_displacement(symbol: str, tf: str, current_price: float,
 # ── Candle sweep / engulf detector ──────────────────────────────────────────
 
 def _t_candle_sweep(symbol: str, tf: str, current_price: float,
-                    cfg: dict | None = None) -> "Trigger | None":
-    """HL SWEEP against the previous bar (engulf variant removed — sweep-only).
+                    cfg: dict | None = None,
+                    bars_override: list | None = None) -> "Trigger | None":
+    """One-sided liquidity SWEEP+RECLAIM against the previous bar (engulf variant
+    removed — sweep-only).
 
-    SWEEP:   current bar's high > prev high AND low < prev low (OUTSIDE bar — swept
-             BOTH prev extremes / took liquidity both sides), THEN closes ABOVE prev
-             high (bullish) or BELOW prev low (bearish). A plain body engulf that did
-             NOT take out both wicks no longer qualifies.
+    BUY sweep:  current bar's low < prev low (swept sell-side liquidity), THEN
+                closes ABOVE prev high (reclaimed and broke out). High needn't
+                exceed prev high — only the low needs to sweep.
+    SELL sweep: current bar's high > prev high (swept buy-side liquidity), THEN
+                closes BELOW prev low. Low needn't undercut prev low.
 
     Grid arms as a breakout straddle: buy stops above candle_high, sell stops
     below candle_low. The fulcrum is the candle midpoint (for dedup); the actual
     leg anchor prices are stored in context as candle_high / candle_low.
+
+    bars_override: when given, detect on THESE bars (e.g. Vantage-native OHLC
+    from the EA's CopyRates poll) instead of the analysis-feed (Binance/Bybit)
+    store — so the sweep pattern is checked on the same candle the broker fills
+    against, no venue rebase needed for candle_high/candle_low afterward.
     """
     cfg = cfg or {}
     min_size = float(cfg.get("candle_sweep_min_size", 0.0) or 0.0)
-    try:
-        from pipeline.state_store import store as _store
-        bars = _store().recent(symbol, tf, 5)
+    if bars_override is not None:
+        bars = bars_override
         if len(bars) < 2:
             return None
-    except Exception:
-        return None
+    else:
+        try:
+            from pipeline.state_store import store as _store
+            bars = _store().recent(symbol, tf, 5)
+            if len(bars) < 2:
+                return None
+        except Exception:
+            return None
 
     # Check the last 2 closed bars (lookback=2) so a sweep that closed one bar ago
     # is still detected when the emitter fires just after the next bar opens.
@@ -1910,9 +2016,8 @@ def _t_candle_sweep(symbol: str, tf: str, current_price: float,
         _prev = bars[i - 1]
         _ch, _cl, _cc = _cur.ohlc.h, _cur.ohlc.l, _cur.ohlc.c
         _ph, _pl       = _prev.ohlc.h, _prev.ohlc.l
-        _outside = _ch > _ph and _cl < _pl        # swept BOTH prev extremes
-        _sb = _outside and _cc > _ph              # sweep bull: closed above prev high
-        _sw = _outside and _cc < _pl              # sweep bear: closed below prev low
+        _sb = _cl < _pl and _cc > _ph              # sweep bull: swept low, closed above prev high
+        _sw = _ch > _ph and _cc < _pl              # sweep bear: swept high, closed below prev low
         if _sb or _sw:
             best_pair = (_cur, _prev, _ch, _cl, _cc, _ph, _pl, _sb, _sw)
             break  # most recent qualifying bar wins

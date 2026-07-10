@@ -69,6 +69,28 @@ def _trigger_tfs(grid_cfg: dict, kind: str) -> list:
     return list(tfs) if tfs else ["1m", "5m", "15m", "1h"]
 
 
+def _htf_expansion_blocks(grid_cfg: dict, kind: str, tf: str, analysis_symbol: str) -> bool:
+    """True when the htf_expansion_gate should BLOCK a fresh arm for (kind, tf): the gate is
+    enabled + covers this kind + this entry tf, AND the higher TF is currently COILED (its
+    squeeze_gate returns ok=True = compressed = NOT expanding). Returns False (allow) when the
+    gate is off, doesn't cover this (kind,tf), or the HTF is in expansion. Fail-open on any
+    error — a detector hiccup must not silently freeze arming."""
+    gate = grid_cfg.get("htf_expansion_gate") or {}
+    if not gate.get("enabled"):
+        return False
+    if kind not in (gate.get("kinds") or []) or tf not in (gate.get("tfs") or []):
+        return False
+    htf = str(gate.get("htf", "5m"))
+    try:
+        from execution import zone_triggers
+        sq_ok, _rank = zone_triggers.squeeze_gate(analysis_symbol, htf, grid_cfg)
+        # sq_ok True = HTF coiled (squeeze) → NOT expansion → block the fresh arm.
+        return bool(sq_ok)
+    except Exception:
+        LOG.exception("[htf_expansion_gate] squeeze_gate error — failing open (allow arm)")
+        return False
+
+
 def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
                        tf: str, magic: int, settings: dict,
                        include_positions: bool = False) -> None:
@@ -496,13 +518,41 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
             return
         venue_mid = float(quote["mid"])
 
-    # For gold (XAUUSD+ / XAUTUSDT), venue and analysis are both USD/oz —
-    # use venue_mid directly as the live analysis price. No ratio conversion needed.
-    live_analysis = venue_mid
-    ratio = 1.0  # venue == analysis frame for gold; kept for fulcrum_venue calc below
+    # FRAME (distance-from-close method — avoids the un-measurable live basis).
+    # zone_shift = venue_ref − analysis_ref, where BOTH are the SAME reference candle's close:
+    #   analysis_ref = last real (sentinel-filtered) analysis 1m close  [Binance]
+    #   venue_ref    = last venue candle close on THIS TF (EA CopyRates) [Vantage]
+    # A zone edge's distance from the reference candle is frame-invariant, so the edge in venue
+    # frame = edge_analysis + (venue_ref − analysis_ref). Because zone_shift uses the reference
+    # candle CLOSES (not the live venue_mid), it does NOT collapse — the live venue_mid keeps its
+    # own intrabar deviation from venue_ref, which is exactly the tap signal.
+    #
+    # BUG (fixed 2026-07-10): the prior code did `ratio=venue_mid/close; live=venue_mid/ratio`
+    # which algebraically collapses to live == close (threw the live mid away; on 1m `close` was
+    # the sentinel bar ts=9999999999 frozen on an edge → phantom 1m fires, dead 5m/15m; see
+    # project_mtf_aggregation_freeze). Mirrors the working reference in exec_emit_grid (~L1485).
+    from pipeline.state_store import store as _rebase_store
+    _ref_bars = [b for b in _rebase_store().recent(analysis, "1m", 6)
+                 if b.close_ts and b.close_ts < 9_000_000_000]   # drop sentinel/forming
+    _analysis_ref = float(_ref_bars[-1].ohlc.c) if _ref_bars and _ref_bars[-1].ohlc.c else 0.0
+    # venue_ref = venue candle close on THIS TF. 1m isn't collected by the EA (only 5m/15m),
+    # so fall back to a HIGHER TF's venue close — the feed basis is TF-agnostic. NEVER fall
+    # back to venue_mid (that collapses zone_shift → live_analysis == analysis_ref: the bug).
+    _venue_ref = 0.0
+    for _rtf in (tf, "5m", "15m"):
+        _vb = ExecBridge.get_venue_bars(account, broker_symbol, _rtf)
+        if _vb and _vb[-1].ohlc.c:
+            _venue_ref = float(_vb[-1].ohlc.c); break
+    if _venue_ref <= 0:
+        _venue_ref = venue_mid   # last resort: no venue bars yet → basis ≈ 0
+    zone_shift = (_venue_ref - _analysis_ref) if _analysis_ref > 0 else 0.0
+    # live_analysis = the LIVE venue price expressed in analysis frame (venue_mid − zone_shift),
+    # for plan_grid_levels (current_price is analysis-frame) + the breakout check. This keeps the
+    # live mid's intrabar movement (zone_shift is a candle-close constant, not the live mid).
+    live_analysis = venue_mid - zone_shift
 
-    LOG.info(f"[touch_arm] {broker_symbol}/{tf} venue_mid={venue_mid:.4f} live_analysis={live_analysis:.4f}")
-    trig = touch_arm_trigger(analysis, tf, live_analysis)
+    LOG.info(f"[touch_arm] {broker_symbol}/{tf} venue_mid={venue_mid:.4f} venue_ref={_venue_ref:.4f} analysis_ref={_analysis_ref:.4f} zone_shift={zone_shift:+.4f} live_analysis={live_analysis:.4f}")
+    trig = touch_arm_trigger(analysis, tf, venue_mid, zone_shift=zone_shift)
     LOG.info(f"[touch_arm] {broker_symbol}/{tf} touch_arm_trigger→{trig.kind if trig else None} edge={trig.fulcrum_price if trig else '-'}")
     if trig is None:
         # Price left the HVN — check if it exited THROUGH the tapped edge (breakout).
@@ -605,6 +655,15 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                  f"{flat_side} [edge={side} fulcrum={plan.fulcrum}], {len(cmds)} command(s)")
         return
 
+    # HTF-expansion gate (2026-07-10): block a FRESH full arm for gated (kind,tf) unless the
+    # configured higher TF is in EXPANSION (its squeeze_gate is NOT coiled). Applied only to
+    # the fresh-straddle path below — a live cycle + side-only re-arm returned above, so a
+    # 5m squeeze stops NEW 1m entries while any live 1m cycle rides to its normal exit.
+    if _htf_expansion_blocks(grid_cfg, "hvn_inside_touch", tf, analysis):
+        _emit_audit({"account": account, "symbol": analysis, "tf": tf, "verdict": "skip",
+                     "skip_reason": f"htf_expansion_gate:{grid_cfg.get('htf_expansion_gate',{}).get('htf','5m')}_squeezed"})
+        return
+
     # Both sides flat — full straddle path.
     if _cyc.get("active"):
         return
@@ -619,7 +678,7 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     ExecBridge.clear_emit(account, broker_symbol, magic=leg_magic)
     dedup_pct = float(grid_cfg.get("emit_dedup_pct", 0.0007) or 0.0)
     dedup_tol = venue_mid * dedup_pct
-    fulcrum_venue = round(edge * ratio, 4)
+    fulcrum_venue = round(edge + zone_shift, 4)   # analysis edge → venue frame (additive)
     if not ExecBridge.should_emit(account, broker_symbol, fulcrum_venue, dedup_tol, magic=leg_magic):
         return
 
@@ -690,11 +749,29 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
             return
         venue_mid = float(quote["mid"])
 
-    live_analysis = venue_mid
-    ratio = 1.0
+    # Frame: distance-from-close method (same as _touch_arm_tf — see its comment).
+    # zone_shift = venue_ref − analysis_ref, BOTH the same reference candle's close (analysis
+    # 1m close + venue candle close on this TF via EA CopyRates). Uses candle CLOSES, not the
+    # live venue_mid, so it does NOT collapse; the live mid keeps its intrabar tap signal.
+    from pipeline.state_store import store as _rebase_store
+    _ref_bars = [b for b in _rebase_store().recent(analysis, "1m", 6)
+                 if b.close_ts and b.close_ts < 9_000_000_000]   # drop sentinel/forming 1m bar
+    _analysis_ref = float(_ref_bars[-1].ohlc.c) if _ref_bars and _ref_bars[-1].ohlc.c else 0.0
+    # venue_ref: this TF's venue candle close, falling back to a higher TF (1m not collected).
+    # Never fall back to venue_mid (collapses zone_shift). See _touch_arm_tf.
+    _venue_ref = 0.0
+    for _rtf in (tf, "5m", "15m"):
+        _vb = ExecBridge.get_venue_bars(account, broker_symbol, _rtf)
+        if _vb and _vb[-1].ohlc.c:
+            _venue_ref = float(_vb[-1].ohlc.c); break
+    if _venue_ref <= 0:
+        _venue_ref = venue_mid
+    zone_shift = (_venue_ref - _analysis_ref) if _analysis_ref > 0 else 0.0
+    # live_analysis = live venue price in analysis frame (for plan_grid_levels + breakout check).
+    live_analysis = venue_mid - zone_shift
 
-    trig = lvn_touch_arm_trigger(analysis, tf, live_analysis)
-    LOG.info(f"[touch_arm_lvn] {broker_symbol}/{tf} lvn_touch_arm_trigger→{trig.kind if trig else None} edge={trig.fulcrum_price if trig else '-'}")
+    trig = lvn_touch_arm_trigger(analysis, tf, venue_mid, zone_shift=zone_shift)
+    LOG.info(f"[touch_arm_lvn] {broker_symbol}/{tf} venue_mid={venue_mid:.4f} zone_shift={zone_shift:+.4f} → {trig.kind if trig else None} edge={trig.fulcrum_price if trig else '-'}")
     if trig is None:
         _key = (str(account), broker_symbol, tf, "lvn_edge_touch")
         with ExecBridge._lock:
@@ -780,7 +857,7 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     ExecBridge.clear_emit(account, broker_symbol, magic=leg_magic)
     dedup_pct = float(grid_cfg.get("emit_dedup_pct", 0.0007) or 0.0)
     dedup_tol = venue_mid * dedup_pct
-    fulcrum_venue = round(edge * ratio, 4)
+    fulcrum_venue = round(edge + zone_shift, 4)   # analysis edge → venue frame (additive)
     if not ExecBridge.should_emit(account, broker_symbol, fulcrum_venue, dedup_tol, magic=leg_magic):
         return
 
@@ -832,17 +909,19 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
 # survives across polls within a server run (reset on restart is fine — cooldown + the
 # active-cycle gate still prevent duplicate arms).
 _SWEEP_LAST_BAR: dict = {}
+_HVN_EDGE_LAST_BAR: dict = {}   # (account, broker_symbol, tf) → last close_ts evaluated for hvn_edge
 
 
 def _sweep_trail(account: str, broker_symbol: str, symbol: str, tf: str,
                  leg_magic: int, arm: dict, open_state: dict, quote: dict) -> None:
-    """candle_sweep ratcheting SL trail — only ever tightens. Engages ONLY after VWAP-BE
-    fired (arm.vwap_be_armed) AND the side is >50% filled. Each bar close in the fill
-    direction moves the stop to that candle's extreme, but only if it beats the current
-    stop: Buy+GREEN → SL up to candle LOW; Sell+RED → SL down to candle HIGH. Baseline is
-    the POC the VWAP-BE parked at (sweep_vwap). Shared by /exec/emit_grid and the poll-loop
-    new-bar path so an armed sweep trails identically regardless of what drove the bar."""
-    if arm.get("trigger_kind") != "candle_sweep" or not arm.get("vwap_be_armed"):
+    """candle_sweep ratcheting SL trail — only ever tightens. Engages as soon as a side
+    is >50% filled (no longer gated on VWAP-BE). Each bar close in the fill direction
+    moves the stop to that candle's extreme, but only if it beats the current stop:
+    Buy+GREEN → SL up to candle LOW; Sell+RED → SL down to candle HIGH. Baseline starts
+    at the VWAP-BE price once that's fired (sweep_vwap), or 0 (no floor) before it has.
+    Shared by /exec/emit_grid and the poll-loop new-bar path so an armed sweep trails
+    identically regardless of what drove the bar."""
+    if arm.get("trigger_kind") != "candle_sweep":
         return
     try:
         _latest = store().latest(symbol, tf)
@@ -903,9 +982,16 @@ def _sweep_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     broker_to_analysis = {v: k for k, v in symbol_map.items()}
     analysis = broker_to_analysis.get(broker_symbol, broker_symbol)
 
+    # Vantage-native bars (EA CopyRates) take priority: candle_sweep then detects on
+    # the SAME OHLC the broker fills against — no rebase needed for candle_high/low.
+    # Falls back to the analysis-feed store when the EA hasn't sent bars yet (older
+    # binary, or first poll before any bars_5m/bars_15m has landed).
+    _venue_bars = ExecBridge.get_venue_bars(account, broker_symbol, tf)
+    _use_venue = len(_venue_bars) >= 2
+
     # New-bar gate: only evaluate once per closed bar (the detector reads closed bars).
     try:
-        _bars = _store().recent(analysis, tf, 5)
+        _bars = _venue_bars if _use_venue else _store().recent(analysis, tf, 5)
     except Exception:
         return
     if len(_bars) < 2:
@@ -922,20 +1008,17 @@ def _sweep_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
         venue_mid = float(quote["mid"])
     live_analysis = venue_mid
 
-    trig = _t_candle_sweep(analysis, tf, live_analysis, grid_cfg)
-    # Stamp this bar as evaluated regardless of detect result — no re-scan until next bar.
-    if _last_ts is not None:
-        _SWEEP_LAST_BAR[_key] = _last_ts
-    if trig is None:
-        return
-
     leg_magic = magic_for("candle_sweep", tf)
     _cyc = ExecBridge.get_last_arm(account, broker_symbol, magic=leg_magic) or {}
 
     # One concurrent cycle per (candle_sweep × TF): don't re-arm while a cycle is live —
     # but DO run the bar-close TP refresh + ratcheting SL trail (this new-bar tick is the
-    # only bar-close hook now that the external emit_grid caller is gone).
+    # only bar-close hook now that the external emit_grid caller is gone). Runs on EVERY
+    # bar close regardless of whether a FRESH sweep pattern re-triggers this bar — the
+    # trail must track ordinary follow-through candles, not just re-detected sweeps.
     if _cyc.get("active"):
+        if _last_ts is not None:
+            _SWEEP_LAST_BAR[_key] = _last_ts
         try:
             _refresh_cycle_tps(account, broker_symbol, analysis, tf, leg_magic, settings,
                                include_positions=True)
@@ -948,11 +1031,19 @@ def _sweep_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
             LOG.exception("[exec] sweep active-cycle refresh/trail error")
         return
 
+    trig = _t_candle_sweep(analysis, tf, live_analysis, grid_cfg,
+                          bars_override=_venue_bars if _use_venue else None)
+    # Stamp this bar as evaluated regardless of detect result — no re-scan until next bar.
+    if _last_ts is not None:
+        _SWEEP_LAST_BAR[_key] = _last_ts
+    if trig is None:
+        return
+
     # Cooldown: after a cycle closed (active→False), hold candle_sweep_cooldown_bars
     # before a fresh sweep arm — matches the /exec/emit_grid cooldown gate.
     if _cyc.get("trigger_kind") == "candle_sweep":
         _tf_secs = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}.get(tf, 60)
-        _cd_bars = int(grid_cfg.get("candle_sweep_cooldown_bars", 3) or 3)
+        _cd_bars = int(grid_cfg.get("candle_sweep_cooldown_bars", 3))   # 0 = no cooldown (don't `or 3` — that clobbers an explicit 0)
         _last_arm_ts = float(_cyc.get("ts") or 0.0)
         if _last_arm_ts > 0 and (time.time() - _last_arm_ts) < _cd_bars * _tf_secs:
             return
@@ -1000,6 +1091,109 @@ def _sweep_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
              f"[fulcrum={plan.fulcrum}], {len(cmds)} command(s)")
 
 
+def _hvn_edge_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
+                     venue_mid: float | None = None) -> None:
+    """Bar-close arm for hvn_edge (breakout-retest) — INDEPENDENT of the _score_and_pick
+    competition, mirroring _sweep_arm_tf. Previously hvn_edge only armed via the legacy
+    /exec/emit_grid scorer path, which is now GONE (all live arms come from the poll loop),
+    so hvn_edge never fired live. This gives it its own forced-arm path on its own magic
+    (strat 5), like candle_sweep/lvn_edge_touch. Fires at most once per bar per TF; the
+    active-cycle gate prevents stacking. _t_hvn_edge reads daily-VP HVN zones (chart-parity)
+    + analysis-feed bars, so no venue-bar override is needed."""
+    from execution.grid_planner import plan_grid_levels
+    from execution.zone_triggers import _t_hvn_edge
+    from pipeline.state_store import store as _store
+    grid_cfg = settings.get("grid_levels") or {}
+    if tf not in _trigger_tfs(grid_cfg, "hvn_edge"):
+        return
+
+    symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
+    broker_to_analysis = {v: k for k, v in symbol_map.items()}
+    analysis = broker_to_analysis.get(broker_symbol, broker_symbol)
+
+    # New-bar gate: evaluate once per closed bar (the detector reads closed bars).
+    try:
+        _bars = _store().recent(analysis, tf, 5)
+    except Exception:
+        return
+    if len(_bars) < 3:
+        return
+    _last_ts = getattr(_bars[-1], "close_ts", None) or getattr(_bars[-1], "ts", None)
+    _key = (str(account), broker_symbol, tf)
+    if _last_ts is not None and _HVN_EDGE_LAST_BAR.get(_key) == _last_ts:
+        return
+
+    quote = ExecBridge.get_quote(account, broker_symbol)
+    if venue_mid is None:
+        if not quote or not quote.get("mid"):
+            return
+        venue_mid = float(quote["mid"])
+    live_analysis = venue_mid
+
+    leg_magic = magic_for("hvn_edge", tf)
+    _cyc = ExecBridge.get_last_arm(account, broker_symbol, magic=leg_magic) or {}
+
+    # One concurrent cycle per (hvn_edge × TF): don't re-arm while live, but keep the
+    # bar-close TP-refresh + hvn_edge SL-trail running (the poll loop is the only bar-close
+    # hook now the external emit_grid caller is gone).
+    if _cyc.get("active"):
+        if _last_ts is not None:
+            _HVN_EDGE_LAST_BAR[_key] = _last_ts
+        try:
+            _refresh_cycle_tps(account, broker_symbol, analysis, tf, leg_magic, settings,
+                               include_positions=True)
+        except Exception:
+            LOG.exception("[exec] hvn_edge active-cycle refresh error")
+        return
+
+    trig = _t_hvn_edge(analysis, tf, live_analysis, grid_cfg)
+    if _last_ts is not None:
+        _HVN_EDGE_LAST_BAR[_key] = _last_ts
+    if trig is None:
+        return
+
+    ExecBridge.clear_emit(account, broker_symbol, magic=leg_magic)
+    min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5 if quote else 0.0
+    plan = plan_grid_levels(analysis, tf, live_analysis,
+                            trigger_hint="hvn_edge", settings=settings,
+                            venue_price=venue_mid, min_step_venue=min_step_venue,
+                            force_trigger=trig)
+    if plan.verdict != "arm" or plan.trigger_kind != "hvn_edge":
+        _emit_audit({"account": account, "symbol": analysis, "tf": tf, "verdict": "skip",
+                     "skip_reason": f"hvn_edge_arm:{plan.skip_reason or 'no_plan'}"})
+        return
+
+    cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
+                                        close_first=True, clear_kind="cancel",
+                                        magic=leg_magic,
+                                        leg_tp=(not bool(grid_cfg.get("net_profit_exit_only", False))
+                                                or bool(grid_cfg.get("leg_tp_ceiling", False))))
+    _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
+    node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
+    node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
+    ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum,
+                            edge=str(plan.trigger_context.get("edge", "")),
+                            trigger_kind=plan.trigger_kind, venue_mid=venue_mid, magic=leg_magic,
+                            n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
+                            buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
+                            buy_lots_total=round(sum(l.lot for l in plan.buy_legs), 4),
+                            sell_lots_total=round(sum(l.lot for l in plan.sell_legs), 4),
+                            bias_peak=0.0, bias_booked=False, bias_trail_done=False,
+                            be_done_buy=False, be_done_sell=False,
+                            node_low=round(node_low, 5), node_high=round(node_high, 5),
+                            active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
+                            max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
+                            squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank)
+    ExecBridge.mark_emit(account, broker_symbol, plan.fulcrum, magic=leg_magic)
+    _emit_audit({"account": account, "symbol": analysis, "broker_symbol": broker_symbol,
+                 "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind,
+                 "fulcrum": plan.fulcrum, "venue_mid": venue_mid,
+                 "n_per_side": plan.n_per_side, "step": plan.step,
+                 "buy_tp": plan.buy_tp, "sell_tp": plan.sell_tp})
+    LOG.info(f"[exec] HVN-EDGE-ARM {account} {broker_symbol} {tf} → armed "
+             f"[fulcrum={plan.fulcrum} edge={plan.trigger_context.get('edge','')}], {len(cmds)} command(s)")
+
+
 @bp.post("/exec/poll")
 def exec_poll():
     if not _auth_ok():
@@ -1023,6 +1217,26 @@ def exec_poll():
         # so the innermost leg clears the freeze band (no more silently-rejected legs).
         stops_dist = float(body.get("stops_pts", 0) or 0) * float(body.get("point", 0.0) or 0.0)
         ExecBridge.set_quote(account, sym, float(bid), float(ask), stops_dist=stops_dist)
+
+    # Vantage-native closed bars (EA CopyRates) for candle_sweep detection — lets the
+    # sweep pattern be checked on the SAME OHLC the broker fills against, no venue
+    # rebase needed afterward. Absent on older EA binaries; falls back to analysis feed.
+    if sym:
+        from pipeline.types import Bar, OHLC
+        for _tf, _key in (("5m", "bars_5m"), ("15m", "bars_15m")):
+            _raw_bars = body.get(_key)
+            if not _raw_bars:
+                continue
+            try:
+                _bars = [Bar(bar_id=f"{sym}|{_tf}|{int(b['ts'])}|venue", symbol=sym, tf=_tf,
+                             close_ts=int(b["ts"]), source="live",
+                             ohlc=OHLC(o=float(b["o"]), h=float(b["h"]),
+                                       l=float(b["l"]), c=float(b["c"])),
+                             bid_ladder=(), ask_ladder=())
+                          for b in _raw_bars]
+                ExecBridge.set_venue_bars(account, sym, _tf, _bars)
+            except Exception:
+                LOG.exception(f"[exec] venue bars parse error ({_tf})")
 
     # Daily floating P&L target — check on every poll that carries balance/equity.
     balance = body.get("balance")
@@ -1163,6 +1377,14 @@ def exec_poll():
                 _sweep_arm_tf(account, sym, _tf, settings_cfg or {}, venue_mid=_poll_venue_mid)
             except Exception:
                 LOG.exception("[exec] sweep_arm error")  # never break the poll
+        # hvn_edge — bar-close breakout-retest arm on its OWN magic (strat 5), independent
+        # of the scorer. Was dead live (only the removed emit_grid scorer path armed it).
+        _hvn_edge_tfs = _trigger_tfs((settings_cfg or {}).get("grid_levels", {}), "hvn_edge")
+        for _tf in _hvn_edge_tfs:
+            try:
+                _hvn_edge_arm_tf(account, sym, _tf, settings_cfg or {}, venue_mid=_poll_venue_mid)
+            except Exception:
+                LOG.exception("[exec] hvn_edge_arm error")  # never break the poll
 
     commands = ExecBridge.poll(account)
     if commands:
@@ -1254,9 +1476,16 @@ def exec_emit_grid():
     # Freeze-aware step floor: clear the broker's min-stop distance (×1.5 margin) so the
     # innermost leg can't land inside the freeze band and get silently rejected.
     min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
+    # Rebase reference: the closed Vantage candle on THIS TF (EA CopyRates via bars_5m/
+    # bars_15m), not the instantaneous live mid — fixed once per bar-close instead of
+    # drifting tick-to-tick, matching the cadence this endpoint itself fires on. Falls
+    # back to live mid when venue bars aren't available for this TF (e.g. 1m — not
+    # collected) or the EA hasn't sent any yet.
+    _venue_bars_eg = ExecBridge.get_venue_bars(account, broker_symbol, tf)
+    _venue_ref = float(_venue_bars_eg[-1].ohlc.c) if _venue_bars_eg else float(quote["mid"])
     plan = plan_grid_levels(symbol, tf, float(latest.ohlc.c),
                             trigger_hint=trigger_hint, settings=settings,
-                            venue_price=float(quote["mid"]), min_step_venue=min_step_venue)
+                            venue_price=_venue_ref, min_step_venue=min_step_venue)
     # Cycle state is keyed by MAGIC (strategy×TF) so independent setups (hvn / squeeze /
     # vp …) run as parallel cycles on the SAME symbol+TF. Compute it once from the plan's
     # trigger; "" trigger (skip) → 0 (the legacy single pool). The vp_levels SETUP (va OR
@@ -1312,7 +1541,7 @@ def exec_emit_grid():
     if not force and plan.trigger_kind == "candle_sweep" and arm.get("trigger_kind") == "candle_sweep":
         import time as _time
         _tf_secs = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}.get(tf, 60)
-        _cooldown_bars = int((settings.get("grid_levels") or {}).get("candle_sweep_cooldown_bars", 3) or 3)
+        _cooldown_bars = int((settings.get("grid_levels") or {}).get("candle_sweep_cooldown_bars", 3))   # 0 = no cooldown (don't `or 3`)
         _cooldown_secs = _cooldown_bars * _tf_secs
         _last_arm_ts = float(arm.get("ts") or 0.0)
         if _last_arm_ts > 0 and (_time.time() - _last_arm_ts) < _cooldown_secs:
@@ -1954,7 +2183,9 @@ def exec_zones():
             _trail_status = "armed"
         else:
             _trail_status = "off"
-        _bias_side = str(_cyc.get("bias_side") or "")   # persisted by monitor_cycle when peak is set
+        # bias_side is only set at the moment of booking (whichever side was net-winning
+        # then) — trail is cycle-wide (net P&L) while merely "armed", not side-specific.
+        _bias_side = str(_cyc.get("bias_side") or "")
         grid_cycles.append({
             "magic": _mg, "tf": _tf,
             "kind": _cyc.get("trigger_kind", ""),
