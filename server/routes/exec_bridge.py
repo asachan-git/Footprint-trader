@@ -925,12 +925,17 @@ def _sweep_trail(account: str, broker_symbol: str, symbol: str, tf: str,
     if arm.get("trigger_kind") != "candle_sweep":
         return
     try:
-        _latest = store().latest(symbol, tf)
-        if not _latest:
+        # VANTAGE-ONLY (2026-07-10): trail off the VENUE candle (EA CopyRates), not the
+        # Binance analysis bar. Sweep detects on venue OHLC, so the SL must ratchet to the
+        # SAME candle's extreme the position fills against — no rebase, no analysis-feed
+        # candle whose low/high differs from Vantage. No venue bar yet → skip (don't trail
+        # on a Binance candle). _venue is newest-last (oldest-first array).
+        _vb = ExecBridge.get_venue_bars(account, broker_symbol, tf)
+        if len(_vb) < 1:
             return
-        _ratio_t = float(quote.get("mid") or 0.0) / float(_latest.ohlc.c) if _latest.ohlc.c else 1.0
-        _trail_lo = round(float(_latest.ohlc.l) * _ratio_t, 4)
-        _trail_hi = round(float(_latest.ohlc.h) * _ratio_t, 4)
+        _latest = _vb[-1]
+        _trail_lo = round(float(_latest.ohlc.l), 4)   # already venue frame — no ratio rebase
+        _trail_hi = round(float(_latest.ohlc.h), 4)
         _is_green = _latest.ohlc.c >= _latest.ohlc.o
         _is_red   = _latest.ohlc.c <= _latest.ohlc.o
         _pos_buys  = int(open_state.get("buys",  0) or 0)
@@ -983,20 +988,17 @@ def _sweep_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     broker_to_analysis = {v: k for k, v in symbol_map.items()}
     analysis = broker_to_analysis.get(broker_symbol, broker_symbol)
 
-    # Vantage-native bars (EA CopyRates) take priority: candle_sweep then detects on
-    # the SAME OHLC the broker fills against — no rebase needed for candle_high/low.
-    # Falls back to the analysis-feed store when the EA hasn't sent bars yet (older
-    # binary, or first poll before any bars_5m/bars_15m has landed).
+    # VANTAGE-ONLY (2026-07-10, user): candle_sweep MUST detect on the EXECUTION venue's own
+    # OHLC (EA CopyRates), never the Binance analysis feed. A Binance sweep candle is NOT a
+    # Vantage sweep — the two feeds' 5m OHLC differ (basis + tick data), so an analysis-feed
+    # fallback armed on a candle that never swept on Vantage (observed: fulcrum 4126.045 arm
+    # on a bar that didn't close beyond the prev extreme on Vantage). If the EA hasn't sent
+    # venue bars yet → SKIP (do NOT fall back to analysis). Sweep fires only on real venue bars.
     _venue_bars = ExecBridge.get_venue_bars(account, broker_symbol, tf)
-    _use_venue = len(_venue_bars) >= 2
-
-    # New-bar gate: only evaluate once per closed bar (the detector reads closed bars).
-    try:
-        _bars = _venue_bars if _use_venue else _store().recent(analysis, tf, 5)
-    except Exception:
+    if len(_venue_bars) < 2:
         return
-    if len(_bars) < 2:
-        return
+    _use_venue = True
+    _bars = _venue_bars
     _last_ts = getattr(_bars[-1], "close_ts", None) or getattr(_bars[-1], "ts", None)
     _key = (str(account), broker_symbol, tf)
     if _last_ts is not None and _SWEEP_LAST_BAR.get(_key) == _last_ts:
@@ -1099,8 +1101,13 @@ def _hvn_edge_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     /exec/emit_grid scorer path, which is now GONE (all live arms come from the poll loop),
     so hvn_edge never fired live. This gives it its own forced-arm path on its own magic
     (strat 5), like candle_sweep/lvn_edge_touch. Fires at most once per bar per TF; the
-    active-cycle gate prevents stacking. _t_hvn_edge reads daily-VP HVN zones (chart-parity)
-    + analysis-feed bars, so no venue-bar override is needed."""
+    active-cycle gate prevents stacking.
+
+    VANTAGE-ONLY (2026-07-10, user): the breakout-retest is judged on the EA's own venue OHLC
+    (EA CopyRates), NOT the Binance analysis feed — the two feeds' bars differ by the ~3pt
+    gold basis, so a Binance breakout/retest isn't a Vantage one. Daily-VP HVN zones (analysis
+    frame) are shifted into the venue frame via zone_shift so bars + zones agree. No venue bars
+    yet → SKIP (don't fall back to analysis)."""
     from execution.grid_planner import plan_grid_levels
     from execution.zone_triggers import _t_hvn_edge
     from pipeline.state_store import store as _store
@@ -1112,13 +1119,12 @@ def _hvn_edge_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     broker_to_analysis = {v: k for k, v in symbol_map.items()}
     analysis = broker_to_analysis.get(broker_symbol, broker_symbol)
 
-    # New-bar gate: evaluate once per closed bar (the detector reads closed bars).
-    try:
-        _bars = _store().recent(analysis, tf, 5)
-    except Exception:
+    # VANTAGE-ONLY: detect on venue bars (EA CopyRates). Skip if not yet available — never
+    # fall back to the Binance analysis feed (a Binance retest ≠ a Vantage retest).
+    _venue_bars = ExecBridge.get_venue_bars(account, broker_symbol, tf)
+    if len(_venue_bars) < 3:
         return
-    if len(_bars) < 3:
-        return
+    _bars = _venue_bars
     _last_ts = getattr(_bars[-1], "close_ts", None) or getattr(_bars[-1], "ts", None)
     _key = (str(account), broker_symbol, tf)
     if _last_ts is not None and _HVN_EDGE_LAST_BAR.get(_key) == _last_ts:
@@ -1130,6 +1136,13 @@ def _hvn_edge_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
             return
         venue_mid = float(quote["mid"])
     live_analysis = venue_mid
+
+    # zone_shift (venue − analysis) from the same real reference candle close — shifts the
+    # analysis-frame daily-VP HVN edges into venue frame so they align with the venue bars.
+    _ref_bars = [b for b in _store().recent(analysis, "1m", 6)
+                 if b.close_ts and b.close_ts < 9_000_000_000]   # drop sentinel/forming 1m bar
+    _analysis_ref = float(_ref_bars[-1].ohlc.c) if _ref_bars and _ref_bars[-1].ohlc.c else 0.0
+    zone_shift = (venue_mid - _analysis_ref) if _analysis_ref > 0 else 0.0
 
     leg_magic = magic_for("hvn_edge", tf)
     _cyc = ExecBridge.get_last_arm(account, broker_symbol, magic=leg_magic) or {}
@@ -1147,7 +1160,8 @@ def _hvn_edge_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
             LOG.exception("[exec] hvn_edge active-cycle refresh error")
         return
 
-    trig = _t_hvn_edge(analysis, tf, live_analysis, grid_cfg)
+    trig = _t_hvn_edge(analysis, tf, live_analysis, grid_cfg,
+                       bars_override=_venue_bars, zone_shift=zone_shift)
     if _last_ts is not None:
         _HVN_EDGE_LAST_BAR[_key] = _last_ts
     if trig is None:

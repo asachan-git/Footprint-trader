@@ -174,6 +174,7 @@ class ExecBridge:
     _cmds: dict[str, Command] = {}          # id → Command
     _seq: list[str] = []                    # insertion order (FIFO dispatch)
     _quotes: dict[tuple, dict] = {}         # (account, broker_symbol) → {bid,ask,mid,ts}
+    _venue_bars: dict[tuple, list] = {}     # (account, broker_symbol, tf) → [Bar,...] oldest-first, EA CopyRates
     _last_emit: dict[tuple, float] = {}     # (account, symbol, tf) → last emitted fulcrum
     _last_arm: dict[tuple, dict] = {}       # (account, broker_symbol) → last armed grid metadata
     _last_modify_ts: dict[tuple, float] = {}  # (acct, sym, magic, side, kind) → last MODIFY enqueue ts (broker-rate throttle)
@@ -311,6 +312,9 @@ class ExecBridge:
                     cls._touch_state.pop(key, None)   # consume — one confirm per tap
                     return True
                 return False
+            # confirm_ticks <= 0 → NO reversal wait: arm on the raw first tap (2026-07-10 user).
+            if confirm_ticks <= 0:
+                return True
             # new tap on this edge → record, await reversal
             cls._touch_state[key] = {"edge": edge, "side": side,
                                      "tapped_px": live_price, "ts": t, "trig": None}
@@ -719,12 +723,13 @@ class ExecBridge:
                                       "squeeze_ok": cyc.get("squeeze_ok"),
                                       "squeeze_rank": cyc.get("squeeze_rank")})
 
-        # net-basket exit (which a hedge leg can mask). Gate: a side has a LOT-WEIGHTED
-        # MAJORITY of its planned exposure filled (>50% of buy_lots_total/sell_lots_total,
-        # not >50% of leg COUNT — the ladder's far legs carry more lot size than near ones,
-        # so a count-based gate under/over-states real commitment). Track that side's peak
-        # floating P&L; when it gives back ≥ giveback% from the peak, BOOK half that side
-        # and move the rest to breakeven (risk-free runner).
+        # net-basket exit (which a single-side view can mask). Gate: the WHOLE CYCLE's
+        # net floating P&L (buy_pnl + sell_pnl), not a single side's fill fraction —
+        # no more picking a "dominant" side to track (that 50%-of-lots gate had a bug
+        # where it silently collapsed to always-buy once any bias had ever been set,
+        # see project memory). Track the cycle's peak net P&L; when it gives back
+        # ≥ giveback% from the peak, BOOK half of whichever side is net-winning AT
+        # THAT MOMENT and move the rest of that side to breakeven (risk-free runner).
         # Fires once per cycle — guarded by bias_trail_done, a PRIVATE one-shot flag
         # (NOT bias_booked, which the flatten-rest suppression below resets one poll
         # after booking; gating on bias_booked let the trail double/triple-fire within
@@ -732,55 +737,48 @@ class ExecBridge:
         if (bool(grid_cfg.get("bias_trail_enabled", True))
                 and not cyc.get("bias_trail_done")
                 and buy_pnl is not None and sell_pnl is not None):
-            buy_lots_total  = float(cyc.get("buy_lots_total")  or 0.0)
-            sell_lots_total = float(cyc.get("sell_lots_total") or 0.0)
-            bias = ""
-            _bias_peak_set = float(cyc.get("bias_peak") or 0.0) > 0.0
-            if buy_lots_total > 0 and float(buy_lots or 0.0) > 0 \
-                    and (float(buy_lots or 0.0) > buy_lots_total / 2 or _bias_peak_set):
-                bias = "buy"
-            elif sell_lots_total > 0 and float(sell_lots or 0.0) > 0 \
-                    and (float(sell_lots or 0.0) > sell_lots_total / 2 or _bias_peak_set):
-                bias = "sell"
-            if bias:
-                side_pnl = float(buy_pnl if bias == "buy" else sell_pnl)
-                peak = max(float(cyc.get("bias_peak") or 0.0), side_pnl)
-                if peak != float(cyc.get("bias_peak") or 0.0) or cyc.get("bias_side") != bias:
-                    cyc["bias_peak"] = peak
-                    cyc["bias_side"] = bias   # persisted so downstream (dashboard) doesn't re-derive
-                    cls.set_last_arm(account, symbol, magic=magic, **cyc)
-                # Per-TF activate (mirrors cycle_net_target_by_tf): scale the trail-arm
-                # threshold to the TF so a big-target cycle isn't BE-locked on a tiny wiggle.
-                _act_by_tf = grid_cfg.get("bias_trail_activate_by_tf") or {}
-                _act_base = grid_cfg.get("bias_trail_activate_usd", 5.0)
-                activate = float((_act_by_tf.get(tf, _act_base) if isinstance(_act_by_tf, dict)
-                                  else _act_base) or 0.0)
-                if cyc.get("squeeze_ok"):
-                    activate *= float(grid_cfg.get("squeeze_trail_mult", 1.0) or 1.0)
-                giveback = float(grid_cfg.get("bias_trail_giveback_pct", 40.0) or 0.0)
-                book_frac = float(grid_cfg.get("bias_book_frac", 0.5) or 0.5)
-                # side_pnl > 0 floor: giveback%-off-peak alone has no floor at zero, so a
-                # side that ran deep negative after touching peak would still satisfy
-                # "retraced ≥ giveback% from peak" and book a LOSS as if it were a
-                # profit-lock (observed: booked at side_pnl -1895 off a peak of 1500).
-                # This is meant to lock in profit on a pullback, not realize a reversal.
-                if (activate > 0 and peak >= activate and side_pnl > 0
-                        and side_pnl <= peak * (1.0 - giveback / 100.0)):
-                    cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic, side=bias,
-                                frac=book_frac, comment=f"FB|book|{bias}", now=t)
-                    cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=bias,
-                                comment=f"FB|be|{bias}", now=t)
-                    # bias_trail_done = private one-shot (never reset while cycle lives);
-                    # bias_booked = flatten-rest suppression (reset by that block below).
-                    cls.set_last_arm(account, symbol, magic=magic, **{**cyc, "bias_booked": True,
-                                                         "bias_trail_done": True})
-                    _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
-                                      "tf": tf, "magic": magic, "exit_reason": "bias_book_trail",
-                                      "bias": bias, "peak": round(peak, 2),
-                                      "side_pnl": round(side_pnl, 2), "book_frac": book_frac,
-                                      "squeeze_ok": cyc.get("squeeze_ok"),
-                                      "squeeze_rank": cyc.get("squeeze_rank")})
-                    return "bias_book_trail"   # cycle continues (runner + hedge); no flatten
+            net_pnl = float(buy_pnl) + float(sell_pnl)
+            peak = max(float(cyc.get("bias_peak") or 0.0), net_pnl)
+            if peak != float(cyc.get("bias_peak") or 0.0):
+                cyc["bias_peak"] = peak
+                cls.set_last_arm(account, symbol, magic=magic, **cyc)
+            # Per-TF activate (mirrors cycle_net_target_by_tf): scale the trail-arm
+            # threshold to the TF so a big-target cycle isn't BE-locked on a tiny wiggle.
+            _act_by_tf = grid_cfg.get("bias_trail_activate_by_tf") or {}
+            _act_base = grid_cfg.get("bias_trail_activate_usd", 5.0)
+            activate = float((_act_by_tf.get(tf, _act_base) if isinstance(_act_by_tf, dict)
+                              else _act_base) or 0.0)
+            if cyc.get("squeeze_ok"):
+                activate *= float(grid_cfg.get("squeeze_trail_mult", 1.0) or 1.0)
+            giveback = float(grid_cfg.get("bias_trail_giveback_pct", 40.0) or 0.0)
+            book_frac = float(grid_cfg.get("bias_book_frac", 0.5) or 0.5)
+            # net_pnl > 0 floor: giveback%-off-peak alone has no floor at zero, so a
+            # cycle that ran deep negative after touching peak would still satisfy
+            # "retraced ≥ giveback% from peak" and book a LOSS as if it were a
+            # profit-lock (observed on the old side-only version: booked at side_pnl
+            # -1895 off a peak of 1500). This is meant to lock in profit on a
+            # pullback, not realize a reversal.
+            if (activate > 0 and peak >= activate and net_pnl > 0
+                    and net_pnl <= peak * (1.0 - giveback / 100.0)):
+                # Book whichever side is net-winning RIGHT NOW — the trail fired off
+                # combined P&L, but CLOSE_SIDE/MOVE_BE are inherently directional.
+                bias = "buy" if float(buy_pnl) >= float(sell_pnl) else "sell"
+                cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic, side=bias,
+                            frac=book_frac, comment=f"FB|book|{bias}", now=t)
+                cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=bias,
+                            comment=f"FB|be|{bias}", now=t)
+                # bias_trail_done = private one-shot (never reset while cycle lives);
+                # bias_booked = flatten-rest suppression (reset by that block below).
+                cls.set_last_arm(account, symbol, magic=magic, **{**cyc, "bias_side": bias,
+                                                     "bias_booked": True,
+                                                     "bias_trail_done": True})
+                _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
+                                  "tf": tf, "magic": magic, "exit_reason": "bias_book_trail",
+                                  "bias": bias, "peak": round(peak, 2),
+                                  "net_pnl": round(net_pnl, 2), "book_frac": book_frac,
+                                  "squeeze_ok": cyc.get("squeeze_ok"),
+                                  "squeeze_rank": cyc.get("squeeze_rank")})
+                return "bias_book_trail"   # cycle continues (runner + hedge); no flatten
 
         reason: str | None = None
         detail: dict = {}
@@ -831,7 +829,19 @@ class ExecBridge:
         if reason is None and 0 < positions < max_seen and pendings > 0 and not bias_booked:
             tol = max(mid * 1e-4, 1e-6) if mid > 0 else 1e-6
             confirms = (tp_up > 0 and mid >= tp_up - tol) or (tp_down > 0 and 0 < mid <= tp_down + tol)
-            reason = "leg_tp" if confirms else "leg_closed_other"
+            # NET-NEGATIVE GUARD (2026-07-10, fixes the leg_closed_other/leg_tp bleed —
+            # project_leg_closed_other_bleed): a single leg dropping (its TP tapped on a
+            # retrace, OR any other close) used to fire CLOSE_ALL on the WHOLE basket
+            # regardless of net P&L. When price ran hard against the ladder, a far outer
+            # big-lot leg's TP fired on a small bounce while 4+ legs sat deep red → the
+            # flatten dumped the underwater basket at market (15m: leg_tp −9750 in one cycle,
+            # −16.7k across 3). Only flatten-rest when the basket is net ≥ 0 (a genuine
+            # "winner leg closed, lock the rest"). Net-negative → HOLD: let survivors ride to
+            # net_target (recovery thesis) or bias_trail; full_hedge is the only loss-cut.
+            if pnl is not None and float(pnl) < 0:
+                pass   # underwater — do NOT flatten on a leg drop; hold for recovery/target
+            else:
+                reason = "leg_tp" if confirms else "leg_closed_other"
 
         # 3) full-hedge backstop (delta-neutral → cut to free margin; realizes a loss)
         if reason is None and close_on_full_hedge and n > 0 \
@@ -898,6 +908,19 @@ class ExecBridge:
         with cls._lock:
             q = cls._quotes.get((str(account), symbol))
             return dict(q) if q else None
+
+    # ── venue-native bar cache (EA CopyRates on each poll — candle_sweep detects on
+    # THIS instead of the analysis-feed store, so it fires on the same OHLC Vantage
+    # will fill against; no rebase needed for candle_high/candle_low afterward) ────
+    @classmethod
+    def set_venue_bars(cls, account: str, symbol: str, tf: str, bars: list) -> None:
+        with cls._lock:
+            cls._venue_bars[(str(account), symbol, tf)] = bars
+
+    @classmethod
+    def get_venue_bars(cls, account: str, symbol: str, tf: str) -> list:
+        with cls._lock:
+            return list(cls._venue_bars.get((str(account), symbol, tf), []))
 
     # ── audit ────────────────────────────────────────────────────────────────
     @classmethod

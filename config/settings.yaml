@@ -66,12 +66,12 @@ grid_levels:
   # Bias trail — arms when peak floating ≥ activate, fires on giveback% retrace.
   # Values are in native account currency (same note as cycle_net_target above).
   bias_trail_activate_by_tf: {}   # empty → BTC Jun22 exact: flat bias_trail_activate_usd (5.0) for all TFs
-  bias_trail_giveback_pct: 40    # fire when floating retraces this % off the peak (Jun19: 40 — books sooner)
+  bias_trail_giveback_pct: 50    # fire when floating retraces this % off the peak (Jun19: 40 — books sooner)
   bias_book_frac: 0.5            # fraction of bias-side positions to close at trail trigger (Jun19: 0.5 — keep a BE runner)
 
   # Squeeze multiplier — when a cycle was armed on a confirmed squeeze (squeeze_ok=True),
   # scale up targets so the system holds the runner longer into the expansion move.
-  squeeze_target_mult: 1.0       # multiply cycle_net_target when squeeze_ok (Jun19: no mult — 2.0 stranded winners e.g. 1m +1000 vs target 2000)
+  squeeze_target_mult: 2.0       # multiply cycle_net_target when squeeze_ok (Jun19: no mult — 2.0 stranded winners e.g. 1m +1000 vs target 2000)
   squeeze_trail_mult: 1.0        # multiply bias_trail_activate when squeeze_ok
 
   # Runtime expansion upgrade — flip squeeze_ok=True on a live cycle when expansion fires:
@@ -105,7 +105,7 @@ grid_levels:
   # ─────────────────────────────────────────────────────────────────────────────
 
   tp_atr_mult: 1.5
-  hvn_max_legs: 6            # BTC Jun22 cap: n = node_width/step, clamped 2..6 (× flat 0.50 mult = ~3×ATR ladder half-span)
+  hvn_max_legs: 8            # BTC Jun22 cap: n = node_width/step, clamped 2..6 (× flat 0.50 mult = ~3×ATR ladder half-span)
   # Minimum TP distance ($) beyond the outermost leg — a structural level closer than
   # this is skipped (keep walking out to the next). Stops the tiny-TP-into-own-node bug
   # (a fulcrum on an HVN edge had its into-node TP land ~2pt away). 0 = no floor.
@@ -229,7 +229,7 @@ grid_levels:
   # that side and move the rest to breakeven (risk-free runner). Captures directional
   # profit the net-basket exit masks (a hedge leg drags net down → target never hits).
   bias_trail_enabled: true      # SIMPLE: no trail — CLOSE_ALL only on net_target
-  bias_trail_activate_usd: 1000   # fallback when TF not in bias_trail_activate_by_tf (BTC's $5 → 750 USC equivalent)
+  bias_trail_activate_usd: 500   # 2026-07-10: 500 USC = BTC Jun22 $5 logic scaled to this lot size (USD acct 1 lot=0.01). Flat all TFs (by_tf empty).
   # ── Active trigger list — single source of truth for which strategies run and on which TFs.
   # Each entry: kind (required), tfs (required), enabled (default true), touch_only (default false).
   # touch_only=true → arm via intrabar price tap only (not bar-close emit).
@@ -252,7 +252,7 @@ grid_levels:
       tfs: [5m, 15m]             # A→B displacement: prev candle opens in HVN-A, closes in HVN-B (bar-close arm, strat 10 → magic 7701xx)
       enabled: true             # ON 2026-07-10 (user) — own forced-arm path _hvn_displacement_arm_tf
   candle_sweep_cooldown_bars: 0   # 0 = NO post-arm cooldown (2026-07-09: user "no cooldown"); default was 3 → 45min lockout on 15m suppressed fresh sweeps
-  touch_arm_confirm_ticks: 0.02   # reversal distance ($) for hvn_inside_touch tap confirm
+  touch_arm_confirm_ticks: 0      # 0 = NO reversal wait — arm on the raw edge tap (2026-07-10, user)
   # lvn_edge_touch tap tolerances — mirror hvn_touch_buffer/_pct/hvn_lookback_bars but
   # independently tunable. 0.10 = tap within 10% of node width counts (same width-relative
   # logic as HVN).

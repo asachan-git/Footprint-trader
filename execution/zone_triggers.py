@@ -399,7 +399,9 @@ def hvn_or_vp_tp(symbol: str, zones: list[tuple[float, float]],
 
 
 def _t_hvn_edge(symbol: str, tf: str, current_price: float,
-                cfg: dict | None = None) -> Trigger | None:
+                cfg: dict | None = None,
+                bars_override: list | None = None,
+                zone_shift: float = 0.0) -> Trigger | None:
     """HVN edge breakout-retest trigger.
 
     Fires when two conditions are met on the last closed bar:
@@ -415,7 +417,13 @@ def _t_hvn_edge(symbol: str, tf: str, current_price: float,
     Bias is directional:
       • Bullish break (closed above HVN top) → bias="buy"  fulcrum=HVN top edge
       • Bearish break (closed below HVN bot) → bias="sell" fulcrum=HVN bottom edge
-    """
+
+    bars_override / zone_shift (2026-07-10, VANTAGE-ONLY): when bars_override is given, detect on
+    THOSE bars (EA CopyRates venue OHLC) instead of the analysis-feed store — so the breakout /
+    retest is judged on the SAME candles the broker fills against. zone_shift (venue − analysis)
+    is ADDED to every daily-VP HVN edge so the zones sit in the venue frame too → bars + zones +
+    fulcrum all one frame (no ~3pt basis mismatch). Fulcrum/SL returned in venue frame; the caller
+    must NOT re-rebase (pass venue_price=venue_mid to plan but it won't double-shift a venue trig)."""
     cfg = cfg or {}
     lookback = int(cfg.get("hvn_edge_lookback", 20) or 20)
     tap_buf = float(cfg.get("hvn_edge_tap_buffer", cfg.get("hvn_touch_buffer", 0.5)) or 0.5)
@@ -426,7 +434,10 @@ def _t_hvn_edge(symbol: str, tf: str, current_price: float,
     except Exception:
         return None
 
-    bars = _store().recent(symbol, tf, lookback + 2)
+    if bars_override is not None:
+        bars = bars_override
+    else:
+        bars = _store().recent(symbol, tf, lookback + 2)
     if len(bars) < 3:
         return None
 
@@ -436,9 +447,11 @@ def _t_hvn_edge(symbol: str, tf: str, current_price: float,
     tap_lo = float(tap.ohlc.l)
     tap_close = float(tap.ohlc.c)
 
-    # Daily VP for HVN zones (same source the chart uses)
+    # Daily VP for HVN zones (same source the chart uses), shifted into the venue frame
+    # (zone_shift) when detecting on venue bars so edges and bars share one frame.
     vp = vp_get(symbol, "daily") or {}
-    hvn_zones = vp.get("hvn_zones") or []
+    hvn_zones = [{"low": float(z["low"]) + zone_shift, "high": float(z["high"]) + zone_shift}
+                 for z in (vp.get("hvn_zones") or [])]
     if not hvn_zones:
         return None
 
@@ -2008,10 +2021,15 @@ def _t_candle_sweep(symbol: str, tf: str, current_price: float,
         except Exception:
             return None
 
-    # Check the last 2 closed bars (lookback=2) so a sweep that closed one bar ago
-    # is still detected when the emitter fires just after the next bar opens.
+    # Check ONLY the last 2 closed bars (lookback=2) so a sweep that closed one bar ago is
+    # still caught when the poll fires just after the next bar opens — but a STALE sweep from
+    # many bars back does NOT arm now (that was the bug: the old `range(len-1, 0, -1)` scanned
+    # the WHOLE venue window (10 bars) and armed on any qualifying bar, so a sweep 5-8 bars ago
+    # armed a fresh cycle with no recent confirmation). Newest-first so the most recent wins.
+    _lookback_sweep = 2
+    _lo_i = max(1, len(bars) - _lookback_sweep)
     best_pair: tuple | None = None
-    for i in range(len(bars) - 1, 0, -1):
+    for i in range(len(bars) - 1, _lo_i - 1, -1):
         _cur  = bars[i]
         _prev = bars[i - 1]
         _ch, _cl, _cc = _cur.ohlc.h, _cur.ohlc.l, _cur.ohlc.c
