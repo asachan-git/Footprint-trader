@@ -910,6 +910,7 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
 # active-cycle gate still prevent duplicate arms).
 _SWEEP_LAST_BAR: dict = {}
 _HVN_EDGE_LAST_BAR: dict = {}   # (account, broker_symbol, tf) → last close_ts evaluated for hvn_edge
+_HVN_DISP_LAST_BAR: dict = {}   # (account, broker_symbol, tf) → last close_ts evaluated for hvn_displacement
 
 
 def _sweep_trail(account: str, broker_symbol: str, symbol: str, tf: str,
@@ -1194,6 +1195,108 @@ def _hvn_edge_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
              f"[fulcrum={plan.fulcrum} edge={plan.trigger_context.get('edge','')}], {len(cmds)} command(s)")
 
 
+def _hvn_displacement_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
+                             venue_mid: float | None = None) -> None:
+    """Bar-close arm for hvn_displacement — INDEPENDENT of _score_and_pick, mirroring
+    _hvn_edge_arm_tf (its own magic, strat 10). Displacement = prev candle opens in HVN-A,
+    closes in HVN-B → neutral straddle at B's near edge. Detector is bar-close (reads the
+    just-completed candle), reads DAILY-VP HVN zones (chart-parity), so no venue-bar override
+    is needed. Fires at most once per closed bar per TF; active-cycle gate prevents stacking."""
+    from execution.grid_planner import plan_grid_levels
+    from execution.zone_triggers import _t_hvn_displacement
+    from pipeline.state_store import store as _store
+    from pipeline.features.vp_cache import get as _vp_get
+    grid_cfg = settings.get("grid_levels") or {}
+    if tf not in _trigger_tfs(grid_cfg, "hvn_displacement"):
+        return
+
+    symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
+    broker_to_analysis = {v: k for k, v in symbol_map.items()}
+    analysis = broker_to_analysis.get(broker_symbol, broker_symbol)
+
+    # New-bar gate: evaluate once per closed bar (the detector reads the just-completed candle).
+    try:
+        _bars = _store().recent(analysis, tf, 5)
+    except Exception:
+        return
+    if len(_bars) < 3:
+        return
+    _last_ts = getattr(_bars[-1], "close_ts", None) or getattr(_bars[-1], "ts", None)
+    _key = (str(account), broker_symbol, tf)
+    if _last_ts is not None and _HVN_DISP_LAST_BAR.get(_key) == _last_ts:
+        return
+
+    quote = ExecBridge.get_quote(account, broker_symbol)
+    if venue_mid is None:
+        if not quote or not quote.get("mid"):
+            return
+        venue_mid = float(quote["mid"])
+    live_analysis = venue_mid
+
+    leg_magic = magic_for("hvn_displacement", tf)
+    _cyc = ExecBridge.get_last_arm(account, broker_symbol, magic=leg_magic) or {}
+
+    # One concurrent cycle per (hvn_displacement × TF): don't re-arm while live, but keep the
+    # bar-close TP-refresh running (poll loop is the only bar-close hook).
+    if _cyc.get("active"):
+        if _last_ts is not None:
+            _HVN_DISP_LAST_BAR[_key] = _last_ts
+        try:
+            _refresh_cycle_tps(account, broker_symbol, analysis, tf, leg_magic, settings,
+                               include_positions=True)
+        except Exception:
+            LOG.exception("[exec] hvn_displacement active-cycle refresh error")
+        return
+
+    _daily_vp = _vp_get(analysis, "daily") or {}
+    trig = _t_hvn_displacement(analysis, tf, live_analysis, _daily_vp)
+    if _last_ts is not None:
+        _HVN_DISP_LAST_BAR[_key] = _last_ts
+    if trig is None:
+        return
+
+    ExecBridge.clear_emit(account, broker_symbol, magic=leg_magic)
+    min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5 if quote else 0.0
+    plan = plan_grid_levels(analysis, tf, live_analysis,
+                            trigger_hint="hvn_displacement", settings=settings,
+                            venue_price=venue_mid, min_step_venue=min_step_venue,
+                            force_trigger=trig)
+    if plan.verdict != "arm" or plan.trigger_kind != "hvn_displacement":
+        _emit_audit({"account": account, "symbol": analysis, "tf": tf, "verdict": "skip",
+                     "skip_reason": f"hvn_disp_arm:{plan.skip_reason or 'no_plan'}"})
+        return
+
+    cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
+                                        close_first=True, clear_kind="cancel",
+                                        magic=leg_magic,
+                                        leg_tp=(not bool(grid_cfg.get("net_profit_exit_only", False))
+                                                or bool(grid_cfg.get("leg_tp_ceiling", False))))
+    _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
+    node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
+    node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
+    ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum,
+                            edge=str(plan.trigger_context.get("edge", "")),
+                            trigger_kind=plan.trigger_kind, venue_mid=venue_mid, magic=leg_magic,
+                            n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
+                            buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
+                            buy_lots_total=round(sum(l.lot for l in plan.buy_legs), 4),
+                            sell_lots_total=round(sum(l.lot for l in plan.sell_legs), 4),
+                            bias_peak=0.0, bias_booked=False, bias_trail_done=False,
+                            be_done_buy=False, be_done_sell=False,
+                            node_low=round(node_low, 5), node_high=round(node_high, 5),
+                            active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
+                            max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
+                            squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank)
+    ExecBridge.mark_emit(account, broker_symbol, plan.fulcrum, magic=leg_magic)
+    _emit_audit({"account": account, "symbol": analysis, "broker_symbol": broker_symbol,
+                 "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind,
+                 "fulcrum": plan.fulcrum, "venue_mid": venue_mid,
+                 "n_per_side": plan.n_per_side, "step": plan.step,
+                 "buy_tp": plan.buy_tp, "sell_tp": plan.sell_tp})
+    LOG.info(f"[exec] HVN-DISP-ARM {account} {broker_symbol} {tf} → armed "
+             f"[fulcrum={plan.fulcrum} dir={plan.trigger_context.get('direction','')}], {len(cmds)} command(s)")
+
+
 @bp.post("/exec/poll")
 def exec_poll():
     if not _auth_ok():
@@ -1385,6 +1488,14 @@ def exec_poll():
                 _hvn_edge_arm_tf(account, sym, _tf, settings_cfg or {}, venue_mid=_poll_venue_mid)
             except Exception:
                 LOG.exception("[exec] hvn_edge_arm error")  # never break the poll
+        # hvn_displacement — bar-close A→B displacement arm on its OWN magic (strat 10),
+        # independent of the scorer (same pattern as hvn_edge).
+        _hvn_disp_tfs = _trigger_tfs((settings_cfg or {}).get("grid_levels", {}), "hvn_displacement")
+        for _tf in _hvn_disp_tfs:
+            try:
+                _hvn_displacement_arm_tf(account, sym, _tf, settings_cfg or {}, venue_mid=_poll_venue_mid)
+            except Exception:
+                LOG.exception("[exec] hvn_displacement_arm error")  # never break the poll
 
     commands = ExecBridge.poll(account)
     if commands:

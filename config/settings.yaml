@@ -248,6 +248,9 @@ grid_levels:
       tfs: [1m, 5m, 15m]             # 1m dropped — tightest step (~0.3) + most re-arms, biggest density source
       touch_only: true           # arm via intrabar price tap only, same as hvn_inside_touch
       enabled: true             # ON — EA recompiled (InpMagicRange=150), magics 770131-133 owned
+    - kind: hvn_displacement
+      tfs: [5m, 15m]             # A→B displacement: prev candle opens in HVN-A, closes in HVN-B (bar-close arm, strat 10 → magic 7701xx)
+      enabled: true             # ON 2026-07-10 (user) — own forced-arm path _hvn_displacement_arm_tf
   candle_sweep_cooldown_bars: 0   # 0 = NO post-arm cooldown (2026-07-09: user "no cooldown"); default was 3 → 45min lockout on 15m suppressed fresh sweeps
   touch_arm_confirm_ticks: 0.02   # reversal distance ($) for hvn_inside_touch tap confirm
   # lvn_edge_touch tap tolerances — mirror hvn_touch_buffer/_pct/hvn_lookback_bars but
