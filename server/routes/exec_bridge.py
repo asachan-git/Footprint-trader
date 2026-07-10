@@ -615,10 +615,20 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
         # "re-arming the same level", it's replacing the side that just closed.
         flat_side = "sell" if buy_live else "buy"
         min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
+        # RE-ANCHOR TO ORIGINAL FULCRUM (2026-07-10, user): the backfilled side must straddle
+        # the SAME center as the still-live side, else the two ladders bracket different prices
+        # → a large inner dead zone (observed: b1↔s1 ~$18 while same-side legs ~$2-3). The fresh
+        # tap `trig` carries the CURRENT (moved) edge as its fulcrum; override it with the live
+        # cycle's stored fulcrum so re-armed legs sit at cyc.fulcrum ± i·step, symmetric with the
+        # original. If price has run too far from that fulcrum, plan_grid_levels' ladder-span gate
+        # (|price − fulcrum| ≤ n·step) correctly skips the backfill rather than placing far legs.
+        import dataclasses as _dc
+        _orig_fulcrum = float(_cyc.get("fulcrum") or 0.0)
+        _rearm_trig = _dc.replace(trig, fulcrum_price=_orig_fulcrum) if _orig_fulcrum > 0 else trig
         plan = plan_grid_levels(analysis, tf, live_analysis,
                                 trigger_hint="hvn_inside_touch", settings=settings,
                                 venue_price=venue_mid, min_step_venue=min_step_venue,
-                                force_trigger=trig)
+                                force_trigger=_rearm_trig)
         if plan.verdict != "arm" or plan.trigger_kind != "hvn_inside_touch":
             _emit_audit({"account": account, "symbol": analysis, "tf": tf, "verdict": "skip",
                          "skip_reason": f"touch_arm_side:{plan.skip_reason or 'no_plan'}",
@@ -817,10 +827,15 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     if (buy_live or sell_live) and _cyc.get("active"):
         flat_side = "sell" if buy_live else "buy"
         min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
+        # RE-ANCHOR to original fulcrum (same fix as hvn_inside_touch side-rearm) — keep the
+        # backfilled side symmetric with the still-live side; ladder-span gate skips if too far.
+        import dataclasses as _dc
+        _orig_fulcrum = float(_cyc.get("fulcrum") or 0.0)
+        _rearm_trig = _dc.replace(trig, fulcrum_price=_orig_fulcrum) if _orig_fulcrum > 0 else trig
         plan = plan_grid_levels(analysis, tf, live_analysis,
                                 trigger_hint="lvn_edge_touch", settings=settings,
                                 venue_price=venue_mid, min_step_venue=min_step_venue,
-                                force_trigger=trig)
+                                force_trigger=_rearm_trig)
         if plan.verdict != "arm" or plan.trigger_kind != "lvn_edge_touch":
             _emit_audit({"account": account, "symbol": analysis, "tf": tf, "verdict": "skip",
                          "skip_reason": f"touch_arm_lvn_side:{plan.skip_reason or 'no_plan'}",
@@ -2000,6 +2015,9 @@ def exec_zones():
     broker_to_analysis = {v: k for k, v in symbol_map.items()}
     symbol = broker_to_analysis.get(req_symbol, req_symbol)
     broker_symbol = symbol_map.get(symbol, req_symbol)
+    # tf now MATTERS: the drawn zones are the detector's per-TF _session_*_zones (2026-07-10)
+    # so the chart draws EXACTLY what arms. Default to primary_tf if the EA omits it.
+    tf = str(body.get("tf") or settings["instrument"].get("primary_tf") or "15m")
 
     # Fetch the EA quote first — used to rebase analysis-frame (Bybit) zones onto the
     # broker venue price so zone rectangles, levels, histogram and fulcrum all align.
@@ -2007,25 +2025,30 @@ def exec_zones():
 
     from pipeline.features import vp_cache
     from pipeline.state_store import store as _store
-    # Fetch prev-D and today separately so we can overlay both on the chart.
-    # /exec/zones always returns both: prev-D zones as "hvn"/"lvn", today's as
-    # "hvn_today"/"lvn_today" so the EA can color them differently.
     _prev_daily, _today_daily = vp_cache.get_prev_and_today(symbol)
-    # Fallback: if neither exists use the standard get() (weekly or legacy path).
     daily = _prev_daily or _today_daily or vp_cache.get(symbol, "daily") or {}
 
-    # Zone rebase: when MetaAPI offset is 0 (403 plan) derive the ratio from the live
-    # EA quote vs Bybit last close so EA-drawn zones align with the rebased fulcrum.
-    _zone_ratio = 1.0
-    _broker_mid = float(quote.get("mid") or 0.0)
-    if _broker_mid > 0:
-        _bybit_bars = _store().recent(symbol, "1m", 2)
-        _bybit_close = float(_bybit_bars[-1].ohlc.c) if _bybit_bars else 0.0
-        if _bybit_close > 0:
-            _zone_ratio = _broker_mid / _bybit_close
+    # FRAME: draw zones in VENUE frame using the SAME additive zone_shift the detector uses
+    # (venue_ref − analysis_ref, both same-candle closes) — NOT a multiplicative ratio. The
+    # old `_zone_ratio` (venue_mid / bybit_close) diverged from the detector's shift, so the
+    # drawn edge sat a few pt off the true arm edge. zone_shift keeps chart == detector.
+    _venue_mid = float(quote.get("mid") or 0.0)
+    _ref_bars = [b for b in _store().recent(symbol, "1m", 6)
+                 if b.close_ts and b.close_ts < 9_000_000_000]
+    _analysis_ref = float(_ref_bars[-1].ohlc.c) if _ref_bars and _ref_bars[-1].ohlc.c else 0.0
+    _venue_ref = 0.0
+    for _rtf in (tf, "5m", "15m"):
+        _vb = ExecBridge.get_venue_bars(account, broker_symbol, _rtf)
+        if _vb and _vb[-1].ohlc.c:
+            _venue_ref = float(_vb[-1].ohlc.c); break
+    if _venue_ref <= 0:
+        _venue_ref = _venue_mid
+    _zone_shift = (_venue_ref - _analysis_ref) if (_analysis_ref > 0 and _venue_ref > 0) else 0.0
+    # legacy multiplicative ratio kept only for the cosmetic fine/tick overlays below
+    _zone_ratio = (_venue_mid / _analysis_ref) if (_venue_mid > 0 and _analysis_ref > 0) else 1.0
 
     def _rebase_price(p: float) -> float:
-        return round(p * _zone_ratio, 5) if _zone_ratio != 1.0 else round(p, 5)
+        return round(p + _zone_shift, 5)
 
     _vpc = (settings.get("vp_cache") or {}) if isinstance(settings, dict) else {}
     _draw_dual = bool(_vpc.get("vp_draw_today_zones", False))
@@ -2034,74 +2057,33 @@ def exec_zones():
         return [(float(z["low"]), float(z["high"]))
                 for z in ((period.get(key) or []) if period else [])]
 
-    # IST time-band zone drawing — mirrors vp_cache.get(daily) exactly so the chart shows
-    # the SAME structure the grid trades on:
-    #   < 09:00 IST     → prev-D only (early Asia — today not yet structural)
-    #   09:00-19:59 IST → prev-D as hvn/lvn + today as hvn_today/lvn_today (union in play)
-    #   >= 20:00 IST    → today primary; prev-D zones only where outside today's range
-    #                     (chart analog of the prior-day vacuum fallback)
-    # Fallback: if the preferred source is empty, drop to whichever exists.
-    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-    _ist_hour = _dt.now(tz=_tz(_td(hours=5, minutes=30))).hour
-
+    # ZONES = the EXACT detector zones (2026-07-10). The chart draws what ARMS: the same
+    # _session_hvn_zones / _session_lvn_zones (cached-daily, per-TF) the touch detectors read,
+    # rebased to venue via the additive _zone_shift above. No more prev-D/today/IST-band
+    # divergence — the drawn HVN/LVN edge IS the trigger edge. LVN gets the same HVN-context
+    # filter the detector applies. Re-add the old get_prev_and_today path if a multi-day
+    # overlay is wanted for VISUAL context (it never matched the arm zones).
     zones = []
-    if _draw_dual:
-        # explicit dual-overlay mode: prev-D as hvn/lvn, today as hvn_today/lvn_today
-        for lo, hi in _collect(_prev_daily, "hvn_zones"):
-            zones.append({"kind": "hvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-        for lo, hi in _collect(_prev_daily, "lvn_zones"):
-            zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-        for lo, hi in _collect(_today_daily, "hvn_zones"):
-            zones.append({"kind": "hvn_today", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-        for lo, hi in _collect(_today_daily, "lvn_zones"):
-            zones.append({"kind": "lvn_today", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-    elif _ist_hour < 9:
-        # pre-09:00: prev-D only (fall back to today if prev-D not yet cached)
-        _src = _prev_daily or _today_daily
-        for lo, hi in _collect(_src, "hvn_zones"):
-            zones.append({"kind": "hvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-        for lo, hi in _collect(_src, "lvn_zones"):
-            zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-    elif _ist_hour < 20:
-        # 09:00-19:59: both — prev-D as hvn/lvn, today distinct as hvn_today/lvn_today
-        _src = _prev_daily or _today_daily
-        for lo, hi in _collect(_src, "hvn_zones"):
-            zones.append({"kind": "hvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-        for lo, hi in _collect(_src, "lvn_zones"):
-            zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-        if _today_daily and _today_daily is not _src:
-            for lo, hi in _collect(_today_daily, "hvn_zones"):
-                zones.append({"kind": "hvn_today", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-            for lo, hi in _collect(_today_daily, "lvn_zones"):
-                zones.append({"kind": "lvn_today", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-    else:
-        # >= 20:00: today's zones primary; add prev-D zones only outside today's price range
-        _today_hvn = _collect(_today_daily, "hvn_zones")
-        _today_lvn = _collect(_today_daily, "lvn_zones")
-        _today_all = _today_hvn + _today_lvn
-        if _today_all:
-            _today_floor = min(lo for lo, hi in _today_all)
-            _today_ceil  = max(hi for lo, hi in _today_all)
-        else:
-            _today_floor = _today_ceil = 0.0
-        for lo, hi in _today_hvn:
-            zones.append({"kind": "hvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-        for lo, hi in _today_lvn:
-            zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-        # prev-D zones that don't overlap today's range at all
-        _outside = lambda lo, hi: _today_floor == 0.0 or hi <= _today_floor or lo >= _today_ceil
-        for lo, hi in _collect(_prev_daily, "hvn_zones"):
-            if _outside(lo, hi):
+    try:
+        from execution.zone_triggers import (_session_hvn_zones, _session_lvn_zones,
+                                             _filter_lvn_zones_by_hvn_context)
+        _zbars = _store().recent(symbol, tf, 120)
+        if _zbars:
+            _hz, _ = _session_hvn_zones(symbol, tf, _zbars)
+            _lz, _ = _session_lvn_zones(symbol, tf, _zbars)
+            # LVN HVN-context filter — identical to lvn_touch_arm_trigger
+            _ctx = [(float(z["low"]), float(z["high"]))
+                    for z in ((daily.get("hvn_zones")) or [])]
+            try:
+                _lz = _filter_lvn_zones_by_hvn_context(_lz, _ctx)
+            except Exception:
+                pass
+            for lo, hi in _hz:
                 zones.append({"kind": "hvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-        for lo, hi in _collect(_prev_daily, "lvn_zones"):
-            if _outside(lo, hi):
+            for lo, hi in _lz:
                 zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-        # if today has no zones yet, fall back to prev-D entirely
-        if not _today_all:
-            for lo, hi in _collect(_prev_daily, "hvn_zones"):
-                zones.append({"kind": "hvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
-            for lo, hi in _collect(_prev_daily, "lvn_zones"):
-                zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+    except Exception:
+        LOG.exception("[exec_zones] detector-zone build failed")
 
     # Fine-resolution HVN/LVN (tick-bin vp_profile_bin, e.g. 0.1) computed over the last
     # session's bars and drawn as kind hvn_fine / lvn_fine — a TradingView-style A/B
