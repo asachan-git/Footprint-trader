@@ -307,6 +307,12 @@ grid_levels:
   # the data favours the gate. The label is stamped either way.
   squeeze_gate_max_bars: 20  # how stale a just-ended coil may be and still pass the gate
 
+# VP warm-up floor — minimum bars before a cached VP (HVN/LVN/POC) is built. Below this a
+# profile is a single-cluster degenerate, so /exec/zones returns empty. Was hardcoded 30
+# (~30min into a session before zones appear). 5 = zones ~5min after a session roll; thinner
+# structure but avoids the 1-bar degenerate. Read fresh by pipeline/features/vp_cache.py.
+vp_min_bars: 5
+
 # Startup preflight — server REFUSES to start unless footprint + VP data are present.
 startup_check:
   enabled: true

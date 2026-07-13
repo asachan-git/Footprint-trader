@@ -29,6 +29,19 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 CACHE_FILE = ROOT / "data" / "vp_cache.json"
 
 
+def _vp_min_bars() -> int:
+    """Minimum bars required to build a cached VP (HVN/LVN/POC). Config knob
+    `vp_min_bars` (default 5). Below this a profile is a single-cluster degenerate,
+    so zones are withheld. Lower = zones appear sooner after a session roll at the
+    cost of thinner structure. Read fresh (cheap; settings is small)."""
+    try:
+        import yaml as _yaml
+        _cfg = _yaml.safe_load((ROOT / "config" / "settings.yaml").read_text()) or {}
+        return int(_cfg.get("vp_min_bars", 5))
+    except Exception:
+        return 5
+
+
 _IST = timezone(timedelta(hours=5, minutes=30))
 
 
@@ -168,7 +181,7 @@ def _compute_period_vp(
 ) -> dict | None:
     from .volume_profile import compute
     period_bars = [b for b in all_bars if start_ts <= b.close_ts < end_ts]
-    if len(period_bars) < 30:   # need at least 30 bars for cached VP
+    if len(period_bars) < _vp_min_bars():   # need at least vp_min_bars for cached VP
         return None
     latest_close = period_bars[-1].ohlc.c
     vp = compute(period_bars, "cached", latest_close, bin_size=bin_size)
@@ -316,7 +329,7 @@ def refresh_today(symbol: str, primary_tf: str = "1m") -> bool:
     """Recompute only today's VP entry for one symbol. Fast path for 1m intraday refresh.
 
     Skips the full 5-day loop and the 100k-bar reload that build_and_save does.
-    Returns True if the entry was updated, False if not enough bars (<30).
+    Returns True if the entry was updated, False if not enough bars (< vp_min_bars).
     """
     from pipeline.state_store import store as _store
     from .volume_profile import compute
@@ -338,7 +351,7 @@ def refresh_today(symbol: str, primary_tf: str = "1m") -> bool:
     s = _store()
     today_bars = [b for b in s.recent(symbol, primary_tf, 1500)
                   if start_ts <= b.close_ts < min(end_ts, now_ts)]
-    if len(today_bars) < 30:
+    if len(today_bars) < _vp_min_bars():
         return False
 
     latest_close = today_bars[-1].ohlc.c
@@ -458,7 +471,7 @@ def _profile_from_bars(bars: list, draw_cfg: dict, draw_bin, offset: float) -> d
     Returns {"bin": float, "profile": [{price, vol}, ...]} or None if too few bars."""
     from .volume_profile import _build_bins
     import numpy as _np
-    if len(bars) < 30:
+    if len(bars) < _vp_min_bars():
         return None
     res = _build_bins(bars, bin_size=draw_bin)
     if not res:
@@ -493,7 +506,7 @@ def period_profile(symbol: str, period: str) -> dict | None:
     The cache stores only aggregates (POC/zones/etc), so the bins are rebuilt here from
     stored 1m bars over the same session window get() uses — for the EA's VP overlay.
     Returns {"bin": <width>, "profile": [{price, vol}, ...]} (vol>0 bins, venue-shifted),
-    or None if <30 bars (matches _compute_period_vp's floor)."""
+    or None if < vp_min_bars (matches _compute_period_vp's floor)."""
     from pipeline.state_store import store as _store
     cache = _load()
     sym = cache.get(symbol, {})
@@ -524,7 +537,7 @@ def period_profiles_session(symbol: str) -> list[dict]:
     forming (rolling) session, each anchored at its own session start.
 
     Returns a list (oldest first) of {"bin", "profile", "start_ts"} dicts suitable for
-    the EA's session-anchored VP drawing. Entries are omitted if <30 bars are available,
+    the EA's session-anchored VP drawing. Entries are omitted if < vp_min_bars are available,
     so thin/closed days simply drop out."""
     from pipeline.state_store import store as _store
     cache = _load()
@@ -567,7 +580,7 @@ def period_profiles_session(symbol: str) -> list[dict]:
 def rolling_profile(symbol: str, minutes: int = 1440) -> dict | None:
     """Trailing-window VP histogram (default 24h of 1m bars) — the same window the
     grid trigger's rolling VP (`_rolling_hvn`) sees, for chart parity. Venue-offset
-    applied; start_ts = first bar of the window. None if <30 bars."""
+    applied; start_ts = first bar of the window. None if < vp_min_bars."""
     from pipeline.state_store import store as _store
     cache = _load()
     sym = cache.get(symbol, {})
