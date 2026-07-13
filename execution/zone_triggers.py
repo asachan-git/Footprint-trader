@@ -936,10 +936,12 @@ def _t_lvn_edge_touch(symbol: str, tf: str, current_price: float) -> Trigger | N
         _gcfg = _cfg.get("grid_levels") or {}
         _buf = float(_gcfg.get("lvn_touch_buffer", 0.0))
         _buf_pct = float(_gcfg.get("lvn_touch_buffer_pct", 0.0))
+        _buf_ppct = float(_gcfg.get("lvn_touch_buffer_price_pct", 0.0))
         _lookback = int(_gcfg.get("lvn_lookback_bars", 3))
     except Exception:
         _buf = 0.0
         _buf_pct = 0.0
+        _buf_ppct = 0.0
         _lookback = 3
 
     win = _VP_WIN.get(tf, 96)
@@ -973,7 +975,7 @@ def _t_lvn_edge_touch(symbol: str, tf: str, current_price: float) -> Trigger | N
                 continue
             # Edge proximity only — no close-inside-zone gate. A bar whose wick reaches
             # an LVN edge (from either side) is a valid tap; the close needn't sit inside.
-            _buf_eff = max(_buf, width * _buf_pct)
+            _buf_eff = max(_buf, width * _buf_pct, abs(current_price) * _buf_ppct)
             touch_top = (h >= hi - _buf_eff) and (lo_p <= hi + _buf_eff)
             touch_bot = (lo_p <= lo + _buf_eff) and (h >= lo - _buf_eff)
             if not (touch_top or touch_bot):
@@ -1046,9 +1048,11 @@ def lvn_touch_arm_trigger(symbol: str, tf: str, live_price: float,
         _gcfg2 = _cfg.get("grid_levels") or {}
         _buf = float(_gcfg2.get("lvn_touch_buffer", 0.0))
         _buf_pct = float(_gcfg2.get("lvn_touch_buffer_pct", 0.0))
+        _buf_ppct = float(_gcfg2.get("lvn_touch_buffer_price_pct", 0.0))
     except Exception:
         _buf = 0.0
         _buf_pct = 0.0
+        _buf_ppct = 0.0
 
     win = _VP_WIN.get(tf, 96)
     bars = store().recent(symbol, tf, win + 5)
@@ -1091,7 +1095,7 @@ def lvn_touch_arm_trigger(symbol: str, tf: str, live_price: float,
                 continue
             # Edge proximity only — no inside-zone gate. Price tapping an LVN edge from
             # OUTSIDE the vacuum is just as valid a straddle anchor as from inside.
-            _buf_eff = max(_buf, width * _buf_pct)
+            _buf_eff = max(_buf, width * _buf_pct, abs(_px) * _buf_ppct)
             touch_top = abs(_px - hi) <= _buf_eff
             touch_bot = abs(_px - lo) <= _buf_eff
             if not (touch_top or touch_bot):

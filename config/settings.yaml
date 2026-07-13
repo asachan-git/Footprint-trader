@@ -256,8 +256,9 @@ grid_levels:
   # lvn_edge_touch tap tolerances — mirror hvn_touch_buffer/_pct/hvn_lookback_bars but
   # independently tunable. 0.10 = tap within 10% of node width counts (same width-relative
   # logic as HVN).
-  lvn_touch_buffer: 0.01      # 1¢ floor — "at the edge" tolerating tick granularity (2026-07-09: user "no buffer")
-  lvn_touch_buffer_pct: 0.0   # width-relative buffer OFF — tap must be AT the drawn edge, not X% into the node
+  lvn_touch_buffer: 0.01      # 1¢ absolute floor
+  lvn_touch_buffer_pct: 0.0   # width-relative buffer OFF
+  lvn_touch_buffer_price_pct: 0.0002  # PRICE-relative buffer (2026-07-13) — 0.02% of price ≈ 0.82 @4090. tap within this of the drawn edge counts. 0.01 floor was unreachable: a 15m wick 0.40pt INTO the edge (visible on chart) failed the ≤1¢ test → lvn_edge armed nothing. buffer_eff = max(0.01, width·pct, price·price_pct).
   lvn_lookback_bars: 3
   # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
   vp_fulcrum_levels: [poc, vah, val, naked_poc, lvn]   # which VP levels are fulcrums
