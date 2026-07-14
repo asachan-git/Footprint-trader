@@ -95,12 +95,15 @@ grid_levels:
   require_squeeze_gate: false    # OFF (2026-07-09, user relaxed) — data (2026-07-07): squeeze_ok arms net-NEGATIVE on 1m/5m (5m sqOK -733 avg / 20.8% full_hedge vs noSQ +433 / 9.1%); gate only helped 15m. Not earning its keep. Use per-side loss-cap / regime instead.
 
   # Safety
-  fullfill_be_enabled: false     # SIMPLE: no BE move — keep only net_target exit
+  # Match the 9590331 baseline (2026-07-14, user): NO full-fill BE and NO >50%-fill
+  # structural SL. Neither existed at 9590331 — only bias_trail (runner→BE on profit
+  # giveback) + net_target/full_hedge manage exits. The committed side is NOT stopped
+  # (grid-recovery thesis). Profit-trailing SL (candle_sweep ratchet, hvn_edge cont) is a
+  # separate mechanism and unaffected.
+  fullfill_be_enabled: false
   fullfill_cancel_opposite: false
-  # Deferred structural SL: when >50% of one side's legs fill, lock a fixed SL at the
-  # node edge (hvn_inside_touch) / fulcrum (hvn_edge reversion). false = NO such SL —
-  # a committed side can't be stopped out; net_target/full_hedge own the exit (grid-
-  # recovery thesis). Does NOT affect profit-trailing SL (candle_sweep/hvn_edge cont).
+  # Deferred structural SL (>50% of a side filled → SL at node edge). OFF — did not exist
+  # at 9590331. false = committed side can't be stopped out; net_target/full_hedge own the exit.
   defer_sl_on_half_fill: false
   # ─────────────────────────────────────────────────────────────────────────────
 
