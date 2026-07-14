@@ -98,6 +98,12 @@ class MT5Direct:
     def pendings(self, symbol: str = "", magic: int = 0) -> list[dict]:
         return [dict(o) for o in self._call("pendings", symbol, magic)]
 
+    def history_deals(self, ts_from: float, ts_to: float,
+                      symbol: str = "", magic: int = 0) -> list[dict]:
+        """Broker-realized closed-out deals in [ts_from, ts_to] (epoch s). Each dict has
+        net = profit+swap+commission. Ground-truth per-magic P&L (see scripts/mt5_deals_report.py)."""
+        return [dict(d) for d in self._call("history_deals", ts_from, ts_to, symbol, magic)]
+
     # --- write -------------------------------------------------------------
     def place_pending(self, symbol: str, side: str, otype: str, price: float, lot: float,
                       sl: float = 0.0, tp: float = 0.0, magic: int = 0, comment: str = "",

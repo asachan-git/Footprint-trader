@@ -42,6 +42,10 @@ def _deserialize(line: str) -> Bar:
         ask_ladder=tuple(Level(**lvl) for lvl in d["ask_ladder"]),
         poc=d.get("poc"),
         delta=d.get("delta"),
+        cvd_open=d.get("cvd_open"),
+        cvd_high=d.get("cvd_high"),
+        cvd_low=d.get("cvd_low"),
+        cvd_close=d.get("cvd_close"),
     )
 
 

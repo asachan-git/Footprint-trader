@@ -37,6 +37,48 @@ def _emit_audit(row: dict) -> None:
             fh.write(json.dumps({"ts": time.time(), **row}) + "\n")
     except Exception:
         pass  # audit must never break execution
+
+
+def _orderflow_snapshot(analysis_symbol: str, tf: str) -> dict:
+    """Order-flow state at decision time (arm/update), for correlating entries/updates
+    against footprint. Read from the analysis-feed bar store (carries live CVD path + per-bar
+    delta). All fields None-safe; a bar with no delta/cvd (synthetic/historical) yields nulls.
+
+    Fields (nested under "orderflow" in the audit row):
+      cvd            — latest bar's cvd_close (running cumulative volume delta)
+      cvd_prev       — prior bar's cvd_close
+      cvd_slope      — cvd − cvd_prev (rising = net buying pressure across the last bar)
+      delta_cur      — CURRENT (latest, forming) candle delta
+      delta_prev     — PREV (last-closed) candle delta
+      delta_2        — bar before prev (for a 3-bar delta run)
+      delta_flip     — sign changed prev→cur (buy/sell aggression flipped)
+      bars_n         — how many bars were available (0 → all fields null)
+    """
+    try:
+        from pipeline.state_store import store
+        bars = store().recent(analysis_symbol, tf, 3)
+    except Exception:
+        bars = []
+    n = len(bars)
+    def _d(b):
+        return None if b is None or b.delta is None else round(float(b.delta), 4)
+    cur  = bars[-1] if n >= 1 else None
+    prev = bars[-2] if n >= 2 else None
+    two  = bars[-3] if n >= 3 else None
+    cvd      = None if cur  is None or cur.cvd_close  is None else round(float(cur.cvd_close), 4)
+    cvd_prev = None if prev is None or prev.cvd_close is None else round(float(prev.cvd_close), 4)
+    dcur, dprev = _d(cur), _d(prev)
+    return {
+        "cvd": cvd,
+        "cvd_prev": cvd_prev,
+        "cvd_slope": (round(cvd - cvd_prev, 4) if cvd is not None and cvd_prev is not None else None),
+        "delta_cur": dcur,
+        "delta_prev": dprev,
+        "delta_2": _d(two),
+        "delta_flip": (None if dcur is None or dprev is None
+                       else (dcur > 0) != (dprev > 0)),
+        "bars_n": n,
+    }
 LOG = logging.getLogger(__name__)
 
 
@@ -708,9 +750,15 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                                         magic=leg_magic,
                                         leg_tp=(not bool(grid_cfg.get("net_profit_exit_only", False))
                                                 or bool(grid_cfg.get("leg_tp_ceiling", False))))
-    _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
-    node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
-    node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
+    # ADDITIVE venue rebase (2026-07-14) — match plan_grid's additive _rebase_to_venue and the
+    # /exec/zones chart shift. node_low/high are analysis-frame trigger bounds; translate by the
+    # basis shift (venue_anchor − analysis_anchor), do NOT scale (the old *_ratio drifted the
+    # nodes off the additively-rebased fulcrum, re-opening the fulcrum-vs-edge gap for far nodes).
+    _shift = (plan.venue_anchor - plan.analysis_anchor) if plan.analysis_anchor else 0.0
+    _nl = float(plan.trigger_context.get("node_low", 0.0) or 0.0)
+    _nh = float(plan.trigger_context.get("node_high", 0.0) or 0.0)
+    node_low = (_nl + _shift) if _nl else 0.0
+    node_high = (_nh + _shift) if _nh else 0.0
     ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum, edge=side,
                             trigger_kind=plan.trigger_kind, venue_mid=venue_mid, magic=leg_magic,
                             n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
@@ -723,13 +771,18 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
                             max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
                             squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank,
+                            squeeze_bb=plan.squeeze_bb,
+                            skew=plan.skew, skew_reason=plan.skew_reason, skew_votes=plan.skew_votes,
                             sweep_be_usd=float(plan.trigger_context.get("sweep_be_usd") or 0.0),
                             sweep_vwap=float(plan.trigger_context.get("sweep_vwap") or 0.0))
     ExecBridge.mark_emit(account, broker_symbol, plan.fulcrum, magic=leg_magic)
+    _of = _orderflow_snapshot(analysis, tf)
     _emit_audit({"account": account, "symbol": analysis, "broker_symbol": broker_symbol,
                  "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind, "edge": side,
                  "fulcrum": plan.fulcrum, "venue_mid": venue_mid, "touch_armed": True,
                  "n_per_side": plan.n_per_side, "step": plan.step,
+                 "skew": plan.skew, "skew_reason": plan.skew_reason, "skew_votes": plan.skew_votes,
+                 "orderflow": _of, "squeeze_bb": plan.squeeze_bb,
                  "buy_tp": plan.buy_tp, "sell_tp": plan.sell_tp})
     LOG.info(f"[exec] TOUCH-ARM {account} {broker_symbol} {tf} → armed "
              f"[edge={side} fulcrum={plan.fulcrum}], {len(cmds)} command(s)")
@@ -892,9 +945,15 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                                         magic=leg_magic,
                                         leg_tp=(not bool(grid_cfg.get("net_profit_exit_only", False))
                                                 or bool(grid_cfg.get("leg_tp_ceiling", False))))
-    _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
-    node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
-    node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
+    # ADDITIVE venue rebase (2026-07-14) — match plan_grid's additive _rebase_to_venue and the
+    # /exec/zones chart shift. node_low/high are analysis-frame trigger bounds; translate by the
+    # basis shift (venue_anchor − analysis_anchor), do NOT scale (the old *_ratio drifted the
+    # nodes off the additively-rebased fulcrum, re-opening the fulcrum-vs-edge gap for far nodes).
+    _shift = (plan.venue_anchor - plan.analysis_anchor) if plan.analysis_anchor else 0.0
+    _nl = float(plan.trigger_context.get("node_low", 0.0) or 0.0)
+    _nh = float(plan.trigger_context.get("node_high", 0.0) or 0.0)
+    node_low = (_nl + _shift) if _nl else 0.0
+    node_high = (_nh + _shift) if _nh else 0.0
     ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum, edge=side,
                             trigger_kind=plan.trigger_kind, venue_mid=venue_mid, magic=leg_magic,
                             n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
@@ -907,13 +966,18 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
                             max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
                             squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank,
+                            squeeze_bb=plan.squeeze_bb,
+                            skew=plan.skew, skew_reason=plan.skew_reason, skew_votes=plan.skew_votes,
                             sweep_be_usd=float(plan.trigger_context.get("sweep_be_usd") or 0.0),
                             sweep_vwap=float(plan.trigger_context.get("sweep_vwap") or 0.0))
     ExecBridge.mark_emit(account, broker_symbol, plan.fulcrum, magic=leg_magic)
+    _of = _orderflow_snapshot(analysis, tf)
     _emit_audit({"account": account, "symbol": analysis, "broker_symbol": broker_symbol,
                  "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind, "edge": side,
                  "fulcrum": plan.fulcrum, "venue_mid": venue_mid, "touch_armed": True,
                  "n_per_side": plan.n_per_side, "step": plan.step,
+                 "skew": plan.skew, "skew_reason": plan.skew_reason, "skew_votes": plan.skew_votes,
+                 "orderflow": _of, "squeeze_bb": plan.squeeze_bb,
                  "buy_tp": plan.buy_tp, "sell_tp": plan.sell_tp})
     LOG.info(f"[exec] TOUCH-ARM-LVN {account} {broker_symbol} {tf} → armed "
              f"[edge={side} fulcrum={plan.fulcrum}], {len(cmds)} command(s)")
@@ -925,16 +989,19 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
 # active-cycle gate still prevent duplicate arms).
 _SWEEP_LAST_BAR: dict = {}
 _HVN_EDGE_LAST_BAR: dict = {}   # (account, broker_symbol, tf) → last close_ts evaluated for hvn_edge
-_HVN_DISP_LAST_BAR: dict = {}   # (account, broker_symbol, tf) → last close_ts evaluated for hvn_displacement
 
 
 def _sweep_trail(account: str, broker_symbol: str, symbol: str, tf: str,
                  leg_magic: int, arm: dict, open_state: dict, quote: dict) -> None:
     """candle_sweep ratcheting SL trail — only ever tightens. Engages as soon as a side
-    is >50% filled (no longer gated on VWAP-BE). Each bar close in the fill direction
-    moves the stop to that candle's extreme, but only if it beats the current stop:
-    Buy+GREEN → SL up to candle LOW; Sell+RED → SL down to candle HIGH. Baseline starts
-    at the VWAP-BE price once that's fired (sweep_vwap), or 0 (no floor) before it has.
+    is >50% filled (no longer gated on VWAP-BE). Each bar close moves the stop to that
+    candle's extreme regardless of the bar's color, but only if it beats the current
+    stop: Buy → SL up to candle LOW; Sell → SL down to candle HIGH. Ratcheting every bar
+    (not just follow-through bars) is what caps a LOSING single-sided cycle — a
+    counter-move bar pulls the stop toward price so the next extreme break exits, instead
+    of the loser sitting at the far structural SL forever (net_target/leg_closed_other/
+    full_hedge never fire on a one-sided drawdown). Baseline starts at the VWAP-BE price
+    once that's fired (sweep_vwap), or 0 (no floor) before it has.
     Shared by /exec/emit_grid and the poll-loop new-bar path so an armed sweep trails
     identically regardless of what drove the bar."""
     if arm.get("trigger_kind") != "candle_sweep":
@@ -951,8 +1018,6 @@ def _sweep_trail(account: str, broker_symbol: str, symbol: str, tf: str,
         _latest = _vb[-1]
         _trail_lo = round(float(_latest.ohlc.l), 4)   # already venue frame — no ratio rebase
         _trail_hi = round(float(_latest.ohlc.h), 4)
-        _is_green = _latest.ohlc.c >= _latest.ohlc.o
-        _is_red   = _latest.ohlc.c <= _latest.ohlc.o
         _pos_buys  = int(open_state.get("buys",  0) or 0)
         _pos_sells = int(open_state.get("sells", 0) or 0)
         _buy_n     = int(arm.get("buy_n")  or 0)
@@ -963,14 +1028,23 @@ def _sweep_trail(account: str, broker_symbol: str, symbol: str, tf: str,
         _arm_tp_up   = float(arm.get("tp_up")   or 0.0)
         _arm_tp_down = float(arm.get("tp_down") or 0.0)
         _dirty = False
+        # Ratchet to the latest venue candle's extreme EVERY bar — NOT only on
+        # follow-through (green for buys / red for sells). Dropping the color gate is
+        # what caps a LOSING single-sided cycle: previously the loser's SL sat at the
+        # far structural extreme forever because net_target/leg_closed_other/full_hedge
+        # never fire on a one-sided drawdown and the winner-only trail skipped it. The
+        # monotonic guards below (_trail_lo > _sl_buy, _trail_hi < _sl_sell) still make
+        # this STRICTLY tighten — the SL only ever moves toward price, never away — so a
+        # counter-move bar (red for a buy) pulls the buy stop UP under that bar's low and
+        # the next lower-low exits, instead of grinding unbounded.
         if (_pos_buys > 0 and _buy_n > 0 and _pos_buys > _buy_n / 2
-                and _is_green and _trail_lo > 0 and _trail_lo > _sl_buy):
+                and _trail_lo > 0 and _trail_lo > _sl_buy):
             ExecBridge.enqueue_modify_sl(account, broker_symbol, leg_magic, _trail_lo,
                                          side="buy", comment="FB|sweep_trail|buy", tp=_arm_tp_up)
             arm["trail_sl_buy"] = _trail_lo
             _dirty = True
         if (_pos_sells > 0 and _sell_n > 0 and _pos_sells > _sell_n / 2
-                and _is_red and _trail_hi > 0 and (_sl_sell <= 0 or _trail_hi < _sl_sell)):
+                and _trail_hi > 0 and (_sl_sell <= 0 or _trail_hi < _sl_sell)):
             ExecBridge.enqueue_modify_sl(account, broker_symbol, leg_magic, _trail_hi,
                                          side="sell", comment="FB|sweep_trail|sell", tp=_arm_tp_down)
             arm["trail_sl_sell"] = _trail_hi
@@ -1082,9 +1156,15 @@ def _sweep_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                                         magic=leg_magic,
                                         leg_tp=(not bool(grid_cfg.get("net_profit_exit_only", False))
                                                 or bool(grid_cfg.get("leg_tp_ceiling", False))))
-    _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
-    node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
-    node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
+    # ADDITIVE venue rebase (2026-07-14) — match plan_grid's additive _rebase_to_venue and the
+    # /exec/zones chart shift. node_low/high are analysis-frame trigger bounds; translate by the
+    # basis shift (venue_anchor − analysis_anchor), do NOT scale (the old *_ratio drifted the
+    # nodes off the additively-rebased fulcrum, re-opening the fulcrum-vs-edge gap for far nodes).
+    _shift = (plan.venue_anchor - plan.analysis_anchor) if plan.analysis_anchor else 0.0
+    _nl = float(plan.trigger_context.get("node_low", 0.0) or 0.0)
+    _nh = float(plan.trigger_context.get("node_high", 0.0) or 0.0)
+    node_low = (_nl + _shift) if _nl else 0.0
+    node_high = (_nh + _shift) if _nh else 0.0
     ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum, edge="",
                             trigger_kind=plan.trigger_kind, venue_mid=venue_mid, magic=leg_magic,
                             n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
@@ -1097,13 +1177,18 @@ def _sweep_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
                             max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
                             squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank,
+                            squeeze_bb=plan.squeeze_bb,
+                            skew=plan.skew, skew_reason=plan.skew_reason, skew_votes=plan.skew_votes,
                             sweep_be_usd=float(plan.trigger_context.get("sweep_be_usd") or 0.0),
                             sweep_vwap=float(plan.trigger_context.get("sweep_vwap") or 0.0))
     ExecBridge.mark_emit(account, broker_symbol, plan.fulcrum, magic=leg_magic)
+    _of = _orderflow_snapshot(analysis, tf)
     _emit_audit({"account": account, "symbol": analysis, "broker_symbol": broker_symbol,
                  "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind,
                  "fulcrum": plan.fulcrum, "venue_mid": venue_mid,
                  "n_per_side": plan.n_per_side, "step": plan.step,
+                 "skew": plan.skew, "skew_reason": plan.skew_reason, "skew_votes": plan.skew_votes,
+                 "orderflow": _of, "squeeze_bb": plan.squeeze_bb,
                  "buy_tp": plan.buy_tp, "sell_tp": plan.sell_tp})
     LOG.info(f"[exec] SWEEP-ARM {account} {broker_symbol} {tf} → armed "
              f"[fulcrum={plan.fulcrum}], {len(cmds)} command(s)")
@@ -1120,9 +1205,11 @@ def _hvn_edge_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
 
     VANTAGE-ONLY (2026-07-10, user): the breakout-retest is judged on the EA's own venue OHLC
     (EA CopyRates), NOT the Binance analysis feed — the two feeds' bars differ by the ~3pt
-    gold basis, so a Binance breakout/retest isn't a Vantage one. Daily-VP HVN zones (analysis
-    frame) are shifted into the venue frame via zone_shift so bars + zones agree. No venue bars
-    yet → SKIP (don't fall back to analysis)."""
+    gold basis, so a Binance breakout/retest isn't a Vantage one. Session HVN zones (analysis
+    frame, _session_hvn_zones — same source /exec/zones draws) are shifted into the venue frame
+    via zone_shift ONLY for the tap test; _t_hvn_edge returns the fulcrum back in analysis frame
+    so plan_grid does the SINGLE venue rebase (2026-07-14: was double-shifted → ~3pt fulcrum-vs-
+    drawn-edge gap). No venue bars yet → SKIP (don't fall back to analysis)."""
     from execution.grid_planner import plan_grid_levels
     from execution.zone_triggers import _t_hvn_edge
     from pipeline.state_store import store as _store
@@ -1150,14 +1237,29 @@ def _hvn_edge_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
         if not quote or not quote.get("mid"):
             return
         venue_mid = float(quote["mid"])
-    live_analysis = venue_mid
 
-    # zone_shift (venue − analysis) from the same real reference candle close — shifts the
-    # analysis-frame daily-VP HVN edges into venue frame so they align with the venue bars.
+    # zone_shift (venue − analysis) from the same real reference candle CLOSE on BOTH
+    # sides — venue candle close and analysis candle close, NOT live venue_mid. Using
+    # venue_mid here (the old code) folded the entire intrabar move into zone_shift, so
+    # the armed hvn_edge fulcrum drifted from the drawn zone edge (which /exec/zones
+    # shifts by the candle-close-based zone_shift) by however far price had ticked since
+    # the bar open — the "significant fulcrum vs edge gap". Match /exec/zones + touch_arm:
+    # venue_ref = latest venue candle close (this TF, then 5m/15m), analysis_ref = latest
+    # real 1m analysis close. live_analysis is then the LIVE mid expressed in analysis
+    # frame (venue_mid − zone_shift), which is a live value — only the SHIFT is a
+    # candle-close constant.
+    _venue_ref = 0.0
+    for _rtf in (tf, "5m", "15m"):
+        _vb_ref = ExecBridge.get_venue_bars(account, broker_symbol, _rtf)
+        if _vb_ref and _vb_ref[-1].ohlc.c:
+            _venue_ref = float(_vb_ref[-1].ohlc.c); break
+    if _venue_ref <= 0:
+        _venue_ref = venue_mid
     _ref_bars = [b for b in _store().recent(analysis, "1m", 6)
                  if b.close_ts and b.close_ts < 9_000_000_000]   # drop sentinel/forming 1m bar
     _analysis_ref = float(_ref_bars[-1].ohlc.c) if _ref_bars and _ref_bars[-1].ohlc.c else 0.0
-    zone_shift = (venue_mid - _analysis_ref) if _analysis_ref > 0 else 0.0
+    zone_shift = (_venue_ref - _analysis_ref) if _analysis_ref > 0 else 0.0
+    live_analysis = venue_mid - zone_shift
 
     leg_magic = magic_for("hvn_edge", tf)
     _cyc = ExecBridge.get_last_arm(account, broker_symbol, magic=leg_magic) or {}
@@ -1198,9 +1300,15 @@ def _hvn_edge_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                                         magic=leg_magic,
                                         leg_tp=(not bool(grid_cfg.get("net_profit_exit_only", False))
                                                 or bool(grid_cfg.get("leg_tp_ceiling", False))))
-    _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
-    node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
-    node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
+    # ADDITIVE venue rebase (2026-07-14) — match plan_grid's additive _rebase_to_venue and the
+    # /exec/zones chart shift. node_low/high are analysis-frame trigger bounds; translate by the
+    # basis shift (venue_anchor − analysis_anchor), do NOT scale (the old *_ratio drifted the
+    # nodes off the additively-rebased fulcrum, re-opening the fulcrum-vs-edge gap for far nodes).
+    _shift = (plan.venue_anchor - plan.analysis_anchor) if plan.analysis_anchor else 0.0
+    _nl = float(plan.trigger_context.get("node_low", 0.0) or 0.0)
+    _nh = float(plan.trigger_context.get("node_high", 0.0) or 0.0)
+    node_low = (_nl + _shift) if _nl else 0.0
+    node_high = (_nh + _shift) if _nh else 0.0
     ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum,
                             edge=str(plan.trigger_context.get("edge", "")),
                             trigger_kind=plan.trigger_kind, venue_mid=venue_mid, magic=leg_magic,
@@ -1213,117 +1321,20 @@ def _hvn_edge_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                             node_low=round(node_low, 5), node_high=round(node_high, 5),
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
                             max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
-                            squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank)
+                            squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank,
+                            squeeze_bb=plan.squeeze_bb,
+                            skew=plan.skew, skew_reason=plan.skew_reason, skew_votes=plan.skew_votes)
     ExecBridge.mark_emit(account, broker_symbol, plan.fulcrum, magic=leg_magic)
+    _of = _orderflow_snapshot(analysis, tf)
     _emit_audit({"account": account, "symbol": analysis, "broker_symbol": broker_symbol,
                  "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind,
                  "fulcrum": plan.fulcrum, "venue_mid": venue_mid,
                  "n_per_side": plan.n_per_side, "step": plan.step,
+                 "skew": plan.skew, "skew_reason": plan.skew_reason, "skew_votes": plan.skew_votes,
+                 "orderflow": _of, "squeeze_bb": plan.squeeze_bb,
                  "buy_tp": plan.buy_tp, "sell_tp": plan.sell_tp})
     LOG.info(f"[exec] HVN-EDGE-ARM {account} {broker_symbol} {tf} → armed "
              f"[fulcrum={plan.fulcrum} edge={plan.trigger_context.get('edge','')}], {len(cmds)} command(s)")
-
-
-def _hvn_displacement_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
-                             venue_mid: float | None = None) -> None:
-    """Bar-close arm for hvn_displacement — INDEPENDENT of _score_and_pick, mirroring
-    _hvn_edge_arm_tf (its own magic, strat 10). Displacement = prev candle opens in HVN-A,
-    closes in HVN-B → neutral straddle at B's near edge. Detector is bar-close (reads the
-    just-completed candle), reads DAILY-VP HVN zones (chart-parity), so no venue-bar override
-    is needed. Fires at most once per closed bar per TF; active-cycle gate prevents stacking."""
-    from execution.grid_planner import plan_grid_levels
-    from execution.zone_triggers import _t_hvn_displacement
-    from pipeline.state_store import store as _store
-    from pipeline.features.vp_cache import get as _vp_get
-    grid_cfg = settings.get("grid_levels") or {}
-    if tf not in _trigger_tfs(grid_cfg, "hvn_displacement"):
-        return
-
-    symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
-    broker_to_analysis = {v: k for k, v in symbol_map.items()}
-    analysis = broker_to_analysis.get(broker_symbol, broker_symbol)
-
-    # New-bar gate: evaluate once per closed bar (the detector reads the just-completed candle).
-    try:
-        _bars = _store().recent(analysis, tf, 5)
-    except Exception:
-        return
-    if len(_bars) < 3:
-        return
-    _last_ts = getattr(_bars[-1], "close_ts", None) or getattr(_bars[-1], "ts", None)
-    _key = (str(account), broker_symbol, tf)
-    if _last_ts is not None and _HVN_DISP_LAST_BAR.get(_key) == _last_ts:
-        return
-
-    quote = ExecBridge.get_quote(account, broker_symbol)
-    if venue_mid is None:
-        if not quote or not quote.get("mid"):
-            return
-        venue_mid = float(quote["mid"])
-    live_analysis = venue_mid
-
-    leg_magic = magic_for("hvn_displacement", tf)
-    _cyc = ExecBridge.get_last_arm(account, broker_symbol, magic=leg_magic) or {}
-
-    # One concurrent cycle per (hvn_displacement × TF): don't re-arm while live, but keep the
-    # bar-close TP-refresh running (poll loop is the only bar-close hook).
-    if _cyc.get("active"):
-        if _last_ts is not None:
-            _HVN_DISP_LAST_BAR[_key] = _last_ts
-        try:
-            _refresh_cycle_tps(account, broker_symbol, analysis, tf, leg_magic, settings,
-                               include_positions=True)
-        except Exception:
-            LOG.exception("[exec] hvn_displacement active-cycle refresh error")
-        return
-
-    _daily_vp = _vp_get(analysis, "daily") or {}
-    trig = _t_hvn_displacement(analysis, tf, live_analysis, _daily_vp)
-    if _last_ts is not None:
-        _HVN_DISP_LAST_BAR[_key] = _last_ts
-    if trig is None:
-        return
-
-    ExecBridge.clear_emit(account, broker_symbol, magic=leg_magic)
-    min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5 if quote else 0.0
-    plan = plan_grid_levels(analysis, tf, live_analysis,
-                            trigger_hint="hvn_displacement", settings=settings,
-                            venue_price=venue_mid, min_step_venue=min_step_venue,
-                            force_trigger=trig)
-    if plan.verdict != "arm" or plan.trigger_kind != "hvn_displacement":
-        _emit_audit({"account": account, "symbol": analysis, "tf": tf, "verdict": "skip",
-                     "skip_reason": f"hvn_disp_arm:{plan.skip_reason or 'no_plan'}"})
-        return
-
-    cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
-                                        close_first=True, clear_kind="cancel",
-                                        magic=leg_magic,
-                                        leg_tp=(not bool(grid_cfg.get("net_profit_exit_only", False))
-                                                or bool(grid_cfg.get("leg_tp_ceiling", False))))
-    _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
-    node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
-    node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
-    ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum,
-                            edge=str(plan.trigger_context.get("edge", "")),
-                            trigger_kind=plan.trigger_kind, venue_mid=venue_mid, magic=leg_magic,
-                            n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
-                            buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
-                            buy_lots_total=round(sum(l.lot for l in plan.buy_legs), 4),
-                            sell_lots_total=round(sum(l.lot for l in plan.sell_legs), 4),
-                            bias_peak=0.0, bias_booked=False, bias_trail_done=False,
-                            be_done_buy=False, be_done_sell=False,
-                            node_low=round(node_low, 5), node_high=round(node_high, 5),
-                            active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
-                            max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
-                            squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank)
-    ExecBridge.mark_emit(account, broker_symbol, plan.fulcrum, magic=leg_magic)
-    _emit_audit({"account": account, "symbol": analysis, "broker_symbol": broker_symbol,
-                 "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind,
-                 "fulcrum": plan.fulcrum, "venue_mid": venue_mid,
-                 "n_per_side": plan.n_per_side, "step": plan.step,
-                 "buy_tp": plan.buy_tp, "sell_tp": plan.sell_tp})
-    LOG.info(f"[exec] HVN-DISP-ARM {account} {broker_symbol} {tf} → armed "
-             f"[fulcrum={plan.fulcrum} dir={plan.trigger_context.get('direction','')}], {len(cmds)} command(s)")
 
 
 @bp.post("/exec/poll")
@@ -1517,14 +1528,6 @@ def exec_poll():
                 _hvn_edge_arm_tf(account, sym, _tf, settings_cfg or {}, venue_mid=_poll_venue_mid)
             except Exception:
                 LOG.exception("[exec] hvn_edge_arm error")  # never break the poll
-        # hvn_displacement — bar-close A→B displacement arm on its OWN magic (strat 10),
-        # independent of the scorer (same pattern as hvn_edge).
-        _hvn_disp_tfs = _trigger_tfs((settings_cfg or {}).get("grid_levels", {}), "hvn_displacement")
-        for _tf in _hvn_disp_tfs:
-            try:
-                _hvn_displacement_arm_tf(account, sym, _tf, settings_cfg or {}, venue_mid=_poll_venue_mid)
-            except Exception:
-                LOG.exception("[exec] hvn_displacement_arm error")  # never break the poll
 
     commands = ExecBridge.poll(account)
     if commands:
@@ -1714,10 +1717,12 @@ def exec_emit_grid():
             try:
                 _he_latest = store().latest(symbol, tf)
                 if _he_latest:
-                    _ratio_he = (float(quote.get("mid") or 0.0) / float(_he_latest.ohlc.c)
-                                 if _he_latest.ohlc.c else 1.0)
-                    _he_lo = round(float(_he_latest.ohlc.l) * _ratio_he, 4)
-                    _he_hi = round(float(_he_latest.ohlc.h) * _ratio_he, 4)
+                    # ADDITIVE analysis→venue shift (2026-07-14) — match _rebase_to_venue.
+                    # Trailing SL to a candle extreme: translate by the basis, don't scale.
+                    _shift_he = (float(quote.get("mid") or 0.0) - float(_he_latest.ohlc.c)
+                                 if _he_latest.ohlc.c else 0.0)
+                    _he_lo = round(float(_he_latest.ohlc.l) + _shift_he, 4)
+                    _he_hi = round(float(_he_latest.ohlc.h) + _shift_he, 4)
                     _he_green = _he_latest.ohlc.c >= _he_latest.ohlc.o
                     _he_red   = _he_latest.ohlc.c <= _he_latest.ohlc.o
                     _he_bias  = str(arm.get("breakout_bias") or (arm.get("context") or {}).get("breakout_bias") or "")
@@ -1846,9 +1851,15 @@ def exec_emit_grid():
                                         close_first=close_first, clear_kind="cancel",
                                         magic=leg_magic, leg_tp=leg_tp)
     edge = plan.trigger_context.get("edge", "")
-    _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
-    node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
-    node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
+    # ADDITIVE venue rebase (2026-07-14) — match plan_grid's additive _rebase_to_venue and the
+    # /exec/zones chart shift. node_low/high are analysis-frame trigger bounds; translate by the
+    # basis shift (venue_anchor − analysis_anchor), do NOT scale (the old *_ratio drifted the
+    # nodes off the additively-rebased fulcrum, re-opening the fulcrum-vs-edge gap for far nodes).
+    _shift = (plan.venue_anchor - plan.analysis_anchor) if plan.analysis_anchor else 0.0
+    _nl = float(plan.trigger_context.get("node_low", 0.0) or 0.0)
+    _nh = float(plan.trigger_context.get("node_high", 0.0) or 0.0)
+    node_low = (_nl + _shift) if _nl else 0.0
+    node_high = (_nh + _shift) if _nh else 0.0
     # Count ACTUAL placed commands (some legs may be skipped when already behind market).
     # bias_trail requires buys >= buy_n; using planned len() would make it unreachable
     # for any arm where one or more legs were behind-market at placement time.
@@ -1872,10 +1883,13 @@ def exec_emit_grid():
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
                             max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
                             squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank,
+                            squeeze_bb=plan.squeeze_bb,
+                            skew=plan.skew, skew_reason=plan.skew_reason, skew_votes=plan.skew_votes,
                             sweep_be_usd=float(plan.trigger_context.get("sweep_be_usd") or 0.0),
                             sweep_vwap=float(plan.trigger_context.get("sweep_vwap") or 0.0),
                             breakout_bias=str(plan.trigger_context.get("breakout_bias") or ""))
     ExecBridge.mark_emit(account, symbol, plan.fulcrum, magic=leg_magic)   # dedup: this fulcrum is now armed
+    _of = _orderflow_snapshot(symbol, tf)
     _emit_audit({"account": account, "symbol": symbol, "broker_symbol": broker_symbol,
                  "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind, "edge": edge,
                  "fulcrum": plan.fulcrum, "venue_mid": quote["mid"],
@@ -1884,6 +1898,8 @@ def exec_emit_grid():
                  "buy_legs": [l.price for l in plan.buy_legs],
                  "sell_legs": [l.price for l in plan.sell_legs],
                  "buy_tp": plan.buy_tp, "sell_tp": plan.sell_tp,
+                 "skew": plan.skew, "skew_reason": plan.skew_reason, "skew_votes": plan.skew_votes,
+                 "orderflow": _of, "squeeze_bb": plan.squeeze_bb,
                  "squeeze_ok": plan.squeeze_ok, "squeeze_rank": plan.squeeze_rank})
     LOG.info(f"[exec] emit_grid {account} {broker_symbol} {tf} → armed [{plan.trigger_kind} "
              f"edge={edge} fulcrum={plan.fulcrum}], {len(cmds)} command(s)")

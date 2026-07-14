@@ -54,6 +54,7 @@ class GridPlan:
     step: float = 0.0
     skew: str = "none"                # "buy" | "sell" | "none"
     skew_reason: str = ""
+    skew_votes: int = 0               # net Σ of the vote sum (buy +, sell −); 0 = symmetric
     buy_legs: list[Leg] = field(default_factory=list)
     sell_legs: list[Leg] = field(default_factory=list)
     buy_tp: float = 0.0
@@ -75,6 +76,7 @@ class GridPlan:
     # can bucket outcomes squeeze-pass vs squeeze-fail.
     squeeze_ok: bool = False
     squeeze_rank: float = 1.0
+    squeeze_bb: dict = field(default_factory=dict)   # raw BB snapshot at arm (bbw/upper/lower/mid/px_pos)
     base_lot: float = 0.0   # ladder base — used by enqueue to re-index lots for behind-market skips
     lot_step: float = 0.0
 
@@ -84,7 +86,7 @@ class GridPlan:
 # only). The detector still runs but can never win the structural hint, so no VP-level
 # straddles arm. Re-add "vp_level_touch" here to revive it.
 _HINT_GROUPS = {
-    "structural": {"hvn_inside_touch", "squeeze", "hvn_displacement", "bb_expansion_touch"},
+    "structural": {"hvn_inside_touch", "squeeze", "bb_expansion_touch"},
     # LVN displacement: vp_level_touch is the only detector that arms on an LVN.
     # The planner narrows it to level_type=="lvn" (see plan_grid_levels) so only the
     # vacuum fires. Neutral straddle-in-vacuum: price sits in the LVN, leaves fast one
@@ -199,7 +201,7 @@ def _should_skip(trigger: Trigger | None, regime, fulcrum: float,
     # just on the opposite (low-volume) node type — an LVN can legitimately sit inside a
     # wider daily HVN band, and the touch itself is still the real setup, not chop
     # (confirmed 2026-07-08: 13 genuine touch_armed=True taps blanket-skipped here).
-    if (trigger.kind not in ("hvn_edge", "hvn_inside_touch", "hvn_displacement",
+    if (trigger.kind not in ("hvn_edge", "hvn_inside_touch",
                              "vp_level_touch", "squeeze", "bb_expansion_touch", "candle_sweep",
                              "lvn_edge_touch")
             and _price_inside_hvn(fulcrum, daily_vp)):
@@ -210,7 +212,7 @@ def _should_skip(trigger: Trigger | None, regime, fulcrum: float,
         # (price rejected the HVN boundary), not POC balance — straddle the tapped edge.
         _poc_ok = (trigger.kind == "vp_level_touch"
                    and trigger.context.get("level_type") in ("poc", "naked_poc"))
-        _structural = trigger.kind in ("hvn_inside_touch", "hvn_displacement",
+        _structural = trigger.kind in ("hvn_inside_touch",
                                        "bb_expansion_touch", "candle_sweep")
         if not (_poc_ok or _structural):
             return True, "chop:at_poc"
@@ -219,7 +221,7 @@ def _should_skip(trigger: Trigger | None, regime, fulcrum: float,
     # they represent committed directional flow between zones, not oscillation.
     rtype = getattr(regime, "type", "uncertain")
     ib_range = getattr(regime, "ib_range", 0.0) or 0.0
-    _is_structural = trigger.kind in ("hvn_inside_touch", "hvn_displacement",
+    _is_structural = trigger.kind in ("hvn_inside_touch",
                                       "bb_expansion_touch", "candle_sweep")
     if (not _is_structural and rtype == "uncertain" and ib_range > 0
             and getattr(regime, "ib_expansion_pct", 0.0) < 0.5):
@@ -356,7 +358,7 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
 # ── skew ────────────────────────────────────────────────────────────────────
 
 def _resolve_skew(trigger: Trigger, regime, cfg: dict | None = None,
-                  symbol: str = "", tf: str = "") -> tuple[str, str]:
+                  symbol: str = "", tf: str = "") -> tuple[str, str, int]:
     """Which side to load (scale into the winner) — a VOTE SUM across signals. Net sign
     picks the side; net zero stays symmetric. Directional inventory (skew) also makes a
     net-profit exit price exist (L_buy ≠ L_sell). Votes (buy +, sell −):
@@ -407,7 +409,7 @@ def _resolve_skew(trigger: Trigger, regime, cfg: dict | None = None,
             votes += ev; why.append(ew)
 
     side = "buy" if votes > 0 else "sell" if votes < 0 else "none"
-    return side, (f"skew={side}(Σ{votes:+d}): " + "; ".join(why) if why else "symmetric")
+    return side, (f"skew={side}(Σ{votes:+d}): " + "; ".join(why) if why else "symmetric"), votes
 
 
 # ── legs ────────────────────────────────────────────────────────────────────
@@ -477,33 +479,41 @@ def _resolve_tps(symbol: str, fulcrum: float, buy_legs: list[Leg],
 
 def _rebase_to_venue(plan: GridPlan, analysis_anchor: float, venue_price: float) -> GridPlan:
     """Re-anchor a plan computed in the analysis frame (Binance/Bybit) onto the
-    execution venue's live price (Vantage). Every absolute level — fulcrum, each
-    leg, both TPs, the step — is scaled by the ratio venue/analysis, preserving the
-    structural % geometry while moving it to where the broker actually quotes. Same
-    principle as execution.venue_translator, applied to the neutral grid.
+    execution venue's live price (Vantage). Every absolute level — fulcrum, each leg,
+    both TPs, the SLs — is TRANSLATED by the ADDITIVE basis shift (venue − analysis),
+    the SAME transform /exec/zones uses to draw the zones (_rebase_price = p + shift).
+    Widths (step, and thus leg SPACING) are frame-invariant differences → NOT shifted.
 
-    Why this is mandatory: a BuyStop must sit above the venue ask and a SellStop
-    below the venue bid. Binance-frame absolute prices won't satisfy that on Vantage
-    → MT5 rejects the orders. (Tick-rounding + broker min-stop-distance are enforced
-    EA-side, since only the terminal knows the symbol's stopsLevel.)
+    2026-07-14: switched from the old MULTIPLICATIVE ratio (level * venue/analysis) to
+    additive. The ratio anchored the scaling at LIVE price, so a fulcrum far from spot
+    landed at edge*(venue/analysis) while the chart drew edge+shift — the two diverged
+    by ~shift*(edge_distance/price), i.e. the fulcrum-vs-drawn-edge gap grew with the
+    edge's distance from spot. Gold basis is a near-constant additive offset (XAUUSD.pc
+    − Binance), not a percentage, so additive is the physically correct frame map AND it
+    makes fulcrum == drawn edge exactly. Step stays put (a spacing, not a price).
+
+    Why rebasing is mandatory at all: a BuyStop must sit above the venue ask and a
+    SellStop below the venue bid. Binance-frame absolute prices won't satisfy that on
+    Vantage → MT5 rejects the orders. (Tick-rounding + broker min-stop-distance are
+    enforced EA-side, since only the terminal knows the symbol's stopsLevel.)
     """
     if analysis_anchor <= 0 or venue_price <= 0:
         return plan
-    ratio = venue_price / analysis_anchor
-    if abs(ratio - 1.0) < 1e-9:
+    shift = venue_price - analysis_anchor
+    if abs(shift) < 1e-9:
         # in-frame caller (dashboard/sim) — identity, just stamp the anchors
         return replace(plan, analysis_anchor=round(analysis_anchor, 4),
                        venue_anchor=round(venue_price, 4), rebased=False)
     return replace(
         plan,
-        fulcrum=round(plan.fulcrum * ratio, 4),
-        step=round(plan.step * ratio, 4),
-        buy_legs=[Leg(price=round(l.price * ratio, 4), lot=l.lot) for l in plan.buy_legs],
-        sell_legs=[Leg(price=round(l.price * ratio, 4), lot=l.lot) for l in plan.sell_legs],
-        buy_tp=round(plan.buy_tp * ratio, 4),
-        sell_tp=round(plan.sell_tp * ratio, 4),
-        buy_sl=round(plan.buy_sl * ratio, 4) if plan.buy_sl else 0.0,
-        sell_sl=round(plan.sell_sl * ratio, 4) if plan.sell_sl else 0.0,
+        fulcrum=round(plan.fulcrum + shift, 4),
+        step=plan.step,   # width — frame-invariant, do NOT shift
+        buy_legs=[Leg(price=round(l.price + shift, 4), lot=l.lot) for l in plan.buy_legs],
+        sell_legs=[Leg(price=round(l.price + shift, 4), lot=l.lot) for l in plan.sell_legs],
+        buy_tp=round(plan.buy_tp + shift, 4),
+        sell_tp=round(plan.sell_tp + shift, 4),
+        buy_sl=round(plan.buy_sl + shift, 4) if plan.buy_sl else 0.0,
+        sell_sl=round(plan.sell_sl + shift, 4) if plan.sell_sl else 0.0,
         analysis_anchor=round(analysis_anchor, 4),
         venue_anchor=round(venue_price, 4),
         rebased=True,
@@ -649,14 +659,16 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     # still tags every arm for the squeeze A/B. ENFORCE (skip uncoiled) only when
     # require_squeeze_gate is set — else arm both and let the outcome audit compare.
     sq_ok, sq_rank = False, 1.0
+    sq_bb: dict = {}
     if not skip and fulcrum_t is not None:
         sq_ok, sq_rank = zone_triggers.squeeze_gate(symbol, tf, grid_cfg)
+        sq_bb = zone_triggers.squeeze_bb_snapshot(symbol, tf, grid_cfg)
         # Structural HVN setups arm on a node edge/touch, not on a vol coil — exempt
         # them from the squeeze gate. hvn_edge reads the same daily/weekly VP the chart
         # draws, so it should arm on the visible edge-touch regardless of squeeze.
         # candle_sweep is a structural signal (swept a level), not a coil→expansion play —
         # arm on the sweep regardless of squeeze. Gate stays ON for the vol-coil strats.
-        _structural_kinds = ("hvn_inside_touch", "hvn_displacement", "hvn_edge", "candle_sweep")
+        _structural_kinds = ("hvn_inside_touch", "hvn_edge", "candle_sweep")
         is_structural = ((fulcrum_t is not None and fulcrum_t.kind in _structural_kinds)
                          or any(k in trigger_hint for k in _structural_kinds))
         if bool(grid_cfg.get("require_squeeze_gate", False)) and not sq_ok and not is_structural:
@@ -667,7 +679,7 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
                         atr=round(atr, 4), plan_id=plan_id)
 
     fulcrum = fulcrum_t.fulcrum_price
-    skew, skew_reason = _resolve_skew(fulcrum_t, regime, grid_cfg, symbol=symbol, tf=tf)
+    skew, skew_reason, skew_votes = _resolve_skew(fulcrum_t, regime, grid_cfg, symbol=symbol, tf=tf)
     swing_range = _opposing_swing_range(symbol, fulcrum, skew, daily_vp, atr)
     conviction = _candle_conviction(symbol, tf)
     n, step = _size_grid(fulcrum_t, regime, atr, swing_range, conviction,
@@ -767,20 +779,6 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
             buy_sl  = round(_cs_lo, 4)   # buy stops: SL below sweep candle low
             sell_sl = round(_cs_hi, 4)   # sell stops: SL above sweep candle high
 
-    # HVN displacement keeps ONLY its SL override (counter-side = displacement candle
-    # extreme); its TP now follows the unified next-HVN-far-edge rule above.
-    if fulcrum_t.kind == "hvn_displacement":
-        ctx = fulcrum_t.context
-        direction = ctx.get("direction", "")
-        extreme = float(ctx.get("candle_extreme") or 0.0)
-        if extreme > 0:
-            if direction == "buy":
-                buy_sl  = 0.0                 # bias side (buys): no hard SL — BE logic owns it
-                sell_sl = round(extreme, 4)   # counter side (sells): SL = candle high
-            elif direction == "sell":
-                sell_sl = 0.0
-                buy_sl  = round(extreme, 4)   # counter side (buys): SL = candle low
-
     # BB expansion touch: counter-side SL = BB mid (the fulcrum itself).
     # If price returns to the 20-SMA after touching the 2.5σ band, the directional
     # thesis has failed. Bias side has no hard SL — fullfill_be / bias_trail own exit.
@@ -816,10 +814,12 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         trigger_confidence=round(fulcrum_t.confidence, 3),
         squeeze_ok=bool(sq_ok),
         squeeze_rank=round(float(sq_rank), 3),
+        squeeze_bb=sq_bb,
         n_per_side=n,
         step=step,
         skew=skew,
         skew_reason=skew_reason,
+        skew_votes=skew_votes,
         buy_legs=buy_legs,
         sell_legs=sell_legs,
         buy_tp=buy_tp,

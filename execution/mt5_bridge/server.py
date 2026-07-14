@@ -156,6 +156,38 @@ class MT5Service(rpyc.Service):
                         "sl": o.sl, "tp": o.tp, "magic": o.magic, "comment": o.comment})
         return out
 
+    def exposed_history_deals(self, ts_from: float, ts_to: float,
+                              symbol: str = "", magic: int = 0) -> list:
+        """Realized closed-out deals in [ts_from, ts_to] (epoch seconds). Only
+        DEAL_ENTRY_OUT / OUT_BY / INOUT rows carry realized P&L (profit+swap+commission);
+        entry deals have profit 0. Filter by symbol and/or magic. This is the BROKER-SIDE
+        ground truth (vs the server's exec_emit basket estimate). Returns plain dicts."""
+        _ensure()
+        deals = mt5.history_deals_get(int(ts_from), int(ts_to))
+        if not deals:
+            return []
+        _OUT = (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY, mt5.DEAL_ENTRY_INOUT)
+        out = []
+        for d in deals:
+            if symbol and d.symbol != symbol:
+                continue
+            if magic and d.magic != magic:
+                continue
+            if d.entry not in _OUT:
+                continue   # entry deal — no realized P&L
+            out.append({
+                "ticket": int(d.ticket), "order": int(d.order),
+                "position_id": int(getattr(d, "position_id", 0) or 0),
+                "symbol": d.symbol, "magic": int(d.magic),
+                "type": "buy" if d.type == mt5.DEAL_TYPE_BUY else "sell",
+                "entry": int(d.entry), "volume": float(d.volume), "price": float(d.price),
+                "profit": float(d.profit), "swap": float(d.swap),
+                "commission": float(d.commission),
+                "net": float(d.profit) + float(d.swap) + float(d.commission),
+                "time": int(d.time), "comment": str(d.comment),
+            })
+        return out
+
     # --- write -------------------------------------------------------------
     def exposed_place_pending(self, symbol: str, side: str, otype: str, price: float,
                               lot: float, sl: float = 0.0, tp: float = 0.0,

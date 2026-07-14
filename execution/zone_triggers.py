@@ -421,16 +421,19 @@ def _t_hvn_edge(symbol: str, tf: str, current_price: float,
     bars_override / zone_shift (2026-07-10, VANTAGE-ONLY): when bars_override is given, detect on
     THOSE bars (EA CopyRates venue OHLC) instead of the analysis-feed store — so the breakout /
     retest is judged on the SAME candles the broker fills against. zone_shift (venue − analysis)
-    is ADDED to every daily-VP HVN edge so the zones sit in the venue frame too → bars + zones +
-    fulcrum all one frame (no ~3pt basis mismatch). Fulcrum/SL returned in venue frame; the caller
-    must NOT re-rebase (pass venue_price=venue_mid to plan but it won't double-shift a venue trig)."""
+    is ADDED to the HVN edges ONLY for the venue-bar tap comparison (so bars + zones share one
+    frame during detection); it is then SUBTRACTED back off the returned fulcrum/range so the
+    Trigger is in the ANALYSIS frame — identical convention to touch/lvn triggers. plan_grid then
+    does the SINGLE venue rebase (2026-07-14 fix): previously this returned a venue-frame fulcrum
+    AND plan_grid re-rebased it → ~3pt double-shift. HVN zones now come from _session_hvn_zones
+    (the SAME per-TF session source /exec/zones draws), not vp_get('daily') → chart edge == arm."""
     cfg = cfg or {}
-    lookback = int(cfg.get("hvn_edge_lookback", 20) or 20)
+    _lb_by_tf = cfg.get("hvn_edge_lookback_by_tf") or {}
+    lookback = int(_lb_by_tf.get(tf, cfg.get("hvn_edge_lookback", 20)) or 20)
     tap_buf = float(cfg.get("hvn_edge_tap_buffer", cfg.get("hvn_touch_buffer", 0.5)) or 0.5)
 
     try:
         from pipeline.state_store import store as _store
-        from pipeline.features.vp_cache import get as vp_get
     except Exception:
         return None
 
@@ -447,11 +450,15 @@ def _t_hvn_edge(symbol: str, tf: str, current_price: float,
     tap_lo = float(tap.ohlc.l)
     tap_close = float(tap.ohlc.c)
 
-    # Daily VP for HVN zones (same source the chart uses), shifted into the venue frame
-    # (zone_shift) when detecting on venue bars so edges and bars share one frame.
-    vp = vp_get(symbol, "daily") or {}
-    hvn_zones = [{"low": float(z["low"]) + zone_shift, "high": float(z["high"]) + zone_shift}
-                 for z in (vp.get("hvn_zones") or [])]
+    # HVN zones from the SAME per-TF session source the /exec/zones chart draws
+    # (_session_hvn_zones) — NOT vp_get('daily'), which is a different node set (no
+    # prev/today band, no merge, no vacuum fallback) and drifted ~3-4pt from the drawn
+    # edge. Shift into the venue frame (zone_shift) only for the venue-bar tap test below;
+    # the returned fulcrum is un-shifted back to analysis frame (see end of fn).
+    _abars = _store().recent(symbol, tf, 120)
+    _sz, _ = _session_hvn_zones(symbol, tf, _abars) if _abars else ([], "")
+    hvn_zones = [{"low": float(lo) + zone_shift, "high": float(hi) + zone_shift}
+                 for (lo, hi) in _sz]
     if not hvn_zones:
         return None
 
@@ -498,6 +505,10 @@ def _t_hvn_edge(symbol: str, tf: str, current_price: float,
         return None
 
     conf, bias, edge, width = best
+    # Un-shift back to ANALYSIS frame (detection ran on venue-shifted zones/bars; the
+    # Trigger must be analysis-frame so plan_grid does the SINGLE venue rebase). width is
+    # frame-invariant (a difference); only absolute prices carry zone_shift.
+    edge = edge - zone_shift
     # Recover the matched zone bounds for asymmetric TP in grid_planner
     _matched_lo = edge - width if bias == "buy" else edge
     _matched_hi = edge if bias == "buy" else edge + width
@@ -1530,6 +1541,67 @@ def squeeze_gate(symbol: str, tf: str, cfg: dict | None = None) -> tuple[bool, f
     return False, 1.0
 
 
+def squeeze_bb_snapshot(symbol: str, tf: str, cfg: dict | None = None) -> dict:
+    """Raw Bollinger state at the LAST bar — the numbers squeeze_gate derives its rank from
+    but discards. Logged on arm rows so the squeeze A/B can regress outcomes against the
+    actual band, not just the compressed/not bool. Same BB(period, bb_mult·σ) / BBW math as
+    squeeze_gate — stateless, causal, identical live and sim.
+
+    Returns (all None-safe when history is too short):
+      ok        — compressed NOW (rank ≤ bbw_pct)
+      rank      — BBW percentile within trailing window (== squeeze_rank)
+      bbw       — (upper − lower)/mid at the last bar (absolute compression magnitude)
+      bb_upper / bb_lower / bb_mid — the band in price
+      px_pos    — where the last close sits in the band: 0=lower, 0.5=mid, 1=upper (can exceed [0,1])
+    """
+    cfg = cfg or {}
+    period = int(cfg.get("squeeze_bb_period", 20))
+    bb_mult = float(cfg.get("squeeze_bb_mult", 3.0))
+    bbw_pct = float(cfg.get("squeeze_bbw_pct", 0.15))
+    bbw_window = int(cfg.get("squeeze_bbw_window", 100))
+    _null = {"ok": None, "rank": None, "bbw": None,
+             "bb_upper": None, "bb_lower": None, "bb_mid": None, "px_pos": None}
+    try:
+        from pipeline.state_store import store
+        bars = store().recent(symbol, tf, period + bbw_window + 6)
+    except Exception:
+        return _null
+    n = len(bars)
+    if n < period + bbw_window + 1:
+        return _null
+    closes = [b.ohlc.c for b in bars]
+
+    def _stdev(vals: list[float]) -> float:
+        m = sum(vals) / len(vals)
+        return math.sqrt(sum((v - m) ** 2 for v in vals) / len(vals))
+
+    bbw = [0.0] * n
+    for e in range(period - 1, n):
+        w = closes[e - period + 1:e + 1]
+        mid, sd = sum(w) / len(w), _stdev(w)
+        bbw[e] = (2.0 * bb_mult * sd) / mid if mid > 0 else 0.0
+
+    last = n - 1
+    w = closes[last - period + 1:last + 1]
+    mid, sd = sum(w) / len(w), _stdev(w)
+    upper = mid + bb_mult * sd
+    lower = mid - bb_mult * sd
+    lo = last - bbw_window + 1
+    hist = bbw[lo:last + 1]
+    rank = sum(1 for v in hist if v <= bbw[last]) / len(hist) if hist else 1.0
+    span = upper - lower
+    px = closes[last]
+    return {
+        "ok": bool(rank <= bbw_pct),
+        "rank": round(rank, 4),
+        "bbw": round(bbw[last], 6),
+        "bb_upper": round(upper, 5),
+        "bb_lower": round(lower, 5),
+        "bb_mid": round(mid, 5),
+        "px_pos": round((px - lower) / span, 4) if span > 0 else None,
+    }
+
+
 def _t_squeeze(symbol: str, tf: str, current_price: float, atr: float,
               cfg: dict | None = None) -> Trigger | None:
     """Volatility compression → expansion via BOLLINGER BANDWIDTH PERCENTILE — a
@@ -1900,108 +1972,6 @@ def _t_cvd_div(symbol: str, tf: str, current_price: float, latest: Bar | None) -
     )
 
 
-# ── HVN displacement detector ───────────────────────────────────────────────
-
-def _t_hvn_displacement(symbol: str, tf: str, current_price: float,
-                        daily_vp: dict | None = None) -> Trigger | None:
-    """PREV closed candle opens inside HVN-A, closes inside HVN-B (different zone).
-
-    The emitter fires on each bar CLOSE — at that moment bars[-1] is the new (forming)
-    bar and bars[-2] is the just-completed candle we want to check. This means the
-    displacement is confirmed at candle close and the grid arms on the NEXT bar's open,
-    avoiding intrabar noise from a candle that hasn't committed yet.
-
-    Entry: neutral straddle at the near edge of HVN-B (the edge price crossed into).
-    Context carries:
-      origin_lo / origin_hi   — HVN-A bounds (for counter-side TP = A's far edge)
-      dest_lo / dest_hi       — HVN-B bounds (for bias-side TP = B's far edge)
-      direction                — "buy" (A below B) | "sell" (A above B)
-      candle_extreme           — low (buy) or high (sell) of the displacement candle → SL
-      near_edge                — the edge of HVN-B that price just crossed (= fulcrum)
-    """
-    if not daily_vp:
-        return None
-    hvn_zones = [(float(z["low"]), float(z["high"]))
-                 for z in (daily_vp.get("hvn_zones") or [])]
-    if len(hvn_zones) < 2:
-        return None
-
-    try:
-        from pipeline.state_store import store as _store
-        bars = _store().recent(symbol, tf, 4)
-        if len(bars) < 2:
-            return None
-    except Exception:
-        return None
-
-    # The emitter fires with an offset (e.g. 12s) after the bar boundary, by which time
-    # the ingester has committed the just-closed bar as bars[-1]. So bars[-1] IS the
-    # completed displacement candle — check it first. bars[-2] is the fallback for the
-    # case where the emitter fires very early and the bar isn't committed yet, or when
-    # the emitter missed a bar entirely (same lookback grace as hvn_inside_touch).
-
-    def _find_zone(price: float) -> tuple[float, float] | None:
-        for lo, hi in hvn_zones:
-            if lo <= price <= hi:
-                return lo, hi
-        return None
-
-    # Check bars[-1] (just-closed) then bars[-2] (one bar older) — newest first
-    result: tuple | None = None
-    for candidate in reversed(bars):   # bars[-1], bars[-2], bars[-3], ...
-        o = float(candidate.ohlc.o)
-        h = float(candidate.ohlc.h)
-        l = float(candidate.ohlc.l)
-        c = float(candidate.ohlc.c)
-
-        origin = _find_zone(o)
-        dest   = _find_zone(c)
-        if origin is None or dest is None or origin == dest:
-            continue
-
-        o_lo, o_hi = origin
-        d_lo, d_hi = dest
-
-        if d_lo > o_hi:
-            direction = "buy"
-            near_edge = d_lo
-            candle_extreme = l
-        elif d_hi < o_lo:
-            direction = "sell"
-            near_edge = d_hi
-            candle_extreme = h
-        else:
-            continue
-
-        result = (o_lo, o_hi, d_lo, d_hi, direction, near_edge, candle_extreme, c)
-        break   # newest qualifying bar wins
-
-    if result is None:
-        return None
-
-    o_lo, o_hi, d_lo, d_hi, direction, near_edge, candle_extreme, c = result
-    width = d_hi - d_lo
-    # Confidence: stronger if full candle body committed (close well inside dest)
-    body_depth = abs(c - near_edge) / width if width > 0 else 0.0
-    conf = min(0.9, 0.55 + 0.35 * body_depth)
-
-    return Trigger(
-        kind="hvn_displacement",
-        fulcrum_price=float(near_edge),
-        raw_range=float(width),
-        confidence=float(conf),
-        context={
-            "bias": direction,
-            "direction": direction,
-            "origin_lo": o_lo, "origin_hi": o_hi,
-            "dest_lo": d_lo,   "dest_hi": d_hi,
-            "near_edge": near_edge,
-            "candle_extreme": candle_extreme,
-            "edge": "bottom" if direction == "buy" else "top",
-        },
-    )
-
-
 # ── Candle sweep / engulf detector ──────────────────────────────────────────
 
 def _t_candle_sweep(symbol: str, tf: str, current_price: float,
@@ -2140,7 +2110,6 @@ def detect_all(symbol: str, tf: str, current_price: float, regime,
         _t_hvn_edge(symbol, tf, current_price, cfg),
         _t_hvn_inside_touch(symbol, tf, current_price) if _kind_active_for_tf(cfg, "hvn_inside_touch", tf) else None,
         _t_lvn_edge_touch(symbol, tf, current_price) if _kind_active_for_tf(cfg, "lvn_edge_touch", tf) else None,
-        _t_hvn_displacement(symbol, tf, current_price, daily_vp),
         _t_anchor(symbol, current_price, atr, latest),
         _t_va(symbol, current_price, regime, daily_vp),
         _t_vp_level_touch(symbol, tf, current_price, daily_vp, atr, cfg),
