@@ -38,6 +38,22 @@ instrument:
   timeframes: [1m, 3m, 5m, 10m, 15m, 1h]   # 3m/10m added 2026-07-20 for the TF-efficiency run (need backfill on first run, like 1h)
   primary_tf: 1m           # decision fires on close of this TF; higher TFs join as-of
 
+# Feed-gap monitor + self-heal (pipeline/feed_monitor.py). Watches the primary-TF series;
+# WARNs on stall and RECOVERY, and — when the feed recovers from a stall — auto-backfills the
+# exact missed window from Binance aggTrades (real footprint, not OHLC-only) so the 1m series
+# has no hole. The 2026-07-15 audit found 62 real intra-session gaps (~22h) that nothing ever
+# healed. Existing per-symbol fetch settings mirror scripts/start.sh feed launch args.
+monitor:
+  gap_monitor_enabled: true        # master switch for the stall/recovery watcher
+  gap_backfill_enabled: true       # auto-heal the missed window on stale→ok recovery
+  max_backfill_minutes: 1440       # clamp: skip auto-heal for spans larger than this
+                                   # (a multi-day hole = cold-start; use scripts/backfill_binance.py)
+  # gap_alert_secs: 180            # override: stall threshold (default 3× the primary-TF period)
+  # gap_check_secs: 30             # override: how often to poll feed health
+  # backfill_feeds:                # override store_symbol → Binance fetch symbol + price bucket
+  #   XAUTUSDT: {binance_symbol: XAUUSDT, price_step: 0.1}
+  #   BTCUSDT:  {binance_symbol: BTCUSDT, price_step: 1.0}
+
 # Footprint-driven neutral-grid placement (/exec/emit_grid + FBExecBridge EA).
 # Planner reads these via .get() defaults — block is optional but canonical here.
 grid_levels:
