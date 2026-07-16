@@ -60,6 +60,26 @@ def exec_poll():
         # so the innermost leg clears the freeze band (no more silently-rejected legs).
         stops_dist = float(body.get("stops_pts", 0) or 0) * float(body.get("point", 0.0) or 0.0)
         ExecBridge.set_quote(account, sym, float(bid), float(ask), stops_dist=stops_dist)
+
+    # Vantage-native closed bars (EA CopyRates) — lets a feed comparator check the
+    # SAME OHLC the broker fills against, no analysis-feed rebase needed. Absent on
+    # older EA binaries; consumers fall back to the analysis feed.
+    if sym:
+        from pipeline.types import Bar, OHLC
+        for _tf, _key in (("5m", "bars_5m"), ("15m", "bars_15m")):
+            _raw_bars = body.get(_key)
+            if not _raw_bars:
+                continue
+            try:
+                _bars = [Bar(bar_id=f"{sym}|{_tf}|{int(b['ts'])}|venue", symbol=sym, tf=_tf,
+                             close_ts=int(b["ts"]), source="live",
+                             ohlc=OHLC(o=float(b["o"]), h=float(b["h"]),
+                                       l=float(b["l"]), c=float(b["c"])),
+                             bid_ladder=(), ask_ladder=())
+                          for b in _raw_bars]
+                ExecBridge.set_venue_bars(account, sym, _tf, _bars)
+            except Exception:
+                LOG.exception(f"[exec] venue bars parse error ({_tf})")
     # Per-magic open-state + cycle monitor. The EA sends a `magics` array — one entry
     # per (strategy×TF) pool it holds — so each TF cycle is tracked and exited in
     # isolation. tf is recovered from the magic. A flatten ships in the same response

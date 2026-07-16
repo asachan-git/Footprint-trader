@@ -17,7 +17,7 @@
 //|    POST {InpBridgeURL}/exec/ack   {account, results:[...]}        |
 //+------------------------------------------------------------------+
 #property copyright "Aniket"
-#property version   "1.03"
+#property version   "1.04"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -449,6 +449,26 @@ string BuildMagicsJson()
    return js;
 }
 
+//--- CLOSED Vantage bars for one TF (last `count`, OLDEST-FIRST) as a JSON array — lets
+//    the server compare venue candles against the analysis (Binance) feed on the SAME
+//    OHLC Vantage fills against. `start=1` skips the forming bar so every emitted bar
+//    is closed. rates[] from CopyRates is oldest-first; emit in that same order.
+string BuildBarsJson(ENUM_TIMEFRAMES period, int count)
+{
+   MqlRates rates[];
+   int copied = CopyRates(_Symbol, period, 1, count, rates);   // start=1 skips forming bar
+   if(copied <= 0) return "";
+   string js = "";
+   for(int i = 0; i < copied; i++)   // rates[] is oldest-first; emit in the same order
+   {
+      js += (i == 0 ? "" : ",") +
+            StringFormat("{\"ts\":%I64d,\"o\":%.5f,\"h\":%.5f,\"l\":%.5f,\"c\":%.5f}",
+                         (long)rates[i].time, rates[i].open, rates[i].high,
+                         rates[i].low, rates[i].close);
+   }
+   return js;
+}
+
 //+------------------------------------------------------------------+
 //| Cancel this EA's pending orders ONLY (leave positions). The safe   |
 //| re-arm clear — can never flatten a live position.                  |
@@ -549,14 +569,19 @@ void PollAndExecute()
    string magicsJson = BuildMagicsJson();   // per-(strategy×TF) breakdown for per-TF cycles
    long   stopsPts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);  // broker freeze (points)
    double point    = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   // Vantage-native closed bars (5m/15m) — lets the server compare the venue candle
+   // against the analysis (Binance) feed on the SAME OHLC Vantage fills against.
+   string bars5m  = BuildBarsJson(PERIOD_M5,  10);
+   string bars15m = BuildBarsJson(PERIOD_M15, 10);
    // Aggregate fields kept for back-compat/diagnostics; `magics` drives the per-TF monitor.
    // stops_pts/point let the server floor the grid step so no leg lands inside the freeze.
    string pollBody = StringFormat(
       "{\"account\":\"%s\",\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f,"
       "\"positions\":%d,\"pendings\":%d,\"buys\":%d,\"sells\":%d,\"pnl\":%.2f,"
-      "\"stops_pts\":%d,\"point\":%.5f,\"magics\":[%s]}",
+      "\"stops_pts\":%d,\"point\":%.5f,\"magics\":[%s],"
+      "\"bars_5m\":[%s],\"bars_15m\":[%s]}",
       gAccount, _Symbol, bid, ask, buys + sells, CountMyPendings(), buys, sells, SumMyPnL(),
-      (int)stopsPts, point, magicsJson);
+      (int)stopsPts, point, magicsJson, bars5m, bars15m);
    string resp;
    int code = HttpPost(InpBridgeURL + "/exec/poll", pollBody, resp);
    if(code != 200) return;

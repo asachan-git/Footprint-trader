@@ -132,6 +132,7 @@ class ExecBridge:
     _last_arm: dict[tuple, dict] = {}       # (account, broker_symbol) → last armed grid metadata
     _open: dict[tuple, dict] = {}           # (account, broker_symbol) → {positions, pendings, ts}
     _ict_overlay: dict[str, dict] = {}      # analysis_symbol → ict_fvg setup (analysis frame)
+    _venue_bars: dict[tuple, list] = {}     # (account, broker_symbol, tf) → [Bar,...] oldest-first, EA CopyRates
 
     # ── ict_fvg chart overlay (paper strategy publishes its active setup; the EA
     #    draws it rebased onto the venue) ───────────────────────────────────────
@@ -386,6 +387,19 @@ class ExecBridge:
         with cls._lock:
             q = cls._quotes.get((str(account), symbol))
             return dict(q) if q else None
+
+    # ── venue-native bar cache (EA CopyRates on each poll — lets a feed comparator or
+    # detector check the SAME OHLC Vantage will fill against, no analysis-feed rebase
+    # needed) ────────────────────────────────────────────────────────────────
+    @classmethod
+    def set_venue_bars(cls, account: str, symbol: str, tf: str, bars: list) -> None:
+        with cls._lock:
+            cls._venue_bars[(str(account), symbol, tf)] = bars
+
+    @classmethod
+    def get_venue_bars(cls, account: str, symbol: str, tf: str) -> list:
+        with cls._lock:
+            return list(cls._venue_bars.get((str(account), symbol, tf), []))
 
     # ── audit ────────────────────────────────────────────────────────────────
     @classmethod
