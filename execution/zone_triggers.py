@@ -178,8 +178,14 @@ def _merge_zone_tuples(zones: list[tuple[float, float]]) -> list[tuple[float, fl
     collapse them so the grid straddles ONE fulcrum, not two near-duplicate edges."""
     if not zones:
         return zones
-    out: list[list[float]] = [list(zones[0])]
-    for lo, hi in sorted(zones):
+    # Seed from the SORTED list, not the unsorted zones[0]. Seeding with an arbitrary
+    # (possibly high) first element made the merge walk compare the lowest sorted zone
+    # against a higher seed: lo <= out[-1][1] was spuriously True, so the lowest zone got
+    # absorbed into the seed and its low silently discarded — price could sit inside a
+    # real HVN/LVN with no arm.
+    ordered = sorted(zones)
+    out: list[list[float]] = [list(ordered[0])]
+    for lo, hi in ordered[1:]:
         if lo <= out[-1][1]:                       # overlap or touch
             out[-1][1] = max(out[-1][1], hi)
         else:

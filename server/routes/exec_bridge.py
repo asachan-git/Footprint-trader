@@ -584,15 +584,18 @@ def exec_test_order():
 
 @bp.post("/exec/zones")
 def exec_zones():
-    """HVN/LVN zones for the EA to draw — the SAME source the dashboard renders:
-    the cached, session-anchored DAILY VP (vp_cache.get), already venue-shifted by
-    the configured additive offset. This deliberately matches the dashboard's
-    VolumeProfile panel, NOT the rolling-window VP the grid trigger uses (so the
-    drawn zones are for visual parity; the armed fulcrum may sit on a session-rolling
-    edge that differs slightly).
+    """HVN/LVN zones for the EA to draw.
 
-    Body: {account, symbol(broker or analysis), [tf]}. `tf` is accepted but ignored —
-    daily VP is one period. Returns {ok, zones:[{kind, lo, hi}], venue_mid, fulcrum}.
+    HVN zones use the SAME source the live detector arms against — _session_hvn_zones
+    (rolling+cached blend, per `tf`), additively rebased onto the venue — so the drawn
+    box always matches what actually triggered. Falls back to the cached daily VP
+    (dashboard's source) if `tf` is omitted or the session lookup fails.
+    LVN zones stay on the cached daily VP (no session-LVN detector exists to mismatch
+    against).
+
+    Body: {account, symbol(broker or analysis), [tf]}. `tf` drives the HVN session
+    lookup — pass the TF the grid is armed on for zones that match the live trigger.
+    Returns {ok, zones:[{kind, lo, hi}], venue_mid, fulcrum}.
     """
     if not _auth_ok():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
@@ -606,14 +609,39 @@ def exec_zones():
     symbol = broker_to_analysis.get(req_symbol, req_symbol)
     broker_symbol = symbol_map.get(symbol, req_symbol)
 
-    # Same call as the dashboard (server/routes/dashboard.py): cached daily VP with
-    # the additive venue offset already applied → zones are in the venue frame.
     from pipeline.features import vp_cache
     daily = vp_cache.get(symbol, "daily") or {}
     zones = []
-    for z in (daily.get("hvn_zones") or []):
-        zones.append({"kind": "hvn", "lo": round(float(z["low"]), 5),
-                      "hi": round(float(z["high"]), 5)})
+
+    # HVN zones: match the LIVE detector (_t_hvn_inside_touch uses _session_hvn_zones —
+    # a session-aware rolling+cached blend), not the cached-daily-only VP — otherwise the
+    # chart can draw a different HVN box than the one that actually armed. Rebased onto
+    # the venue with the SAME additive shift as _rebase_to_venue (venue - analysis), since
+    # _session_hvn_zones returns analysis-frame prices. Falls back to the cached daily VP
+    # (old behaviour) if no tf/bars/quote are available.
+    tf_for_zones = str(body.get("tf") or "")
+    hvn_zones_out = None
+    if tf_for_zones:
+        try:
+            from pipeline.state_store import store as _zstore
+            from execution.zone_triggers import _session_hvn_zones, _VP_WIN
+            _win = _VP_WIN.get(tf_for_zones, 96)
+            _bars = _zstore().recent(symbol, tf_for_zones, _win + 5)
+            if _bars:
+                _sess_zones, _ = _session_hvn_zones(symbol, tf_for_zones, _bars)
+                _quote_early = ExecBridge.get_quote(account, broker_symbol) or {}
+                _shift = float(_quote_early.get("mid") or 0.0) - float(_bars[-1].ohlc.c or 0.0)
+                if _sess_zones and abs(_shift) < 1e9:   # sanity: a real shift, not garbage
+                    hvn_zones_out = [(lo + _shift, hi + _shift) for lo, hi in _sess_zones]
+        except Exception:
+            hvn_zones_out = None
+    if hvn_zones_out is None:
+        # Same call as the dashboard (server/routes/dashboard.py): cached daily VP with
+        # the additive venue offset already applied → zones are in the venue frame.
+        hvn_zones_out = [(float(z["low"]), float(z["high"])) for z in (daily.get("hvn_zones") or [])]
+    for lo, hi in hvn_zones_out:
+        zones.append({"kind": "hvn", "lo": round(lo, 5), "hi": round(hi, 5)})
+
     for z in (daily.get("lvn_zones") or []):
         zones.append({"kind": "lvn", "lo": round(float(z["low"]), 5),
                       "hi": round(float(z["high"]), 5)})

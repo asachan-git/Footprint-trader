@@ -408,31 +408,39 @@ def _resolve_tps(symbol: str, fulcrum: float, buy_legs: list[Leg],
 
 def _rebase_to_venue(plan: GridPlan, analysis_anchor: float, venue_price: float) -> GridPlan:
     """Re-anchor a plan computed in the analysis frame (Binance/Bybit) onto the
-    execution venue's live price (Vantage). Every absolute level — fulcrum, each
-    leg, both TPs, the step — is scaled by the ratio venue/analysis, preserving the
-    structural % geometry while moving it to where the broker actually quotes. Same
-    principle as execution.venue_translator, applied to the neutral grid.
+    execution venue's live price (Vantage). Every absolute level — fulcrum, each leg,
+    both TPs — is TRANSLATED by the ADDITIVE basis shift (venue − analysis), the same
+    transform /exec/zones uses to draw the zones. Widths (step, and thus leg SPACING)
+    are frame-invariant differences → NOT shifted.
 
-    Why this is mandatory: a BuyStop must sit above the venue ask and a SellStop
-    below the venue bid. Binance-frame absolute prices won't satisfy that on Vantage
-    → MT5 rejects the orders. (Tick-rounding + broker min-stop-distance are enforced
-    EA-side, since only the terminal knows the symbol's stopsLevel.)
+    Additive, not multiplicative: gold's Vantage-vs-Binance basis is a near-constant
+    ADDITIVE offset, not a percentage. A multiplicative ratio (level * venue/analysis)
+    anchors the scaling at the live price, so a fulcrum far from spot lands at
+    edge*(venue/analysis) while the chart draws edge+shift — the two diverge by
+    ~shift*(edge_distance/price), i.e. the fulcrum-vs-drawn-edge gap grows with the
+    edge's distance from spot. Additive makes fulcrum == drawn edge exactly regardless
+    of distance.
+
+    Why rebasing is mandatory at all: a BuyStop must sit above the venue ask and a
+    SellStop below the venue bid. Binance-frame absolute prices won't satisfy that on
+    Vantage → MT5 rejects the orders. (Tick-rounding + broker min-stop-distance are
+    enforced EA-side, since only the terminal knows the symbol's stopsLevel.)
     """
     if analysis_anchor <= 0 or venue_price <= 0:
         return plan
-    ratio = venue_price / analysis_anchor
-    if abs(ratio - 1.0) < 1e-9:
+    shift = venue_price - analysis_anchor
+    if abs(shift) < 1e-9:
         # in-frame caller (dashboard/sim) — identity, just stamp the anchors
         return replace(plan, analysis_anchor=round(analysis_anchor, 4),
                        venue_anchor=round(venue_price, 4), rebased=False)
     return replace(
         plan,
-        fulcrum=round(plan.fulcrum * ratio, 4),
-        step=round(plan.step * ratio, 4),
-        buy_legs=[Leg(price=round(l.price * ratio, 4), lot=l.lot) for l in plan.buy_legs],
-        sell_legs=[Leg(price=round(l.price * ratio, 4), lot=l.lot) for l in plan.sell_legs],
-        buy_tp=round(plan.buy_tp * ratio, 4),
-        sell_tp=round(plan.sell_tp * ratio, 4),
+        fulcrum=round(plan.fulcrum + shift, 4),
+        step=plan.step,   # width — frame-invariant, do NOT shift
+        buy_legs=[Leg(price=round(l.price + shift, 4), lot=l.lot) for l in plan.buy_legs],
+        sell_legs=[Leg(price=round(l.price + shift, 4), lot=l.lot) for l in plan.sell_legs],
+        buy_tp=round(plan.buy_tp + shift, 4),
+        sell_tp=round(plan.sell_tp + shift, 4),
         analysis_anchor=round(analysis_anchor, 4),
         venue_anchor=round(venue_price, 4),
         rebased=True,
