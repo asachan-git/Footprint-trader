@@ -42,6 +42,77 @@ def _auth_ok() -> bool:
     return request.headers.get("X-FB-Token") == token
 
 
+_RECON_LAST_TS: dict = {}       # (account, broker_symbol, tf) → last venue close_ts feed-reconciled
+_RECON_HEAL_AT: dict = {}       # (analysis_symbol, tf) → last wall-clock a breach heal fired (cooldown)
+
+
+def _reconcile_feeds(account: str, broker_symbol: str, settings: dict) -> None:
+    """Per-close Binance(analysis)-vs-Vantage(venue) discrepancy check. Called each poll, but
+    only evaluates once per NEW venue 5m/15m close (dedup on close_ts). On a basis-adjusted
+    breach: log (rate-limited) and — if monitor.feed_recon_heal_on_breach — re-fetch that
+    candle's 1m window from Binance aggTrades (replace=True) to overwrite a corrupt bar.
+
+    Diagnostic + heal only; never touches arming. Fully fail-open — any error is swallowed so
+    the poll path is never broken by the comparator."""
+    mon = (settings.get("monitor") or {})
+    if not mon.get("feed_recon_enabled", True):
+        return
+    try:
+        from pipeline.feed_reconcile import compare_close
+        from pipeline.state_store import store as _store
+        symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
+        analysis = {v: k for k, v in symbol_map.items()}.get(broker_symbol, broker_symbol)
+        tol_pct = float(mon.get("feed_recon_tol_pct", 0.0008) or 0.0008)
+        tol_abs = float(mon.get("feed_recon_tol_abs", 2.0) or 2.0)
+        basis_win = int(mon.get("feed_recon_basis_window", 12) or 12)
+        heal_on = bool(mon.get("feed_recon_heal_on_breach", False))
+        cooldown = float(mon.get("feed_recon_heal_cooldown_s", 300) or 300)
+
+        for tf in ("5m", "15m"):
+            venue_bars = ExecBridge.get_venue_bars(account, broker_symbol, tf)
+            if len(venue_bars) < 4:
+                continue
+            v_ts = int(getattr(venue_bars[-1], "close_ts", 0) or 0)
+            key = (str(account), broker_symbol, tf)
+            if not v_ts or _RECON_LAST_TS.get(key) == v_ts:
+                continue                      # not a new close → skip (dedup)
+            _RECON_LAST_TS[key] = v_ts
+            analysis_bars = _store().recent(analysis, tf, basis_win + 4)
+            breach = compare_close(analysis, tf, venue_bars, analysis_bars,
+                                   tol_pct, tol_abs, basis_window=basis_win)
+            if not breach:
+                continue
+            LOG.warning(f"[feed_recon] {analysis} {tf} close_ts={breach['close_ts']} "
+                        f"venue={breach['venue_c']} analysis={breach['analysis_c']} "
+                        f"basis={breach['basis']:+.3f} resid={breach['resid']:+.3f} "
+                        f"ret_div={breach['ret_div']:+.3f} (tol={breach['tol']:.3f}, "
+                        f"signal={breach['signal']})"
+                        + (" — healing" if heal_on else " — log-only"))
+            if not heal_on:
+                continue
+            hk = (analysis, tf)
+            now = time.time()
+            if now - _RECON_HEAL_AT.get(hk, 0.0) < cooldown:
+                continue
+            _RECON_HEAL_AT[hk] = now
+            _tf_secs = {"5m": 300, "15m": 900}.get(tf, 300)
+            start_ms = (v_ts - _tf_secs + 60) * 1000   # first 1m of the breached candle
+            end_ms = (v_ts + 1) * 1000
+            feeds = {"XAUTUSDT": ("XAUUSDT", 0.1), "BTCUSDT": ("BTCUSDT", 1.0)}
+            bsym, pstep = feeds.get(analysis, (analysis, 0.1))
+            try:
+                from binance.backfill import backfill_window
+                n = backfill_window(bsym, analysis, start_ms, end_ms, tf="1m",
+                                    price_step=pstep, source="binance_agg_recon",
+                                    replace=True)
+                LOG.info(f"[feed_recon] healed {n} 1m bars for {analysis} covering the "
+                         f"breached {tf} candle {breach['close_ts']}")
+            except Exception as e:
+                LOG.warning(f"[feed_recon] heal fetch failed {analysis} {tf}: {e}")
+    except Exception as e:
+        LOG.debug(f"[feed_recon] check skipped ({broker_symbol}): {e}")
+
+
 @bp.post("/exec/poll")
 def exec_poll():
     if not _auth_ok():
@@ -55,6 +126,7 @@ def exec_poll():
     sym = body.get("symbol")
     bid, ask = body.get("bid"), body.get("ask")
     ExecBridge.last_poll_body = dict(body)   # DEBUG: surface the EA's raw poll body
+    settings_cfg = current_app.config.get("FB_SETTINGS")
     if sym and bid and ask:
         # broker min-stop distance ($) = stops_level(points)·point — floors the grid step
         # so the innermost leg clears the freeze band (no more silently-rejected legs).
@@ -80,12 +152,14 @@ def exec_poll():
                 ExecBridge.set_venue_bars(account, sym, _tf, _bars)
             except Exception:
                 LOG.exception(f"[exec] venue bars parse error ({_tf})")
+
+        # Per-close Binance-vs-Vantage feed discrepancy check (once per new venue 5m/15m close).
+        _reconcile_feeds(account, sym, settings_cfg or {})
     # Per-magic open-state + cycle monitor. The EA sends a `magics` array — one entry
     # per (strategy×TF) pool it holds — so each TF cycle is tracked and exited in
     # isolation. tf is recovered from the magic. A flatten ships in the same response
     # (saves a ~1s round-trip). Falls back to the legacy aggregate fields for an older
     # EA binary (single pool, no per-magic breakdown).
-    settings_cfg = current_app.config.get("FB_SETTINGS")
     magics = body.get("magics")
     if sym and isinstance(magics, list) and magics:
         for m in magics:

@@ -76,15 +76,24 @@ def fetch_agg_trades(symbol: str, start_ms: int, end_ms: int,
 
 def backfill_window(binance_symbol: str, store_symbol: str, start_ms: int, end_ms: int,
                     tf: str = "1m", price_step: float = 0.1,
-                    source: str = "binance_agg_backfill") -> int:
+                    source: str = "binance_agg_backfill", replace: bool = False) -> int:
     """Fetch aggTrades in [start_ms, end_ms), replay through FootprintBuilder, inject into
     the state_store. Returns the count of NEW bars injected (dupes dropped by store.put).
 
     binance_symbol: the Binance fetch symbol (e.g. XAUUSDT).
     store_symbol:   the key it's stored under (e.g. XAUTUSDT) — bar_id is recomputed for it.
+    replace: when True, first DELETE any existing bars in the window so a WRONG existing bar
+      is overwritten (put() is idempotent and won't replace). Used by the feed-reconcile heal
+      path — keep the window tight (only the breached candle's minutes). Default False =
+      gap-heal semantics (fill missing only, never touch good bars).
     Bounded: the caller clamps the [start,end) span; this replays whatever it's given.
     Safe to overlap the live feed (idempotent + Lock-guarded store)."""
     s = store()
+    if replace:
+        removed = s.delete_range(store_symbol, tf, start_ms // 1000, (end_ms + 999) // 1000)
+        if removed:
+            LOG.info(f"[backfill] replace: evicted {removed} existing {store_symbol} {tf} "
+                     f"bars in [{start_ms // 1000}, {end_ms // 1000}) before re-fetch")
     injected = 0
 
     def _on_bar_close(payload: dict) -> None:

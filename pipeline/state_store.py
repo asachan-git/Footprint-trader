@@ -106,6 +106,29 @@ class StateStore:
     def recent(self, symbol: str, tf: str, n: int) -> list[Bar]:
         return list(self._bars.get((symbol, tf), [])[-n:])
 
+    def delete_range(self, symbol: str, tf: str, start_ts: int, end_ts: int) -> int:
+        """Evict all bars with start_ts <= close_ts < end_ts from memory AND rewrite the
+        on-disk JSONL without them. Returns the count removed. Used by the feed-reconcile
+        heal path to overwrite a WRONG existing bar (put() is idempotent and won't replace,
+        so the corrupt bar must be deleted before the corrected one is re-inserted). Bounded:
+        the caller passes only the breached candle's minute window."""
+        key = (symbol, tf)
+        with self._lock:
+            series = self._bars.get(key)
+            if not series:
+                return 0
+            keep = [b for b in series if not (start_ts <= b.close_ts < end_ts)]
+            removed = len(series) - len(keep)
+            if removed == 0:
+                return 0
+            self._bars[key] = keep
+            # Rewrite the file atomically-ish (truncate + rewrite the survivors).
+            p = _path(symbol, tf)
+            with p.open("w") as fh:
+                for b in keep:
+                    fh.write(_serialize(b) + "\n")
+            return removed
+
 
 _singleton: StateStore | None = None
 _singleton_lock = Lock()

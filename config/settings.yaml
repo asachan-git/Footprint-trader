@@ -54,6 +54,19 @@ monitor:
   #   XAUTUSDT: {binance_symbol: XAUUSDT, price_step: 0.1}
   #   BTCUSDT:  {binance_symbol: BTCUSDT, price_step: 1.0}
 
+  # Per-close feed discrepancy check (pipeline/feed_reconcile.py). On each new venue 5m/15m
+  # close, compare the Vantage candle against the Binance candle BASIS-ADJUSTED (flags only
+  # when venue−analysis deviates from the rolling ~3pt basis beyond tolerance, not the basis
+  # itself). Diagnostic + heal only — never touches arming. heal_on_breach ships OFF so the
+  # first session's [feed_recon] logs can calibrate the tolerance against real basis noise;
+  # flip on once tuned. On breach with heal on: re-fetch that candle's 1m window (replace=True).
+  feed_recon_enabled: true
+  feed_recon_tol_pct: 0.0008       # residual tolerance as fraction of price (~3.2 on 4000 gold)
+  feed_recon_tol_abs: 2.0          # absolute floor ($) so small prices aren't over-sensitive
+  feed_recon_basis_window: 12      # shared closes for the rolling basis median
+  feed_recon_heal_on_breach: false # OFF for calibration; flip true after tuning tolerances
+  feed_recon_heal_cooldown_s: 300  # min seconds between heals per (symbol,tf)
+
 # Footprint-driven neutral-grid placement (/exec/emit_grid + FBExecBridge EA).
 # Planner reads these via .get() defaults — block is optional but canonical here.
 grid_levels:
