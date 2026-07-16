@@ -226,6 +226,52 @@ def exec_ack():
     return jsonify({"ok": True, **summary})
 
 
+_FEED_STALE_LOG_AT: dict = {}   # analysis_symbol → last wall-clock we logged a stale-feed skip (rate-limit)
+
+
+def _feed_is_stale(analysis_symbol: str, grid_cfg: dict) -> float | None:
+    """Guard against arming on a DEAD analysis feed. Returns the age (seconds) of the newest
+    REAL 1m bar when it exceeds feed_max_age_s, else None (feed fresh → arm allowed).
+
+    Why 1m: it's the fastest series, so the tightest liveness signal — if 1m has gone quiet the
+    higher-TF zones/ATR are all stale too. Sentinel/forming bars (close_ts >= 9e9) are dropped so
+    a frozen placeholder can't masquerade as a fresh bar (same filter atr_from_store/put use).
+
+    This is the exact failure that took the system down 2026-07-15: the Binance feed process died,
+    bars stopped, but nothing suppressed new arms — the grid would keep arming on frozen zones.
+    Existing cycles are UNAFFECTED (their exits ride the EA's venue-price poll, independent of this
+    feed); only FRESH arms are frozen, which is correct — you must not draw a new grid on stale
+    zones. Fail-OPEN on any error: a guard hiccup must never itself freeze arming.
+    Returns the age so the caller can log it once (rate-limited)."""
+    try:
+        max_age = float(grid_cfg.get("feed_max_age_s", 180) or 180)
+        from pipeline.state_store import store
+        bars = [b for b in store().recent(analysis_symbol, "1m", 4)
+                if getattr(b, "close_ts", 0) and b.close_ts < 9_000_000_000]
+        if not bars:
+            return 1e9   # no real bars at all → treat as maximally stale
+        age = time.time() - float(bars[-1].close_ts)
+        return age if age > max_age else None
+    except Exception as e:
+        LOG.warning(f"[feed_stale] check failed for {analysis_symbol}: {e} — failing open (allow arm)")
+        return None
+
+
+def _feed_stale_skip(analysis_symbol: str, broker_symbol: str, tf: str, grid_cfg: dict) -> bool:
+    """True if the analysis feed is stale (caller should skip the arm). Logs at most once every
+    30s per symbol so a ~1s poll loop doesn't flood the log."""
+    age = _feed_is_stale(analysis_symbol, grid_cfg)
+    if age is None:
+        return False
+    now = time.time()
+    if now - _FEED_STALE_LOG_AT.get(analysis_symbol, 0.0) >= 30.0:
+        _FEED_STALE_LOG_AT[analysis_symbol] = now
+        LOG.warning(f"[feed_stale] {analysis_symbol} last 1m bar {age:.0f}s old "
+                    f"(>{float(grid_cfg.get('feed_max_age_s', 180) or 180):.0f}s) — "
+                    f"arming suspended ({broker_symbol}/{tf})")
+    return True
+
+
 @bp.post("/exec/emit_grid")
 def exec_emit_grid():
     """Build the neutral grid for `symbol`/`tf`, rebase onto the account's cached
@@ -254,6 +300,13 @@ def exec_emit_grid():
     broker_to_analysis = {v: k for k, v in symbol_map.items()}
     symbol = broker_to_analysis.get(req_symbol, req_symbol)
     broker_symbol = symbol_map.get(symbol, req_symbol)
+
+    # Feed-liveness gate: suppress FRESH arms if the analysis feed has gone stale (dead feed →
+    # frozen zones — the 2026-07-15 outage). Existing cycles unaffected (venue-price driven).
+    grid_cfg = settings.get("grid_levels") or {}
+    if _feed_stale_skip(symbol, broker_symbol, tf, grid_cfg):
+        return jsonify({"ok": True, "verdict": "skip", "skip_reason": "feed_stale",
+                        "symbol": symbol, "broker_symbol": broker_symbol})
 
     # venue quote the EA last reported (the rebase target)
     quote = ExecBridge.get_quote(account, broker_symbol)

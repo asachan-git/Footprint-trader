@@ -31,7 +31,7 @@ def atr(bars: list[Bar], period: int = 14) -> float:
     return sum(trs) / len(trs)
 
 
-def atr_from_store(symbol: str, tf: str, period: int = 14) -> float:
+def atr_from_store(symbol: str, tf: str, period: int = 14, _guard: bool = True) -> float:
     """Convenience: fetch last `period+1` bars from state_store and compute ATR.
 
     Drops the sentinel/forming bar (close_ts >= 9_000_000_000, e.g. the ts=9999999999
@@ -39,8 +39,25 @@ def atr_from_store(symbol: str, tf: str, period: int = 14) -> float:
     gap (observed 2026-07-15: 1m ATR read 7.85 vs true ~0.8 because a sentinel bar sat at
     4130 while price was 4034, a 96pt fake range → oversized 1m grid step → the TP fell
     inside the ladder and legs placed with tp=0). Same filter maybe_emit uses. Fetch a few
-    extra bars so `period` real bars survive the drop."""
+    extra bars so `period` real bars survive the drop.
+
+    PLAUSIBILITY CLAMP (2026-07-15): the sentinel guard above + state_store.put() block the
+    *specific* ts=9999999999 fixture, but ANY future bad bar (fat-finger tick, feed glitch)
+    producing a phantom range would inflate the shorter-TF ATR the same way. A physical
+    invariant catches the whole class: a 1m true-range CANNOT exceed the 5m/15m range that
+    contains it, so 1m ATR must be < higher-TF ATR. If 1m ATR reads implausibly high vs 5m,
+    clamp it to the 5m value (a safe in-family number → sane grid step) and log. `_guard=False`
+    on the inner 5m call prevents infinite recursion."""
     from pipeline.state_store import store
     bars = [b for b in store().recent(symbol, tf, period + 4)
             if getattr(b, "close_ts", 0) and b.close_ts < 9_000_000_000]
-    return atr(bars[-(period + 1):], period=period)
+    val = atr(bars[-(period + 1):], period=period)
+    if _guard and tf == "1m" and val > 0:
+        ref = atr_from_store(symbol, "5m", period, _guard=False)
+        if ref > 0 and val > 1.5 * ref:   # 1m ATR physically < 5m ATR; >1.5× = phantom range
+            import logging
+            logging.getLogger("atr").warning(
+                "[atr_implausible] %s 1m ATR %.4f > 1.5x 5m %.4f — clamping to 5m "
+                "(phantom range from a bad bar?)", symbol, val, ref)
+            return ref
+    return val

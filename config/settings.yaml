@@ -80,6 +80,13 @@ monitor:
 # Footprint-driven neutral-grid placement (/exec/emit_grid + FBExecBridge EA).
 # Planner reads these via .get() defaults — block is optional but canonical here.
 grid_levels:
+
+  # Feed-liveness gate: if the newest REAL 1m analysis bar is older than this many seconds,
+  # SUPPRESS fresh arms (dead Binance feed → frozen zones; the 2026-07-15 outage). Existing
+  # cycles are unaffected — their exits ride the EA venue-price poll, not this feed. Logged
+  # (rate-limited) whenever it trips. Set high to effectively disable.
+  feed_max_age_s: 180
+
   base_lot: 0.01
   lot_step: 0.01
   tp_atr_mult: 1.5
