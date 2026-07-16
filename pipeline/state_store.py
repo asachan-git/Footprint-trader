@@ -29,6 +29,12 @@ def _serialize(bar: Bar) -> str:
     return json.dumps(d, separators=(",", ":"))
 
 
+def _level(lvl: dict) -> Level:
+    # Tolerate extra keys written by a newer schema (e.g. tick-VP "cnt") — this branch's
+    # Level is price/vol only; unknown fields are simply not carried, not an error.
+    return Level(price=lvl["price"], vol=lvl["vol"])
+
+
 def _deserialize(line: str) -> Bar:
     d = json.loads(line)
     return Bar(
@@ -38,8 +44,8 @@ def _deserialize(line: str) -> Bar:
         close_ts=d["close_ts"],
         source=d["source"],
         ohlc=OHLC(**d["ohlc"]),
-        bid_ladder=tuple(Level(**lvl) for lvl in d["bid_ladder"]),
-        ask_ladder=tuple(Level(**lvl) for lvl in d["ask_ladder"]),
+        bid_ladder=tuple(_level(lvl) for lvl in d["bid_ladder"]),
+        ask_ladder=tuple(_level(lvl) for lvl in d["ask_ladder"]),
         poc=d.get("poc"),
         delta=d.get("delta"),
     )

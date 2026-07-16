@@ -53,6 +53,8 @@ CANCEL_PENDINGS = "CANCEL_PENDINGS"  # cancel pendings ONLY, leave positions (sa
 CLOSE_SIDE = "CLOSE_SIDE"        # close a fraction of ONE side's positions (bias-side booking)
 MOVE_BE = "MOVE_BE"              # move one side's positions' SL to breakeven (risk-free runner)
 OPEN_MARKET = "OPEN_MARKET"      # open a market position immediately (feed-outage hedge only)
+MODIFY_TP = "MODIFY_TP"          # set a new TP on one side's resting pendings + open positions
+                                  # (SL/entry price untouched — TP-only zone-shift refresh)
 
 # ── per-strategy × per-TF magic scheme ───────────────────────────────────────
 # magic = MAGIC_BASE + strat_code·10 + tf_code  →  e.g. hvn·15m = 770013,
@@ -128,6 +130,8 @@ class Command:
             d.update(side=self.side, frac=self.frac, comment=self.comment)
         elif self.type == OPEN_MARKET:
             d.update(side=self.side, lot=self.lot, comment=self.comment)
+        elif self.type == MODIFY_TP:
+            d.update(side=self.side, tp=self.tp, comment=self.comment)
         return d
 
 
@@ -469,7 +473,7 @@ class ExecBridge:
     @classmethod
     def enqueue_grid_plan(cls, account: str, broker_symbol: str, plan, *,
                           close_first: bool = True, clear_kind: str = "flatten",
-                          magic: int = 0, leg_tp: bool = True) -> list[Command]:
+                          magic: int = 0, leg_tp: bool = True, tf: str = "") -> list[Command]:
         """Translate a rebased neutral GridPlan into PLACE_PENDING commands.
         buy_legs → buy_stop, sell_legs → sell_stop, shared per-side TP, no SL (v1).
         Optionally prepend a clear command: clear_kind="flatten" → CLOSE_ALL (close
@@ -480,10 +484,11 @@ class ExecBridge:
         winning side can't book while the losing side dangles (a per-leg TP hit ≠ a
         net-positive cycle). The basket net-target exit (monitor_cycle) then owns ALL
         profit-taking and only closes when the whole cycle is net ≥ target."""
-        # Per-order tag = the source level, so each grid's legs are identifiable in the
-        # MT5 comment: FB|poc|b1, FB|vah|s2, FB|hvn|b3 … (vp_level_touch → its level_type;
-        # hvn_inside_touch → "hvn"; else the trigger kind). All legs of one grid share
-        # the level; b/s + index distinguish legs. (MT5 comment cap ~31 chars — fits.)
+        # Per-order tag = strategy + TF, so each grid's legs are identifiable in the MT5
+        # comment even without decoding the magic number: FB|hvn|15m|b1, FB|vah|5m|s2 …
+        # (vp_level_touch → its level_type; hvn_inside_touch → "hvn"; else the trigger
+        # kind). All legs of one grid share the level+tf; b/s + index distinguish legs.
+        # (MT5 comment cap ~31 chars — the longest tag still fits with room to spare.)
         ctx = getattr(plan, "trigger_context", {}) or {}
         kind = getattr(plan, "trigger_kind", "") or ""
         if kind == "vp_level_touch":
@@ -494,6 +499,7 @@ class ExecBridge:
             tag = "sqz"
         else:
             tag = (kind[:8] or "grid")
+        tag = f"{tag}|{tf}" if tf else tag
 
         out: list[Command] = []
         if close_first:

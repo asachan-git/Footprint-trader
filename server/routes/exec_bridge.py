@@ -18,7 +18,7 @@ from pathlib import Path
 
 from flask import Blueprint, current_app, jsonify, request
 
-from execution.exec_bridge import ExecBridge, magic_for, tf_from_magic
+from execution.exec_bridge import ExecBridge, magic_for, tf_from_magic, MODIFY_TP
 
 bp = Blueprint("exec_bridge", __name__)
 _EMIT_LOG = Path(__file__).resolve().parent.parent.parent / "data" / "exec_emit.jsonl"
@@ -187,6 +187,8 @@ def exec_poll():
                                          pnl=float(m.get("pnl", 0.0)), buys=b, sells=s,
                                          buy_pnl=float(m.get("buy_pnl", 0.0)),
                                          sell_pnl=float(m.get("sell_pnl", 0.0)))
+                if analysis_sym:
+                    _refresh_cycle_tp(account, sym, analysis_sym, tf_m, mg, settings_cfg or {})
             except Exception:
                 LOG.exception("[exec] per-magic cycle monitor error")  # never break the poll
     elif sym and ("positions" in body or "pendings" in body):
@@ -272,6 +274,84 @@ def _feed_stale_skip(analysis_symbol: str, broker_symbol: str, tf: str, grid_cfg
     return True
 
 
+_TP_REFRESH_LAST_BAR: dict = {}   # (account, broker_symbol, tf, magic) → last analysis close_ts checked
+
+
+def _refresh_cycle_tp(account: str, broker_symbol: str, analysis_symbol: str,
+                      tf: str, magic: int, settings: dict) -> None:
+    """Once per NEW closed analysis bar on this TF, recompute the cycle's structural TP
+    from the CURRENT HVN/VP structure and — if it moved beyond a noise floor — push a
+    fresh TP to the resting pendings and any filled position(s) on that side. Entry
+    price and SL are never touched here; this only chases the target, not the ladder.
+
+    A leg's TP is set once at arm time (exec_emit_grid) and then frozen — if the HVN the
+    fulcrum sits on drifts afterward, the cycle would ride a stale target until basket
+    exit. This keeps the leg TP tracking the live structure instead. Fails open: any
+    error just skips this poll's refresh, never blocks/breaks the cycle."""
+    try:
+        arm = ExecBridge.get_last_arm(account, broker_symbol, magic=magic)
+        if not arm or not arm.get("active"):
+            return
+        grid_cfg = settings.get("grid_levels") or {}
+        # Only meaningful if legs actually carry a broker TP (leg_tp_ceiling / not
+        # net_profit_exit_only) — a TP-less leg has nothing to refresh.
+        leg_tp = (not bool(grid_cfg.get("net_profit_exit_only", False))
+                  or bool(grid_cfg.get("leg_tp_ceiling", False)))
+        if not leg_tp:
+            return
+
+        from pipeline.state_store import store
+        latest = store().latest(analysis_symbol, tf)
+        if latest is None or not latest.ohlc.c:
+            return
+        key = (str(account), broker_symbol, tf, magic)
+        if _TP_REFRESH_LAST_BAR.get(key) == latest.close_ts:
+            return   # already checked this closed bar
+        _TP_REFRESH_LAST_BAR[key] = latest.close_ts
+
+        quote = ExecBridge.get_quote(account, broker_symbol)
+        if not quote:
+            return
+        buy_n, sell_n = int(arm.get("buy_n") or 0), int(arm.get("sell_n") or 0)
+        if buy_n <= 0 and sell_n <= 0:
+            return   # nothing resting/filled on either side — nothing to refresh
+
+        from execution.grid_planner import plan_grid_levels
+        min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
+        plan = plan_grid_levels(analysis_symbol, tf, float(latest.ohlc.c),
+                                trigger_hint=str(arm.get("trigger_kind") or ""),
+                                settings=settings, venue_price=float(quote["mid"]),
+                                min_step_venue=min_step_venue)
+        if plan.verdict != "arm":
+            return   # structure gone/invalid — leave the existing TP alone (basket exit still owns risk)
+
+        tol = max(float(quote["mid"]) * float(grid_cfg.get("emit_dedup_pct", 0.0007) or 0.0007), 1e-6)
+        old_tp_up = float(arm.get("tp_up") or 0.0)
+        old_tp_down = float(arm.get("tp_down") or 0.0)
+        new_tp_up, new_tp_down = float(plan.buy_tp or 0.0), float(plan.sell_tp or 0.0)
+        updated = dict(arm)
+        moved = False
+
+        if buy_n > 0 and new_tp_up > 0 and abs(new_tp_up - old_tp_up) > tol:
+            ExecBridge.enqueue(account, MODIFY_TP, broker_symbol, magic=magic, side="buy",
+                               tp=new_tp_up, comment="FB|tp_refresh|buy")
+            updated["tp_up"] = new_tp_up
+            moved = True
+        if sell_n > 0 and new_tp_down > 0 and abs(new_tp_down - old_tp_down) > tol:
+            ExecBridge.enqueue(account, MODIFY_TP, broker_symbol, magic=magic, side="sell",
+                               tp=new_tp_down, comment="FB|tp_refresh|sell")
+            updated["tp_down"] = new_tp_down
+            moved = True
+
+        if moved:
+            ExecBridge.set_last_arm(account, broker_symbol, **updated)
+            _emit_audit({"account": account, "symbol": analysis_symbol, "tf": tf, "magic": magic,
+                         "verdict": "tp_refresh", "tp_up_old": old_tp_up, "tp_down_old": old_tp_down,
+                         "tp_up": new_tp_up, "tp_down": new_tp_down})
+    except Exception as e:
+        LOG.debug(f"[tp_refresh] skipped {broker_symbol}/{tf} magic={magic}: {e}")
+
+
 @bp.post("/exec/emit_grid")
 def exec_emit_grid():
     """Build the neutral grid for `symbol`/`tf`, rebase onto the account's cached
@@ -306,6 +386,13 @@ def exec_emit_grid():
     grid_cfg = settings.get("grid_levels") or {}
     if _feed_stale_skip(symbol, broker_symbol, tf, grid_cfg):
         return jsonify({"ok": True, "verdict": "skip", "skip_reason": "feed_stale",
+                        "symbol": symbol, "broker_symbol": broker_symbol})
+
+    # Per-TF arm gate: some TFs may be excluded from opening NEW grid cycles (e.g.
+    # disabling 1h) while their bars/htf_bias_map usage elsewhere stays untouched.
+    disabled_tfs = set(grid_cfg.get("disabled_tfs") or [])
+    if tf in disabled_tfs:
+        return jsonify({"ok": True, "verdict": "skip", "skip_reason": f"tf_disabled:{tf}",
                         "symbol": symbol, "broker_symbol": broker_symbol})
 
     # venue quote the EA last reported (the rebase target)
@@ -396,7 +483,7 @@ def exec_emit_grid():
               or bool(grid_cfg_ep.get("leg_tp_ceiling", False)))
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
                                         close_first=close_first, clear_kind="cancel",
-                                        magic=leg_magic, leg_tp=leg_tp)
+                                        magic=leg_magic, leg_tp=leg_tp, tf=tf)
     edge = plan.trigger_context.get("edge", "")
     net_target = float(((settings.get("grid_levels") or {}).get("cycle_net_target_usd", 0.0)) or 0.0)
     # ground truth + cycle state: touched edge (=fulcrum), TF owner, structural targets
@@ -588,3 +675,23 @@ def exec_queue():
     account = request.args.get("account")
     return jsonify({"ok": True, "commands": ExecBridge.snapshot(account),
                     "last_poll_body": getattr(ExecBridge, "last_poll_body", None)})
+
+
+@bp.post("/exec/close_magic")
+def exec_close_magic():
+    """Manual one-off flatten: CLOSE_ALL (positions + pendings) scoped to one magic.
+    For operator-initiated exits (e.g. clearing a cycle before a server restart) —
+    the EA drains this exactly like any other CLOSE_ALL. Does not touch _last_arm;
+    a later poll's flat report naturally marks the cycle inactive."""
+    if not _auth_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    account = str(body.get("account") or "")
+    symbol = str(body.get("symbol") or "")
+    magic = int(body.get("magic") or 0)
+    if not account or not symbol or not magic:
+        return jsonify({"ok": False, "error": "account, symbol, magic required"}), 400
+    from execution.exec_bridge import CLOSE_ALL
+    cmd = ExecBridge.enqueue(account, CLOSE_ALL, symbol, magic=magic, comment="FB|manual_close")
+    LOG.warning(f"[exec] manual close_magic {account}/{symbol} magic={magic} id={cmd.id}")
+    return jsonify({"ok": True, "id": cmd.id})

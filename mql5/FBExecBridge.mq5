@@ -17,7 +17,7 @@
 //|    POST {InpBridgeURL}/exec/ack   {account, results:[...]}        |
 //+------------------------------------------------------------------+
 #property copyright "Aniket"
-#property version   "1.05"
+#property version   "1.07"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -42,6 +42,7 @@ input color  InpLVNColor       = clrSandyBrown; // LVN zone fill
 input bool   InpShowZoneLabels = true;          // Label zones/levels with name + value
 input bool   InpDrawVP         = true;          // Draw computed volume profile (right margin)
 input int    InpVPMaxBars      = 50;            // VP histogram max width (bars)
+input int    InpVPRightBuffer  = 5;             // Empty gap (bars) between last candle and the VP histogram
 input color  InpVPColor        = clrDimGray;    // VP histogram bar colour
 input color  InpVPPocColor     = clrGoldenrod;  // VP histogram POC (max) bar colour
 
@@ -630,6 +631,56 @@ bool ExecMoveBE(const string cmd, int &moved, string &err)
 }
 
 //+------------------------------------------------------------------+
+//| Set a new TP on one side's resting pendings + open positions (magic-scoped).
+//| Entry price and SL are left exactly as they are — this only chases the target
+//| when the server recomputes a materially different structural TP. Idempotent:
+//| skips an order/position already at the requested TP (within a point).
+//+------------------------------------------------------------------+
+bool ExecModifyTP(const string cmd, int &modified, string &err)
+{
+   string sym   = JsonGetString(cmd, "symbol");
+   long   magic = (long)JsonGetNumber(cmd, "magic");
+   string side  = JsonGetString(cmd, "side");
+   int    digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   double tp    = NormalizeDouble(JsonGetNumber(cmd, "tp"), digits);
+   modified = 0; err = ""; bool allOk = true;
+
+   if(sym == "" || tp <= 0 || (side != "buy" && side != "sell"))
+   {
+      err = "bad fields"; return false;
+   }
+   double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+
+   // Resting pendings on this side.
+   ENUM_ORDER_TYPE wantOrder = (side == "buy") ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP;
+   for(int i = 0; i < OrdersTotal(); i++)
+   {
+      if(!orderInfo.SelectByIndex(i)) continue;
+      if(orderInfo.Magic() != magic || orderInfo.Symbol() != sym
+         || orderInfo.OrderType() != wantOrder) continue;
+      if(MathAbs(orderInfo.TakeProfit() - tp) <= point) continue;   // already there
+      if(trade.OrderModify(orderInfo.Ticket(), orderInfo.PriceOpen(), orderInfo.StopLoss(), tp,
+                           ORDER_TIME_GTC, 0))
+         modified++;
+      else { allOk = false; err = "pending modify fail #" + IntegerToString((long)orderInfo.Ticket()); }
+   }
+
+   // Any already-filled position(s) on this side.
+   ENUM_POSITION_TYPE wantPos = (side == "buy") ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Magic() != magic || posInfo.Symbol() != sym
+         || posInfo.PositionType() != wantPos) continue;
+      if(MathAbs(posInfo.TakeProfit() - tp) <= point) continue;   // already there
+      if(trade.PositionModify(posInfo.Ticket(), posInfo.StopLoss(), tp))
+         modified++;
+      else { allOk = false; err = "position modify fail #" + IntegerToString((long)posInfo.Ticket()); }
+   }
+   return allOk;
+}
+
+//+------------------------------------------------------------------+
 //| Poll the queue, execute commands, build + POST the ack array.    |
 //+------------------------------------------------------------------+
 void PollAndExecute()
@@ -736,6 +787,16 @@ void PollAndExecute()
          if(InpVerbose)
             Print(ok ? "✅ " : "⚠️ ", "MOVE_BE ", JsonGetString(cmds[i], "side"),
                   " → moved ", movedN, (err == "" ? "" : " | " + err));
+      }
+      else if(type == "MODIFY_TP")
+      {
+         int modifiedN = 0;
+         ok = ExecModifyTP(cmds[i], modifiedN, err);
+         extra = StringFormat(",\"modified\":%d", modifiedN);
+         if(InpVerbose)
+            Print(ok ? "✅ " : "⚠️ ", "MODIFY_TP ", JsonGetString(cmds[i], "side"),
+                  " → tp ", DoubleToString(JsonGetNumber(cmds[i], "tp"), _Digits),
+                  " modified ", modifiedN, (err == "" ? "" : " | " + err));
       }
       else
       {
@@ -1005,7 +1066,9 @@ void DrawProfile(const string js)
    if(maxv <= 0.0) return;
 
    int      secs = PeriodSeconds(PERIOD_CURRENT);
-   datetime t0   = TimeCurrent();
+   // Start the histogram InpVPRightBuffer bars PAST the current candle — an empty gap
+   // so the profile never crowds/overlaps the most recently forming price action.
+   datetime t0   = TimeCurrent() + MathMax(InpVPRightBuffer, 0) * secs;
    double   half = vpbin / 2.0;
    for(int i = 0; i < n; i++)
    {
@@ -1199,7 +1262,7 @@ int OnInit()
    bool tradeAllowed = TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) &&
                        MQLInfoInteger(MQL_TRADE_ALLOWED);
    Print("─────────────────────────────────────────────");
-   Print("✅ FBExecBridge v1.05 — + venue bars (feed reconcile) + OPEN_MARKET (feed-outage hedge magic 770990)");
+   Print("✅ FBExecBridge v1.07 — + MODIFY_TP (server-driven TP refresh on HVN zone shift)");
    Print("    Account:   ", gAccount);
    Print("    Bridge:    ", InpBridgeURL, "  (poll ", InpPollMs, "ms)");
    Print("    Magic:     ", InpMagic, "..", InpMagic + InpMagicRange - 1, " (strategy×TF range)");
