@@ -52,6 +52,7 @@ CLOSE_ALL = "CLOSE_ALL"          # close positions + cancel pendings (deliberate
 CANCEL_PENDINGS = "CANCEL_PENDINGS"  # cancel pendings ONLY, leave positions (safe re-arm)
 CLOSE_SIDE = "CLOSE_SIDE"        # close a fraction of ONE side's positions (bias-side booking)
 MOVE_BE = "MOVE_BE"              # move one side's positions' SL to breakeven (risk-free runner)
+OPEN_MARKET = "OPEN_MARKET"      # open a market position immediately (feed-outage hedge only)
 
 # ── per-strategy × per-TF magic scheme ───────────────────────────────────────
 # magic = MAGIC_BASE + strat_code·10 + tf_code  →  e.g. hvn·15m = 770013,
@@ -81,6 +82,13 @@ def tf_from_magic(magic: int) -> str:
     if magic < MAGIC_BASE or magic >= MAGIC_BASE + 100:
         return ""
     return _CODE_TF.get(int(magic) % 10, "")
+
+
+# Reserved OUT-OF-BAND magic for the feed-outage protective hedge — deliberately ABOVE the
+# strat range (MAGIC_BASE+100) so it never collides with a strat×TF cycle and is NOT decoded
+# as one (tf_from_magic(HEDGE_MAGIC) returns ""). CLOSE_ALL magic=HEDGE_MAGIC scopes cleanly
+# to just the hedge. See pipeline/feed_hedge.py.
+HEDGE_MAGIC = MAGIC_BASE + 990   # 770990 — "not a cycle"
 
 
 _RECLAIM_AFTER_S = 10.0   # IN_FLIGHT with no ack this long → back to PENDING
@@ -118,6 +126,8 @@ class Command:
                      sl=self.sl, tp=self.tp, comment=self.comment)
         elif self.type in (CLOSE_SIDE, MOVE_BE):
             d.update(side=self.side, frac=self.frac, comment=self.comment)
+        elif self.type == OPEN_MARKET:
+            d.update(side=self.side, lot=self.lot, comment=self.comment)
         return d
 
 
@@ -133,6 +143,11 @@ class ExecBridge:
     _open: dict[tuple, dict] = {}           # (account, broker_symbol) → {positions, pendings, ts}
     _ict_overlay: dict[str, dict] = {}      # analysis_symbol → ict_fvg setup (analysis frame)
     _venue_bars: dict[tuple, list] = {}     # (account, broker_symbol, tf) → [Bar,...] oldest-first, EA CopyRates
+    # Last poll's per-magic breakdown + the (account, broker_symbol) that reported it — stashed
+    # each poll so the out-of-band feed-hedge (driven by the feed_monitor thread, which only
+    # knows analysis symbols) can read net exposure + resolve the account during a Binance
+    # outage. Keyed by analysis_symbol so feed_hedge can look it up directly.
+    _last_magics: dict[str, dict] = {}      # analysis_symbol → {account, broker_symbol, magics:[...], ts}
 
     # ── ict_fvg chart overlay (paper strategy publishes its active setup; the EA
     #    draws it rebased onto the venue) ───────────────────────────────────────
@@ -400,6 +415,27 @@ class ExecBridge:
     def get_venue_bars(cls, account: str, symbol: str, tf: str) -> list:
         with cls._lock:
             return list(cls._venue_bars.get((str(account), symbol, tf), []))
+
+    @classmethod
+    def set_last_magics(cls, analysis_symbol: str, account: str, broker_symbol: str,
+                        magics: list, now: float | None = None) -> None:
+        """Stash the latest poll's per-magic breakdown + originating account/broker, keyed by
+        analysis symbol. Read by pipeline/feed_hedge.py (which runs on the feed_monitor thread
+        and only knows analysis symbols) to size the hedge + resolve the account during a
+        Binance-feed outage — the EA keeps polling Vantage even when Binance is down, so this
+        stays fresh."""
+        with cls._lock:
+            cls._last_magics[analysis_symbol] = {
+                "account": str(account), "broker_symbol": broker_symbol,
+                "magics": list(magics or []),
+                "ts": now if now is not None else time.time(),
+            }
+
+    @classmethod
+    def get_last_magics(cls, analysis_symbol: str) -> dict | None:
+        with cls._lock:
+            v = cls._last_magics.get(analysis_symbol)
+            return dict(v) if v else None
 
     # ── audit ────────────────────────────────────────────────────────────────
     @classmethod

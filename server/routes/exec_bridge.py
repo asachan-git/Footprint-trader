@@ -161,6 +161,19 @@ def exec_poll():
     # (saves a ~1s round-trip). Falls back to the legacy aggregate fields for an older
     # EA binary (single pool, no per-magic breakdown).
     magics = body.get("magics")
+    # Stash the poll's per-magic breakdown + account/broker for the out-of-band feed-hedge
+    # (feed_monitor thread only knows analysis symbols; the EA keeps polling Vantage even when
+    # the Binance feed is down, so this is the fresh exposure snapshot the hedge sizes against).
+    _symmap = (settings_cfg or {}).get("execution", {}).get("symbol_map") or {}
+    _b2a = {v: k for k, v in _symmap.items()}
+    analysis_sym = _b2a.get(sym, sym) if sym else sym
+    if sym and analysis_sym and isinstance(magics, list):
+        try:
+            ExecBridge.set_last_magics(analysis_sym, account, sym, magics)
+            from pipeline import feed_hedge as _fh
+            _fh.rehydrate(analysis_sym, magics)   # adopt a hedge that survived a restart
+        except Exception:
+            LOG.debug("[exec] feed_hedge stash/rehydrate skipped")
     if sym and isinstance(magics, list) and magics:
         for m in magics:
             try:
@@ -190,7 +203,16 @@ def exec_poll():
     commands = ExecBridge.poll(account)
     if commands:
         LOG.info(f"[exec] poll account={account} → {len(commands)} command(s)")
-    return jsonify({"ok": True, "account": account, "commands": commands})
+    # Feed-hedge draw-state so the EA can annotate the chart (retry count / hedge side / qty /
+    # entry price). {active:false, retry:N} when no hedge is open.
+    hedge_draw = {"active": False, "retry": 0}
+    try:
+        from pipeline import feed_hedge as _fh
+        if analysis_sym:
+            hedge_draw = _fh.chart_state(analysis_sym)
+    except Exception:
+        pass
+    return jsonify({"ok": True, "account": account, "commands": commands, "hedge": hedge_draw})
 
 
 @bp.post("/exec/ack")

@@ -17,7 +17,7 @@
 //|    POST {InpBridgeURL}/exec/ack   {account, results:[...]}        |
 //+------------------------------------------------------------------+
 #property copyright "Aniket"
-#property version   "1.04"
+#property version   "1.05"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -115,6 +115,29 @@ double JsonGetNumber(const string js, const string key)
       i++;
    }
    return StringToDouble(StringSubstr(js, start, i - start));
+}
+
+//+------------------------------------------------------------------+
+//| Extract a nested object value "key":{...} as a substring. Used so |
+//| generic keys (side/lot/price) inside the hedge object don't match |
+//| the same-named keys inside the commands[] array.                  |
+//+------------------------------------------------------------------+
+string JsonExtractObject(const string js, const string key)
+{
+   int k = StringFind(js, "\"" + key + "\"");
+   if(k < 0) return "";
+   int brace = StringFind(js, "{", k);
+   if(brace < 0) return "";
+   int depth = 0, i = brace;
+   int len = StringLen(js);
+   while(i < len)
+   {
+      ushort ch = StringGetCharacter(js, i);
+      if(ch == '{') depth++;
+      else if(ch == '}') { depth--; if(depth == 0) return StringSubstr(js, brace, i - brace + 1); }
+      i++;
+   }
+   return "";
 }
 
 //+------------------------------------------------------------------+
@@ -275,6 +298,57 @@ bool ExecPlacePending(const string cmd, ulong &ticket, int &retcode, string &err
       err = "phantom (not in book)";
       return false;
    }
+   err = "";
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Execute one OPEN_MARKET command — an immediate BUY/SELL at market  |
+//| under the given magic. Used by the server's feed-outage protective |
+//| hedge (magic 770990): when the Binance feed dies, the server opens  |
+//| an opposite-side market position to freeze net P&L, and CLOSE_ALLs  |
+//| it (same magic) on recovery. No SL/TP — it's removed on recovery,   |
+//| not target-managed. Same transient-reject retry as ExecPlacePending.|
+//+------------------------------------------------------------------+
+bool ExecOpenMarket(const string cmd, ulong &ticket, int &retcode, string &err)
+{
+   string sym     = JsonGetString(cmd, "symbol");
+   string side    = JsonGetString(cmd, "side");
+   string comment = JsonGetString(cmd, "comment");
+   long   magic   = (long)JsonGetNumber(cmd, "magic");
+   double lot     = NormalizeDouble(JsonGetNumber(cmd, "lot"), 2);
+
+   if(sym == "" || lot <= 0 || (side != "buy" && side != "sell"))
+   {
+      err = "bad fields"; retcode = 0; ticket = 0; return false;
+   }
+
+   trade.SetExpertMagicNumber(magic > 0 ? magic : InpMagic);
+
+   bool ok = false;
+   for(int attempt = 0; attempt < 2; attempt++)
+   {
+      if(side == "buy") ok = trade.Buy(lot, sym, 0.0, 0.0, 0.0, comment);
+      else              ok = trade.Sell(lot, sym, 0.0, 0.0, 0.0, comment);
+
+      retcode = (int)trade.ResultRetcode();
+      if(ok) break;
+      bool transientRej = (retcode == TRADE_RETCODE_PRICE_OFF    ||
+                           retcode == TRADE_RETCODE_REQUOTE      ||
+                           retcode == TRADE_RETCODE_PRICE_CHANGED||
+                           retcode == TRADE_RETCODE_TIMEOUT      ||
+                           retcode == TRADE_RETCODE_CONNECTION);
+      if(!transientRej || attempt == 1) break;
+      Sleep(200);
+   }
+
+   if(!ok)
+   {
+      err = trade.ResultRetcodeDescription();
+      ticket = 0;
+      return false;
+   }
+   ticket = trade.ResultDeal();
    err = "";
    return true;
 }
@@ -586,6 +660,9 @@ void PollAndExecute()
    int code = HttpPost(InpBridgeURL + "/exec/poll", pollBody, resp);
    if(code != 200) return;
 
+   //--- feed-outage hedge annotation (every poll, even with no commands)
+   DrawHedge(resp);
+
    string cmds[];
    int n = JsonSplitCommands(resp, cmds);
    if(n <= 0) return;
@@ -611,6 +688,17 @@ void PollAndExecute()
                   " @ ", DoubleToString(JsonGetNumber(cmds[i], "price"), _Digits),
                   " lot ", DoubleToString(JsonGetNumber(cmds[i], "lot"), 2),
                   ok ? (" → #" + IntegerToString((long)ticket)) : (" | " + err));
+      }
+      else if(type == "OPEN_MARKET")
+      {
+         ok = ExecOpenMarket(cmds[i], ticket, retcode, err);
+         extra = StringFormat(",\"ticket\":%I64u,\"retcode\":%d", ticket, retcode);
+         if(InpVerbose)
+            Print(ok ? "✅ " : "❌ ", "OPEN_MARKET ", JsonGetString(cmds[i], "side"),
+                  " ", JsonGetString(cmds[i], "symbol"),
+                  " lot ", DoubleToString(JsonGetNumber(cmds[i], "lot"), 2),
+                  " magic ", (long)JsonGetNumber(cmds[i], "magic"),
+                  ok ? (" → deal #" + IntegerToString((long)ticket)) : (" | " + err));
       }
       else if(type == "CLOSE_ALL")
       {
@@ -744,6 +832,69 @@ void DrawZone(int idx, const string kind, double lo, double hi)
       ZoneText("ztxt_" + IntegerToString(idx), tR, hi,
                (kind == "hvn" ? "HVN " : "LVN ") +
                DoubleToString(lo, _Digits) + "–" + DoubleToString(hi, _Digits), clr);
+}
+
+//--- Feed-outage protective hedge annotation. From the poll response "hedge" object:
+//    {active,side,lot,price,retry}. When active, draws a magenta H-line at the hedge entry
+//    price + a label "HEDGE {side} {lot} @ {price} · retry N". When inactive but retry>0,
+//    shows just the countdown label (feed stale, hedge not yet placed). Cleared otherwise.
+void DrawHedge(const string resp)
+{
+   string obj = JsonExtractObject(resp, "hedge");
+   string lineName = ZONE_PREFIX + "hedge_line";
+   string lblName  = ZONE_PREFIX + "hedge_lbl";
+   if(obj == "")
+   {
+      ObjectDelete(0, lineName); ObjectDelete(0, lblName);
+      return;
+   }
+   bool   isActive = (StringFind(obj, "\"active\":true") >= 0);
+   int    retry  = (int)JsonGetNumber(obj, "retry");
+
+   if(!isActive)
+   {
+      ObjectDelete(0, lineName);
+      if(retry > 0)   // feed stale, counting down to hedge — show the retry countdown
+      {
+         double px = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         if(ObjectFind(0, lblName) < 0) ObjectCreate(0, lblName, OBJ_TEXT, 0, TimeCurrent(), px);
+         ObjectSetInteger(0, lblName, OBJPROP_TIME,  0, TimeCurrent());
+         ObjectSetDouble (0, lblName, OBJPROP_PRICE, 0, px);
+         ObjectSetString (0, lblName, OBJPROP_TEXT,  StringFormat(" FEED STALE · retry %d", retry));
+         ObjectSetString (0, lblName, OBJPROP_FONT,  "Consolas");
+         ObjectSetInteger(0, lblName, OBJPROP_FONTSIZE, 9);
+         ObjectSetInteger(0, lblName, OBJPROP_COLOR, clrOrange);
+         ObjectSetInteger(0, lblName, OBJPROP_ANCHOR, ANCHOR_LEFT);
+         ObjectSetInteger(0, lblName, OBJPROP_SELECTABLE, false);
+      }
+      else ObjectDelete(0, lblName);
+      return;
+   }
+
+   string side = JsonGetString(obj, "side");
+   double lot  = JsonGetNumber(obj, "lot");
+   double price= JsonGetNumber(obj, "price");
+   if(price <= 0) price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   if(ObjectFind(0, lineName) < 0) ObjectCreate(0, lineName, OBJ_HLINE, 0, 0, price);
+   ObjectSetDouble (0, lineName, OBJPROP_PRICE, 0, price);
+   ObjectSetInteger(0, lineName, OBJPROP_COLOR, clrMagenta);
+   ObjectSetInteger(0, lineName, OBJPROP_STYLE, STYLE_DASHDOT);
+   ObjectSetInteger(0, lineName, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, lineName, OBJPROP_BACK,  false);
+   ObjectSetInteger(0, lineName, OBJPROP_SELECTABLE, false);
+
+   if(ObjectFind(0, lblName) < 0) ObjectCreate(0, lblName, OBJ_TEXT, 0, TimeCurrent(), price);
+   ObjectSetInteger(0, lblName, OBJPROP_TIME,  0, TimeCurrent());
+   ObjectSetDouble (0, lblName, OBJPROP_PRICE, 0, price);
+   ObjectSetString (0, lblName, OBJPROP_TEXT,
+      StringFormat(" HEDGE %s %.2f @ %s · retry %d", side, lot,
+                   DoubleToString(price, _Digits), retry));
+   ObjectSetString (0, lblName, OBJPROP_FONT,  "Consolas");
+   ObjectSetInteger(0, lblName, OBJPROP_FONTSIZE, 9);
+   ObjectSetInteger(0, lblName, OBJPROP_COLOR, clrMagenta);
+   ObjectSetInteger(0, lblName, OBJPROP_ANCHOR, ANCHOR_LEFT);
+   ObjectSetInteger(0, lblName, OBJPROP_SELECTABLE, false);
 }
 
 //--- ICT overlay primitives (named with ZONE_PREFIX so ClearZones sweeps them) -----
@@ -1048,7 +1199,7 @@ int OnInit()
    bool tradeAllowed = TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) &&
                        MQLInfoInteger(MQL_TRADE_ALLOWED);
    Print("─────────────────────────────────────────────");
-   Print("✅ FBExecBridge v1.03 — executor + labels + VP histogram + BB/squeeze pane");
+   Print("✅ FBExecBridge v1.05 — + venue bars (feed reconcile) + OPEN_MARKET (feed-outage hedge magic 770990)");
    Print("    Account:   ", gAccount);
    Print("    Bridge:    ", InpBridgeURL, "  (poll ", InpPollMs, "ms)");
    Print("    Magic:     ", InpMagic, "..", InpMagic + InpMagicRange - 1, " (strategy×TF range)");

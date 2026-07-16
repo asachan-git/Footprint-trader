@@ -31,6 +31,9 @@ _lock = threading.Lock()
 # Callback set by start(): (symbol, gap_start_ts, now_ts) -> None. Fires the aggTrades
 # self-heal on a stale→ok recovery. None when auto-backfill is disabled or unconfigured.
 _on_recover = None
+# Settings snapshot set by start() — lets check_once reach monitor.* config (feed-hedge) with
+# no signature change (existing check_once unit tests pass symbols/tf/gap only). None until start.
+_settings = None
 
 
 def health() -> dict[str, dict]:
@@ -61,6 +64,15 @@ def check_once(symbols: list[str], tf: str, gap_alert_secs: float,
             if status == "stale" and prev != "stale" and last_ts:
                 _gap_start[sym] = int(last_ts)
             gap_start = _gap_start.get(sym)
+        # Protective feed-hedge: on EVERY stale pass count toward the hedge threshold; the
+        # module opens the hedge once at the threshold and no-ops thereafter. Gated + fail-open
+        # inside feed_hedge. Runs regardless of transition (needs the per-pass count).
+        if _settings is not None and status == "stale":
+            try:
+                from pipeline import feed_hedge
+                feed_hedge.on_stale(sym, tf, _settings)
+            except Exception as e:
+                LOG.debug(f"[gap-monitor] {sym} hedge on_stale skipped: {e}")
         if status != prev:
             transitions.append({"symbol": sym, "status": status, "age_s": age})
             if status == "stale":
@@ -76,6 +88,13 @@ def check_once(symbols: list[str], tf: str, gap_alert_secs: float,
                         LOG.warning(f"[gap-monitor] {sym} backfill trigger failed: {e}")
                 with _lock:
                     _gap_start.pop(sym, None)
+                # Remove the protective hedge now that data is back.
+                if _settings is not None:
+                    try:
+                        from pipeline import feed_hedge
+                        feed_hedge.on_recovered(sym, tf, _settings)
+                    except Exception as e:
+                        LOG.debug(f"[gap-monitor] {sym} hedge on_recovered skipped: {e}")
     return transitions
 
 
@@ -135,7 +154,8 @@ def _make_recover_cb(settings: dict, tf: str, gap_alert_secs: float):
 
 def start(settings: dict) -> None:
     """Launch the monitor as a daemon thread. No-op if disabled in settings."""
-    global _on_recover
+    global _on_recover, _settings
+    _settings = settings
     mon = settings.get("monitor", {}) or {}
     if not mon.get("gap_monitor_enabled", True):
         LOG.info("[gap-monitor] disabled via settings.monitor.gap_monitor_enabled")

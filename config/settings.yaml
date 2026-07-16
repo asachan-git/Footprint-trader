@@ -67,6 +67,16 @@ monitor:
   feed_recon_heal_on_breach: false # OFF for calibration; flip true after tuning tolerances
   feed_recon_heal_cooldown_s: 300  # min seconds between heals per (symbol,tf)
 
+  # Feed-outage protective hedge (pipeline/feed_hedge.py). If the feed stays stale across
+  # feed_hedge_after_checks gap-monitor cycles (~30s each), open an opposite-side MARKET
+  # position sized to net grid exposure (Σ buy_lots − sell_lots) under the dedicated hedge
+  # magic (770990) to freeze P&L during the blind window; remove it on recovery. Keeps the
+  # balance intact across a Binance outage. NEEDS the recompiled EA (OPEN_MARKET command) —
+  # until then the command enqueues but the EA can't execute it.
+  feed_hedge_enabled: true
+  feed_hedge_after_checks: 3       # consecutive stale checks before hedging (~90s at 30s/check)
+  feed_hedge_min_lots: 0.01        # skip hedge if |net exposure| below this
+
 # Footprint-driven neutral-grid placement (/exec/emit_grid + FBExecBridge EA).
 # Planner reads these via .get() defaults — block is optional but canonical here.
 grid_levels:
