@@ -32,7 +32,15 @@ def atr(bars: list[Bar], period: int = 14) -> float:
 
 
 def atr_from_store(symbol: str, tf: str, period: int = 14) -> float:
-    """Convenience: fetch last `period+1` bars from state_store and compute ATR."""
+    """Convenience: fetch last `period+1` bars from state_store and compute ATR.
+
+    Drops the sentinel/forming bar (close_ts >= 9_000_000_000, e.g. the ts=9999999999
+    frozen bar carrying a STALE price) — it poisons the true-range with a huge phantom
+    gap (observed 2026-07-15: 1m ATR read 7.85 vs true ~0.8 because a sentinel bar sat at
+    4130 while price was 4034, a 96pt fake range → oversized 1m grid step → the TP fell
+    inside the ladder and legs placed with tp=0). Same filter maybe_emit uses. Fetch a few
+    extra bars so `period` real bars survive the drop."""
     from pipeline.state_store import store
-    bars = store().recent(symbol, tf, period + 1)
-    return atr(bars, period=period)
+    bars = [b for b in store().recent(symbol, tf, period + 4)
+            if getattr(b, "close_ts", 0) and b.close_ts < 9_000_000_000]
+    return atr(bars[-(period + 1):], period=period)

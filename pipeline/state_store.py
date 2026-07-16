@@ -64,8 +64,23 @@ class StateStore:
         for series in self._bars.values():
             series.sort(key=lambda b: b.close_ts)
 
+    # Reject bars whose close_ts is a sentinel / far-future placeholder. A forming-bar
+    # or test fixture with a max ts (e.g. 9999999999) would sort LAST and become the
+    # "newest" bar, poisoning every raw recent()/latest() consumer — ATR read a 96pt
+    # phantom range from such a bar (2026-07-15, bar_id ...|9999999999|cnttest, a leaked
+    # count-VP test fixture that put() persisted to the live footprint file → oversized
+    # 1m step → zeroed TP). Guard at the single write chokepoint so it can never persist.
+    _MAX_VALID_TS = 9_000_000_000   # ~year 2255; real epoch-seconds bars are far below
+
     def put(self, bar: Bar) -> bool:
-        """Idempotent insert. Returns True if new, False if duplicate bar_id."""
+        """Idempotent insert. Returns True if new, False if duplicate/invalid bar_id."""
+        _ts = getattr(bar, "close_ts", 0) or 0
+        if _ts <= 0 or _ts >= self._MAX_VALID_TS:
+            import logging
+            logging.getLogger("state_store").warning(
+                "[state_store] rejected sentinel/invalid-ts bar %s (close_ts=%s)",
+                getattr(bar, "bar_id", "?"), _ts)
+            return False
         with self._lock:
             series = self._bars[(bar.symbol, bar.tf)]
             for b in reversed(series):
