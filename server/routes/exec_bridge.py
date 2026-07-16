@@ -287,12 +287,18 @@ def _refresh_cycle_tp(account: str, broker_symbol: str, analysis_symbol: str,
     A leg's TP is set once at arm time (exec_emit_grid) and then frozen — if the HVN the
     fulcrum sits on drifts afterward, the cycle would ride a stale target until basket
     exit. This keeps the leg TP tracking the live structure instead. Fails open: any
-    error just skips this poll's refresh, never blocks/breaks the cycle."""
+    error just skips this poll's refresh, never blocks/breaks the cycle.
+
+    Gated by grid_levels.tp_refresh_enabled (default False — orders are STATIC once
+    armed; the HVN/LVN structure may drift after arm time but the leg TP does not
+    chase it). Flip true to re-enable the moving-TP behaviour."""
     try:
+        grid_cfg = settings.get("grid_levels") or {}
+        if not bool(grid_cfg.get("tp_refresh_enabled", False)):
+            return
         arm = ExecBridge.get_last_arm(account, broker_symbol, magic=magic)
         if not arm or not arm.get("active"):
             return
-        grid_cfg = settings.get("grid_levels") or {}
         # Only meaningful if legs actually carry a broker TP (leg_tp_ceiling / not
         # net_profit_exit_only) — a TP-less leg has nothing to refresh.
         leg_tp = (not bool(grid_cfg.get("net_profit_exit_only", False))
