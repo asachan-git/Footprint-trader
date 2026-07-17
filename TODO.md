@@ -2,6 +2,32 @@
 
 ---
 
+## Investigation
+
+- [ ] **Whipsaw / one-side-filled risk management deep-dive** — trace with
+  code + live data exactly how a grid cycle behaves once one side starts
+  filling while the other still rests:
+  - When one side's legs filled first, were the opposite side's still-resting
+    pendings cancelled, left alone, or something else? (trace
+    `monitor_cycle`/`enqueue_grid_plan`/`CANCEL_PENDINGS` call paths across the
+    June-22-live commit `4f387b7` vs current HEAD)
+  - What happened to the resting side specifically when `bias_book_trail`
+    fired vs when it never fired (fill_frac gate not reached, or no giveback)?
+  - How exactly did the June 22-24 system avoid the both-sides-fill →
+    delta-neutral → `full_hedge`-at-a-loss trap that hit recently? Was it
+    avoided by design, by market behavior that day, or by a mechanism no
+    longer present?
+  - How was Volume Profile computed and HVN/LVN zones detected on the
+    June-22-live code (`pipeline/features/volume_profile.py` at `4f387b7`) —
+    full method, smoothing, merging — compared to the current algorithm.
+  - Deliverable: a data-backed writeup (reusing the `4f387b7` vs `HEAD` diff
+    work and the June 22-24 broker statements already in this conversation)
+    showing the exact sequence of events for at least one real one-side-filled
+    cycle from the statements, cross-referenced against the code path that
+    produced it.
+
+---
+
 ## Active / In Progress
 
 - [ ] Collect 50+ paper trade outcomes and check `/stats` hit rate + expectancy
