@@ -53,8 +53,6 @@ CANCEL_PENDINGS = "CANCEL_PENDINGS"  # cancel pendings ONLY, leave positions (sa
 CLOSE_SIDE = "CLOSE_SIDE"        # close a fraction of ONE side's positions (bias-side booking)
 MOVE_BE = "MOVE_BE"              # move one side's positions' SL to breakeven (risk-free runner)
 OPEN_MARKET = "OPEN_MARKET"      # open a market position immediately (feed-outage hedge only)
-MODIFY_TP = "MODIFY_TP"          # set a new TP on one side's resting pendings + open positions
-                                  # (SL/entry price untouched — TP-only zone-shift refresh)
 
 # ── per-strategy × per-TF magic scheme ───────────────────────────────────────
 # magic = MAGIC_BASE + strat_code·10 + tf_code  →  e.g. hvn·15m = 770013,
@@ -130,8 +128,6 @@ class Command:
             d.update(side=self.side, frac=self.frac, comment=self.comment)
         elif self.type == OPEN_MARKET:
             d.update(side=self.side, lot=self.lot, comment=self.comment)
-        elif self.type == MODIFY_TP:
-            d.update(side=self.side, tp=self.tp, comment=self.comment)
         return d
 
 
@@ -256,9 +252,55 @@ class ExecBridge:
                 cls.set_last_arm(account, symbol, **{**cyc, "active": False, "flatten_ts": 0.0})
             elif (t - fts) > _FLATTEN_GRACE_S:
                 # close demonstrably didn't land (past the queue's reclaim window) → re-issue once
-                cls.enqueue(account, CLOSE_ALL, symbol, comment="FB|flatten|retry", magic=magic, now=t)
+                cls.enqueue(account, CLOSE_ALL, symbol,
+                           comment=f"FB|flatten|{cyc.get('armed_tf') or tf}|retry", magic=magic, now=t)
                 cls.set_last_arm(account, symbol, **{**cyc, "flatten_ts": t})
             return None
+
+        # 0.1) retry legs that failed placement with "inside freeze" (ack() stashed them —
+        # a client-side EA pre-check that rejects a stop too close to market; it never
+        # reaches the broker so the EA's own transient-reject retry never sees it, since
+        # freeze zones don't clear in 200ms). Checked BEFORE the positions<=0 flat-return
+        # below — a freshly-armed cycle with 0 fills yet (only resting pendings) is exactly
+        # when freeze-rejected legs exist and most need retrying, so this can't sit after
+        # that guard. Re-attempt once per poll tick, only once the CURRENT quote actually
+        # clears the freeze distance — buy_n/sell_n get bumped back up on success so the
+        # leg counts (and bias_trail_fill_frac's gate) reflect the full intended ladder
+        # again, not the reduced one from the failure.
+        retry_legs = list(cyc.get("pending_retry") or [])
+        if retry_legs:
+            q0 = cls.get_quote(account, symbol) or {}
+            bid0 = float(q0.get("bid") or 0.0)
+            ask0 = float(q0.get("ask") or 0.0)
+            if bid0 > 0 and ask0 > 0:
+                # Match the EA's OWN freeze check exactly (ExecPlacePending: buy vs ask,
+                # sell vs bid — not mid, which sits between the two and would under-count
+                # the true freeze distance, causing the EA to re-reject the retry anyway.
+                min_stop = float(q0.get("stops_dist") or 0.0)   # broker min-stop distance ($)
+                still_frozen: list[dict] = []
+                bumped = {"buy": 0, "sell": 0}
+                for leg in retry_legs:
+                    price = float(leg.get("price") or 0.0)
+                    order_type = leg.get("order_type")
+                    clear = (order_type == "buy_stop" and price >= ask0 + min_stop) or \
+                            (order_type == "sell_stop" and price <= bid0 - min_stop) or \
+                            min_stop <= 0   # no freeze-distance info from quote → don't block retry forever
+                    if not clear:
+                        still_frozen.append(leg)
+                        continue
+                    cls.enqueue(account, PLACE_PENDING, symbol, order_type=order_type,
+                               price=price, lot=float(leg.get("lot") or 0.0),
+                               tp=float(leg.get("tp") or 0.0), comment=leg.get("comment", ""),
+                               magic=magic, now=t)
+                    bumped["buy" if order_type == "buy_stop" else "sell"] += 1
+                if len(still_frozen) != len(retry_legs):
+                    updated = dict(cyc, pending_retry=still_frozen)
+                    for side in ("buy", "sell"):
+                        if bumped[side]:
+                            ckey = f"{side}_n"
+                            updated[ckey] = int(updated.get(ckey) or 0) + bumped[side]
+                    cls.set_last_arm(account, symbol, **updated)
+                    cyc = updated
 
         # track high-water of open positions (basis for flatten-rest) + resting pendings
         # (so a never-filled cycle can be retired); both reset per arm.
@@ -292,44 +334,54 @@ class ExecBridge:
         min_target = float(grid_cfg.get("cycle_min_target_usd", 0.20) or 0.0)
         close_on_full_hedge = bool(grid_cfg.get("cycle_close_on_full_hedge", True))
 
-        # 0.5) bias-side trailing book — directional profit capture, independent of the
-        # net-basket exit (which a hedge leg can mask). Gate: a side has ALL its legs
-        # filled (the move committed your way). Track that side's peak floating P&L; when
-        # it gives back ≥ giveback% from the peak, BOOK half that side and move the rest
-        # to breakeven (risk-free runner). Fires once per cycle (bias_booked guard).
-        if (bool(grid_cfg.get("bias_trail_enabled", True))
-                and not cyc.get("bias_booked")
-                and buy_pnl is not None and sell_pnl is not None):
-            buy_n = int(cyc.get("buy_n") or 0)
-            sell_n = int(cyc.get("sell_n") or 0)
-            bias = ""
-            if buy_n > 0 and int(buys or 0) >= buy_n:
-                bias = "buy"
-            elif sell_n > 0 and int(sells or 0) >= sell_n:
-                bias = "sell"
-            if bias:
-                side_pnl = float(buy_pnl if bias == "buy" else sell_pnl)
-                peak = max(float(cyc.get("bias_peak") or 0.0), side_pnl)
+        # 0.5) cycle-wide trailing book — directional profit capture on the CYCLE's
+        # combined net P&L (buy+sell together), independent of the net-basket TARGET
+        # exit below (which requires reaching base_target; this can fire earlier on a
+        # give-back from any peak). Gate: at least bias_trail_fill_frac of the cycle's
+        # TOTAL legs are filled (default 50%) before tracking starts — a single filled
+        # leg could swing past bias_trail_activate_usd and back with nothing tracking it
+        # otherwise. Track the cycle's peak net floating P&L; when it gives back ≥
+        # giveback% from that peak, book bias_book_frac of BOTH sides and move the rest
+        # to breakeven (risk-free runner), matching how CLOSE_ALL/full-hedge already
+        # treat the cycle as one basket rather than per-side.
+        #
+        # Single cycle-wide peak/booked flag — NOT per-side (bias_peak_buy/sell). A
+        # trade-off vs the prior per-side version: if net P&L peaks while one side is
+        # winning big and the other is small/resting, then reverses HARD on the other
+        # side after this books, there's no independent per-side trail left to catch
+        # that reversal — only net_target/full_hedge remain as backstops. Accepted
+        # explicitly in favor of a simpler, single running-profit-for-the-cycle trail.
+        if (bool(grid_cfg.get("bias_trail_enabled", True)) and pnl is not None
+                and not cyc.get("bias_booked")):
+            total_n = int(cyc.get("buy_n") or 0) + int(cyc.get("sell_n") or 0)
+            filled_n = int(buys or 0) + int(sells or 0)
+            fill_frac = float(grid_cfg.get("bias_trail_fill_frac", 0.5) or 0.5)
+            activate = float(grid_cfg.get("bias_trail_activate_usd", 5.0) or 0.0)
+            giveback = float(grid_cfg.get("bias_trail_giveback_pct", 40.0) or 0.0)
+            book_frac = float(grid_cfg.get("bias_book_frac", 0.5) or 0.5)
+
+            if total_n > 0 and filled_n >= fill_frac * total_n:
+                cycle_pnl = float(pnl)
+                peak = max(float(cyc.get("bias_peak") or 0.0), cycle_pnl)
                 if peak != float(cyc.get("bias_peak") or 0.0):
                     cyc["bias_peak"] = peak
                     cls.set_last_arm(account, symbol, **cyc)
-                activate = float(grid_cfg.get("bias_trail_activate_usd", 5.0) or 0.0)
-                giveback = float(grid_cfg.get("bias_trail_giveback_pct", 40.0) or 0.0)
-                book_frac = float(grid_cfg.get("bias_book_frac", 0.5) or 0.5)
                 if (activate > 0 and peak >= activate
-                        and side_pnl <= peak * (1.0 - giveback / 100.0)):
-                    cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic, side=bias,
-                                frac=book_frac, comment=f"FB|book|{bias}", now=t)
-                    cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=bias,
-                                comment=f"FB|be|{bias}", now=t)
+                        and cycle_pnl <= peak * (1.0 - giveback / 100.0)):
+                    comment_tf = cyc.get("armed_tf") or tf
+                    for side in ("buy", "sell"):
+                        cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic, side=side,
+                                    frac=book_frac, comment=f"FB|book|{comment_tf}|{side}", now=t)
+                        cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=side,
+                                    comment=f"FB|be|{comment_tf}|{side}", now=t)
                     cls.set_last_arm(account, symbol, **{**cyc, "bias_booked": True})
                     _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
                                       "tf": tf, "magic": magic, "exit_reason": "bias_book_trail",
-                                      "bias": bias, "peak": round(peak, 2),
-                                      "side_pnl": round(side_pnl, 2), "book_frac": book_frac,
+                                      "peak": round(peak, 2), "cycle_pnl": round(cycle_pnl, 2),
+                                      "book_frac": book_frac,
                                       "squeeze_ok": cyc.get("squeeze_ok"),
                                       "squeeze_rank": cyc.get("squeeze_rank")})
-                    return "bias_book_trail"   # cycle continues (runner + hedge); no flatten
+                    return "bias_book_trail"
 
         reason: str | None = None
         detail: dict = {}
@@ -358,7 +410,12 @@ class ExecBridge:
         if reason is None:
             return None
 
-        cls.enqueue(account, CLOSE_ALL, symbol, comment=f"FB|flatten|{reason}", magic=magic, now=t)
+        # MT5 order comment cap ~31 chars — "FB|flatten|15m|leg_closed_other" sits AT
+        # that boundary with zero margin, so clip defensively. The full `reason` string
+        # is still what goes to the audit log/exit-reason return value; only the
+        # broker-visible comment is shortened.
+        cls.enqueue(account, CLOSE_ALL, symbol,
+                   comment=f"FB|flatten|{cyc.get('armed_tf') or tf}|{reason}"[:31], magic=magic, now=t)
         cls.set_last_arm(account, symbol, **{**cyc, "flatten_ts": t})
         _emit_exit_audit({"account": str(account), "broker_symbol": symbol, "tf": tf, "magic": magic,
                           "exit_reason": reason, "armed_tf": cyc.get("armed_tf", ""),
@@ -484,11 +541,14 @@ class ExecBridge:
         winning side can't book while the losing side dangles (a per-leg TP hit ≠ a
         net-positive cycle). The basket net-target exit (monitor_cycle) then owns ALL
         profit-taking and only closes when the whole cycle is net ≥ target."""
-        # Per-order tag = strategy + TF, so each grid's legs are identifiable in the MT5
-        # comment even without decoding the magic number: FB|hvn|15m|b1, FB|vah|5m|s2 …
-        # (vp_level_touch → its level_type; hvn_inside_touch → "hvn"; else the trigger
-        # kind). All legs of one grid share the level+tf; b/s + index distinguish legs.
-        # (MT5 comment cap ~31 chars — the longest tag still fits with room to spare.)
+        # Per-order tag = the source level, so each grid's legs are identifiable in the
+        # MT5 comment: FB|poc|5m|b1, FB|vah|15m|s2, FB|hvn|1m|b3 … (vp_level_touch → its
+        # level_type; hvn_inside_touch → "hvn"; else the trigger kind). TF disambiguates
+        # magic in the MT5 history view without cross-referencing the magic number — a
+        # symbol can run several TF cycles of the same setup in parallel (magic already
+        # encodes strat×TF, but the comment is what's visible in the terminal at a glance).
+        # All legs of one grid share the level+tf; b/s + index distinguish legs. (MT5
+        # comment cap ~31 chars — longest case FB|vp_level|15m|b7 is 18, comfortably fits.)
         ctx = getattr(plan, "trigger_context", {}) or {}
         kind = getattr(plan, "trigger_kind", "") or ""
         if kind == "vp_level_touch":
@@ -499,7 +559,7 @@ class ExecBridge:
             tag = "sqz"
         else:
             tag = (kind[:8] or "grid")
-        tag = f"{tag}|{tf}" if tf else tag
+        tf_part = f"|{tf}" if tf else ""
 
         out: list[Command] = []
         if close_first:
@@ -513,12 +573,12 @@ class ExecBridge:
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="buy_stop",
                 price=leg.price, lot=leg.lot, sl=0.0, tp=buy_tp,
-                comment=f"FB|{tag}|b{i + 1}", magic=magic))
+                comment=f"FB|{tag}{tf_part}|b{i + 1}", magic=magic))
         for i, leg in enumerate(getattr(plan, "sell_legs", []) or []):
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="sell_stop",
                 price=leg.price, lot=leg.lot, sl=0.0, tp=sell_tp,
-                comment=f"FB|{tag}|s{i + 1}", magic=magic))
+                comment=f"FB|{tag}{tf_part}|s{i + 1}", magic=magic))
         return out
 
     # ── poll (EA pulls) ──────────────────────────────────────────────────────
@@ -546,6 +606,21 @@ class ExecBridge:
     def ack(cls, results: list[dict]) -> dict:
         """Finalise commands from EA results: [{id, ok, ticket, retcode, error}]."""
         done = failed = unknown = 0
+        # A failed PLACE_PENDING leg (e.g. "inside freeze") never becomes a fillable
+        # position, but buy_n/sell_n (set at arm time from the PLANNED leg count, before
+        # any broker result is known) still counts it — so bias_trail_fill_frac's
+        # filled_n >= fill_frac*total_n gate stays out of reach if enough near-market
+        # legs get rejected (common: they're closest to price, most likely to freeze-
+        # reject, and also the ones most likely to fill first). Decrement the arm
+        # record's count for that side so the gate reflects legs that could ACTUALLY fill.
+        #
+        # "inside freeze" is a CLIENT-SIDE pre-check in the EA (price too close to
+        # market at that instant) — it never reaches the broker, so the EA's own 200ms
+        # transient-reject retry never sees it (freeze zones don't clear that fast).
+        # Stash the leg's price/lot/tp/comment/order_type as a pending_retry entry so
+        # monitor_cycle can re-attempt it on a later poll, once price has moved clear.
+        arm_decrements: dict[tuple, dict[str, int]] = {}   # (account, symbol, magic) → {"buy":n, "sell":n}
+        arm_retries: dict[tuple, list[dict]] = {}          # (account, symbol, magic) → [leg dict, ...]
         with cls._lock:
             for r in results or []:
                 cid = str(r.get("id") or "")
@@ -560,7 +635,30 @@ class ExecBridge:
                 else:
                     c.status = FAILED
                     failed += 1
+                    if c.type == PLACE_PENDING and c.order_type in ("buy_stop", "sell_stop"):
+                        side = "buy" if c.order_type == "buy_stop" else "sell"
+                        key = (c.account, c.symbol, c.magic)
+                        arm_decrements.setdefault(key, {"buy": 0, "sell": 0})[side] += 1
+                        if "inside freeze" in str(r.get("error") or ""):
+                            arm_retries.setdefault(key, []).append({
+                                "order_type": c.order_type, "price": c.price, "lot": c.lot,
+                                "tp": c.tp, "comment": c.comment,
+                            })
                 cls._audit("ack", c)
+        for key in set(arm_decrements) | set(arm_retries):
+            acct, sym, magic = key
+            cyc = cls.get_last_arm(acct, sym, magic=magic)
+            if not cyc:
+                continue
+            updated = dict(cyc)
+            dec = arm_decrements.get(key, {"buy": 0, "sell": 0})
+            for side in ("buy", "sell"):
+                if dec[side]:
+                    ckey = f"{side}_n"
+                    updated[ckey] = max(0, int(updated.get(ckey) or 0) - dec[side])
+            if key in arm_retries:
+                updated["pending_retry"] = list(updated.get("pending_retry") or []) + arm_retries[key]
+            cls.set_last_arm(acct, sym, **updated)
         return {"done": done, "failed": failed, "unknown": unknown}
 
     # ── introspection (tests / dashboard) ──────────────────────────────────────

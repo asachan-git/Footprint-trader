@@ -18,7 +18,7 @@ from pathlib import Path
 
 from flask import Blueprint, current_app, jsonify, request
 
-from execution.exec_bridge import ExecBridge, magic_for, tf_from_magic, MODIFY_TP
+from execution.exec_bridge import ExecBridge, magic_for, tf_from_magic
 
 bp = Blueprint("exec_bridge", __name__)
 _EMIT_LOG = Path(__file__).resolve().parent.parent.parent / "data" / "exec_emit.jsonl"
@@ -187,8 +187,6 @@ def exec_poll():
                                          pnl=float(m.get("pnl", 0.0)), buys=b, sells=s,
                                          buy_pnl=float(m.get("buy_pnl", 0.0)),
                                          sell_pnl=float(m.get("sell_pnl", 0.0)))
-                if analysis_sym:
-                    _refresh_cycle_tp(account, sym, analysis_sym, tf_m, mg, settings_cfg or {})
             except Exception:
                 LOG.exception("[exec] per-magic cycle monitor error")  # never break the poll
     elif sym and ("positions" in body or "pendings" in body):
@@ -274,90 +272,6 @@ def _feed_stale_skip(analysis_symbol: str, broker_symbol: str, tf: str, grid_cfg
     return True
 
 
-_TP_REFRESH_LAST_BAR: dict = {}   # (account, broker_symbol, tf, magic) → last analysis close_ts checked
-
-
-def _refresh_cycle_tp(account: str, broker_symbol: str, analysis_symbol: str,
-                      tf: str, magic: int, settings: dict) -> None:
-    """Once per NEW closed analysis bar on this TF, recompute the cycle's structural TP
-    from the CURRENT HVN/VP structure and — if it moved beyond a noise floor — push a
-    fresh TP to the resting pendings and any filled position(s) on that side. Entry
-    price and SL are never touched here; this only chases the target, not the ladder.
-
-    A leg's TP is set once at arm time (exec_emit_grid) and then frozen — if the HVN the
-    fulcrum sits on drifts afterward, the cycle would ride a stale target until basket
-    exit. This keeps the leg TP tracking the live structure instead. Fails open: any
-    error just skips this poll's refresh, never blocks/breaks the cycle.
-
-    Gated by grid_levels.tp_refresh_enabled (default False — orders are STATIC once
-    armed; the HVN/LVN structure may drift after arm time but the leg TP does not
-    chase it). Flip true to re-enable the moving-TP behaviour."""
-    try:
-        grid_cfg = settings.get("grid_levels") or {}
-        if not bool(grid_cfg.get("tp_refresh_enabled", False)):
-            return
-        arm = ExecBridge.get_last_arm(account, broker_symbol, magic=magic)
-        if not arm or not arm.get("active"):
-            return
-        # Only meaningful if legs actually carry a broker TP (leg_tp_ceiling / not
-        # net_profit_exit_only) — a TP-less leg has nothing to refresh.
-        leg_tp = (not bool(grid_cfg.get("net_profit_exit_only", False))
-                  or bool(grid_cfg.get("leg_tp_ceiling", False)))
-        if not leg_tp:
-            return
-
-        from pipeline.state_store import store
-        latest = store().latest(analysis_symbol, tf)
-        if latest is None or not latest.ohlc.c:
-            return
-        key = (str(account), broker_symbol, tf, magic)
-        if _TP_REFRESH_LAST_BAR.get(key) == latest.close_ts:
-            return   # already checked this closed bar
-        _TP_REFRESH_LAST_BAR[key] = latest.close_ts
-
-        quote = ExecBridge.get_quote(account, broker_symbol)
-        if not quote:
-            return
-        buy_n, sell_n = int(arm.get("buy_n") or 0), int(arm.get("sell_n") or 0)
-        if buy_n <= 0 and sell_n <= 0:
-            return   # nothing resting/filled on either side — nothing to refresh
-
-        from execution.grid_planner import plan_grid_levels
-        min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
-        plan = plan_grid_levels(analysis_symbol, tf, float(latest.ohlc.c),
-                                trigger_hint=str(arm.get("trigger_kind") or ""),
-                                settings=settings, venue_price=float(quote["mid"]),
-                                min_step_venue=min_step_venue)
-        if plan.verdict != "arm":
-            return   # structure gone/invalid — leave the existing TP alone (basket exit still owns risk)
-
-        tol = max(float(quote["mid"]) * float(grid_cfg.get("emit_dedup_pct", 0.0007) or 0.0007), 1e-6)
-        old_tp_up = float(arm.get("tp_up") or 0.0)
-        old_tp_down = float(arm.get("tp_down") or 0.0)
-        new_tp_up, new_tp_down = float(plan.buy_tp or 0.0), float(plan.sell_tp or 0.0)
-        updated = dict(arm)
-        moved = False
-
-        if buy_n > 0 and new_tp_up > 0 and abs(new_tp_up - old_tp_up) > tol:
-            ExecBridge.enqueue(account, MODIFY_TP, broker_symbol, magic=magic, side="buy",
-                               tp=new_tp_up, comment="FB|tp_refresh|buy")
-            updated["tp_up"] = new_tp_up
-            moved = True
-        if sell_n > 0 and new_tp_down > 0 and abs(new_tp_down - old_tp_down) > tol:
-            ExecBridge.enqueue(account, MODIFY_TP, broker_symbol, magic=magic, side="sell",
-                               tp=new_tp_down, comment="FB|tp_refresh|sell")
-            updated["tp_down"] = new_tp_down
-            moved = True
-
-        if moved:
-            ExecBridge.set_last_arm(account, broker_symbol, **updated)
-            _emit_audit({"account": account, "symbol": analysis_symbol, "tf": tf, "magic": magic,
-                         "verdict": "tp_refresh", "tp_up_old": old_tp_up, "tp_down_old": old_tp_down,
-                         "tp_up": new_tp_up, "tp_down": new_tp_down})
-    except Exception as e:
-        LOG.debug(f"[tp_refresh] skipped {broker_symbol}/{tf} magic={magic}: {e}")
-
-
 @bp.post("/exec/emit_grid")
 def exec_emit_grid():
     """Build the neutral grid for `symbol`/`tf`, rebase onto the account's cached
@@ -392,13 +306,6 @@ def exec_emit_grid():
     grid_cfg = settings.get("grid_levels") or {}
     if _feed_stale_skip(symbol, broker_symbol, tf, grid_cfg):
         return jsonify({"ok": True, "verdict": "skip", "skip_reason": "feed_stale",
-                        "symbol": symbol, "broker_symbol": broker_symbol})
-
-    # Per-TF arm gate: some TFs may be excluded from opening NEW grid cycles (e.g.
-    # disabling 1h) while their bars/htf_bias_map usage elsewhere stays untouched.
-    disabled_tfs = set(grid_cfg.get("disabled_tfs") or [])
-    if tf in disabled_tfs:
-        return jsonify({"ok": True, "verdict": "skip", "skip_reason": f"tf_disabled:{tf}",
                         "symbol": symbol, "broker_symbol": broker_symbol})
 
     # venue quote the EA last reported (the rebase target)
@@ -504,6 +411,7 @@ def exec_emit_grid():
                             n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
                             buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
                             bias_peak=0.0, bias_booked=False,
+                            pending_retry=[],
                             node_low=round(node_low, 5), node_high=round(node_high, 5),
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
                             net_target_usd=net_target, max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
@@ -590,18 +498,20 @@ def exec_test_order():
 
 @bp.post("/exec/zones")
 def exec_zones():
-    """HVN/LVN zones for the EA to draw.
+    """HVN/LVN zones for the EA to draw. `zones` is the cached, session-anchored
+    DAILY VP (vp_cache.get) — the SAME source the dashboard's VolumeProfile panel
+    renders, for visual parity across the whole session.
 
-    HVN zones use the SAME source the live detector arms against — _session_hvn_zones
-    (rolling+cached blend, per `tf`), additively rebased onto the venue — so the drawn
-    box always matches what actually triggered. Falls back to the cached daily VP
-    (dashboard's source) if `tf` is omitted or the session lookup fails.
-    LVN zones stay on the cached daily VP (no session-LVN detector exists to mismatch
-    against).
+    `zones_session`, when `tf` is given, is the SAME session-blended HVN source
+    hvn_inside_touch actually arms on (zone_triggers._session_hvn_zones — rolling
+    intrasession VP during NY/London/Overlap, cached daily during Asia/Off, plus the
+    prior-day vacuum-fallback node). During NY/London/Overlap this can differ from
+    `zones` since rolling VP reacts faster than the cached daily profile; draw it so
+    the touched edge on-screen matches the edge the emitter actually straddles.
 
-    Body: {account, symbol(broker or analysis), [tf]}. `tf` drives the HVN session
-    lookup — pass the TF the grid is armed on for zones that match the live trigger.
-    Returns {ok, zones:[{kind, lo, hi}], venue_mid, fulcrum}.
+    Body: {account, symbol(broker or analysis), [tf]}. `tf` (e.g. "5m"/"15m") is
+    required for `zones_session`; omitted → zones_session is empty.
+    Returns {ok, zones:[{kind, lo, hi}], zones_session:[{kind, lo, hi}], venue_mid, fulcrum}.
     """
     if not _auth_ok():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
@@ -615,39 +525,14 @@ def exec_zones():
     symbol = broker_to_analysis.get(req_symbol, req_symbol)
     broker_symbol = symbol_map.get(symbol, req_symbol)
 
+    # Same call as the dashboard (server/routes/dashboard.py): cached daily VP with
+    # the additive venue offset already applied → zones are in the venue frame.
     from pipeline.features import vp_cache
     daily = vp_cache.get(symbol, "daily") or {}
     zones = []
-
-    # HVN zones: match the LIVE detector (_t_hvn_inside_touch uses _session_hvn_zones —
-    # a session-aware rolling+cached blend), not the cached-daily-only VP — otherwise the
-    # chart can draw a different HVN box than the one that actually armed. Rebased onto
-    # the venue with the SAME additive shift as _rebase_to_venue (venue - analysis), since
-    # _session_hvn_zones returns analysis-frame prices. Falls back to the cached daily VP
-    # (old behaviour) if no tf/bars/quote are available.
-    tf_for_zones = str(body.get("tf") or "")
-    hvn_zones_out = None
-    if tf_for_zones:
-        try:
-            from pipeline.state_store import store as _zstore
-            from execution.zone_triggers import _session_hvn_zones, _VP_WIN
-            _win = _VP_WIN.get(tf_for_zones, 96)
-            _bars = _zstore().recent(symbol, tf_for_zones, _win + 5)
-            if _bars:
-                _sess_zones, _ = _session_hvn_zones(symbol, tf_for_zones, _bars)
-                _quote_early = ExecBridge.get_quote(account, broker_symbol) or {}
-                _shift = float(_quote_early.get("mid") or 0.0) - float(_bars[-1].ohlc.c or 0.0)
-                if _sess_zones and abs(_shift) < 1e9:   # sanity: a real shift, not garbage
-                    hvn_zones_out = [(lo + _shift, hi + _shift) for lo, hi in _sess_zones]
-        except Exception:
-            hvn_zones_out = None
-    if hvn_zones_out is None:
-        # Same call as the dashboard (server/routes/dashboard.py): cached daily VP with
-        # the additive venue offset already applied → zones are in the venue frame.
-        hvn_zones_out = [(float(z["low"]), float(z["high"])) for z in (daily.get("hvn_zones") or [])]
-    for lo, hi in hvn_zones_out:
-        zones.append({"kind": "hvn", "lo": round(lo, 5), "hi": round(hi, 5)})
-
+    for z in (daily.get("hvn_zones") or []):
+        zones.append({"kind": "hvn", "lo": round(float(z["low"]), 5),
+                      "hi": round(float(z["high"]), 5)})
     for z in (daily.get("lvn_zones") or []):
         zones.append({"kind": "lvn", "lo": round(float(z["low"]), 5),
                       "hi": round(float(z["high"]), 5)})
@@ -670,6 +555,30 @@ def exec_zones():
     vp_bin = prof.get("bin", 0.0)
 
     quote = ExecBridge.get_quote(account, broker_symbol) or {}
+
+    # Session-blended HVN zones — the SAME source hvn_inside_touch arms on
+    # (zone_triggers._session_hvn_zones), rebased analysis→venue the same way
+    # plan_grid_levels rebases the emitted grid (ratio = venue_mid / analysis_close).
+    # Only computed when the EA supplies a tf, since the source is per-TF.
+    zones_session = []
+    zone_tf_req = str(body.get("tf") or "")
+    if zone_tf_req:
+        try:
+            from pipeline.state_store import store
+            from execution.zone_triggers import _session_hvn_zones
+            bars = store().recent(symbol, zone_tf_req, 101)
+            if bars:
+                sess_zones, _sess = _session_hvn_zones(symbol, zone_tf_req, bars)
+                analysis_anchor = float(bars[-1].ohlc.c)
+                venue_mid = float(quote.get("mid") or 0.0)
+                ratio = (venue_mid / analysis_anchor
+                         if analysis_anchor > 0 and venue_mid > 0 else 1.0)
+                zones_session = [
+                    {"kind": "hvn", "lo": round(lo * ratio, 5), "hi": round(hi * ratio, 5)}
+                    for lo, hi in sess_zones
+                ]
+        except Exception:
+            zones_session = []
     # dashboard shows the cycle for the EA's drawn TF (body.tf). Cycles are now per-TF,
     # so without a tf we'd find nothing — default to the zone TF the EA reports.
     zone_tf = str(body.get("tf") or "")
@@ -691,7 +600,8 @@ def exec_zones():
             ict_out["side"] = ov.get("side", "")
             ict_out["status"] = ov.get("status", "")
 
-    return jsonify({"ok": True, "zones": zones, "levels": levels, "ict": ict_out,
+    return jsonify({"ok": True, "zones": zones, "zones_session": zones_session,
+                    "levels": levels, "ict": ict_out,
                     "profile": profile, "vp_bin": vp_bin,
                     "venue_mid": quote.get("mid", 0.0),
                     "symbol": symbol, "broker_symbol": broker_symbol,
@@ -709,23 +619,3 @@ def exec_queue():
     account = request.args.get("account")
     return jsonify({"ok": True, "commands": ExecBridge.snapshot(account),
                     "last_poll_body": getattr(ExecBridge, "last_poll_body", None)})
-
-
-@bp.post("/exec/close_magic")
-def exec_close_magic():
-    """Manual one-off flatten: CLOSE_ALL (positions + pendings) scoped to one magic.
-    For operator-initiated exits (e.g. clearing a cycle before a server restart) —
-    the EA drains this exactly like any other CLOSE_ALL. Does not touch _last_arm;
-    a later poll's flat report naturally marks the cycle inactive."""
-    if not _auth_ok():
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    body = request.get_json(silent=True) or {}
-    account = str(body.get("account") or "")
-    symbol = str(body.get("symbol") or "")
-    magic = int(body.get("magic") or 0)
-    if not account or not symbol or not magic:
-        return jsonify({"ok": False, "error": "account, symbol, magic required"}), 400
-    from execution.exec_bridge import CLOSE_ALL
-    cmd = ExecBridge.enqueue(account, CLOSE_ALL, symbol, magic=magic, comment="FB|manual_close")
-    LOG.warning(f"[exec] manual close_magic {account}/{symbol} magic={magic} id={cmd.id}")
-    return jsonify({"ok": True, "id": cmd.id})
