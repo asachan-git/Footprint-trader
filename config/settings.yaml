@@ -89,9 +89,9 @@ grid_levels:
 
   base_lot: 0.25
   lot_step: 0.25
-  tp_atr_mult: 1.5
+  tp_atr_mult: 2
   hvn_max_legs: 8
-  max_fulcrum_dist_pct: 0.02
+  max_fulcrum_dist_pct: 0.05
   # Cycle exit (server-side cycle monitor). DEMO ONLY — strategy is -EV.
   # Net-profit-exit-only: place legs with NO per-order TP so the winning side can't book
   # while the losing side dangles (a per-leg TP hit ≠ a net-positive cycle). The basket
@@ -105,11 +105,6 @@ grid_levels:
   # structure. The basket net_target stays primary (it's closer → fires first in the
   # common case); the leg TP is the backstop. false = truly TP-less legs.
   leg_tp_ceiling: true
-  # TP refresh on HVN/LVN zone shift: once per new closed bar, recompute each active
-  # cycle's structural TP from the CURRENT HVN/VP structure and push it (MODIFY_TP) if
-  # it moved beyond a noise floor. false (default) = orders are STATIC — the TP set at
-  # arm time never changes even if the underlying HVN/LVN drifts afterward.
-  tp_refresh_enabled: false
   # HVN inside-touch reversion bias: a rejection at an edge is a fade INTO the node, so
   # skew lots to the into-node side + target POC on that side (breakout side stays light,
   # far next-HVN target). Directional inventory → a net-profit exit price exists. false =
@@ -130,17 +125,24 @@ grid_levels:
   cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full
   cycle_min_target_usd: 0.20     # floor; must be >0 so a hedged cycle still has a positive net-$ exit
   cycle_close_on_full_hedge: true  # cut a fully-hedged (delta-neutral) cycle to free margin
-  # Bias-side trailing book: when ONE side has ALL its legs filled (the move committed
-  # that way), track its peak floating P&L; on a give-back from peak, BOOK a fraction of
-  # that side and move the rest to breakeven (risk-free runner). Captures directional
-  # profit the net-basket exit masks (a hedge leg drags net down → target never hits).
+  # Bias-side trailing book: when ONE side has ≥ bias_trail_fill_frac of its legs filled
+  # (the move committed that way), track its peak floating P&L; on a give-back from peak,
+  # BOOK a fraction of that side and move the rest to breakeven (risk-free runner).
+  # Captures directional profit the net-basket exit masks (a hedge leg drags net down →
+  # target never hits).
   bias_trail_enabled: true
-  bias_trail_activate_usd: 250.0   # bias-side floating must PEAK ≥ this ($) to arm the trail
+  # fill_frac was 100% (ALL legs) — on a 5-6 leg ladder that's rarely reached, so a side
+  # could swing well past bias_trail_activate_usd and back to a loss with NOTHING
+  # tracking it. Lowered to 50%: the trail arms once half that side's legs are filled,
+  # tracking peak/giveback from there. bias_booked is also now PER-SIDE (bias_booked_buy/
+  # sell), not one cycle-wide flag — booking one side no longer blocks the trail from
+  # ever tracking the other side later in the same cycle.
+  bias_trail_fill_frac: 0.5
+  bias_trail_activate_usd: 200.0   # bias-side floating must PEAK ≥ this ($) to arm the trail
   bias_trail_giveback_pct: 40    # fire when floating retraces this % off the peak
   bias_book_frac: 0.5            # fraction of the bias side's positions to book at the trigger
   # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
   triggers: [hvn_inside_touch, squeeze]   # "structural" group the emitter arms (vp_level_touch disabled)
-  disabled_tfs: [1h]   # TFs excluded from NEW grid arming (data ingestion / htf_bias_map unaffected)
   vp_fulcrum_levels: [poc, vah, val, naked_poc, lvn]   # which VP levels are fulcrums
   vp_tol_atr_mult: 0.25      # tap "test" band = max(this·ATR, vp_tol_pct·price)
   vp_tol_pct: 0.0005         # ATR-free floor for the tap band (replay safety)
@@ -215,10 +217,16 @@ vp_cache:
   #   BTC tick = 0.1 → 1.0 = 10-tick bins
   vp_bin_size:
     BTCUSDT:  25.0          # 25$ bins (Sierra/Bookmap convention for BTC ~1300/day range = ~52 bins)
-    XAUTUSDT: 1.0           # 1$ bins (was 0.5; gives ~25 bins per day for typical XAU range)
+    XAUTUSDT: 0.4           # 0.4 = coarsest bin where the 1.5-bin Gaussian smoothing floor
+                            # (0.6$) still lands below gold's ~2$ node spacing. At 1.0 the
+                            # smoothing floor (1.5$) exceeds node spacing so real nodes merge
+                            # into one blob (was producing a single 15pt+ HVN with 0 LVN).
   # Intra-day VP refresh — rebuild current day's POC/VAH/VAL/HVN/LVN every N
-  # primary-TF bars. Default 5 = every 5 minutes at 1m primary TF. Set 0 to disable.
-  intraday_refresh_bars: 5
+  # primary-TF bars. 1 = every bar (every 1 minute at 1m primary TF) — was 5, which let
+  # the cached zones lag up to 5min behind vp_cache.period_profile()'s always-fresh
+  # histogram after a fast move (zone boxes visually mismatched the drawn bars). Set 0
+  # to disable.
+  intraday_refresh_bars: 1
   # Venue price offset — shifts all VP levels (POC/VAH/VAL/HVN/LVN) to match execution venue.
   # "auto": compute at build time from Vantage MT5 mid vs ByBit last close (requires MT5 reachable).
   # <float>: static offset in price units applied directly (positive = Vantage trades higher than ByBit).
@@ -232,7 +240,7 @@ execution:
   broker: vantage_mt5
   tradable_symbols: [XAUTUSDT, BTCUSDT]
   symbol_map:
-    XAUTUSDT: "XAUUSD.pc"        # Vantage MT5 USC cent account
+    XAUTUSDT: "XAUUSD.pc"
     BTCUSDT:  "BTCUSD"
   # Risk-adjusted sizing: lots = (balance × risk_per_trade_pct) / (SL_distance × contract_size)
   # Set risk_per_trade_pct = 0 to disable; falls back to default_lots.
