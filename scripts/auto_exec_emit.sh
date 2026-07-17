@@ -59,16 +59,22 @@ else:
 
 # Each TF runs an INDEPENDENT parallel cycle (server keys cycles by TF, isolates by
 # strategy×TF magic) — they no longer contend for the symbol. Offsets keep coincident
-# closes off the same instant (avoids a thundering-herd at :00).
-emit_loop 1h  3600 20 &
-P1H=$!
-emit_loop 15m 900  8 &
-P15=$!
-emit_loop 5m  300  12 &
-P5=$!
-emit_loop 1m  60   3 &
-P1=$!
+# closes off the same instant (avoids a thundering-herd at :00). Override the TF set
+# per instance with FB_TFS (space-separated, from: 1h 15m 5m 1m) — same pattern as
+# FB_SETUPS above, e.g.  FB_TFS="1m 5m 15m" scripts/auto_exec_emit.sh ...
+TFS=(${FB_TFS:-1h 15m 5m 1m})
+PIDS=()
+for tf in "${TFS[@]}"; do
+  case "$tf" in
+    1h)  emit_loop 1h  3600 20 & ;;
+    15m) emit_loop 15m 900  8  & ;;
+    5m)  emit_loop 5m  300  12 & ;;
+    1m)  emit_loop 1m  60   3  & ;;
+    *) echo "[auto_exec_emit] unknown TF '$tf' in FB_TFS, skipping" >&2; continue ;;
+  esac
+  PIDS+=($!)
+done
 
-echo "[auto_exec_emit] running — 1H($P1H) 15m($P15) 5m($P5) 1m($P1). Ctrl-C to stop."
-trap 'kill $P1H $P15 $P5 $P1 2>/dev/null; echo "[auto_exec_emit] stopped."; exit 0' INT TERM
+echo "[auto_exec_emit] running — ${TFS[*]} (pids: ${PIDS[*]}). Ctrl-C to stop."
+trap 'kill "${PIDS[@]}" 2>/dev/null; echo "[auto_exec_emit] stopped."; exit 0' INT TERM
 wait
