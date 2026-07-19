@@ -17,7 +17,7 @@
 //|    POST {InpBridgeURL}/exec/ack   {account, results:[...]}        |
 //+------------------------------------------------------------------+
 #property copyright "Aniket"
-#property version   "1.07"
+#property version   "1.05"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -42,7 +42,6 @@ input color  InpLVNColor       = clrSandyBrown; // LVN zone fill
 input bool   InpShowZoneLabels = true;          // Label zones/levels with name + value
 input bool   InpDrawVP         = true;          // Draw computed volume profile (right margin)
 input int    InpVPMaxBars      = 50;            // VP histogram max width (bars)
-input int    InpVPRightBuffer  = 5;             // Empty gap (bars) between last candle and the VP histogram
 input color  InpVPColor        = clrDimGray;    // VP histogram bar colour
 input color  InpVPPocColor     = clrGoldenrod;  // VP histogram POC (max) bar colour
 
@@ -631,56 +630,6 @@ bool ExecMoveBE(const string cmd, int &moved, string &err)
 }
 
 //+------------------------------------------------------------------+
-//| Set a new TP on one side's resting pendings + open positions (magic-scoped).
-//| Entry price and SL are left exactly as they are — this only chases the target
-//| when the server recomputes a materially different structural TP. Idempotent:
-//| skips an order/position already at the requested TP (within a point).
-//+------------------------------------------------------------------+
-bool ExecModifyTP(const string cmd, int &modified, string &err)
-{
-   string sym   = JsonGetString(cmd, "symbol");
-   long   magic = (long)JsonGetNumber(cmd, "magic");
-   string side  = JsonGetString(cmd, "side");
-   int    digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
-   double tp    = NormalizeDouble(JsonGetNumber(cmd, "tp"), digits);
-   modified = 0; err = ""; bool allOk = true;
-
-   if(sym == "" || tp <= 0 || (side != "buy" && side != "sell"))
-   {
-      err = "bad fields"; return false;
-   }
-   double point = SymbolInfoDouble(sym, SYMBOL_POINT);
-
-   // Resting pendings on this side.
-   ENUM_ORDER_TYPE wantOrder = (side == "buy") ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP;
-   for(int i = 0; i < OrdersTotal(); i++)
-   {
-      if(!orderInfo.SelectByIndex(i)) continue;
-      if(orderInfo.Magic() != magic || orderInfo.Symbol() != sym
-         || orderInfo.OrderType() != wantOrder) continue;
-      if(MathAbs(orderInfo.TakeProfit() - tp) <= point) continue;   // already there
-      if(trade.OrderModify(orderInfo.Ticket(), orderInfo.PriceOpen(), orderInfo.StopLoss(), tp,
-                           ORDER_TIME_GTC, 0))
-         modified++;
-      else { allOk = false; err = "pending modify fail #" + IntegerToString((long)orderInfo.Ticket()); }
-   }
-
-   // Any already-filled position(s) on this side.
-   ENUM_POSITION_TYPE wantPos = (side == "buy") ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
-   for(int i = 0; i < PositionsTotal(); i++)
-   {
-      if(!posInfo.SelectByIndex(i)) continue;
-      if(posInfo.Magic() != magic || posInfo.Symbol() != sym
-         || posInfo.PositionType() != wantPos) continue;
-      if(MathAbs(posInfo.TakeProfit() - tp) <= point) continue;   // already there
-      if(trade.PositionModify(posInfo.Ticket(), posInfo.StopLoss(), tp))
-         modified++;
-      else { allOk = false; err = "position modify fail #" + IntegerToString((long)posInfo.Ticket()); }
-   }
-   return allOk;
-}
-
-//+------------------------------------------------------------------+
 //| Poll the queue, execute commands, build + POST the ack array.    |
 //+------------------------------------------------------------------+
 void PollAndExecute()
@@ -788,16 +737,6 @@ void PollAndExecute()
             Print(ok ? "✅ " : "⚠️ ", "MOVE_BE ", JsonGetString(cmds[i], "side"),
                   " → moved ", movedN, (err == "" ? "" : " | " + err));
       }
-      else if(type == "MODIFY_TP")
-      {
-         int modifiedN = 0;
-         ok = ExecModifyTP(cmds[i], modifiedN, err);
-         extra = StringFormat(",\"modified\":%d", modifiedN);
-         if(InpVerbose)
-            Print(ok ? "✅ " : "⚠️ ", "MODIFY_TP ", JsonGetString(cmds[i], "side"),
-                  " → tp ", DoubleToString(JsonGetNumber(cmds[i], "tp"), _Digits),
-                  " modified ", modifiedN, (err == "" ? "" : " | " + err));
-      }
       else
       {
          err = "unknown type " + type;
@@ -861,14 +800,18 @@ void DrawLevel(const string kind, double price)
    }
 }
 
-void DrawZone(int idx, const string kind, double lo, double hi)
+void DrawZone(int idx, const string kind, double lo, double hi, const string tag = "")
 {
-   string name  = ZONE_PREFIX + IntegerToString(idx);
+   string name  = ZONE_PREFIX + tag + IntegerToString(idx);
    int    secs  = PeriodSeconds(PERIOD_CURRENT);
    datetime tL  = TimeCurrent() - 120 * secs;
    datetime tR  = TimeCurrent() + 20 * secs;
-   color  clr   = (kind == "hvn") ? InpHVNColor : InpLVNColor;
-   bool   fill  = (kind == "hvn");   // HVN filled, LVN outline → visually distinct
+   bool   isSession = (tag == "sess_");
+   color  clr   = isSession ? clrLimeGreen : ((kind == "hvn") ? InpHVNColor : InpLVNColor);
+   // Daily zones filled; session-blended zones (the actual hvn_inside_touch arming
+   // source) drawn as an unfilled dashed outline so they're visually distinct —
+   // during NY/London/Overlap these can sit off the filled daily zone.
+   bool   fill  = (!isSession && kind == "hvn");
 
    if(ObjectFind(0, name) < 0)
    {
@@ -887,11 +830,12 @@ void DrawZone(int idx, const string kind, double lo, double hi)
    ObjectSetInteger(0, name, OBJPROP_FILL,    fill);
    ObjectSetInteger(0, name, OBJPROP_COLOR,   clr);
    ObjectSetInteger(0, name, OBJPROP_BGCOLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_STYLE,   isSession ? STYLE_DASH : STYLE_SOLID);
    ObjectSetInteger(0, name, OBJPROP_WIDTH,   1);
 
    if(InpShowZoneLabels)
-      ZoneText("ztxt_" + IntegerToString(idx), tR, hi,
-               (kind == "hvn" ? "HVN " : "LVN ") +
+      ZoneText("ztxt_" + tag + IntegerToString(idx), tR, hi,
+               (isSession ? "ARM " : (kind == "hvn" ? "HVN " : "LVN ")) +
                DoubleToString(lo, _Digits) + "–" + DoubleToString(hi, _Digits), clr);
 }
 
@@ -1066,9 +1010,7 @@ void DrawProfile(const string js)
    if(maxv <= 0.0) return;
 
    int      secs = PeriodSeconds(PERIOD_CURRENT);
-   // Start the histogram InpVPRightBuffer bars PAST the current candle — an empty gap
-   // so the profile never crowds/overlaps the most recently forming price action.
-   datetime t0   = TimeCurrent() + MathMax(InpVPRightBuffer, 0) * secs;
+   datetime t0   = TimeCurrent();
    double   half = vpbin / 2.0;
    for(int i = 0; i < n; i++)
    {
@@ -1113,6 +1055,19 @@ void FetchAndDrawZones()
       double lo   = JsonGetNumber(zs[i], "lo");
       double hi   = JsonGetNumber(zs[i], "hi");
       if(lo > 0 && hi > 0) DrawZone(i, kind, lo, hi);
+   }
+
+   //--- session-blended HVN zones (the actual hvn_inside_touch arming source —
+   //    zone_triggers._session_hvn_zones). Dashed green outline, drawn alongside the
+   //    filled daily zones above so the chart matches what the emitter arms on.
+   string zss[];
+   int ns = JsonSplitArray(resp, "zones_session", zss);
+   for(int i = 0; i < ns; i++)
+   {
+      string kind = JsonGetString(zss[i], "kind");
+      double lo   = JsonGetNumber(zss[i], "lo");
+      double hi   = JsonGetNumber(zss[i], "hi");
+      if(lo > 0 && hi > 0) DrawZone(i, kind, lo, hi, "sess_");
    }
 
    //--- draw the VP point-levels the grid triggers on (POC/VAH/VAL/naked-POC)
@@ -1262,7 +1217,7 @@ int OnInit()
    bool tradeAllowed = TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) &&
                        MQLInfoInteger(MQL_TRADE_ALLOWED);
    Print("─────────────────────────────────────────────");
-   Print("✅ FBExecBridge v1.07 — + MODIFY_TP (server-driven TP refresh on HVN zone shift)");
+   Print("✅ FBExecBridge v1.05 — + venue bars (feed reconcile) + OPEN_MARKET (feed-outage hedge magic 770990)");
    Print("    Account:   ", gAccount);
    Print("    Bridge:    ", InpBridgeURL, "  (poll ", InpPollMs, "ms)");
    Print("    Magic:     ", InpMagic, "..", InpMagic + InpMagicRange - 1, " (strategy×TF range)");

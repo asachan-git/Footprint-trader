@@ -346,32 +346,31 @@ def _resolve_skew(trigger: Trigger, regime, cfg: dict | None = None,
 
 # ── legs ────────────────────────────────────────────────────────────────────
 
-def _ladder(n: int, base_lot: float, lot_step: float, heavy_near_mid: bool) -> list[float]:
-    """LINEAR_REVERSED (heavy near mid) or LINEAR (light near mid), matching the
-    EA's ResolveLotForIndex semantics. Index 1 = nearest the fulcrum."""
+def _ladder(n: int, base_lot: float, lot_step: float) -> list[float]:
+    """LINEAR (light near mid, growing with distance from the fulcrum). Index 1 =
+    nearest the fulcrum. Never reversed — a heavy-near-mid ladder would put the
+    largest lot on the leg most likely to fill first and shrink further out, which
+    is backwards for a grid that adds exposure as price runs against it."""
     lots = []
     for i in range(1, n + 1):
-        if heavy_near_mid:
-            raw = base_lot + (n - i) * lot_step
-        else:
-            raw = base_lot + (i - 1) * lot_step
+        raw = base_lot + (i - 1) * lot_step
         lots.append(round(max(base_lot, raw), 2))
     return lots
 
 
 def _build_legs(fulcrum: float, n: int, step: float, skew: str,
                 base_lot: float, lot_step: float) -> tuple[list[Leg], list[Leg]]:
-    """fulcrum ± i·step prices. Favoured side gets the heavier/longer ladder."""
+    """fulcrum ± i·step prices. Favoured side gets one extra (longer) ladder."""
     buy_n = n
     sell_n = n
-    # Skew adds one extra leg + heavier ladder to the favoured side.
+    # Skew adds one extra leg to the favoured side.
     if skew == "buy":
         buy_n = n + 1
     elif skew == "sell":
         sell_n = n + 1
 
-    buy_lots = _ladder(buy_n, base_lot, lot_step, heavy_near_mid=(skew == "buy"))
-    sell_lots = _ladder(sell_n, base_lot, lot_step, heavy_near_mid=(skew == "sell"))
+    buy_lots = _ladder(buy_n, base_lot, lot_step)
+    sell_lots = _ladder(sell_n, base_lot, lot_step)
 
     buy_legs = [Leg(price=round(fulcrum + i * step, 4), lot=buy_lots[i - 1])
                 for i in range(1, buy_n + 1)]
@@ -408,39 +407,31 @@ def _resolve_tps(symbol: str, fulcrum: float, buy_legs: list[Leg],
 
 def _rebase_to_venue(plan: GridPlan, analysis_anchor: float, venue_price: float) -> GridPlan:
     """Re-anchor a plan computed in the analysis frame (Binance/Bybit) onto the
-    execution venue's live price (Vantage). Every absolute level — fulcrum, each leg,
-    both TPs — is TRANSLATED by the ADDITIVE basis shift (venue − analysis), the same
-    transform /exec/zones uses to draw the zones. Widths (step, and thus leg SPACING)
-    are frame-invariant differences → NOT shifted.
+    execution venue's live price (Vantage). Every absolute level — fulcrum, each
+    leg, both TPs, the step — is scaled by the ratio venue/analysis, preserving the
+    structural % geometry while moving it to where the broker actually quotes. Same
+    principle as execution.venue_translator, applied to the neutral grid.
 
-    Additive, not multiplicative: gold's Vantage-vs-Binance basis is a near-constant
-    ADDITIVE offset, not a percentage. A multiplicative ratio (level * venue/analysis)
-    anchors the scaling at the live price, so a fulcrum far from spot lands at
-    edge*(venue/analysis) while the chart draws edge+shift — the two diverge by
-    ~shift*(edge_distance/price), i.e. the fulcrum-vs-drawn-edge gap grows with the
-    edge's distance from spot. Additive makes fulcrum == drawn edge exactly regardless
-    of distance.
-
-    Why rebasing is mandatory at all: a BuyStop must sit above the venue ask and a
-    SellStop below the venue bid. Binance-frame absolute prices won't satisfy that on
-    Vantage → MT5 rejects the orders. (Tick-rounding + broker min-stop-distance are
-    enforced EA-side, since only the terminal knows the symbol's stopsLevel.)
+    Why this is mandatory: a BuyStop must sit above the venue ask and a SellStop
+    below the venue bid. Binance-frame absolute prices won't satisfy that on Vantage
+    → MT5 rejects the orders. (Tick-rounding + broker min-stop-distance are enforced
+    EA-side, since only the terminal knows the symbol's stopsLevel.)
     """
     if analysis_anchor <= 0 or venue_price <= 0:
         return plan
-    shift = venue_price - analysis_anchor
-    if abs(shift) < 1e-9:
+    ratio = venue_price / analysis_anchor
+    if abs(ratio - 1.0) < 1e-9:
         # in-frame caller (dashboard/sim) — identity, just stamp the anchors
         return replace(plan, analysis_anchor=round(analysis_anchor, 4),
                        venue_anchor=round(venue_price, 4), rebased=False)
     return replace(
         plan,
-        fulcrum=round(plan.fulcrum + shift, 4),
-        step=plan.step,   # width — frame-invariant, do NOT shift
-        buy_legs=[Leg(price=round(l.price + shift, 4), lot=l.lot) for l in plan.buy_legs],
-        sell_legs=[Leg(price=round(l.price + shift, 4), lot=l.lot) for l in plan.sell_legs],
-        buy_tp=round(plan.buy_tp + shift, 4),
-        sell_tp=round(plan.sell_tp + shift, 4),
+        fulcrum=round(plan.fulcrum * ratio, 4),
+        step=round(plan.step * ratio, 4),
+        buy_legs=[Leg(price=round(l.price * ratio, 4), lot=l.lot) for l in plan.buy_legs],
+        sell_legs=[Leg(price=round(l.price * ratio, 4), lot=l.lot) for l in plan.sell_legs],
+        buy_tp=round(plan.buy_tp * ratio, 4),
+        sell_tp=round(plan.sell_tp * ratio, 4),
         analysis_anchor=round(analysis_anchor, 4),
         venue_anchor=round(venue_price, 4),
         rebased=True,

@@ -178,14 +178,8 @@ def _merge_zone_tuples(zones: list[tuple[float, float]]) -> list[tuple[float, fl
     collapse them so the grid straddles ONE fulcrum, not two near-duplicate edges."""
     if not zones:
         return zones
-    # Seed from the SORTED list, not the unsorted zones[0]. Seeding with an arbitrary
-    # (possibly high) first element made the merge walk compare the lowest sorted zone
-    # against a higher seed: lo <= out[-1][1] was spuriously True, so the lowest zone got
-    # absorbed into the seed and its low silently discarded — price could sit inside a
-    # real HVN/LVN with no arm.
-    ordered = sorted(zones)
-    out: list[list[float]] = [list(ordered[0])]
-    for lo, hi in ordered[1:]:
+    out: list[list[float]] = [list(zones[0])]
+    for lo, hi in sorted(zones):
         if lo <= out[-1][1]:                       # overlap or touch
             out[-1][1] = max(out[-1][1], hi)
         else:
@@ -258,7 +252,11 @@ def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger |
     One candle, not a multi-bar sequence: requires lo < close < hi AND (high ≥ hi or
     low ≤ lo). A candle that closes BEYOND the edge is a breakout, not this setup, and
     is excluded. Stateless / causal — behaves identically live and in the sim.
+
+    Restricted to 1m/5m/15m — 1h nodes are too wide/stale for this edge-rejection read.
     """
+    if tf not in ("1m", "5m", "15m"):
+        return None
     from pipeline.state_store import store
     win = _VP_WIN.get(tf, 96)
     bars = store().recent(symbol, tf, win + 5)
