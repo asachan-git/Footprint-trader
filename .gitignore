@@ -73,3 +73,9 @@ data/iter_compare_*.md
 data/strategies/
 data/reports/
 data/sweeps_*.jsonl
+
+# Exec-bridge runtime audit logs + live cycle/CVD state + generated docs (runtime, not source)
+data/exec_bridge.jsonl
+data/exec_emit.jsonl
+data/cvd_div_state.json
+docs/
