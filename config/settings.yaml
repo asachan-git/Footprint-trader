@@ -65,10 +65,10 @@ grid_levels:
   # Values are in native account currency (USC cents for Vantage XAUUSD.pc cent account;
   # plain USD for a standard USD account). 1 USD = 100 USC on a cent account.
   # EVERY live TF must appear here — a TF missing from this map silently falls back to
-  # cycle_net_target_usd below (266.0), which is 4-13x these values. 3m/10m interpolated
+  # cycle_net_target_usd below, which is NOT tuned per TF. 3m/10m interpolated
   # on the existing 1m->15m ladder.
   cycle_net_target_by_tf: {1m: 20.0, 3m: 30.0, 5m: 40.0, 10m: 53.0, 15m: 66.0, 1h: 20.0}
-  cycle_net_target_usd: 266.0   # fallback when TF not in by_tf map
+  cycle_net_target_usd: 50.0   # fallback when TF not in by_tf map
 
   # Bias trail — arms when peak floating ≥ activate, fires on giveback% retrace.
   # Values are in native account currency (same note as cycle_net_target above).
@@ -255,18 +255,18 @@ grid_levels:
   # To disable a kind without removing it: set enabled: false.
   triggers:
     - kind: hvn_inside_touch
-      tfs: [1m, 5m, 15m]         # 1m added 2026-07-10 — gated by htf_expansion_gate below
+      tfs: [1m, 3m, 5m, 10m, 15m]   # 3m/10m added 2026-07-20 for the TF-efficiency run; 1m gated by htf_expansion_gate below
       touch_only: true           # arm on candle close (bar-close emit)
     - kind: hvn_edge
-      tfs: [5m, 15m]             # breakout-retest: prior close outside HVN + bar tap + rejection close
-      enabled: false            # OFF 2026-07-14: worst live strat (−36.9k, PF 0.37 on 07-13). Re-measure AFTER the fulcrum double-shift fix (was arming on wrong price) before re-enabling.
+      tfs: [3m, 5m, 10m, 15m]    # breakout-retest: prior close outside HVN + bar tap + rejection close
+      enabled: true             # ON 2026-07-20: re-measure on the TF-efficiency run (was OFF — worst live strat, PF 0.37/0.70; re-enabled to gather fresh data across all TFs)
     - kind: candle_sweep
-      tfs: [5m, 15m]
-      enabled: true              # ON — best live strat (+16k, PF 27, 97% WR on 07-13)
+      tfs: [3m, 5m, 10m, 15m]
+      enabled: true              # ON — data run (clean July: 5m PF 0.73, 15m 0.93 — re-measuring)
     - kind: lvn_edge_touch
-      tfs: [1m, 5m, 15m]             # 1m dropped — tightest step (~0.3) + most re-arms, biggest density source
+      tfs: [1m, 3m, 5m, 10m, 15m]
       touch_only: true           # arm via intrabar price tap only, same as hvn_inside_touch
-      enabled: false            # OFF 2026-07-14: net loser (−18.7k, PF 0.66 on 07-13). Densest re-arm source. Jun-22 profitable system ran hvn_inside_touch only.
+      enabled: true             # ON 2026-07-20: clean July had 15m PF 1.40 (BEST in book); prior -18.7k was 1m/5m. Re-measuring per TF.
     - kind: hvn_displacement
       tfs: [5m, 15m]             # A→B displacement: prev candle opens in HVN-A, closes in HVN-B (bar-close arm, strat 10 → magic 7701xx)
       enabled: false            # OFF 2026-07-14: 0 cycles on 07-13 (unproven). Clean Jun-22-style setup = hvn_inside_touch + candle_sweep only.

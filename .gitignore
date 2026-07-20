@@ -81,3 +81,7 @@ data/exec_emit.jsonl
 data/arm_state.jsonl
 data/emit_state.jsonl
 data/cycles/
+
+# Runtime state written by the exec bridge (not source)
+data/last_account.txt
+data/cvd_div_state.json
