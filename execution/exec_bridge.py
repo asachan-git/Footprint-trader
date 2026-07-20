@@ -40,6 +40,60 @@ def _emit_exit_audit(row: dict) -> None:
     except Exception:
         pass  # audit must never break execution
 
+
+# ── durable cycle-outcome log (survives restarts; the analysis ground truth) ──
+# exec_emit.jsonl logs arms and exits as SEPARATE rows with no join key, and its
+# in-memory cycle state dies on restart — which is why per-cycle P&L could only be
+# reconstructed from broker statements. This log writes ONE row per completed cycle
+# with the arm context and the exit outcome already joined, keyed by cycle_id.
+_CYCLE_LOG = _ROOT / "data" / "cycle_outcomes.jsonl"
+
+
+def cycle_id_for(account: str, symbol: str, magic: int, armed_ts: float) -> str:
+    """Stable id for one arm→exit lifecycle. armed_ts disambiguates re-arms on the
+    same magic, so consecutive cycles never collide."""
+    return f"{account}:{symbol}:{int(magic)}:{int(armed_ts)}"
+
+
+def _emit_cycle_outcome(cyc: dict, *, account: str, symbol: str, magic: int,
+                        tf: str, exit_reason: str, **outcome) -> None:
+    """One durable row per completed cycle: arm context + exit outcome, joined.
+
+    Pulls the arm-side fields straight off the persisted cycle dict so the row is
+    self-contained — no post-hoc join against exec_emit.jsonl is needed to answer
+    "which setup, on which TF, from which fulcrum, exited how, for how much".
+    """
+    try:
+        armed_ts = float(cyc.get("ts") or 0.0)
+        row = {
+            "cycle_id": cycle_id_for(account, symbol, magic, armed_ts),
+            "account": str(account), "broker_symbol": symbol,
+            "magic": int(magic), "tf": tf or cyc.get("armed_tf", ""),
+            # arm context
+            "armed_ts": armed_ts, "exit_ts": time.time(),
+            "held_s": round(time.time() - armed_ts, 1) if armed_ts else None,
+            "trigger_kind": cyc.get("trigger_kind", ""), "edge": cyc.get("edge", ""),
+            "fulcrum": cyc.get("fulcrum"), "step": cyc.get("step"),
+            "n_per_side": cyc.get("n_per_side"),
+            "buy_n": cyc.get("buy_n"), "sell_n": cyc.get("sell_n"),
+            "node_low": cyc.get("node_low"), "node_high": cyc.get("node_high"),
+            "tp_up": cyc.get("tp_up"), "tp_down": cyc.get("tp_down"),
+            "squeeze_ok": cyc.get("squeeze_ok"), "squeeze_rank": cyc.get("squeeze_rank"),
+            "skew": cyc.get("skew"), "net_target_usd": cyc.get("net_target_usd"),
+            # lifecycle high-water
+            "max_pos_seen": cyc.get("max_pos_seen"), "pend_seen": cyc.get("pend_seen"),
+            "bias_booked": bool(cyc.get("bias_booked")),
+            "bias_peak": cyc.get("bias_peak"),
+            # exit outcome
+            "exit_reason": exit_reason,
+            **outcome,
+        }
+        _CYCLE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _CYCLE_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except Exception:
+        pass  # audit must never break execution
+
 # command lifecycle
 PENDING = "pending"
 IN_FLIGHT = "in_flight"
@@ -381,6 +435,13 @@ class ExecBridge:
                                       "book_frac": book_frac,
                                       "squeeze_ok": cyc.get("squeeze_ok"),
                                       "squeeze_rank": cyc.get("squeeze_rank")})
+                    # durable per-cycle record (partial: cycle continues)
+                    _emit_cycle_outcome(cyc, account=str(account), symbol=symbol,
+                                        magic=magic, tf=tf,
+                                        exit_reason="bias_book_trail", partial=True,
+                                        peak=round(peak, 2),
+                                        pnl_at_exit=round(cycle_pnl, 2),
+                                        book_frac=book_frac, buys=buys, sells=sells)
                     return "bias_book_trail"
 
         reason: str | None = None
@@ -424,6 +485,11 @@ class ExecBridge:
                           "tp_up": tp_up, "tp_down": tp_down,
                           "squeeze_ok": cyc.get("squeeze_ok"), "squeeze_rank": cyc.get("squeeze_rank"),
                           **detail})
+        # durable, restart-proof per-cycle record (arm context + outcome joined)
+        _emit_cycle_outcome(cyc, account=str(account), symbol=symbol, magic=magic, tf=tf,
+                            exit_reason=reason, pnl_at_exit=pnl, venue_mid=mid,
+                            positions=positions, pendings=pendings,
+                            buys=buys, sells=sells, **detail)
         return reason
 
     # ── emit dedup (one grid per HVN-touch episode, not per bar) ───────────────
