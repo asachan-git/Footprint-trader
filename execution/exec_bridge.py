@@ -50,7 +50,18 @@ def _emit_exit_audit(row: dict) -> None:
 # in-memory cycle state dies on restart — which is why per-cycle P&L could only be
 # reconstructed from broker statements. This log writes ONE row per completed cycle
 # with the arm context and the exit outcome already joined, keyed by cycle_id.
-_CYCLE_LOG = _ROOT / "data" / "cycle_outcomes.jsonl"
+_CYCLE_LOG_DIR = _ROOT / "data" / "cycles"
+
+
+def _cycle_log_path(now: float | None = None) -> Path:
+    """Date-partitioned cycle log: data/cycles/cycle_outcomes_YYYY-MM-DD.jsonl.
+
+    One file per TRADING DAY so a run can be analysed (or diffed) day by day
+    without slicing one ever-growing file. Dated in LOCAL time, matching how the
+    broker statement and the emit logs are read.
+    """
+    t = time.localtime(now if now is not None else time.time())
+    return _CYCLE_LOG_DIR / f"cycle_outcomes_{time.strftime('%Y-%m-%d', t)}.jsonl"
 
 
 def cycle_id_for(account: str, symbol: str, magic: int, armed_ts: float) -> str:
@@ -71,6 +82,9 @@ def _emit_cycle_outcome(cyc: dict, *, account: str, symbol: str, magic: int,
         armed_ts = float(cyc.get("ts") or 0.0)
         row = {
             "cycle_id": cycle_id_for(account, symbol, magic, armed_ts),
+            # local trading date — redundant with the filename, but keeps rows
+            # groupable after several days are concatenated for a combined view.
+            "date": time.strftime("%Y-%m-%d", time.localtime()),
             "account": str(account), "broker_symbol": symbol,
             "magic": int(magic), "tf": tf or cyc.get("armed_tf", ""),
             # arm context
@@ -92,8 +106,9 @@ def _emit_cycle_outcome(cyc: dict, *, account: str, symbol: str, magic: int,
             "exit_reason": exit_reason,
             **outcome,
         }
-        _CYCLE_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with _CYCLE_LOG.open("a") as fh:
+        path = _cycle_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as fh:
             fh.write(json.dumps(row) + "\n")
     except Exception:
         pass  # audit must never break execution
