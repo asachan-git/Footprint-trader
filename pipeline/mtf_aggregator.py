@@ -6,13 +6,36 @@ footprints by merging consecutive primary-TF bars' ladders.
 
 from __future__ import annotations
 
+import re
+
 from .types import Bar, Level, OHLC
 
-_TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
+# Fast path for the common TFs; anything else is parsed. Kept as a dict so the
+# hot aggregation loop avoids a regex on every bar.
+_TF_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "10m": 600, "15m": 900, "1h": 3600}
+
+_TF_RE = re.compile(r"^(\d+)(s|m|h|d)$")
+_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 def tf_seconds(tf: str) -> int:
-    return _TF_SECONDS[tf]
+    """Seconds in one bar of `tf` ("3m" → 180, "10m" → 600, "1h" → 3600).
+
+    Parses ANY <int><unit> timeframe rather than looking up a fixed table — the
+    old bare `_TF_SECONDS[tf]` raised KeyError for every unlisted TF, so adding
+    a timeframe to instrument.timeframes crashed the aggregator on every bar.
+    Raises ValueError (not KeyError) with the offending value on a bad TF.
+    """
+    sec = _TF_SECONDS.get(tf)
+    if sec is not None:
+        return sec
+    m = _TF_RE.match(str(tf).strip().lower())
+    if not m:
+        raise ValueError(f"unparseable timeframe {tf!r} (expected e.g. '3m', '10m', '1h')")
+    n, unit = int(m.group(1)), m.group(2)
+    if n <= 0:
+        raise ValueError(f"timeframe {tf!r} must be positive")
+    return n * _UNIT_SECONDS[unit]
 
 
 def bucket_close(close_ts: int, target_tf: str) -> int:

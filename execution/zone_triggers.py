@@ -43,7 +43,10 @@ def _hvn_dbg(msg: str) -> None:
         print(f"[hvn_touch_dbg] {msg}", file=sys.stderr, flush=True)
 
 # ~24h trailing VP window per TF (matches reversal_hvn / continuation_hvn).
-_VP_WIN = {"15m": 96, "5m": 288, "1m": 1440, "1h": 24}
+# EVERY live TF must be listed: the six call sites use `.get(tf, 96)`, so a missing
+# TF silently gets a 96-bar window — on 3m that is 4.8h, not 24h, i.e. a truncated
+# profile with no error. 3m: 1440/3=480, 10m: 1440/10=144.
+_VP_WIN = {"1m": 1440, "3m": 480, "5m": 288, "10m": 144, "15m": 96, "1h": 24}
 
 # Which HVN source(s) feed the inside-touch trigger, per session. Every session
 # currently blends BOTH the price-tracking rolling profile and the stable
@@ -1368,7 +1371,7 @@ def _t_vp_level_touch(symbol: str, tf: str, current_price: float,
     )
 
 
-_HTF_MAP = {"1m": "15m", "5m": "15m", "15m": "1h", "1h": "4h"}
+_HTF_MAP = {"1m": "15m", "3m": "15m", "5m": "15m", "10m": "1h", "15m": "1h", "1h": "4h"}
 
 
 def bb_htf_bias(symbol: str, grid_tf: str, cfg: dict | None = None) -> tuple[int, str]:

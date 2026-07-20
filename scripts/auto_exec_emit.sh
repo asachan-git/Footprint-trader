@@ -52,11 +52,15 @@ trap 'rm -f "$_LOCKDIR/pid" 2>/dev/null; rmdir "$_LOCKDIR" 2>/dev/null' EXIT INT
 # BTC Jun22 regime: hvn_inside_touch + squeeze ONLY. Breakout/edge/displacement family
 # dropped — correlated with leg_closed_other losses. Override per-TF with FB_SETUPS_* env.
 _1m_raw="${FB_SETUPS_1M-hvn_inside_touch squeeze}"
+_3m_raw="${FB_SETUPS_3M-hvn_inside_touch squeeze}"
 _5m_raw="${FB_SETUPS_5M-hvn_inside_touch squeeze}"
+_10m_raw="${FB_SETUPS_10M-hvn_inside_touch squeeze}"
 _15m_raw="${FB_SETUPS_15M-hvn_inside_touch squeeze}"
 _1h_raw="${FB_SETUPS_1H-}"
 read -ra SETUPS_1M  <<< "$_1m_raw"
+read -ra SETUPS_3M  <<< "$_3m_raw"
 read -ra SETUPS_5M  <<< "$_5m_raw"
+read -ra SETUPS_10M <<< "$_10m_raw"
 read -ra SETUPS_15M <<< "$_15m_raw"
 read -ra SETUPS_1H  <<< "$_1h_raw"
 
@@ -124,8 +128,12 @@ except Exception: print('?')" 2>/dev/null || echo '?')
 # Use ${arr[@]+"${arr[@]}"} to avoid "unbound variable" on empty arrays under set -u (bash 3.2).
 emit_loop 15m 900   8  ${SETUPS_15M[@]+"${SETUPS_15M[@]}"} &
 P15=$!
+emit_loop 10m 600  10  ${SETUPS_10M[@]+"${SETUPS_10M[@]}"} &
+P10=$!
 emit_loop 5m  300  12  ${SETUPS_5M[@]+"${SETUPS_5M[@]}"} &
 P5=$!
+emit_loop 3m  180   5  ${SETUPS_3M[@]+"${SETUPS_3M[@]}"} &
+P3=$!
 emit_loop 1m  60    3  ${SETUPS_1M[@]+"${SETUPS_1M[@]}"} &
 P1=$!
 emit_loop 1h  3600 15  ${SETUPS_1H[@]+"${SETUPS_1H[@]}"} &
@@ -133,6 +141,6 @@ P1H=$!
 refresh_loop &
 PR=$!
 
-echo "[auto_exec_emit] running — 15m($P15) 5m($P5) 1m($P1) 1h($P1H) refresh($PR). Ctrl-C to stop."
-trap 'kill $P15 $P5 $P1 $P1H $PR 2>/dev/null; echo "[auto_exec_emit] stopped."; exit 0' INT TERM
+echo "[auto_exec_emit] running — 15m($P15) 10m($P10) 5m($P5) 3m($P3) 1m($P1) 1h($P1H) refresh($PR). Ctrl-C to stop."
+trap 'kill $P15 $P10 $P5 $P3 $P1 $P1H $PR 2>/dev/null; echo "[auto_exec_emit] stopped."; exit 0' INT TERM
 wait

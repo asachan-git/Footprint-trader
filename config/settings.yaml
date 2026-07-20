@@ -35,7 +35,7 @@ decide_on_bar_close:
 
 instrument:
   symbol: XAUTUSDT
-  timeframes: [1m, 5m, 15m, 1h]   # 1h added for the per-TF grid fleet (needs backfill on first run)
+  timeframes: [1m, 3m, 5m, 10m, 15m, 1h]   # 3m/10m added 2026-07-20 for the TF-efficiency run (need backfill on first run, like 1h)
   primary_tf: 1m           # decision fires on close of this TF; higher TFs join as-of
 
 # Footprint-driven neutral-grid placement (/exec/emit_grid + FBExecBridge EA).
@@ -53,14 +53,21 @@ grid_levels:
   # lvn_edge_touch, bb_expansion_touch — n = node_width/step clamped here) and the EXACT
   # count for fixed-n strats (hvn_edge, candle_sweep). Step stays flat (do NOT re-add the
   # inverted per-TF step map — it over-compressed higher TFs → full_hedge).
-  hvn_max_legs_by_tf: {1m: 4, 5m: 5, 15m: 6, 1h: 7}   # per-TF leg count (cap for touch strats, exact for edge/sweep)
+  # 2026-07-20 TF-efficiency run: n FIXED at 5 on every TF so TIMEFRAME is the only
+  # variable. (Was {1m:4, 5m:5, 15m:6, 1h:7} — n co-varied with TF, confounding the two.)
+  # The cycle log records the n the planner actually chose after the node_width/step
+  # clamp, so a later run can sweep n from that evidence.
+  hvn_max_legs_by_tf: {1m: 5, 3m: 5, 5m: 5, 10m: 5, 15m: 5, 1h: 5}
   mean_rev_step_mult: 0.50    # step = this × ATR between legs (BTC Jun22 flat value)
   mean_rev_step_mult_by_tf: {}   # empty → flat 0.50 all TFs (was inverted per-TF, over-tight on higher TFs)
 
   # Cycle profit targets — primary basket exit (net floating ≥ target → CLOSE_ALL)
   # Values are in native account currency (USC cents for Vantage XAUUSD.pc cent account;
   # plain USD for a standard USD account). 1 USD = 100 USC on a cent account.
-  cycle_net_target_by_tf: {1m: 20.0, 5m: 40.0, 15m: 66.0, 1h: 20.0}   # per-TF (USC; real $10/$15/$20/$30)
+  # EVERY live TF must appear here — a TF missing from this map silently falls back to
+  # cycle_net_target_usd below (266.0), which is 4-13x these values. 3m/10m interpolated
+  # on the existing 1m->15m ladder.
+  cycle_net_target_by_tf: {1m: 20.0, 3m: 30.0, 5m: 40.0, 10m: 53.0, 15m: 66.0, 1h: 20.0}
   cycle_net_target_usd: 266.0   # fallback when TF not in by_tf map
 
   # Bias trail — arms when peak floating ≥ activate, fires on giveback% retrace.
@@ -216,7 +223,7 @@ grid_levels:
   htf_bias_enabled: true          # ON (2026-07-10, Jun22 restore) — HTF-20MA vote skews ladder → directional inventory
   htf_bias_period: 20
   htf_bias_slope_bars: 3
-  htf_bias_map: {1m: "5m", 5m: "15m", 15m: "1h", 1h: "4h"}
+  htf_bias_map: {1m: "5m", 3m: "15m", 5m: "15m", 10m: "1h", 15m: "1h", 1h: "4h"}
   bb_edge_enabled: true           # ON (2026-07-10, Jun22 restore) — 2.5σ mean-rev edge vote
   bb_edge_sigma: 2.5
   # cycle_net_target_* and bias_trail_* moved to TUNING block at top of grid_levels
@@ -410,7 +417,7 @@ execution:
   broker_utc_offset_hours: 3      # Vantage server time = UTC+3 (EET); used to shift CVD arrow timestamps
   tradable_symbols: [XAUTUSDT, BTCUSDT]
   symbol_map:
-    XAUTUSDT: "XAUUSD.pc"        # Vantage MT5 USC cent account (24678823; 26443422 algo-disabled by broker 2026-07-06)
+    XAUTUSDT: "XAUUSD+"          # DEMO account (2026-07-20 test run). Live USC cent used XAUUSD.pc.
     BTCUSDT:  "BTCUSD"
   # Risk-adjusted sizing: lots = (balance × risk_per_trade_pct) / (SL_distance × contract_size)
   # Set risk_per_trade_pct = 0 to disable; falls back to default_lots.

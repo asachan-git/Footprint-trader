@@ -150,7 +150,11 @@ _STRAT_CODE = {
     "candle_sweep": 12,
     "lvn_edge_touch": 13,
 }
-_TF_CODE = {"1m": 1, "5m": 2, "15m": 3, "1h": 4}
+# tf_code is recovered as `magic % 10`, so it MUST stay a single digit: codes
+# 1-9 are usable, 0 is the "unknown TF" sentinel. 3m/10m added 2026-07-20 for
+# the TF-efficiency run. At 9 TFs this scheme is FULL — a 10th would require
+# re-basing every magic, so spend the remaining codes deliberately.
+_TF_CODE = {"1m": 1, "5m": 2, "15m": 3, "1h": 4, "3m": 5, "10m": 6}
 _CODE_TF = {v: k for k, v in _TF_CODE.items()}
 # Upper bound of our owned magic range, derived from the highest strat decade (+9 for tf,
 # +1 exclusive). With hvn_displacement=10 this is 770110 — so 7701xx displacement magics

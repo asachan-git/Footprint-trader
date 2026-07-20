@@ -24,7 +24,9 @@ from datetime import datetime, timezone
 _DAY = 86400.0
 
 # expected bars per day per tf (24/7); used only for a low-density WARNING
-_BARS_PER_DAY = {"1m": 1440, "5m": 288, "15m": 96}
+# A TF missing here yields expected=0 at the .get(tf, 0) below, so its data check
+# silently passes — list every live TF.
+_BARS_PER_DAY = {"1m": 1440, "3m": 480, "5m": 288, "10m": 144, "15m": 96, "1h": 24}
 
 
 def _cfg(settings: dict) -> dict:

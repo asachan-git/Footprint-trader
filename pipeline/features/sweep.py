@@ -626,7 +626,7 @@ def read_sweep_log(symbol: str, since_ts: int = 0, tf: str = "1m") -> list[dict]
 
 
 _TF_BARS_PER_DAY: dict[str, int] = {
-    "1m": 1440, "3m": 480, "5m": 288, "15m": 96, "30m": 48, "1h": 24,
+    "1m": 1440, "3m": 480, "5m": 288, "10m": 144, "15m": 96, "30m": 48, "1h": 24,
 }
 
 

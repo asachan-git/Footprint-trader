@@ -274,9 +274,12 @@ from typing import Literal as _Literal
 
 # A cycle's regime is read from its NEXT-HIGHER TF (HTF sets the context an LTF entry
 # trades within — standard multi-TF confluence): 1m→5m, 5m→15m, 15m→1h, 1h→1h.
-_REGIME_TF = {"1m": "5m", "5m": "15m", "15m": "1h", "1h": "1h"}
+_REGIME_TF = {"1m": "5m", "3m": "15m", "5m": "15m", "10m": "1h", "15m": "1h", "1h": "1h"}
 # IB (~1h real time) in bars of the REGIME TF, so the initial-balance window is comparable
 # regardless of TF. 5m:12, 15m:4, 1h:1→3 (1 bar can't form an IB; floor at 3 ≈ 3h context).
+# NOTE: these two are keyed by the REGIME TF (the _REGIME_TF value), not the entry TF —
+# see the .get(regime_tf, ...) lookups below. 3m/10m map to 15m/1h, which are already
+# present, so no new entries are needed here.
 _IB_BARS_BY_TF = {"1m": 60, "5m": 12, "15m": 4, "1h": 3}
 # Session window (bars of the regime TF) ≈ a full session on each.
 _SESSION_N_BY_TF = {"1m": 100, "5m": 100, "15m": 96, "1h": 48}
