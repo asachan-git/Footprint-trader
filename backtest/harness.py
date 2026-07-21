@@ -23,6 +23,7 @@ from pathlib import Path
 
 from execution import clock
 from backtest.seams import vp_asof, store_asof
+from backtest.fill_engine import Broker
 
 
 @dataclass
@@ -35,6 +36,7 @@ class Emitted:
 class HarnessResult:
     polls: int = 0
     commands: list[Emitted] = field(default_factory=list)
+    broker: object | None = None      # backtest.fill_engine.Broker after a run
 
     def arms(self) -> list[dict]:
         """PLACE_PENDING commands = grid arms (one batch per armed cycle)."""
@@ -58,6 +60,7 @@ def run(
     settings: dict,
     venue_offset: float,
     poll_tf: str = "5m",
+    balance: float = 100_000.0,
 ) -> HarnessResult:
     """Replay one session-day, polling on each `poll_tf` bar close.
 
@@ -83,25 +86,32 @@ def run(
     stops_pts = 0.0           # freeze band unknown offline → 0 (Phase-2 fill engine models it)
 
     cadence_bars = _bar_closes(analysis_symbol, poll_tf, start_ts, end_ts)
+    # 1m bars give the broker a finer intrabar path than the poll cadence: between two
+    # 5m polls we step every 1m bar, so fewer bars are range-ambiguous for SL-vs-TP.
+    path_bars = _bar_closes(analysis_symbol, "1m", start_ts, end_ts)
+    path_i = 0
 
-    # Pending-fill model: once a magic arms, its legs REST as unfilled pendings so the
-    # cycle persists — otherwise empty magics[] makes the absent-magic reap retire it and
-    # it re-arms every bar. This holds Phase-1's question at "did it arm once, correctly".
-    # magic -> pending leg count. Actual fills (pending→position) are Phase 2.
-    pending_by_magic: dict[int, int] = {}
+    broker = Broker(symbol=broker_symbol, stops_dist=stops_pts * point)
+    res.broker = broker
 
     with vp_asof(replay_cache), store_asof():
         for bar in cadence_bars:
             ts = bar.close_ts
+
+            # Advance the broker over every 1m bar up to this poll instant. Prices are
+            # shifted into the venue frame so fills happen where the legs actually sit.
+            while path_i < len(path_bars) and path_bars[path_i].close_ts <= ts:
+                pb = path_bars[path_i]
+                broker.step_bar(pb.ohlc.o + venue_offset, pb.ohlc.h + venue_offset,
+                                pb.ohlc.l + venue_offset, pb.ohlc.c + venue_offset,
+                                pb.close_ts)
+                path_i += 1
+
             clock.set_source(lambda ts=ts: float(ts))
             # venue quote = analysis close shifted to venue frame
             mid = bar.ohlc.c + venue_offset
-            spread = point  # nominal 1-point; Phase-2 models real spread
-            magics_arr = [
-                {"magic": mg, "buys": 0, "sells": 0, "pendings": n}
-                for mg, n in pending_by_magic.items() if n > 0
-            ]
-            tot_pend = sum(pending_by_magic.values())
+            spread = point  # nominal 1-point; real spread is Phase 2d
+            tot = broker.totals(mid)
             body = {
                 "account": account,
                 "symbol": broker_symbol,
@@ -109,28 +119,21 @@ def run(
                 "ask": round(mid + spread / 2, 5),
                 "point": point,
                 "stops_pts": stops_pts,
-                "buys": 0, "sells": 0, "pendings": tot_pend,
-                "magics": magics_arr,
+                "balance": balance,
+                "equity": round(balance + broker.realized + broker.floating(mid), 2),
+                "buys": tot["buys"], "sells": tot["sells"], "pendings": tot["pendings"],
+                "pnl": tot["pnl"],
+                "magics": broker.magics_json(mid),
             }
             resp = client.post("/exec/poll", json=body)
             res.polls += 1
             data = resp.get_json(silent=True) or {}
             cmds = data.get("commands", [])
+
+            acks = []
             for c in cmds:
                 res.commands.append(Emitted(poll_ts=float(ts), cmd=c))
-                # reflect placed/cancelled pendings so the next poll's magics[] holds them
-                mg = int(c.get("magic", 0) or 0)
-                ctype = c.get("type")
-                if ctype == "PLACE_PENDING" and mg:
-                    pending_by_magic[mg] = pending_by_magic.get(mg, 0) + 1
-                elif ctype in ("CANCEL_PENDINGS", "CLOSE_ALL") and mg:
-                    pending_by_magic[mg] = 0
-            # Null-fill ack: mark every emitted command DONE so poll() doesn't re-emit
-            # it on the next cadence (IN_FLIGHT reclaim would otherwise re-return the
-            # whole queue). We record the FIRST emission as the arm — that's the arm
-            # fidelity signal; the fill outcome is Phase 2.
-            acks = [{"id": c.get("id"), "ok": True, "ticket": 0, "retcode": 10009}
-                    for c in cmds if c.get("id")]
+                acks.append(broker.apply_command(c, mid, int(ts)))
             if acks:
                 client.post("/exec/ack", json={"account": account, "results": acks})
 
@@ -159,6 +162,14 @@ if __name__ == "__main__":
             venue_offset=args.offset, poll_tf=args.poll_tf)
     arms = r.arms()
     print(f"polls={r.polls} commands={len(r.commands)} arms(PLACE_PENDING)={len(arms)}")
+    b = r.broker
+    if b is not None:
+        import collections as _c
+        ev = _c.Counter(e.kind for e in b.events)
+        print(f"broker: events={dict(ev)}")
+        print(f"        open_positions={len(b.positions)} resting_pendings={len(b.pendings)}")
+        # GROSS — no spread/commission/swap/margin yet (Phase 2d). Not a result.
+        print(f"        realized(GROSS, no costs)={round(b.realized, 2)}")
     if args.out:
         # poll_ts is required to group legs into arms downstream (legs of one arm are
         # emitted in the same poll; the per-leg `comment` tag is NOT an arm key).
