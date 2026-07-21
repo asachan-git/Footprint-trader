@@ -531,11 +531,53 @@ def _t_hvn_edge(symbol: str, tf: str, current_price: float,
 
 # ── session-aware HVN sources (for the inside-touch trigger) ─────────────────
 
+# ── fractal-gated rolling VP ────────────────────────────────────────────────
+# (symbol, tf) → (last_fractal_close_ts, zones). The rolling profile is recomputed
+# ONLY when a new fractal confirms on the SAME tf; between fractals the last result
+# is served unchanged, so HVN edges stop drifting mid-move (a drifting edge moves the
+# fulcrum under a live cycle and re-registers taps that already fired).
+_ROLLING_VP_CACHE: dict[tuple[str, str], tuple[int, list[tuple[float, float]]]] = {}
+
+# Fractal half-width: 1 → 3-bar (1 left + 1 right), 2 → 5-bar. 3-bar chosen 2026-07-21
+# (more pivots → the profile still tracks price, just no longer drifts every poll).
+_VP_FRACTAL_N = 1
+
+
+def _last_fractal_ts(bars: list[Bar], n: int = 1) -> int:
+    """close_ts of the most recent CONFIRMED fractal (swing high or low).
+
+    n=1 → 3-bar fractal: centre bar's high strictly above (or low strictly below)
+    both neighbours. Confirmation needs `n` bars to the RIGHT, so the newest
+    candidate centre is bars[-1-n] — never the forming bar. Returns 0 if none.
+    """
+    if len(bars) < 2 * n + 1:
+        return 0
+    for c in range(len(bars) - 1 - n, n - 1, -1):
+        hi, lo = bars[c].ohlc.h, bars[c].ohlc.l
+        is_high = all(hi > bars[c + d].ohlc.h and hi > bars[c - d].ohlc.h
+                      for d in range(1, n + 1))
+        is_low = all(lo < bars[c + d].ohlc.l and lo < bars[c - d].ohlc.l
+                     for d in range(1, n + 1))
+        if is_high or is_low:
+            return int(bars[c].close_ts or 0)
+    return 0
+
+
 def _rolling_hvn(symbol: str, tf: str, bars: list[Bar]) -> list[tuple[float, float]]:
-    """Price-tracking rolling-VP HVN zones over the ~24h window for `tf`."""
+    """Price-tracking rolling-VP HVN zones over the ~24h window for `tf`.
+
+    Recomputed only on a NEW confirmed fractal for this tf (see _ROLLING_VP_CACHE);
+    otherwise the previously computed zones are returned as-is.
+    """
     win = _VP_WIN.get(tf, 96)
     if len(bars) < win:
         return []
+
+    _key = (symbol, tf)
+    _frac_ts = _last_fractal_ts(bars, n=int(_VP_FRACTAL_N))
+    _cached = _ROLLING_VP_CACHE.get(_key)
+    if _cached is not None and _frac_ts and _cached[0] == _frac_ts:
+        return _cached[1]            # no new fractal → serve the frozen profile
     try:
         # Honor the configured vp_bin_size[symbol] (falls back to DEFAULT_BIN_SIZE) so the
         # rolling VP matches the cached daily VP — else a config bin change only affects the
@@ -543,9 +585,13 @@ def _rolling_hvn(symbol: str, tf: str, bars: list[Bar]) -> list[tuple[float, flo
         from pipeline.features.volume_profile import compute as vp_compute, _resolve_bin_size
         vp = vp_compute(bars[-win:], "daily", bars[-1].ohlc.c,
                         bin_size=_resolve_bin_size(symbol))
-        return [(float(z["low"]), float(z["high"])) for z in (vp.hvn_zones or [])]
+        _zones = [(float(z["low"]), float(z["high"])) for z in (vp.hvn_zones or [])]
+        if _frac_ts:
+            _ROLLING_VP_CACHE[_key] = (_frac_ts, _zones)
+        return _zones
     except Exception:
-        return []
+        # keep serving the last good profile rather than dropping to no zones
+        return _cached[1] if _cached is not None else []
 
 
 def _cached_hvn(symbol: str) -> list[tuple[float, float]]:
