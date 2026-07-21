@@ -166,7 +166,16 @@ grid_levels:
   # skew lots to the into-node side + target POC on that side (breakout side stays light,
   # far next-HVN target). Directional inventory → a net-profit exit price exists. false =
   # symmetric HVN→HVN straddle.
-  hvn_reversion_bias: true         # BTC regime: fade-side skew (+2 vote, +1 heavier leg into node) → directional inventory so a net-profit exit price EXISTS under net_profit_exit_only (symmetric+equal-lots is net-neg at any single exit)
+  # 2026-07-21: flipped to FALSE — the POC snap (grid_planner.py:754-763) was OVERWRITING
+  # the next-HVN far-edge TP on the fade side at arm time. HVN-edge is the better target
+  # and is already what the REFRESH path computes (it never reads this flag), so arm and
+  # refresh now agree instead of TP silently shifting on the first poll.
+  # COUPLED EFFECT (accepted): also drops the weight-2 fade-skew vote (grid_planner.py:373)
+  # → possibly no +1 leg / different favoured side. Watch that hvn_inside_touch cycles do
+  # not collapse to symmetric buy_n==sell_n, which is net-neg at any single exit under
+  # net_profit_exit_only. Revert to true, or split into a separate hvn_reversion_tp_poc
+  # key, if the lost skew hurts more than the farther TP helps.
+  hvn_reversion_bias: false        # was true (BTC regime: fade-side skew +2 vote / +1 leg into node)
   # Wick proximity buffer for hvn_inside_touch: fire if wick came within this many price
   # units of the edge even without crossing it (e.g. 0.5pt catches near-misses on gold).
   # 0.0 = exact touch only (original behaviour). Edge is still the fulcrum price.
