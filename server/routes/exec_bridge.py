@@ -60,6 +60,25 @@ def _log_venue_bars(sym: str, tf: str, raw_bars: list) -> None:
         pass  # capture must never break the poll
 
 
+def _capture_poll(body: dict) -> None:
+    """Record one raw poll body + receive time for offline replay parity.
+
+    Gated by FB_CAPTURE_POLLS so it never runs in normal prod. `recv_ts` (real
+    wall-clock at receipt) lets the replay harness install a clock source that
+    returns the same time the live server saw, so cooldowns/daily-keys resolve
+    identically across old-code vs new-code replays.
+    """
+    try:
+        import time as _t
+        path = _emit_log().parent / "poll_capture.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as fh:
+            fh.write(json.dumps({"recv_ts": _t.time(), "body": body},
+                                separators=(",", ":")) + "\n")
+    except Exception:
+        pass  # capture must never break the poll
+
+
 def _emit_audit(row: dict) -> None:
     """Append one emit decision (arm or skip) — ground truth for diagnostics."""
     try:
@@ -1386,6 +1405,12 @@ def exec_poll():
     sym = body.get("symbol")
     bid, ask = body.get("bid"), body.get("ask")
     ExecBridge.last_poll_body = dict(body)   # DEBUG: surface the EA's raw poll body
+    # Parity capture: when FB_CAPTURE_POLLS is set, append every raw poll body + its
+    # receive time to data/poll_capture.jsonl. Off by default (zero cost in prod);
+    # a live session with it on records the exact input stream, which the offline
+    # replay harness feeds through old-code and new-code apps to byte-diff commands.
+    if os.environ.get("FB_CAPTURE_POLLS"):
+        _capture_poll(body)
     settings_cfg = current_app.config.get("FB_SETTINGS")
     if sym and bid and ask:
         # broker min-stop distance ($) = stops_level(points)·point — floors the grid step

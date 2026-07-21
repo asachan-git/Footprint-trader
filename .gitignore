@@ -85,3 +85,5 @@ data/cycles/
 # Runtime state written by the exec bridge (not source)
 data/last_account.txt
 data/cvd_div_state.json
+data/venue/
+data/poll_capture.jsonl
