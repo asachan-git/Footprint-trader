@@ -19,9 +19,17 @@ import json
 import threading
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent.parent
-_ARM_LOG  = _ROOT / "data" / "arm_state.jsonl"
-_EMIT_LOG = _ROOT / "data" / "emit_state.jsonl"
+from execution.paths import data_dir
+
+
+# Resolved per call so FB_DATA_DIR (backtest scratch) is honoured regardless of
+# import order — see execution/paths.py.
+def _arm_log() -> Path:
+    return data_dir() / "arm_state.jsonl"
+
+
+def _emit_log() -> Path:
+    return data_dir() / "emit_state.jsonl"
 
 ARM_COMPACT_THRESHOLD  = 2000   # lines before compaction
 EMIT_COMPACT_THRESHOLD = 500
@@ -95,9 +103,9 @@ def persist_arm(account: str, broker_symbol: str, magic: int, state: dict) -> No
     record = {"account": str(account), "broker_symbol": str(broker_symbol),
               "magic": int(magic), **state}
     with _lock:
-        n = _append(_ARM_LOG, record)
+        n = _append(_arm_log(), record)
         if n >= ARM_COMPACT_THRESHOLD:
-            _compact(_ARM_LOG, _arm_key)
+            _compact(_arm_log(), _arm_key)
 
 
 def persist_emit(account: str, symbol: str, magic: int,
@@ -106,9 +114,9 @@ def persist_emit(account: str, symbol: str, magic: int,
     record = {"account": str(account), "symbol": str(symbol),
               "magic": int(magic), "fulcrum": fulcrum}
     with _lock:
-        n = _append(_EMIT_LOG, record)
+        n = _append(_emit_log(), record)
         if n >= EMIT_COMPACT_THRESHOLD:
-            _compact(_EMIT_LOG, _emit_key)
+            _compact(_emit_log(), _emit_key)
 
 
 def load() -> tuple[dict[tuple, dict], dict[tuple, float | None]]:
@@ -119,8 +127,8 @@ def load() -> tuple[dict[tuple, dict], dict[tuple, float | None]]:
         emits — {(account, symbol, magic): fulcrum_or_None}
     """
     with _lock:
-        raw_arms  = _load_latest(_ARM_LOG,  _arm_key)
-        raw_emits = _load_latest(_EMIT_LOG, _emit_key)
+        raw_arms  = _load_latest(_arm_log(),  _arm_key)
+        raw_emits = _load_latest(_emit_log(), _emit_key)
 
     arms: dict[tuple, dict] = {}
     for key, rec in raw_arms.items():

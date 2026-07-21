@@ -94,25 +94,37 @@ def _backfill_sweeps(settings: dict) -> None:
     threading.Thread(target=_run, daemon=True, name="sweep-backfill").start()
 
 
-def create_app() -> Flask:
+def create_app(settings: dict | None = None, start_background: bool = True) -> Flask:
+    """Build the Flask app.
+
+    Args default to the live path — `create_app()` behaves exactly as before.
+    The backtest harness passes `settings=<replay cfg>, start_background=False` to
+    inject its config and suppress every startup side effect that would either build
+    against live VP or spawn a thread that reads wall-clock feeds:
+      - _precompute_vp / assert_ready  (harness supplies point-in-time VP itself)
+      - _backfill_sweeps thread
+      - feed-gap monitor thread
+    """
     load_dotenv(ROOT / ".env")
     static_dir = str(ROOT / "static")
     app = Flask(__name__, static_folder=static_dir, static_url_path="/static")
-    settings = load_settings()
+    if settings is None:
+        settings = load_settings()
     app.config["FB_SETTINGS"] = settings
-    _precompute_vp(settings)
-    # Preflight: footprint must cover ≥5d and VP/HVN/LVN must be present, else REFUSE
-    # to start (no trading on stale/short data). Runs after VP build so it checks the
-    # freshly-computed cache. Disable via startup_check.enabled=false (not for live).
-    from pipeline.startup_check import assert_ready
-    assert_ready(settings)
-    _backfill_sweeps(settings)
-    try:
-        from pipeline.feed_monitor import start as _start_gap_monitor
-        _start_gap_monitor(settings)
-    except Exception as e:
-        import logging as _l
-        _l.getLogger(__name__).warning(f"[startup] gap-monitor failed to start (non-fatal): {e}")
+    if start_background:
+        _precompute_vp(settings)
+        # Preflight: footprint must cover ≥5d and VP/HVN/LVN must be present, else REFUSE
+        # to start (no trading on stale/short data). Runs after VP build so it checks the
+        # freshly-computed cache. Disable via startup_check.enabled=false (not for live).
+        from pipeline.startup_check import assert_ready
+        assert_ready(settings)
+        _backfill_sweeps(settings)
+        try:
+            from pipeline.feed_monitor import start as _start_gap_monitor
+            _start_gap_monitor(settings)
+        except Exception as e:
+            import logging as _l
+            _l.getLogger(__name__).warning(f"[startup] gap-monitor failed to start (non-fatal): {e}")
     app.register_blueprint(health_bp)
     app.register_blueprint(ingest_bp)
     app.register_blueprint(decide_bp)

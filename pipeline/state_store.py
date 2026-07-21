@@ -16,7 +16,12 @@ from threading import Lock
 
 from .types import Bar, Level, OHLC
 
-PERSIST_DIR = Path(__file__).resolve().parent.parent / "data" / "footprint"
+import os as _os
+# Data root honours FB_DATA_DIR (backtest scratch). A replay points FB_DATA_DIR at
+# a scratch dir with footprint/ copied or symlinked in, so live bars are never
+# written. PERSIST_DIR stays a module attribute so a harness can rebind it directly.
+_DATA_DIR = Path(_os.environ["FB_DATA_DIR"]) if _os.environ.get("FB_DATA_DIR") else Path(__file__).resolve().parent.parent / "data"
+PERSIST_DIR = _DATA_DIR / "footprint"
 
 
 def _path(symbol: str, tf: str) -> Path:

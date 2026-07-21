@@ -26,7 +26,12 @@ from zoneinfo import ZoneInfo
 LOG = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-CACHE_FILE = ROOT / "data" / "vp_cache.json"
+# Data root honours FB_DATA_DIR so a backtest points at scratch and cannot rewrite
+# the live cache. CACHE_FILE stays a module attribute on purpose: backtest/seams.py
+# rebinds it (vp_cache.CACHE_FILE = ...) for point-in-time replay caches.
+import os as _os
+_DATA_DIR = Path(_os.environ["FB_DATA_DIR"]) if _os.environ.get("FB_DATA_DIR") else ROOT / "data"
+CACHE_FILE = _DATA_DIR / "vp_cache.json"
 
 
 def _vp_min_bars() -> int:

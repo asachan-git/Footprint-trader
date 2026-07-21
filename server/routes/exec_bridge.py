@@ -18,10 +18,11 @@ from pathlib import Path
 
 from flask import Blueprint, current_app, jsonify, request
 
-from execution.exec_bridge import ExecBridge, magic_for, tf_from_magic
+from execution import clock
+from execution.exec_bridge import ExecBridge, magic_for, tf_from_magic, _emit_log
 
 bp = Blueprint("exec_bridge", __name__)
-_EMIT_LOG = Path(__file__).resolve().parent.parent.parent / "data" / "exec_emit.jsonl"
+# Same log the exec-bridge exit path writes; resolved per call via FB_DATA_DIR.
 
 # Vantage TICK-VP cache: (account, broker_symbol) → {hvn:[(lo,hi)], lvn:[...], poc, vah,
 # val, naked_poc, ts}. Populated by /exec/tick_profile (EA CopyTicks histogram → server
@@ -29,12 +30,43 @@ _EMIT_LOG = Path(__file__).resolve().parent.parent.parent / "data" / "exec_emit.
 _TICK_VP_CACHE: dict = {}
 
 
+# Durable Vantage-venue OHLC history, appended straight off the poll body. There is
+# NO Vantage OHLC anywhere else in the repo (footprint/ is Binance/Bybit analysis
+# frame), so candle_sweep — which hard-refuses an analysis-frame proxy — cannot be
+# backtested until this history accrues. Capturing server-side (not EA-side) means
+# no live-account recompile and it records the exact bars the sweep detector saw.
+# Deduped by close_ts per (sym,tf); newest poll's closed bars are appended once.
+_VENUE_SEEN_TS: dict = {}   # (sym,tf) -> last close_ts written
+
+
+def _log_venue_bars(sym: str, tf: str, raw_bars: list) -> None:
+    try:
+        if not raw_bars:
+            return
+        key = (sym, tf)
+        last = _VENUE_SEEN_TS.get(key, 0)
+        fresh = [b for b in raw_bars if int(b.get("ts", 0)) > last]
+        if not fresh:
+            return
+        path = _emit_log().parent / "venue" / f"{sym}_{tf}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as fh:
+            for b in fresh:
+                fh.write(json.dumps({"ts": int(b["ts"]), "o": float(b["o"]),
+                                     "h": float(b["h"]), "l": float(b["l"]),
+                                     "c": float(b["c"])}, separators=(",", ":")) + "\n")
+        _VENUE_SEEN_TS[key] = max(int(b["ts"]) for b in fresh)
+    except Exception:
+        pass  # capture must never break the poll
+
+
 def _emit_audit(row: dict) -> None:
     """Append one emit decision (arm or skip) — ground truth for diagnostics."""
     try:
-        _EMIT_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with _EMIT_LOG.open("a") as fh:
-            fh.write(json.dumps({"ts": time.time(), **row}) + "\n")
+        _p = _emit_log()
+        _p.parent.mkdir(parents=True, exist_ok=True)
+        with _p.open("a") as fh:
+            fh.write(json.dumps({"ts": clock.now(), **row}) + "\n")
     except Exception:
         pass  # audit must never break execution
 
@@ -266,8 +298,8 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
 
         # Placement-window grace: don't fade-flatten a cycle armed in the last 30s — its
         # legs may not be placed/reported yet, and a mid-rebuild HVN read could be noise.
-        import time as _t
-        _arm_age = _t.time() - float(arm.get("ts", 0.0) or 0.0)
+        pass  # clock via execution.clock
+        _arm_age = clock.now() - float(arm.get("ts", 0.0) or 0.0)
         if (not _bracketed) and best_dist > _drift_cap and _arm_age > 30.0:
             # FADED candidate — anchor node absent THIS recompute. Zone recomputes are
             # noisy (rolling-VP jitter flickers borderline nodes in/out), so require
@@ -276,7 +308,7 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
             _confirm_n = int(_gcfg.get("hvn_fade_confirm_n", 3) or 3)
             _strike_gap = float(_gcfg.get("hvn_fade_strike_min_gap_s", 240) or 240)
             _strikes = int(arm.get("fade_strikes") or 0)
-            _now = _t.time()
+            _now = clock.now()
             if _now - float(arm.get("fade_last_strike_ts") or 0.0) >= _strike_gap:
                 _strikes += 1
                 arm = {**arm, "fade_strikes": _strikes, "fade_last_strike_ts": _now}
@@ -761,7 +793,7 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     node_high = (_nh + _shift) if _nh else 0.0
     ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum, edge=side,
                             trigger_kind=plan.trigger_kind, venue_mid=venue_mid, magic=leg_magic,
-                            n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
+                            n_per_side=plan.n_per_side, step=plan.step, ts=clock.now(),
                             buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
                             buy_lots_total=round(sum(l.lot for l in plan.buy_legs), 4),
                             sell_lots_total=round(sum(l.lot for l in plan.sell_legs), 4),
@@ -956,7 +988,7 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     node_high = (_nh + _shift) if _nh else 0.0
     ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum, edge=side,
                             trigger_kind=plan.trigger_kind, venue_mid=venue_mid, magic=leg_magic,
-                            n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
+                            n_per_side=plan.n_per_side, step=plan.step, ts=clock.now(),
                             buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
                             buy_lots_total=round(sum(l.lot for l in plan.buy_legs), 4),
                             sell_lots_total=round(sum(l.lot for l in plan.sell_legs), 4),
@@ -1137,7 +1169,7 @@ def _sweep_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
         _tf_secs = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}.get(tf, 60)
         _cd_bars = int(grid_cfg.get("candle_sweep_cooldown_bars", 3))   # 0 = no cooldown (don't `or 3` — that clobbers an explicit 0)
         _last_arm_ts = float(_cyc.get("ts") or 0.0)
-        if _last_arm_ts > 0 and (time.time() - _last_arm_ts) < _cd_bars * _tf_secs:
+        if _last_arm_ts > 0 and (clock.now() - _last_arm_ts) < _cd_bars * _tf_secs:
             return
 
     ExecBridge.clear_emit(account, broker_symbol, magic=leg_magic)
@@ -1167,7 +1199,7 @@ def _sweep_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     node_high = (_nh + _shift) if _nh else 0.0
     ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum, edge="",
                             trigger_kind=plan.trigger_kind, venue_mid=venue_mid, magic=leg_magic,
-                            n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
+                            n_per_side=plan.n_per_side, step=plan.step, ts=clock.now(),
                             buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
                             buy_lots_total=round(sum(l.lot for l in plan.buy_legs), 4),
                             sell_lots_total=round(sum(l.lot for l in plan.sell_legs), 4),
@@ -1312,7 +1344,7 @@ def _hvn_edge_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum,
                             edge=str(plan.trigger_context.get("edge", "")),
                             trigger_kind=plan.trigger_kind, venue_mid=venue_mid, magic=leg_magic,
-                            n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
+                            n_per_side=plan.n_per_side, step=plan.step, ts=clock.now(),
                             buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
                             buy_lots_total=round(sum(l.lot for l in plan.buy_legs), 4),
                             sell_lots_total=round(sum(l.lot for l in plan.sell_legs), 4),
@@ -1378,6 +1410,7 @@ def exec_poll():
                              bid_ladder=(), ask_ladder=())
                           for b in _raw_bars]
                 ExecBridge.set_venue_bars(account, sym, _tf, _bars)
+                _log_venue_bars(sym, _tf, _raw_bars)
             except Exception:
                 LOG.exception(f"[exec] venue bars parse error ({_tf})")
 
@@ -1463,8 +1496,8 @@ def exec_poll():
     # legacy single-pool path (no per-magic truth there). clear_emit frees the fulcrum dedup.
     if sym and isinstance(magics, list):
         try:
-            import time as _t
-            _now = _t.time()
+            pass  # clock via execution.clock
+            _now = clock.now()
             _reap_grace = 30.0   # s — let a freshly-armed cycle place + report its legs first
             # Whole-account-flat signal: EA reports zero buys/sells/pendings at the top level
             # AND an empty magics array → MT5 holds nothing for us. Unambiguous; reap WITHOUT
@@ -1682,14 +1715,14 @@ def exec_emit_grid():
     #   a) fills and is managed, or b) expires cleanly before a new sweep arm is allowed.
     # cooldown = candle_sweep_cooldown_bars × tf_seconds (default 3 bars).
     if not force and plan.trigger_kind == "candle_sweep" and arm.get("trigger_kind") == "candle_sweep":
-        import time as _time
+        pass  # clock via execution.clock
         _tf_secs = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}.get(tf, 60)
         _cooldown_bars = int((settings.get("grid_levels") or {}).get("candle_sweep_cooldown_bars", 3))   # 0 = no cooldown (don't `or 3`)
         _cooldown_secs = _cooldown_bars * _tf_secs
         _last_arm_ts = float(arm.get("ts") or 0.0)
-        if _last_arm_ts > 0 and (_time.time() - _last_arm_ts) < _cooldown_secs:
+        if _last_arm_ts > 0 and (clock.now() - _last_arm_ts) < _cooldown_secs:
             return jsonify({"ok": True, "verdict": "skip",
-                            "skip_reason": f"sweep_cooldown({int(_time.time()-_last_arm_ts)}s/{_cooldown_secs}s)",
+                            "skip_reason": f"sweep_cooldown({int(clock.now()-_last_arm_ts)}s/{_cooldown_secs}s)",
                             "symbol": symbol, "broker_symbol": broker_symbol, "tf": tf})
     if not force and arm.get("active") and _live:
         # Bar-close refresh: same tracker as the 1s poll (_refresh_cycle_tps) — frozen
@@ -1874,7 +1907,7 @@ def exec_emit_grid():
     _sell_lots_total = round(sum(l.lot for l in plan.sell_legs), 4)
     ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum, edge=edge,
                             trigger_kind=plan.trigger_kind, venue_mid=quote["mid"], magic=leg_magic,
-                            n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
+                            n_per_side=plan.n_per_side, step=plan.step, ts=clock.now(),
                             buy_n=_placed_buy, sell_n=_placed_sell,
                             buy_lots_total=_buy_lots_total, sell_lots_total=_sell_lots_total,
                             bias_peak=0.0, bias_booked=False, bias_trail_done=False,

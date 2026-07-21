@@ -28,9 +28,26 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
-_AUDIT_LOG = _ROOT / "data" / "exec_bridge.jsonl"
-_EMIT_LOG = _ROOT / "data" / "exec_emit.jsonl"   # ground-truth arm/exit decisions
-_LAST_ACCOUNT_FILE = _ROOT / "data" / "last_account.txt"   # detects an account switch across restarts
+
+from execution import clock  # noqa: E402
+from execution.paths import data_dir  # noqa: E402
+
+
+# Resolved per call, not at import: FB_DATA_DIR must be honourable regardless of
+# import order. See execution/paths.py for why constants here were a hazard.
+def _audit_log() -> Path:
+    return data_dir() / "exec_bridge.jsonl"
+
+
+def _emit_log() -> Path:
+    """Ground-truth arm/exit decisions."""
+    return data_dir() / "exec_emit.jsonl"
+
+
+def _last_account_file() -> Path:
+    """Detects an account switch across restarts."""
+    return data_dir() / "last_account.txt"
+
 
 from execution.arm_state_store import persist_arm, persist_emit, load as _load_arm_state  # noqa: E402
 
@@ -38,9 +55,10 @@ from execution.arm_state_store import persist_arm, persist_emit, load as _load_a
 def _emit_exit_audit(row: dict) -> None:
     """Append one cycle-exit decision — same log the emit route uses for arms."""
     try:
-        _EMIT_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with _EMIT_LOG.open("a") as fh:
-            fh.write(json.dumps({"ts": time.time(), "verdict": "exit", **row}) + "\n")
+        _p = _emit_log()
+        _p.parent.mkdir(parents=True, exist_ok=True)
+        with _p.open("a") as fh:
+            fh.write(json.dumps({"ts": clock.now(), "verdict": "exit", **row}) + "\n")
     except Exception:
         pass  # audit must never break execution
 
@@ -50,7 +68,8 @@ def _emit_exit_audit(row: dict) -> None:
 # in-memory cycle state dies on restart — which is why per-cycle P&L could only be
 # reconstructed from broker statements. This log writes ONE row per completed cycle
 # with the arm context and the exit outcome already joined, keyed by cycle_id.
-_CYCLE_LOG_DIR = _ROOT / "data" / "cycles"
+def _cycle_log_dir() -> Path:
+    return data_dir() / "cycles"
 
 
 def _cycle_log_path(now: float | None = None) -> Path:
@@ -60,8 +79,8 @@ def _cycle_log_path(now: float | None = None) -> Path:
     without slicing one ever-growing file. Dated in LOCAL time, matching how the
     broker statement and the emit logs are read.
     """
-    t = time.localtime(now if now is not None else time.time())
-    return _CYCLE_LOG_DIR / f"cycle_outcomes_{time.strftime('%Y-%m-%d', t)}.jsonl"
+    t = time.localtime(now if now is not None else clock.now())
+    return _cycle_log_dir() / f"cycle_outcomes_{time.strftime('%Y-%m-%d', t)}.jsonl"
 
 
 def cycle_id_for(account: str, symbol: str, magic: int, armed_ts: float) -> str:
@@ -84,12 +103,12 @@ def _emit_cycle_outcome(cyc: dict, *, account: str, symbol: str, magic: int,
             "cycle_id": cycle_id_for(account, symbol, magic, armed_ts),
             # local trading date — redundant with the filename, but keeps rows
             # groupable after several days are concatenated for a combined view.
-            "date": time.strftime("%Y-%m-%d", time.localtime()),
+            "date": time.strftime("%Y-%m-%d", time.localtime(clock.now())),
             "account": str(account), "broker_symbol": symbol,
             "magic": int(magic), "tf": tf or cyc.get("armed_tf", ""),
             # arm context
-            "armed_ts": armed_ts, "exit_ts": time.time(),
-            "held_s": round(time.time() - armed_ts, 1) if armed_ts else None,
+            "armed_ts": armed_ts, "exit_ts": clock.now(),
+            "held_s": round(clock.now() - armed_ts, 1) if armed_ts else None,
             "trigger_kind": cyc.get("trigger_kind", ""), "edge": cyc.get("edge", ""),
             "fulcrum": cyc.get("fulcrum"), "step": cyc.get("step"),
             "n_per_side": cyc.get("n_per_side"),
@@ -274,7 +293,7 @@ class ExecBridge:
         account = str(account)
         if cls._last_seen_account is None:
             try:
-                cls._last_seen_account = _LAST_ACCOUNT_FILE.read_text().strip() or None
+                cls._last_seen_account = _last_account_file().read_text().strip() or None
             except Exception:
                 cls._last_seen_account = None
         retired = 0
@@ -289,8 +308,9 @@ class ExecBridge:
         if cls._last_seen_account != account:
             cls._last_seen_account = account
             try:
-                _LAST_ACCOUNT_FILE.parent.mkdir(parents=True, exist_ok=True)
-                _LAST_ACCOUNT_FILE.write_text(account)
+                _laf = _last_account_file()
+                _laf.parent.mkdir(parents=True, exist_ok=True)
+                _laf.write_text(account)
             except Exception:
                 pass
         return retired
@@ -327,7 +347,9 @@ class ExecBridge:
         """
         import datetime
         account = str(account)
-        today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        # off clock.now() (not utcnow) so a replay buckets by SIMULATED day —
+        # a wall-clock key would make the daily target never reset mid-backtest.
+        today = datetime.datetime.utcfromtimestamp(clock.now()).strftime("%Y-%m-%d")
         with cls._lock:
             # reset on new day
             if cls._daily_start_date.get(account) != today:
@@ -371,7 +393,7 @@ class ExecBridge:
         A breakout (price keeps going through the edge) never reverts → never confirms
         → no arm. State clears on confirm or when price leaves the buffer entirely
         (tap abandoned)."""
-        t = now if now is not None else time.time()
+        t = now if now is not None else clock.now()
         key = (str(account), broker_symbol, tf, kind)
         with cls._lock:
             st = cls._touch_state.get(key)
@@ -430,7 +452,7 @@ class ExecBridge:
                 "positions": int(positions), "pendings": int(pendings), "tf": tf,
                 "buys": int(buys), "sells": int(sells),
                 "buy_pendings": int(buy_pendings), "sell_pendings": int(sell_pendings),
-                "ts": now if now is not None else time.time(),
+                "ts": now if now is not None else clock.now(),
             }
 
     @classmethod
@@ -540,7 +562,7 @@ class ExecBridge:
           2. flatten-rest — a leg closed mid-cycle while the opposite ladder rests
           3. full-hedge   — delta-neutral basket cut to free margin (realizes loss)
         """
-        t = now if now is not None else time.time()
+        t = now if now is not None else clock.now()
         cyc = cls.get_last_arm(account, symbol, magic=magic)
         if not cyc or not cyc.get("active"):
             return None
@@ -973,7 +995,7 @@ class ExecBridge:
             cls._quotes[(str(account), symbol)] = {
                 "bid": float(bid), "ask": float(ask), "mid": (bid + ask) / 2.0,
                 "stops_dist": float(stops_dist),   # broker min stop distance ($) for step floor
-                "ts": now if now is not None else time.time(),
+                "ts": now if now is not None else clock.now(),
             }
 
     @classmethod
@@ -999,8 +1021,9 @@ class ExecBridge:
     @classmethod
     def _audit(cls, event: str, cmd: Command) -> None:
         try:
-            _AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
-            with _AUDIT_LOG.open("a") as fh:
+            _p = _audit_log()
+            _p.parent.mkdir(parents=True, exist_ok=True)
+            with _p.open("a") as fh:
                 fh.write(json.dumps({"event": event, "ts": cmd.ts_created, **asdict(cmd)}) + "\n")
         except Exception:
             pass  # audit must never break execution
@@ -1016,7 +1039,7 @@ class ExecBridge:
             order_type=order_type, price=round(float(price), 5), lot=round(float(lot), 2),
             sl=round(float(sl), 5), tp=round(float(tp), 5), comment=comment,
             magic=int(magic), side=side, frac=float(frac),
-            ts_created=now if now is not None else time.time(),
+            ts_created=now if now is not None else clock.now(),
         )
         with cls._lock:
             cls._cmds[cmd.id] = cmd
@@ -1131,7 +1154,7 @@ class ExecBridge:
         if cd <= 0:
             return False
         k = (str(account), broker_symbol, int(magic), side or "", kind)
-        now = time.time()
+        now = clock.now()
         with cls._lock:
             if now - cls._last_modify_ts.get(k, 0.0) < cd:
                 return True
@@ -1186,7 +1209,7 @@ class ExecBridge:
     def poll(cls, account: str, now: float | None = None) -> list[dict]:
         """Return wire-form commands for `account`: every PENDING, plus any
         IN_FLIGHT stale beyond reclaim_after_s (re-armed). Marks them IN_FLIGHT."""
-        t = now if now is not None else time.time()
+        t = now if now is not None else clock.now()
         account = str(account)
         out: list[dict] = []
         with cls._lock:
