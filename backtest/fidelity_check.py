@@ -90,7 +90,7 @@ def dedupe_harness_arms(cmds: list[dict], fulcrum_round: int = 1) -> list[dict]:
 
 
 def run_gates(live_rows: list[dict], harness_arms: list[dict],
-              fulcrum_tol: float = 0.5) -> dict:
+              fulcrum_tol: float = 0.5, ts_tol_s: float = 900.0) -> dict:
     live_bt = [r for r in live_rows if r.get("trigger_kind") in BACKTESTABLE]
     live_def = [r for r in live_rows if r.get("trigger_kind") in DEFERRED]
     live_other = [r for r in live_rows
@@ -104,17 +104,29 @@ def run_gates(live_rows: list[dict], harness_arms: list[dict],
     for r in live_bt:
         mg = int(r.get("magic", 0) or 0)
         cands = h_by_magic.get(mg, [])
-        # match on magic; geometry compared below
-        if cands:
-            matched.append((r, cands[0]))
-        else:
+        if not cands:
             missed.append(r)
+            continue
+        # Match the harness arm CLOSEST IN TIME to the live arm. Taking cands[0]
+        # compared every live cycle against one arbitrary harness arm on that magic,
+        # which made geometry look 0% even where it was close.
+        lt = float(r.get("armed_ts") or 0.0)
+        best = min(cands, key=lambda a: abs(float(a.get("poll_ts") or 0.0) - lt))
+        # A magic-only match is NOT a match: magics repeat all day, so pairing a live
+        # 15:00 arm with a harness 00:20 arm on the same magic reports high recall for
+        # two events that have nothing to do with each other. Require time proximity.
+        if abs(float(best.get("poll_ts") or 0.0) - lt) > ts_tol_s:
+            missed.append(r)
+            continue
+        matched.append((r, best))
 
     live_magics = {int(r.get("magic", 0) or 0) for r in live_bt}
     phantoms = [a for a in harness_arms if a["magic"] not in live_magics]
 
     g3_ok = g3_tot = 0
     g3_detail = []
+    field_fail: dict[str, int] = defaultdict(int)
+    step_ratios: list[float] = []
     for r, a in matched:
         g3_tot += 1
         checks = {
@@ -122,9 +134,21 @@ def run_gates(live_rows: list[dict], harness_arms: list[dict],
             "sell_n": (r.get("sell_n"), a.get("sell_n")),
             "step": (r.get("step"), a.get("step")),
         }
-        bad = {k: v for k, v in checks.items()
-               if v[0] is not None and v[1] is not None and
-               (abs(float(v[0]) - float(v[1])) > 1e-6 if k == "step" else v[0] != v[1])}
+        # step is a float derived from ATR — compare within 10% rather than exactly.
+        # Leg counts must match exactly (they're integers straight off the planner).
+        def _bad(k, v) -> bool:
+            if v[0] is None or v[1] is None:
+                return False
+            if k == "step":
+                lo, hi = float(v[0]), float(v[1])
+                return abs(hi - lo) > 0.10 * max(abs(lo), 1e-9)
+            return v[0] != v[1]
+
+        bad = {k: v for k, v in checks.items() if _bad(k, v)}
+        for k in bad:
+            field_fail[k] += 1
+        if r.get("step") and a.get("step"):
+            step_ratios.append(float(a["step"]) / float(r["step"]))
         if not bad:
             g3_ok += 1
         else:
@@ -133,7 +157,21 @@ def run_gates(live_rows: list[dict], harness_arms: list[dict],
                                            for k, v in bad.items()}})
 
     n_live = len(live_bt)
+    # Arm-time coverage — surfaces the "harness armed at 00:20, live armed 09:43+"
+    # failure mode that a magic-only match would otherwise hide behind high recall.
+    h_ts = sorted(float(a.get("poll_ts") or 0.0) for a in harness_arms)
+    l_ts = sorted(float(r.get("armed_ts") or 0.0) for r in live_bt)
+    coverage = None
+    if h_ts and l_ts:
+        overlap = sum(1 for t in l_ts if h_ts[0] <= t <= h_ts[-1])
+        coverage = {
+            "harness_window": [int(h_ts[0]), int(h_ts[-1])],
+            "live_window": [int(l_ts[0]), int(l_ts[-1])],
+            "live_arms_in_harness_window": overlap,
+            "live_arms_outside": len(l_ts) - overlap,
+        }
     return {
+        "arm_time_coverage": coverage,
         "day_rows_total": len(live_rows),
         "backtestable": n_live,
         "deferred_candle_sweep": len(live_def),
@@ -153,6 +191,11 @@ def run_gates(live_rows: list[dict], harness_arms: list[dict],
         "G3_geometry": {
             "exact": g3_ok, "compared": g3_tot,
             "pct": round(100.0 * g3_ok / g3_tot, 1) if g3_tot else None,
+            "field_failures": dict(field_fail),
+            "step_ratio_harness_over_live": {
+                "median": round(sorted(step_ratios)[len(step_ratios) // 2], 3),
+                "min": round(min(step_ratios), 3), "max": round(max(step_ratios), 3),
+            } if step_ratios else None,
             "mismatches": g3_detail[:10],
         },
     }
