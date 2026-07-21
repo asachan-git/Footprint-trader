@@ -84,6 +84,9 @@ def dedupe_harness_arms(cmds: list[dict], fulcrum_round: int = 1) -> list[dict]:
         rec["buy_n"] = len(buys)
         rec["sell_n"] = len(sells)
         rec["n_legs"] = len(legs)
+        # planner's n_per_side = legs on the larger side (a skewed ladder truncates the
+        # other side, so max() recovers the planned count rather than the skewed one).
+        rec["n_per_side"] = max(len(buys), len(sells))
         rec["price_lo"] = prices[0] if prices else None
         rec["price_hi"] = prices[-1] if prices else None
         # step = median gap between consecutive distinct leg prices
@@ -135,10 +138,17 @@ def run_gates(live_rows: list[dict], harness_arms: list[dict],
     step_ratios: list[float] = []
     for r, a in matched:
         g3_tot += 1
+        # buy_n / sell_n are deliberately NOT compared. They are set from
+        # len(plan.buy_legs) at arm time, but reconcile_from_poll overwrites them with
+        # the EA's live open-position counts (execution/exec_bridge.py:1352-1355), so by
+        # the time a cycle is logged at exit they mean "positions still held", not "legs
+        # placed". Comparing them to harness placement counts measured survival against
+        # placement: live showed median 2 vs the harness's 9, which looked like a large
+        # geometry failure. The live AUDIT log confirms live actually placed a median of
+        # 10 legs per batch — i.e. the harness matched all along and the metric was wrong.
         checks = {
-            "buy_n": (r.get("buy_n"), a.get("buy_n")),
-            "sell_n": (r.get("sell_n"), a.get("sell_n")),
             "step": (r.get("step"), a.get("step")),
+            "n_per_side": (r.get("n_per_side"), a.get("n_per_side")),
         }
         # step is a float derived from ATR — compare within 10% rather than exactly.
         # Leg counts must match exactly (they're integers straight off the planner).
