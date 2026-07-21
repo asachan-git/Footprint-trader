@@ -29,6 +29,19 @@ from pipeline.features.volume_profile import DEFAULT_BIN_SIZE
 BUCKET_S = 900
 
 
+def _configured_bin_size(symbol: str) -> float | None:
+    """vp_bin_size[symbol] from settings — the same source build_and_save uses."""
+    try:
+        import yaml
+        from pathlib import Path as _P
+        root = _P(__file__).resolve().parent.parent
+        cfg = yaml.safe_load((root / "config" / "settings.yaml").read_text()) or {}
+        raw = ((cfg.get("vp_cache") or {}).get("vp_bin_size") or {}).get(symbol)
+        return float(raw) if raw is not None else None
+    except Exception:
+        return None
+
+
 def build_replay_cache(
     symbol: str,
     out_path: Path,
@@ -50,7 +63,12 @@ def build_replay_cache(
 
     anchor = vpc._normalize_anchor(anchor_raw)
     if bin_size is None:
-        bin_size = DEFAULT_BIN_SIZE.get(symbol)
+        # settings.vp_cache.vp_bin_size FIRST — DEFAULT_BIN_SIZE is only a fallback and
+        # differs for gold (1.0 vs the configured 0.4). Using the default quantises every
+        # zone edge to whole dollars, so edges never land within the touch buffer of real
+        # price and hvn_inside_touch effectively never arms. build_and_save reads the
+        # config the same way; the replay must not diverge from it.
+        bin_size = _configured_bin_size(symbol) or DEFAULT_BIN_SIZE.get(symbol)
 
     s = _store()
     all_bars = s.recent(symbol, primary_tf, 1_000_000)
