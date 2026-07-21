@@ -600,9 +600,13 @@ def _cached_hvn(symbol: str) -> list[tuple[float, float]]:
     ONLY. Before that, merge prev-day + today (today may still be too thin alone)."""
     try:
         from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        from execution import clock as _clock
         from pipeline.features.vp_cache import get_prev_and_today
         prev_vp, today_vp = get_prev_and_today(symbol)
-        ist_hour = _dt.now(tz=_tz(_td(hours=5, minutes=30))).hour
+        # Off clock.now(), not wall time: a replay must evaluate this branch at the
+        # SIMULATED hour, or it reads the live server's current IST hour and picks the
+        # wrong source (today-only vs prev+today) for every historical bar.
+        ist_hour = _dt.fromtimestamp(_clock.now(), tz=_tz(_td(hours=5, minutes=30))).hour
         sources = (today_vp,) if ist_hour >= 20 else (prev_vp, today_vp)
         zones: list[tuple[float, float]] = []
         for vp in sources:
@@ -710,9 +714,13 @@ def _cached_lvn(symbol: str) -> list[tuple[float, float]]:
     rule for consistency (same reference session both draw from)."""
     try:
         from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        from execution import clock as _clock
         from pipeline.features.vp_cache import get_prev_and_today
         prev_vp, today_vp = get_prev_and_today(symbol)
-        ist_hour = _dt.now(tz=_tz(_td(hours=5, minutes=30))).hour
+        # Off clock.now(), not wall time: a replay must evaluate this branch at the
+        # SIMULATED hour, or it reads the live server's current IST hour and picks the
+        # wrong source (today-only vs prev+today) for every historical bar.
+        ist_hour = _dt.fromtimestamp(_clock.now(), tz=_tz(_td(hours=5, minutes=30))).hour
         sources = (today_vp,) if ist_hour >= 20 else (prev_vp, today_vp)
         zones: list[tuple[float, float]] = []
         for vp in sources:
