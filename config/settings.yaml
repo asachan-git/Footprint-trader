@@ -131,7 +131,7 @@ grid_levels:
   # After bias_trail books a side, also cancel THAT side's own resting pendings so the
   # just-booked direction can't re-load at worse prices once the BE-SL scratches the
   # runner (the re-loaded legs get no trail — bias_trail_done is spent — and no SL).
-  book_cancel_own_pendings: true
+  book_cancel_own_pendings: false
   # Deferred structural SL (>50% of a side filled → SL at node edge). OFF — did not exist
   # at 9590331. false = committed side can't be stopped out; net_target/full_hedge own the exit.
   defer_sl_on_half_fill: false

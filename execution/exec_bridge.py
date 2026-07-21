@@ -835,8 +835,21 @@ class ExecBridge:
         # (NOT bias_booked, which the flatten-rest suppression below resets one poll
         # after booking; gating on bias_booked let the trail double/triple-fire within
         # seconds of the first book, each time at a worse price).
+        # PER-SIDE one-shot (2026-07-21): bias_trail_done was cycle-wide, so the FIRST
+        # side to book consumed the trail for the whole cycle. Two consequences:
+        #   (a) the OTHER side could later fill, peak, and give it all back with no trail
+        #       to book it — TP/net_target only;
+        #   (b) when the side-only re-arm backfills a booked-flat side (_touch_arm_tf),
+        #       those fresh legs inherited the spent flag → re-filled, untrailed, and
+        #       (legs place sl=0.0) unprotected.
+        # Now the flag is per-side (bias_trail_done_buy / _sell) and the side-only re-arm
+        # clears the flag for the side it backfills, so each side gets its own trail.
+        # The double-fire bug the cycle-wide flag was added to prevent is still covered:
+        # a side's flag is only cleared when that side went FLAT and is re-armed fresh.
+        _bias_done_buy  = bool(cyc.get("bias_trail_done_buy")  or cyc.get("bias_trail_done"))
+        _bias_done_sell = bool(cyc.get("bias_trail_done_sell") or cyc.get("bias_trail_done"))
         if (bool(grid_cfg.get("bias_trail_enabled", True))
-                and not cyc.get("bias_trail_done")
+                and not (_bias_done_buy and _bias_done_sell)
                 and buy_pnl is not None and sell_pnl is not None):
             net_pnl = float(buy_pnl) + float(sell_pnl)
             peak = max(float(cyc.get("bias_peak") or 0.0), net_pnl)
@@ -863,7 +876,16 @@ class ExecBridge:
                     and net_pnl <= peak * (1.0 - giveback / 100.0)):
                 # Book whichever side is net-winning RIGHT NOW — the trail fired off
                 # combined P&L, but CLOSE_SIDE/MOVE_BE are inherently directional.
+                # Skip a side whose per-side one-shot is already spent, else the trail
+                # would re-book a side it has already booked (the double-fire the
+                # cycle-wide flag originally guarded against).
                 bias = "buy" if float(buy_pnl) >= float(sell_pnl) else "sell"
+                if bias == "buy" and _bias_done_buy:
+                    bias = "sell"
+                elif bias == "sell" and _bias_done_sell:
+                    bias = "buy"
+                if (bias == "buy" and _bias_done_buy) or (bias == "sell" and _bias_done_sell):
+                    return None   # both sides already booked — nothing left to trail
                 cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic, side=bias,
                             frac=book_frac, comment=f"FB|book|{bias}", now=t)
                 cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=bias,
@@ -878,14 +900,20 @@ class ExecBridge:
                 # it stayed harmless there on a single 1m cycle, but bites with 5 TFs x 4
                 # setups. NOTE: distinct from fullfill_cancel_opposite, which kills the
                 # OPPOSITE ladder on a full-fill — this kills the booked side's own.
-                if bool(grid_cfg.get("book_cancel_own_pendings", True)):
+                # DEFAULT OFF: cancelling the booked side's pendings also removes what the
+                # side-only re-arm (_touch_arm_tf) would backfill, killing the harvest
+                # loop. With the per-side trail flag below, a re-loaded side is managed
+                # again rather than naked — so re-loading is now the intended behaviour.
+                if bool(grid_cfg.get("book_cancel_own_pendings", False)):
                     cls.enqueue(account, CANCEL_PENDINGS, symbol, magic=magic, side=bias,
                                 comment=f"FB|book_cancel_own|{bias}", now=t)
-                # bias_trail_done = private one-shot (never reset while cycle lives);
-                # bias_booked = flatten-rest suppression (reset by that block below).
-                cls.set_last_arm(account, symbol, magic=magic, **{**cyc, "bias_side": bias,
-                                                     "bias_booked": True,
-                                                     "bias_trail_done": True})
+                # PER-SIDE one-shot: only the side we just booked is spent. The other side
+                # keeps its own trail, and a side-only re-arm clears this flag when it
+                # backfills that side. bias_booked stays cycle-wide (flatten-rest
+                # suppression, reset by that block below).
+                cls.set_last_arm(account, symbol, magic=magic,
+                                 **{**cyc, "bias_side": bias, "bias_booked": True,
+                                    f"bias_trail_done_{bias}": True})
                 _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
                                   "tf": tf, "magic": magic, "exit_reason": "bias_book_trail",
                                   "bias": bias, "peak": round(peak, 2),

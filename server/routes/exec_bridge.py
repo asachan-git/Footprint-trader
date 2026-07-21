@@ -740,10 +740,16 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
         _update = {f"{flat_side}_n": len(_side_legs),
                    f"{flat_side}_lots_total": _side_lots,
                    f"tp_{'up' if flat_side == 'buy' else 'down'}": _side_tp,
-                   f"be_done_{flat_side}": False}
-        # Everything else (the live side's counts/lots/TP, bias_peak/bias_booked/
-        # bias_trail_done, max_*_seen, fulcrum, node_low/high) is left exactly as-is —
-        # that state belongs to the still-open side and must survive this backfill.
+                   f"be_done_{flat_side}": False,
+                   # Re-arm the trail for THIS side (2026-07-21). The side went flat and is
+                   # being backfilled with fresh legs, so its spent one-shot must clear or
+                   # the new legs ride untrailed — and since legs place sl=0.0 they would
+                   # have no protection at all. Scoped to flat_side, so the still-live
+                   # side's own flag (and the double-fire guard it provides) is untouched.
+                   f"bias_trail_done_{flat_side}": False}
+        # Everything else (the live side's counts/lots/TP, bias_peak/bias_booked, the
+        # OTHER side's bias_trail_done_*, max_*_seen, fulcrum, node_low/high) is left
+        # exactly as-is — that state belongs to the still-open side and must survive.
         # magic= passed explicitly and stripped from the spread: _cyc's own embedded
         # "magic" field is not authoritative (see project_arm_magic_key_bug memory).
         _cyc_body = {k: v for k, v in _cyc.items() if k != "magic"}
@@ -958,7 +964,10 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
         _update = {f"{flat_side}_n": len(_side_legs),
                    f"{flat_side}_lots_total": _side_lots,
                    f"tp_{'up' if flat_side == 'buy' else 'down'}": _side_tp,
-                   f"be_done_{flat_side}": False}
+                   f"be_done_{flat_side}": False,
+                   # see _touch_arm_tf: clear the backfilled side's spent trail one-shot
+                   # so the fresh legs are managed, not naked (legs place sl=0.0).
+                   f"bias_trail_done_{flat_side}": False}
         _cyc_body = {k: v for k, v in _cyc.items() if k != "magic"}
         ExecBridge.set_last_arm(account, broker_symbol, magic=leg_magic,
                                 **{**_cyc_body, **_update})
