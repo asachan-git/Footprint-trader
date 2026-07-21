@@ -61,6 +61,7 @@ def run(
     venue_offset: float,
     poll_tf: str = "1m",
     balance: float = 100_000.0,
+    stops_pts: float = 0.0,
 ) -> HarnessResult:
     """Replay one session-day, polling on each `poll_tf` bar close.
 
@@ -88,7 +89,14 @@ def run(
 
     res = HarnessResult()
     point = 0.01              # XAUUSD+ point
-    stops_pts = 0.0           # freeze band unknown offline → 0 (Phase-2 fill engine models it)
+    # Broker freeze band. THIS IS A KNOWN FIDELITY GAP, not a tuning knob.
+    # SYMBOL_TRADE_STOPS_LEVEL is read by the EA and only ever reaches the server inside
+    # a live poll body (routes/exec_bridge.py:1427); it is not persisted anywhere, so the
+    # historical value cannot be recovered offline. It matters a lot: live cycles record
+    # n_per_side=5 (10 legs planned) but only 1-5 legs actually placed, i.e. the broker
+    # rejected most of the ladder. With stops_pts=0 the harness accepts every leg and
+    # therefore always over-places, which is the dominant G3 buy_n/sell_n failure.
+    # Recover the real value from a capture session (FB_CAPTURE_POLLS=1) and pass it in.
 
     cadence_bars = _bar_closes(analysis_symbol, poll_tf, start_ts, end_ts)
     # 1m bars give the broker a finer intrabar path than the poll cadence: between two
@@ -156,6 +164,10 @@ if __name__ == "__main__":
     ap.add_argument("--replay-cache", required=True)
     ap.add_argument("--offset", type=float, default=0.0)
     ap.add_argument("--poll-tf", default="1m")
+    ap.add_argument("--stops-pts", type=float, default=0.0,
+                    help="broker freeze band in POINTS (SYMBOL_TRADE_STOPS_LEVEL). "
+                         "Not recoverable offline — get it from a capture session. "
+                         "0 accepts every leg and over-places vs live.")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -164,7 +176,8 @@ if __name__ == "__main__":
     r = run(account=args.account, analysis_symbol=args.analysis_symbol,
             broker_symbol=args.broker_symbol, day_key=args.day,
             replay_cache=args.replay_cache, settings=settings,
-            venue_offset=args.offset, poll_tf=args.poll_tf)
+            venue_offset=args.offset, poll_tf=args.poll_tf,
+            stops_pts=args.stops_pts)
     arms = r.arms()
     print(f"polls={r.polls} commands={len(r.commands)} arms(PLACE_PENDING)={len(arms)}")
     b = r.broker
