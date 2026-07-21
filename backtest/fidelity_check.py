@@ -31,9 +31,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # Kinds that run off store() bars and are fully backtestable today.
-BACKTESTABLE = {"hvn_inside_touch", "lvn_edge_touch", "hvn_edge", "hvn_displacement"}
-# Kinds blocked on missing venue history.
-DEFERRED = {"candle_sweep"}
+BACKTESTABLE = {"hvn_inside_touch", "lvn_edge_touch", "hvn_displacement"}
+# Kinds blocked on missing Vantage venue OHLC. BOTH of these arm drivers hard-return
+# when the EA hasn't sent venue bars — server/routes/exec_bridge.py:1147 (_sweep_arm_tf)
+# and :1287 (_hvn_edge_arm_tf) — and both carry an explicit "never fall back to the
+# analysis feed" rule, because a Binance sweep/retest is not a Vantage one. The repo has
+# no historical Vantage OHLC (capture started 2026-07-21), so neither can be replayed.
+# hvn_edge was previously listed as backtestable, which silently scored 18 unachievable
+# live cycles as G1 misses.
+DEFERRED = {"candle_sweep", "hvn_edge"}
 
 
 def load_live(day: str, broker_symbol: str = "XAUUSD+") -> list[dict]:
@@ -174,7 +180,7 @@ def run_gates(live_rows: list[dict], harness_arms: list[dict],
         "arm_time_coverage": coverage,
         "day_rows_total": len(live_rows),
         "backtestable": n_live,
-        "deferred_candle_sweep": len(live_def),
+        "deferred_no_venue_ohlc": len(live_def),
         "other_kinds": len(live_other),
         "harness_arms": len(harness_arms),
         "G1_arm_recall": {
@@ -217,9 +223,11 @@ def main() -> int:
 
     print(json.dumps(rep, indent=2))
     print()
-    if rep["deferred_candle_sweep"]:
-        print(f"NOTE: {rep['deferred_candle_sweep']} candle_sweep cycles EXCLUDED — "
-              f"UNVALIDATED, needs real Vantage venue OHLC (capture started 2026-07-21).")
+    if rep["deferred_no_venue_ohlc"]:
+        print(f"NOTE: {rep['deferred_no_venue_ohlc']} cycles EXCLUDED as UNVALIDATED "
+              f"({', '.join(sorted(DEFERRED))}) — these arm drivers hard-require Vantage "
+              f"venue OHLC and refuse an analysis-feed fallback by design; the repo has no "
+              f"historical venue bars (capture started 2026-07-21).")
     g1 = rep["G1_arm_recall"]["pct"]
     g3 = rep["G3_geometry"]["pct"]
     print(f"VERDICT: G1={g1}%  G3={g3}%  "
