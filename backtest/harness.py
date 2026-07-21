@@ -59,14 +59,19 @@ def run(
     replay_cache: str,
     settings: dict,
     venue_offset: float,
-    poll_tf: str = "5m",
+    poll_tf: str = "1m",
     balance: float = 100_000.0,
 ) -> HarnessResult:
     """Replay one session-day, polling on each `poll_tf` bar close.
 
     poll_tf drives the poll cadence; the arm scanners internally read every TF's
-    store bars as-of the clock, so a 5m cadence exercises 1m/3m/5m/10m/15m arms
-    that would have fired by each 5m close.
+    store bars as-of the clock, so one cadence exercises 1m..15m arms.
+
+    Default 1m, not 5m: the live EA polls on a ~1s timer, so intrabar touch-arms fire
+    far finer than any bar cadence. At 5m the harness misses taps that occur inside the
+    bar and arms the right magic at the wrong time (median gap to the matching live arm
+    was ~39 min). Measured on 2026-07-20: G1 27.0% at 5m vs 33.0% at 1m. 1m is the
+    finest cadence the stored footprint supports.
     """
     if not os.environ.get("FB_DATA_DIR"):
         raise RuntimeError("harness requires FB_DATA_DIR (scratch)")
@@ -150,7 +155,7 @@ if __name__ == "__main__":
     ap.add_argument("--day", required=True, help="session-day key YYYY-MM-DD")
     ap.add_argument("--replay-cache", required=True)
     ap.add_argument("--offset", type=float, default=0.0)
-    ap.add_argument("--poll-tf", default="5m")
+    ap.add_argument("--poll-tf", default="1m")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
