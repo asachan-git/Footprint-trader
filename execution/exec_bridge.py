@@ -250,6 +250,12 @@ class Command:
                      sl=self.sl, tp=self.tp, comment=self.comment)
         elif self.type in (CLOSE_SIDE, MOVE_BE):
             d.update(side=self.side, frac=self.frac, comment=self.comment)
+        elif self.type == CANCEL_PENDINGS:
+            # side ("buy"/"sell") scopes the cancel to ONE ladder; "" = both. The EA has
+            # always honoured it (ExecCancelPendings filters on side) but to_wire never
+            # SENT it, so every side-scoped cancel silently degraded to cancelling BOTH
+            # ladders — including fullfill_cancel_opposite and the book_cancel_own path.
+            d.update(side=self.side, comment=self.comment)
         elif self.type == MODIFY_PENDING:
             # price field carries price_delta; tp = new TP (0 = leave unchanged)
             d.update(price_delta=self.price, tp=self.tp, side=self.side)
@@ -862,6 +868,19 @@ class ExecBridge:
                             frac=book_frac, comment=f"FB|book|{bias}", now=t)
                 cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=bias,
                             comment=f"FB|be|{bias}", now=t)
+                # Cancel the BOOKED side's own resting pendings (2026-07-21). Without this
+                # the side we just took profit on re-loads: BE-SL scratches the runner,
+                # price resumes, the outer legs of that SAME side fill again at WORSE
+                # prices — and with bias_trail_done already spent they get no trail, no
+                # SL (legs place sl=0.0), and the next position drop trips
+                # leg_closed_other into a market flatten. This gap was present in the
+                # Jun-22 baseline too (4f387b7 book path was CLOSE_SIDE + MOVE_BE only);
+                # it stayed harmless there on a single 1m cycle, but bites with 5 TFs x 4
+                # setups. NOTE: distinct from fullfill_cancel_opposite, which kills the
+                # OPPOSITE ladder on a full-fill — this kills the booked side's own.
+                if bool(grid_cfg.get("book_cancel_own_pendings", True)):
+                    cls.enqueue(account, CANCEL_PENDINGS, symbol, magic=magic, side=bias,
+                                comment=f"FB|book_cancel_own|{bias}", now=t)
                 # bias_trail_done = private one-shot (never reset while cycle lives);
                 # bias_booked = flatten-rest suppression (reset by that block below).
                 cls.set_last_arm(account, symbol, magic=magic, **{**cyc, "bias_side": bias,
