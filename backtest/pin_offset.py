@@ -92,13 +92,18 @@ def pin(symbol: str = "XAUTUSDT", broker: str = "XAUUSD+", tf: str = "5m",
 
 def pin_from_cycles(day: str, symbol: str = "XAUTUSDT",
                     broker_symbol: str = "XAUUSD+") -> dict:
-    """Offset from live ground truth — the reliable method.
+    """DO NOT USE AS A VENUE OFFSET — kept only as a diagnostic.
 
-    Each cycle-outcome row records `fulcrum` in the VENUE frame at a known `armed_ts`.
-    Comparing that to the analysis-frame close at the same instant gives one offset
-    sample per live cycle, which is far more coverage than the venue-bar overlap
-    method (which had exactly one matching pair and returned the WRONG SIGN: +6.65
-    against a true -5.21).
+    This differences a cycle's `fulcrum` against the analysis close at `armed_ts`.
+    That is NOT the venue basis: a fulcrum is a ZONE EDGE, which legitimately sits
+    5-15 points away from spot, so the result is dominated by edge-to-price distance.
+    It reported -5.21 for 2026-07-20; the true rebase is ~0.
+
+    The correct measurement is node_rebase_shift() below: live `node_low`/`node_high`
+    land on the analysis 0.4 bin grid to within +/-0.12, which proves the zones the
+    live server armed on are ANALYSIS-frame, not venue-shifted. Empirically the
+    harness scores better at offset 0 than at -5.21 (G1 14.3% vs 12.0%, arm-window
+    coverage 118/133 vs 93/133).
     """
     import bisect
     from pipeline.state_store import store
@@ -138,14 +143,47 @@ def pin_from_cycles(day: str, symbol: str = "XAUTUSDT",
     }
 
 
+def node_rebase_shift(day: str, symbol: str = "XAUTUSDT", bin_size: float = 0.4) -> dict:
+    """How far live node edges sit off the analysis VP bin grid — the real frame test.
+
+    Cached VP zone edges are exact multiples of vp_bin_size in the analysis frame. If
+    the live server had rebased its zones onto the venue, every recorded node edge
+    would be offset by the basis. Measuring the residual against the grid therefore
+    recovers the actual shift applied.
+    """
+    p = ROOT / "data" / "cycles" / f"cycle_outcomes_{day}.jsonl"
+    if not p.exists():
+        return {"ok": False, "reason": f"no cycle log for {day}"}
+    rows = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    shifts = [float(r["node_low"]) - round(float(r["node_low"]) / bin_size) * bin_size
+              for r in rows if r.get("node_low")]
+    if not shifts:
+        return {"ok": False, "reason": "no node_low values"}
+    shifts.sort()
+    n = len(shifts)
+    return {"ok": True, "n": n, "bin_size": bin_size,
+            "median": round(statistics.median(shifts), 4),
+            "mean": round(statistics.fmean(shifts), 4),
+            "std": round(statistics.pstdev(shifts), 4),
+            "p10": round(shifts[int(0.1 * (n - 1))], 4),
+            "p90": round(shifts[int(0.9 * (n - 1))], 4),
+            "verdict": "zones are ANALYSIS-frame (use offset 0)"
+                       if abs(statistics.fmean(shifts)) < bin_size / 2
+                       else "zones appear venue-shifted"}
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbol", default="XAUTUSDT")
     ap.add_argument("--broker", default="XAUUSD+")
     ap.add_argument("--tf", default="5m")
-    ap.add_argument("--day", default="", help="use live cycle ground truth for this day (preferred)")
+    ap.add_argument("--day", default="", help="diagnostic: fulcrum-vs-close (NOT the venue basis)")
+    ap.add_argument("--frame-test", default="", help="day to run the node-grid frame test (preferred)")
     args = ap.parse_args()
+    if args.frame_test:
+        print(json.dumps(node_rebase_shift(args.frame_test, args.symbol), indent=2))
+        raise SystemExit(0)
     if args.day:
         r = pin_from_cycles(args.day, args.symbol, args.broker)
         print(json.dumps(r, indent=2))
