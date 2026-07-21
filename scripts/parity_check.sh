@@ -40,21 +40,28 @@ FB_DATA_DIR="$SCRATCH" ./venv/bin/python scripts/parity_replay.py \
 # Extract the live PLACE/CLOSE/MODIFY command stream from the old server's audit,
 # cleaned to the same fields parity_replay dumps, in emit order.
 echo "[parity] extracting live command stream from old-server audit"
-./venv/bin/python - "$LIVE_AUDIT" "$SCRATCH/cmds_live.jsonl" <<'PY'
+PYTHONPATH="$ROOT" ./venv/bin/python - "$LIVE_AUDIT" "$SCRATCH/cmds_live.jsonl" <<'PY'
 import json, sys
-STRIP = {"id","ts_created","ts_sent","ts","status","result","event"}
+# Same normaliser the replay side uses, so both streams share one comparison shape.
+sys.path.insert(0, ".")
+from scripts.parity_replay import _clean
+
 src, dst = sys.argv[1], sys.argv[2]
-with open(src) as fh, open(dst,"w") as ofh:
+n = 0
+with open(src) as fh, open(dst, "w") as ofh:
     for line in fh:
-        line=line.strip()
-        if not line: continue
-        row=json.loads(line)
-        # audit logs one row per command lifecycle event; take the enqueue-time view
-        if row.get("event") not in ("enqueue","emit","place",None):
-            # keep only the first-seen event per id to avoid double-counting ack rows
-            pass
-        c={k:v for k,v in row.items() if k not in STRIP}
-        ofh.write(json.dumps(c, sort_keys=True, separators=(",",":"))+"\n")
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        # The audit writes one row per lifecycle event (enqueue AND ack). Only
+        # `enqueue` represents a command being ISSUED; keeping ack rows too would
+        # double-count every command and guarantee a spurious diff.
+        if row.get("event") != "enqueue":
+            continue
+        ofh.write(json.dumps(_clean(row), sort_keys=True, separators=(",", ":")) + "\n")
+        n += 1
+print(f"[parity] extracted {n} live enqueue commands")
 PY
 
 echo "[parity] diffing command streams (sorted-set compare)"

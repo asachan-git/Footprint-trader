@@ -30,12 +30,30 @@ from pathlib import Path
 # Allow `python scripts/parity_replay.py` without PYTHONPATH=. (start.sh sets it).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Volatile / non-deterministic fields stripped before comparison.
-_STRIP = {"id", "ts_created", "ts_sent", "ts"}
+# Comparison field set. The audit log dumps the whole Command dataclass (every field,
+# always, including `account`), while poll's to_wire() emits only the fields relevant to
+# each command type and never `account`. Diffing raw would fail on every line for purely
+# structural reasons, so BOTH sides are normalised to these keys, with absent/blank
+# treated as a neutral default.
+_FIELDS = ("type", "symbol", "magic", "order_type", "price", "lot", "sl", "tp",
+           "side", "frac", "comment")
+_DEFAULTS = {"order_type": "", "price": 0.0, "lot": 0.0, "sl": 0.0, "tp": 0.0,
+             "side": "", "frac": 0.0, "comment": "", "symbol": "", "magic": 0, "type": ""}
 
 
 def _clean(cmd: dict) -> dict:
-    return {k: v for k, v in cmd.items() if k not in _STRIP}
+    """Normalise a command (wire-form or audit row) to the shared comparison shape."""
+    out = {}
+    for k in _FIELDS:
+        v = cmd.get(k, _DEFAULTS[k])
+        if v is None:
+            v = _DEFAULTS[k]
+        if isinstance(_DEFAULTS[k], float):
+            v = round(float(v or 0.0), 5)
+        elif isinstance(_DEFAULTS[k], int) and not isinstance(v, bool):
+            v = int(v or 0)
+        out[k] = v
+    return out
 
 
 def main() -> int:
