@@ -118,13 +118,16 @@ grid_levels:
   require_squeeze_gate: false    # OFF (2026-07-09, user relaxed) — data (2026-07-07): squeeze_ok arms net-NEGATIVE on 1m/5m (5m sqOK -733 avg / 20.8% full_hedge vs noSQ +433 / 9.1%); gate only helped 15m. Not earning its keep. Use per-side loss-cap / regime instead.
 
   # Safety
-  # Match the 9590331 baseline (2026-07-14, user): NO full-fill BE and NO >50%-fill
-  # structural SL. Neither existed at 9590331 — only bias_trail (runner→BE on profit
-  # giveback) + net_target/full_hedge manage exits. The committed side is NOT stopped
-  # (grid-recovery thesis). Profit-trailing SL (candle_sweep ratchet, hvn_edge cont) is a
-  # separate mechanism and unaffected.
-  fullfill_be_enabled: false
-  fullfill_cancel_opposite: false
+  # 2026-07-21: full-fill BE + cancel-opposite ON (was OFF, 9590331 baseline). Live -249
+  # bleed root cause: a whipsaw filled ONE side, faded, the opposite ladder's pendings
+  # stayed armed and could re-load wrong-way on the retrace — and a one-sided underwater
+  # cycle reaches NO exit (trail needs +peak, net_target needs +pnl, full_hedge needs both
+  # sides full). Now: once a side fully fills (move committed), MOVE_BE that side AND cancel
+  # the opposite side's pendings so the reverse ladder can't re-load. cancel_opposite is
+  # gated INSIDE the fullfill_be block, so BOTH must be true to fire. Tracking result on
+  # exp/pre-server-tp-8d9f546.
+  fullfill_be_enabled: true
+  fullfill_cancel_opposite: true
   # Deferred structural SL (>50% of a side filled → SL at node edge). OFF — did not exist
   # at 9590331. false = committed side can't be stopped out; net_target/full_hedge own the exit.
   defer_sl_on_half_fill: false
