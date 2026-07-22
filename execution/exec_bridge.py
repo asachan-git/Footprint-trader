@@ -41,6 +41,61 @@ def _emit_exit_audit(row: dict) -> None:
         pass  # audit must never break execution
 
 
+# ── fractal→VP→TP study (LOG-ONLY, no execution effect) ──────────────────────
+_FRACTAL_LOG = _ROOT / "data" / "fractal_tp_study.jsonl"
+
+
+def _emit_fractal_study(row: dict) -> None:
+    try:
+        _FRACTAL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _FRACTAL_LOG.open("a") as fh:
+            fh.write(json.dumps({"ts": time.time(), **row}) + "\n")
+    except Exception:
+        pass  # audit must never break execution
+
+
+def _fractal_tp_study(account: str, broker_symbol: str, cyc: dict, *,
+                      tf: str, magic: int, settings: dict | None) -> None:
+    """On a newly-confirmed 3-candle fractal, recompute the rolling VP and record what
+    this cycle's TP *would* become under the planner's cascade. Modifies nothing.
+
+    Everything is best-effort: any missing piece returns silently rather than raising
+    into the exit path. Gated by grid_levels.fractal_study_enabled.
+    """
+    grid_cfg = (settings.get("grid_levels") or {}) if isinstance(settings, dict) else {}
+    if not bool(grid_cfg.get("fractal_study_enabled", False)):
+        return
+    tf = tf or str(cyc.get("armed_tf") or "")
+    if not tf:
+        return
+
+    # monitor_cycle is handed the BROKER symbol; bars/VP are keyed by the ANALYSIS symbol.
+    symbol_map = ((settings.get("execution") or {}).get("symbol_map") or {}) if isinstance(settings, dict) else {}
+    analysis = {v: k for k, v in symbol_map.items()}.get(broker_symbol, broker_symbol)
+
+    from pipeline.state_store import store
+    from execution import fractal_tp_study as fts
+    from execution.zone_triggers import _VP_WIN
+
+    bars = store().recent(analysis, tf, _VP_WIN.get(tf, 96) + 8)
+    if not bars:
+        return
+    if not fts.should_run(analysis, magic, int(bars[-1].close_ts)):
+        return
+    sp = fts.newly_confirmed_fractal(analysis, tf, bars)
+    if sp is None:
+        return
+
+    q = ExecBridge.get_quote(account, broker_symbol) or {}
+    row = fts.build_row(
+        cycle_id=cycle_id_for(account, broker_symbol, magic, float(cyc.get("ts") or 0.0)),
+        magic=magic, tf=tf, cyc=cyc, symbol=analysis, bars=bars, sp=sp,
+        venue_mid=float(q.get("mid") or 0.0),
+        hvn_reversion_bias=bool(grid_cfg.get("hvn_reversion_bias", True)),
+    )
+    _emit_fractal_study(row)
+
+
 # ── durable cycle-outcome log (survives restarts; the analysis ground truth) ──
 # exec_emit.jsonl logs arms and exits as SEPARATE rows with no join key, and its
 # in-memory cycle state dies on restart — which is why per-cycle P&L could only be
@@ -290,6 +345,14 @@ class ExecBridge:
             return None
         if not magic:
             magic = int(cyc.get("magic") or 0)
+
+        # LOG-ONLY fractal→VP→TP study. Runs before any exit logic and swallows
+        # everything, so it can never change execution. Self-throttled to once per
+        # closed bar (this method is the ~1s poll path).
+        try:
+            _fractal_tp_study(account, symbol, cyc, tf=tf, magic=magic, settings=settings)
+        except Exception:
+            pass  # audit must never break execution
 
         open_state = cls.get_open(account, symbol, magic=magic)
         pendings = int(open_state.get("pendings", 0) or 0)

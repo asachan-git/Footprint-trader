@@ -103,6 +103,12 @@ grid_levels:
   # falls back to the flat value below, so clearing the map restores flat behaviour.
   hvn_max_legs: 6
   hvn_max_legs_by_tf: {1m: 6, 5m: 6, 15m: 6, 1h: 6}
+  # Fractal→VP→TP study (LOG-ONLY, execution/fractal_tp_study.py). On each newly
+  # confirmed 3-candle fractal, recompute the rolling VP and record what this cycle's
+  # TP *would* become under the planner's cascade. Writes data/fractal_tp_study.jsonl.
+  # Modifies NO orders — this branch has no MODIFY_TP command, so acting on the signal
+  # would need a new command type plus an EA recompile. Safe to leave on; false to stop.
+  fractal_study_enabled: true
   max_fulcrum_dist_pct: 0.05
   # Cycle exit (server-side cycle monitor). DEMO ONLY — strategy is -EV.
   # Net-profit-exit-only: place legs with NO per-order TP so the winning side can't book

@@ -403,9 +403,15 @@ def exec_emit_grid():
     # (tp_up=buy target, tp_down=sell target), and the exit-monitor bookkeeping fields.
     # node bounds (the HVN/LVN the fulcrum sits on) — rebased to the venue frame like
     # the legs, so the EA dashboard reports the price band the broker actually quotes.
-    _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
-    node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
-    node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
+    # 2026-07-22: ADDITIVE shift, matching _rebase_to_venue (b93af34) and
+    # vp_cache._shift_vp. This was a multiplicative ratio, which left the node bounds
+    # in a different frame from the legs/fulcrum they describe — the same
+    # additive-vs-multiplicative mismatch that put the fulcrum off the drawn edge.
+    _shift = (plan.venue_anchor - plan.analysis_anchor) if plan.analysis_anchor else 0.0
+    _nl = float(plan.trigger_context.get("node_low", 0.0) or 0.0)
+    _nh = float(plan.trigger_context.get("node_high", 0.0) or 0.0)
+    node_low = (_nl + _shift) if _nl else 0.0
+    node_high = (_nh + _shift) if _nh else 0.0
     ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum, edge=edge,
                             trigger_kind=plan.trigger_kind, venue_mid=quote["mid"], magic=leg_magic,
                             n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
@@ -415,7 +421,14 @@ def exec_emit_grid():
                             node_low=round(node_low, 5), node_high=round(node_high, 5),
                             active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
                             net_target_usd=net_target, max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
-                            squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank)
+                            squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank,
+                            # Frame anchors — every price above is VENUE frame (post
+                            # _rebase_to_venue). Persist both ends so a later consumer can
+                            # convert back to the ANALYSIS frame that bars and a freshly
+                            # computed VP live in. Without these the shift silently reads
+                            # 0.0 and the two frames get compared as if they were one.
+                            analysis_anchor=plan.analysis_anchor,
+                            venue_anchor=plan.venue_anchor)
     ExecBridge.mark_emit(account, symbol, plan.fulcrum, magic=leg_magic)   # dedup: this fulcrum is now armed
     _emit_audit({"account": account, "symbol": symbol, "broker_symbol": broker_symbol,
                  "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind, "edge": edge,
