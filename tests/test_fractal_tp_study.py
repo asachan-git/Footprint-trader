@@ -88,12 +88,18 @@ class _VP:
         self.val = 0.0
 
 
+def _z(vp):
+    """zones tuple-list, as _session_hvn_zones returns them."""
+    return [(float(z["low"]), float(z["high"])) for z in vp.hvn_zones]
+
+
 def test_hvn_to_hvn_picks_nearest_node_edges_beyond_the_ladder():
-    # fulcrum 100, step 1, 2 legs/side -> outer legs at 102 / 98.
-    # Nodes at (104,106) above and (92,94) below both clear the ladder.
+    # The node-edge rule is the hvn_inside_touch branch — other kinds route to
+    # _resolve_tps. fulcrum 100, step 1, 2 legs/side -> outer legs at 102 / 98.
     vp = _VP([(104.0, 106.0), (92.0, 94.0)])
-    r = fts.tp_cascade(vp, edge=100.0, fulcrum=100.0, step=1.0, buy_n=2, sell_n=2,
-                       trigger_kind="hvn_edge", edge_side="", hvn_reversion_bias=False)
+    r = fts.tp_cascade(vp, zones=_z(vp), edge=100.0, fulcrum=100.0, step=1.0, buy_n=2, sell_n=2,
+                       trigger_kind="hvn_inside_touch", edge_side="", hvn_reversion_bias=False)
+    assert r["rule"] == "node_edge"
     assert r["tp_up"] == 106.0    # nearest node TOP above the edge
     assert r["tp_down"] == 92.0   # nearest node BOTTOM below the edge
     assert r["top_leg"] == 102.0 and r["bot_leg"] == 98.0
@@ -103,16 +109,29 @@ def test_target_inside_the_ladder_is_rejected():
     # node top at 101 is above the edge but INSIDE the ladder (outer leg 102) — taking it
     # would make the grid unable to profit. This is the guard from grid_planner:577-590.
     vp = _VP([(100.5, 101.0)])
-    r = fts.tp_cascade(vp, edge=100.0, fulcrum=100.0, step=1.0, buy_n=2, sell_n=2,
-                       trigger_kind="hvn_edge", edge_side="", hvn_reversion_bias=False)
+    r = fts.tp_cascade(vp, zones=_z(vp), edge=100.0, fulcrum=100.0, step=1.0, buy_n=2, sell_n=2,
+                       trigger_kind="hvn_inside_touch", edge_side="", hvn_reversion_bias=False)
     assert r["tp_up"] == 0.0
+
+
+def test_non_inside_touch_routes_to_resolve_tps():
+    # hvn_edge / squeeze do NOT use the node-edge rule — applying it to them was the
+    # defect the first live rows exposed (0.0 targets while the live cycle had real TPs).
+    # With no zone_collector data the ATR fallback owns the result: outer_leg +/- 2*ATR.
+    vp = _VP([(104.0, 106.0), (92.0, 94.0)])
+    r = fts.tp_cascade(vp, zones=_z(vp), edge=100.0, fulcrum=100.0, step=1.0, buy_n=2, sell_n=2,
+                       trigger_kind="hvn_edge", edge_side="", hvn_reversion_bias=False,
+                       symbol="__nosuch__", atr=3.0, tp_mult=2.0)
+    assert r["rule"] == "resolve_tps"
+    assert r["tp_up"] == 108.0     # top_leg 102 + 2*3
+    assert r["tp_down"] == 92.0    # bot_leg  98 - 2*3
 
 
 def test_poc_reversion_retargets_the_fade_side_on_tapped_top():
     # tapped TOP -> the fade is DOWN, so the SELL side retargets POC (which must clear
     # the inner/outer sell leg at 98).
     vp = _VP([(104.0, 106.0), (92.0, 94.0)], poc=95.0)
-    r = fts.tp_cascade(vp, edge=100.0, fulcrum=100.0, step=1.0, buy_n=2, sell_n=2,
+    r = fts.tp_cascade(vp, zones=_z(vp), edge=100.0, fulcrum=100.0, step=1.0, buy_n=2, sell_n=2,
                        trigger_kind="hvn_inside_touch", edge_side="top",
                        hvn_reversion_bias=True)
     assert r["tp_down"] == 95.0
@@ -122,7 +141,7 @@ def test_poc_reversion_retargets_the_fade_side_on_tapped_top():
 
 def test_poc_reversion_skipped_when_flag_off():
     vp = _VP([(104.0, 106.0), (92.0, 94.0)], poc=95.0)
-    r = fts.tp_cascade(vp, edge=100.0, fulcrum=100.0, step=1.0, buy_n=2, sell_n=2,
+    r = fts.tp_cascade(vp, zones=_z(vp), edge=100.0, fulcrum=100.0, step=1.0, buy_n=2, sell_n=2,
                        trigger_kind="hvn_inside_touch", edge_side="top",
                        hvn_reversion_bias=False)
     assert r["tp_down"] == 92.0
@@ -132,13 +151,13 @@ def test_poc_reversion_skipped_when_flag_off():
 def test_skewed_ladder_uses_the_longer_side_for_the_guard():
     # sell_n 4 -> bot_leg 96, so a node bottom at 97 no longer clears the ladder.
     vp = _VP([(97.0, 99.0)])
-    r = fts.tp_cascade(vp, edge=100.0, fulcrum=100.0, step=1.0, buy_n=2, sell_n=4,
-                       trigger_kind="hvn_edge", edge_side="", hvn_reversion_bias=False)
+    r = fts.tp_cascade(vp, zones=_z(vp), edge=100.0, fulcrum=100.0, step=1.0, buy_n=2, sell_n=4,
+                       trigger_kind="hvn_inside_touch", edge_side="", hvn_reversion_bias=False)
     assert r["bot_leg"] == 96.0
     assert r["tp_down"] == 0.0
 
 
 def test_no_zones_yields_no_targets():
-    r = fts.tp_cascade(_VP([]), edge=100.0, fulcrum=100.0, step=1.0, buy_n=2, sell_n=2,
-                       trigger_kind="hvn_edge", edge_side="", hvn_reversion_bias=False)
+    r = fts.tp_cascade(_VP([]), zones=[], edge=100.0, fulcrum=100.0, step=1.0, buy_n=2, sell_n=2,
+                       trigger_kind="hvn_inside_touch", edge_side="", hvn_reversion_bias=False)
     assert r["tp_up"] == 0.0 and r["tp_down"] == 0.0 and r["n_hvn"] == 0

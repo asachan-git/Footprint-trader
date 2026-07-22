@@ -98,56 +98,115 @@ def recompute_rolling_vp(symbol: str, tf: str, bars: list):
         return None, 0, f"vp_error:{type(e).__name__}"
 
 
-def tp_cascade(vp, *, edge: float, fulcrum: float, step: float, buy_n: int,
-               sell_n: int, trigger_kind: str, edge_side: str,
-               hvn_reversion_bias: bool) -> dict:
-    """The planner's 3-stage TP cascade, run against a freshly computed VP.
+def refreshed_session_zones(symbol: str, tf: str, bars: list):
+    """The zone set the ARM path actually uses — zone_triggers._session_hvn_zones —
+    recomputed now. Returns (zones_as_(lo,hi), session_name, skip_reason).
 
-    Replicates, in order:
-      1. HVN->HVN          zone_triggers.py:304-307 — tp_up = nearest node-TOP above the
-                           tapped edge, tp_down = nearest node-BOTTOM below it.
-      2. outer-leg guard   grid_planner.py:577-590 — a structural target is accepted only
-                           if it lies BEYOND the outer leg, else it would sit inside the
-                           ladder and the grid could never profit. This is the guard whose
-                           absence caused the TP-refresh regression documented in
-                           project_tp_refresh_ladder_guard.
-      3. POC reversion     grid_planner.py:596-607 — on hvn_inside_touch with
-                           hvn_reversion_bias, the FADE side retargets POC (tapped top ->
-                           sell_tp = poc, only if poc clears the inner leg).
-
-    All prices in/out are ANALYSIS frame — the caller converts for comparison.
+    Using a raw rolling VP here instead was the defect the first live rows exposed:
+    _session_hvn_zones blends rolling + cached-daily depending on session, so a bare
+    24h rolling profile produces a DIFFERENT zone set than the arm saw, and the
+    resulting "delta" measured the mismatch rather than what the fractal changed.
     """
-    zones = [(float(z["low"]), float(z["high"])) for z in (getattr(vp, "hvn_zones", None) or [])]
+    try:
+        from execution.zone_triggers import _session_hvn_zones
+        zones, sess = _session_hvn_zones(symbol, tf, bars)
+        return zones, sess, ("" if zones else "no_session_zones")
+    except Exception as e:
+        return [], "", f"zones_error:{type(e).__name__}"
 
-    # 1) HVN -> HVN
-    tops_above = [hi for lo, hi in zones if hi > edge]
-    bots_below = [lo for lo, hi in zones if lo < edge]
-    tp_up = min(tops_above) if tops_above else 0.0
-    tp_down = max(bots_below) if bots_below else 0.0
 
-    # 2) beyond-outer-leg guard. Legs are fulcrum +/- i*step (grid_planner._build_legs),
-    #    so the outer leg on each side is fulcrum +/- n*step for that side's leg count.
+def resolve_tps_generic(symbol: str, *, top_leg: float, bot_leg: float, atr: float,
+                        tp_mult: float) -> tuple[float, float]:
+    """Replicates grid_planner._resolve_tps — the path hvn_edge / squeeze / any
+    non-inside-touch trigger uses: outer_leg +/- tp_mult*ATR, then snapped to the
+    nearest zone_collector zone with strength >= 0.6 beyond that leg.
+
+    FRAME CAVEAT (pre-existing in the planner, replicated faithfully so the study
+    reproduces live behaviour rather than an idealised version): _all_zones reads
+    vp_cache.get(), which returns VENUE-shifted prices, and compares them against
+    ANALYSIS-frame legs. On a symbol with a nonzero venue offset the two sides of that
+    comparison are in different frames.
+    """
+    buy_tp = top_leg + tp_mult * atr
+    sell_tp = bot_leg - tp_mult * atr
+    try:
+        from execution.zone_collector import _all_zones
+        zones = [z for z in _all_zones(symbol) if z.strength >= 0.6]
+        above = [z.price for z in zones if z.price > top_leg]
+        below = [z.price for z in zones if z.price < bot_leg]
+        if above:
+            buy_tp = min(above)
+        if below:
+            sell_tp = max(below)
+    except Exception:
+        pass
+    return round(buy_tp, 4), round(sell_tp, 4)
+
+
+def tp_cascade(vp, *, zones, edge: float, fulcrum: float, step: float, buy_n: int,
+               sell_n: int, trigger_kind: str, edge_side: str,
+               hvn_reversion_bias: bool, symbol: str = "", atr: float = 0.0,
+               tp_mult: float = 2.0) -> dict:
+    """The planner's TP resolution, run against freshly recomputed structure.
+
+    Branches by trigger_kind, because the planner does. Getting this wrong was the
+    defect the first live rows exposed: applying the inside-touch rule to hvn_edge /
+    squeeze cycles produced 0.0 targets while the live cycles had real TPs.
+
+      hvn_inside_touch -> node-edge rule (zone_triggers.py:304-307): tp_up = nearest
+                          node-TOP above the tapped edge, tp_down = nearest node-BOTTOM
+                          below it. Then the POC reversion override.
+      everything else  -> grid_planner._resolve_tps: outer_leg +/- tp_mult*ATR snapped
+                          to the nearest strong zone_collector zone beyond that leg.
+
+    Both branches then take the beyond-outer-leg guard (grid_planner.py:577-590): a
+    structural target is accepted only if it clears the outer leg, else it would sit
+    inside the ladder and the grid could never profit. Absence of that guard is the
+    regression recorded in project_tp_refresh_ladder_guard.
+
+    Prices in/out are ANALYSIS frame; the caller converts for comparison.
+    """
+    # Outer legs: _build_legs places fulcrum +/- i*step, so each side's outer leg is
+    # fulcrum +/- n*step for THAT side's count (skew makes the two differ).
     top_leg = fulcrum + max(1, int(buy_n or 0)) * step
     bot_leg = fulcrum - max(1, int(sell_n or 0)) * step
-    if not (tp_up > top_leg):
-        tp_up = 0.0
-    if not (0.0 < tp_down < bot_leg):
-        tp_down = 0.0
 
-    # 3) POC reversion on the fade side
     poc_override = ""
-    poc = float(getattr(vp, "poc", 0.0) or 0.0)
-    if trigger_kind == "hvn_inside_touch" and hvn_reversion_bias and poc > 0:
-        if edge_side == "top" and poc < bot_leg:
-            tp_down = round(poc, 4)
-            poc_override = "sell"
-        elif edge_side == "bottom" and poc > top_leg:
-            tp_up = round(poc, 4)
-            poc_override = "buy"
+    rule = ""
+
+    if trigger_kind == "hvn_inside_touch":
+        rule = "node_edge"
+        tops_above = [hi for lo, hi in zones if hi > edge]
+        bots_below = [lo for lo, hi in zones if lo < edge]
+        tp_up = min(tops_above) if tops_above else 0.0
+        tp_down = max(bots_below) if bots_below else 0.0
+        if not (tp_up > top_leg):
+            tp_up = 0.0
+        if not (0.0 < tp_down < bot_leg):
+            tp_down = 0.0
+        poc = float(getattr(vp, "poc", 0.0) or 0.0)
+        if hvn_reversion_bias and poc > 0:
+            if edge_side == "top" and poc < bot_leg:
+                tp_down = round(poc, 4)
+                poc_override = "sell"
+            elif edge_side == "bottom" and poc > top_leg:
+                tp_up = round(poc, 4)
+                poc_override = "buy"
+    else:
+        rule = "resolve_tps"
+        tp_up, tp_down = resolve_tps_generic(
+            symbol, top_leg=top_leg, bot_leg=bot_leg, atr=atr, tp_mult=tp_mult)
+        # _resolve_tps already measures from the outer leg, so its ATR fallback always
+        # clears the ladder; the snap can only move the target further out. Guard kept
+        # as a belt-and-braces assertion rather than a filter.
+        if not (tp_up > top_leg):
+            tp_up = 0.0
+        if not (0.0 < tp_down < bot_leg):
+            tp_down = 0.0
 
     return {
         "tp_up": round(tp_up, 4), "tp_down": round(tp_down, 4),
-        "poc_override_side": poc_override,
+        "poc_override_side": poc_override, "rule": rule,
         "top_leg": round(top_leg, 4), "bot_leg": round(bot_leg, 4),
         "n_hvn": len(zones),
         "n_lvn": len(getattr(vp, "lvn_zones", None) or []),
@@ -155,9 +214,16 @@ def tp_cascade(vp, *, edge: float, fulcrum: float, step: float, buy_n: int,
 
 
 def build_row(*, cycle_id: str, magic: int, tf: str, cyc: dict, symbol: str,
-              bars: list, sp, venue_mid: float, hvn_reversion_bias: bool) -> dict:
-    """One study row: fresh-VP cascade result beside the cycle's live (armed) TPs."""
+              bars: list, sp, venue_mid: float, hvn_reversion_bias: bool,
+              tp_mult: float = 2.0) -> dict:
+    """One study row: refreshed-structure cascade result beside the cycle's live TPs."""
     vp, vp_bars, skip = recompute_rolling_vp(symbol, tf, bars)
+    zones, sess, zskip = refreshed_session_zones(symbol, tf, bars)
+    try:
+        from pipeline.features.atr import atr_from_store
+        atr = float(atr_from_store(symbol, tf) or 0.0)
+    except Exception:
+        atr = 0.0
 
     fulcrum_v = float(cyc.get("fulcrum") or 0.0)    # VENUE frame — set_last_arm stores
                                                     # plan.fulcrum AFTER _rebase_to_venue
@@ -185,7 +251,8 @@ def build_row(*, cycle_id: str, magic: int, tf: str, cyc: dict, symbol: str,
         "bar_close_ts": int(bars[-1].close_ts) if bars else None,
         "fractal_ts": int(sp.ts), "fractal_kind": sp.kind,
         "fractal_price": round(float(sp.price), 4),
-        "vp_bars": vp_bars,
+        "vp_bars": vp_bars, "session": sess, "atr": round(atr, 4),
+        "n_session_zones": len(zones),
         "tp_up_live_venue": tp_up_live, "tp_down_live_venue": tp_down_live,
         "venue_mid": round(float(venue_mid or 0.0), 4),
         "analysis_anchor": a_anchor, "venue_anchor": v_anchor, "shift": round(shift, 4),
@@ -194,14 +261,18 @@ def build_row(*, cycle_id: str, magic: int, tf: str, cyc: dict, symbol: str,
     if vp is None:
         row["skip_reason"] = skip
         return row
+    if zskip:
+        row["zones_skip"] = zskip
 
     res = tp_cascade(
-        vp, edge=fulcrum, fulcrum=fulcrum, step=step,
+        vp, zones=zones, edge=fulcrum, fulcrum=fulcrum, step=step,
         buy_n=int(cyc.get("buy_n") or 0), sell_n=int(cyc.get("sell_n") or 0),
         trigger_kind=str(cyc.get("trigger_kind") or ""),
         edge_side=str(cyc.get("edge") or ""),
         hvn_reversion_bias=hvn_reversion_bias,
+        symbol=symbol, atr=atr, tp_mult=tp_mult,
     )
+    row["rule"] = res["rule"]
     row.update({
         "vp_poc": round(float(getattr(vp, "poc", 0.0) or 0.0), 4),
         "vp_vah": round(float(getattr(vp, "vah", 0.0) or 0.0), 4),

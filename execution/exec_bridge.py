@@ -92,6 +92,7 @@ def _fractal_tp_study(account: str, broker_symbol: str, cyc: dict, *,
         magic=magic, tf=tf, cyc=cyc, symbol=analysis, bars=bars, sp=sp,
         venue_mid=float(q.get("mid") or 0.0),
         hvn_reversion_bias=bool(grid_cfg.get("hvn_reversion_bias", True)),
+        tp_mult=float(grid_cfg.get("tp_atr_mult", 2.0) or 2.0),
     )
     _emit_fractal_study(row)
 
