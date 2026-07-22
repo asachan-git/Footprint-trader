@@ -388,61 +388,63 @@ class ExecBridge:
         min_target = float(grid_cfg.get("cycle_min_target_usd", 0.20) or 0.0)
         close_on_full_hedge = bool(grid_cfg.get("cycle_close_on_full_hedge", True))
 
-        # 0.5) cycle-wide trailing book — directional profit capture on the CYCLE's
-        # combined net P&L (buy+sell together), independent of the net-basket TARGET
-        # exit below (which requires reaching base_target; this can fire earlier on a
-        # give-back from any peak). Gate: at least bias_trail_fill_frac of the cycle's
-        # TOTAL legs are filled (default 50%) before tracking starts — a single filled
-        # leg could swing past bias_trail_activate_usd and back with nothing tracking it
-        # otherwise. Track the cycle's peak net floating P&L; when it gives back ≥
-        # giveback% from that peak, book bias_book_frac of BOTH sides and move the rest
-        # to breakeven (risk-free runner), matching how CLOSE_ALL/full-hedge already
-        # treat the cycle as one basket rather than per-side.
+        # 0.5) bias-side trailing book — directional profit capture, independent of the
+        # net-basket exit (which a hedge leg can mask). Gate: a side has ALL its legs
+        # filled (the move committed your way). Track that side's peak floating P&L; when
+        # it gives back >= giveback% from the peak, BOOK half that side and move the rest
+        # to breakeven (risk-free runner). Fires once per cycle (bias_booked guard).
         #
-        # Single cycle-wide peak/booked flag — NOT per-side (bias_peak_buy/sell). A
-        # trade-off vs the prior per-side version: if net P&L peaks while one side is
-        # winning big and the other is small/resting, then reverses HARD on the other
-        # side after this books, there's no independent per-side trail left to catch
-        # that reversal — only net_target/full_hedge remain as backstops. Accepted
-        # explicitly in favor of a simpler, single running-profit-for-the-cycle trail.
-        if (bool(grid_cfg.get("bias_trail_enabled", True)) and pnl is not None
-                and not cyc.get("bias_booked")):
-            total_n = int(cyc.get("buy_n") or 0) + int(cyc.get("sell_n") or 0)
-            filled_n = int(buys or 0) + int(sells or 0)
-            fill_frac = float(grid_cfg.get("bias_trail_fill_frac", 0.5) or 0.5)
-            activate = float(grid_cfg.get("bias_trail_activate_usd", 5.0) or 0.0)
-            giveback = float(grid_cfg.get("bias_trail_giveback_pct", 40.0) or 0.0)
-            book_frac = float(grid_cfg.get("bias_book_frac", 0.5) or 0.5)
-
-            if total_n > 0 and filled_n >= fill_frac * total_n:
-                cycle_pnl = float(pnl)
-                peak = max(float(cyc.get("bias_peak") or 0.0), cycle_pnl)
+        # 2026-07-22: reverted to Jun22's PER-SIDE form (4f387b7). 8766961 had rewritten
+        # this to a cycle-wide net-P&L trail; that version's own comment documented the
+        # hole it introduced — if net peaks while one side wins and the OTHER reverses
+        # hard after booking, no per-side trail remains to catch it. Per-side tracks the
+        # committed side's own P&L, so the trail follows the directional move that
+        # actually earned the profit. Restored verbatim except: (a) set_last_arm keeps the
+        # explicit magic= kwarg (the cycle-wide version's fix for the magic-key collapse
+        # bug — Jun22's bare **cyc would re-key the arm to magic 0), and (b) the
+        # _emit_cycle_outcome audit call is retained.
+        if (bool(grid_cfg.get("bias_trail_enabled", True))
+                and not cyc.get("bias_booked")
+                and buy_pnl is not None and sell_pnl is not None):
+            buy_n = int(cyc.get("buy_n") or 0)
+            sell_n = int(cyc.get("sell_n") or 0)
+            bias = ""
+            if buy_n > 0 and int(buys or 0) >= buy_n:
+                bias = "buy"
+            elif sell_n > 0 and int(sells or 0) >= sell_n:
+                bias = "sell"
+            if bias:
+                side_pnl = float(buy_pnl if bias == "buy" else sell_pnl)
+                peak = max(float(cyc.get("bias_peak") or 0.0), side_pnl)
                 if peak != float(cyc.get("bias_peak") or 0.0):
                     cyc["bias_peak"] = peak
-                    cls.set_last_arm(account, symbol, **cyc)
+                    cls.set_last_arm(account, symbol, magic=magic, **cyc)
+                activate = float(grid_cfg.get("bias_trail_activate_usd", 5.0) or 0.0)
+                giveback = float(grid_cfg.get("bias_trail_giveback_pct", 40.0) or 0.0)
+                book_frac = float(grid_cfg.get("bias_book_frac", 0.5) or 0.5)
                 if (activate > 0 and peak >= activate
-                        and cycle_pnl <= peak * (1.0 - giveback / 100.0)):
+                        and side_pnl <= peak * (1.0 - giveback / 100.0)):
                     comment_tf = cyc.get("armed_tf") or tf
-                    for side in ("buy", "sell"):
-                        cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic, side=side,
-                                    frac=book_frac, comment=f"FB|book|{comment_tf}|{side}", now=t)
-                        cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=side,
-                                    comment=f"FB|be|{comment_tf}|{side}", now=t)
-                    cls.set_last_arm(account, symbol, **{**cyc, "bias_booked": True})
+                    cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic, side=bias,
+                                frac=book_frac, comment=f"FB|book|{comment_tf}|{bias}", now=t)
+                    cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=bias,
+                                comment=f"FB|be|{comment_tf}|{bias}", now=t)
+                    cls.set_last_arm(account, symbol, magic=magic,
+                                     **{**cyc, "bias_booked": True})
                     _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
                                       "tf": tf, "magic": magic, "exit_reason": "bias_book_trail",
-                                      "peak": round(peak, 2), "cycle_pnl": round(cycle_pnl, 2),
-                                      "book_frac": book_frac,
+                                      "bias": bias, "peak": round(peak, 2),
+                                      "side_pnl": round(side_pnl, 2), "book_frac": book_frac,
                                       "squeeze_ok": cyc.get("squeeze_ok"),
                                       "squeeze_rank": cyc.get("squeeze_rank")})
                     # durable per-cycle record (partial: cycle continues)
                     _emit_cycle_outcome(cyc, account=str(account), symbol=symbol,
                                         magic=magic, tf=tf,
                                         exit_reason="bias_book_trail", partial=True,
-                                        peak=round(peak, 2),
-                                        pnl_at_exit=round(cycle_pnl, 2),
+                                        bias=bias, peak=round(peak, 2),
+                                        pnl_at_exit=round(side_pnl, 2),
                                         book_frac=book_frac, buys=buys, sells=sells)
-                    return "bias_book_trail"
+                    return "bias_book_trail"   # cycle continues (runner + hedge); no flatten
 
         reason: str | None = None
         detail: dict = {}
