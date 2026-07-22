@@ -51,3 +51,40 @@ def test_retry_count_rides_on_the_command_not_the_wire():
                 order_type="buy_stop", price=100.0, lot=0.25, retry_n=2)
     assert c.retry_n == 2
     assert "retry_n" not in c.to_wire()
+
+
+# ── root cause: TP landing on the same HVN edge the outer leg reaches ────────
+
+def test_tp_is_floored_at_the_brokers_min_stop_distance():
+    """The real fix for 'invalid stops'.
+
+    A wide ladder's OUTER leg can run out to meet the very HVN edge its TP targets, so
+    the TP cleared the leg by a hair and MT5 rejected the order (10016: TP inside the
+    min stop distance from entry). Observed gaps: 0.0287 / 0.0572 / 0.0786 / 0.1249 /
+    0.1462 / 0.1638 against a live stops_dist of 0.20 — every one an outermost leg.
+    """
+    from execution.grid_planner import _resolve_tps, Leg
+
+    buys = [Leg(price=4155.7813, lot=0.25)]
+    sells = [Leg(price=4140.0, lot=0.25)]
+    gap = 0.30   # stops_dist 0.20 * the 1.5 margin the step already uses
+
+    # unguarded: TP can sit flush against the outer leg -> the rejected geometry
+    buy_tp, _ = _resolve_tps("__nozones__", 4148.0, buys, sells,
+                             atr=0.0, tp_mult=2.0, min_gap=0.0)
+    assert buy_tp - 4155.7813 < gap
+
+    # guarded: TP is pushed clear of the broker's floor
+    buy_tp, sell_tp = _resolve_tps("__nozones__", 4148.0, buys, sells,
+                                   atr=0.0, tp_mult=2.0, min_gap=gap)
+    assert buy_tp >= 4155.7813 + gap - 1e-9
+    assert sell_tp <= 4140.0 - gap + 1e-9
+
+
+def test_min_gap_defaults_to_zero_so_callers_are_unaffected():
+    from execution.grid_planner import _resolve_tps, Leg
+    buys = [Leg(price=110.0, lot=0.1)]
+    sells = [Leg(price=90.0, lot=0.1)]
+    buy_tp, sell_tp = _resolve_tps("__nozones__", 100.0, buys, sells, atr=5.0, tp_mult=2.0)
+    assert buy_tp == 120.0    # 110 + 2*5, untouched
+    assert sell_tp == 80.0    # 90  - 2*5

@@ -382,24 +382,40 @@ def _build_legs(fulcrum: float, n: int, step: float, skew: str,
 # ── TP snapping ─────────────────────────────────────────────────────────────
 
 def _resolve_tps(symbol: str, fulcrum: float, buy_legs: list[Leg],
-                 sell_legs: list[Leg], atr: float, tp_mult: float = 1.5) -> tuple[float, float]:
+                 sell_legs: list[Leg], atr: float, tp_mult: float = 1.5,
+                 min_gap: float = 0.0) -> tuple[float, float]:
     """Snap TP beyond the outer leg to the nearest strong structural zone;
-    fallback outer_leg ± tp_mult·ATR."""
+    fallback outer_leg ± tp_mult·ATR.
+
+    min_gap is the broker's minimum stop distance. A snapped zone can sit a hair past
+    the outer leg — the same tiny-TP-into-own-node geometry that gets the order rejected
+    with "invalid stops" (MT5 10016). Zones closer than min_gap are not eligible targets,
+    so the ATR fallback is kept instead. Rejected legs seen from THIS path as well as the
+    structural override (FB|hvn_edge|15m|b3 @ 0.0287, FB|sqz|1m|s2 @ 0.1537), which is
+    why the floor belongs in both places.
+    """
     top = max((l.price for l in buy_legs), default=fulcrum)
     bot = min((l.price for l in sell_legs), default=fulcrum)
     buy_tp = top + tp_mult * atr
     sell_tp = bot - tp_mult * atr
+    g = max(min_gap, 0.0)
     try:
         from execution.zone_collector import _all_zones
         zones = [z for z in _all_zones(symbol) if z.strength >= 0.6]
-        above = [z.price for z in zones if z.price > top]
-        below = [z.price for z in zones if z.price < bot]
+        above = [z.price for z in zones if z.price > top + g]
+        below = [z.price for z in zones if z.price < bot - g]
         if above:
             buy_tp = min(above)
         if below:
             sell_tp = max(below)
     except Exception:
         pass
+    # Last resort: even the ATR fallback can be tiny when ATR is small, so floor both
+    # sides at the broker's min distance from the outer leg.
+    if buy_tp < top + g:
+        buy_tp = top + g
+    if sell_tp > bot - g:
+        sell_tp = bot - g
     return round(buy_tp, 4), round(sell_tp, 4)
 
 
@@ -572,21 +588,36 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
                             atr=round(atr, 4), plan_id=plan_id)
 
     buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
-    buy_tp, sell_tp = _resolve_tps(symbol, fulcrum, buy_legs, sell_legs, atr, tp_mult)
+    buy_tp, sell_tp = _resolve_tps(symbol, fulcrum, buy_legs, sell_legs, atr, tp_mult,
+                                   min_gap=max(min_step_venue, 0.0))
 
     # Structural TP override: any trigger that pre-computed tp_up/tp_down (HVN
     # node edges for hvn_inside_touch; adjacent VP levels for vp_level_touch) targets
     # that structure. Guard: the target must lie BEYOND the OUTER leg, else it would
     # sit inside the ladder and the grid could never profit — in that case keep the
     # _resolve_tps()/ATR fallback already computed above.
+    #
+    # 2026-07-23: "beyond" now means beyond BY THE BROKER'S MIN STOP DISTANCE, not by any
+    # margin at all. The outer leg of a wide ladder can run out to meet the very HVN edge
+    # its TP targets, so tp cleared top_leg by a hair and was attached anyway — MT5 then
+    # rejected the whole order with "invalid stops" (10016: TP inside the min distance
+    # from entry). Measured on the rejects: gaps of 0.0287 / 0.0572 / 0.0786 / 0.1249 /
+    # 0.1462 / 0.1638 against a stops_dist of 0.20, and every one was an OUTERMOST leg
+    # (b9, b7, b3, s2) — the tiny-TP-into-own-node case.
+    #
+    # min_step_venue is stops_dist * 1.5 (set by the emit route from the EA's live quote),
+    # so it is the broker's own floor with the same safety margin the step already uses,
+    # rather than a fixed config constant that would need per-symbol tuning. Frame note:
+    # the rebase is additive, so this venue-frame distance is valid unshifted here.
     tp_up = float(fulcrum_t.context.get("tp_up", 0.0) or 0.0)
     tp_down = float(fulcrum_t.context.get("tp_down", 0.0) or 0.0)
     if tp_up or tp_down:
         top_leg = max((l.price for l in buy_legs), default=fulcrum)
         bot_leg = min((l.price for l in sell_legs), default=fulcrum)
-        if tp_up > top_leg:
+        _tp_gap = max(min_step_venue, 0.0)
+        if tp_up > top_leg + _tp_gap:
             buy_tp = round(tp_up, 4)
-        if 0.0 < tp_down < bot_leg:
+        if 0.0 < tp_down < bot_leg - _tp_gap:
             sell_tp = round(tp_down, 4)
 
     # HVN inside-touch reversion TP: the fade INTO the node targets the POC (the node's
