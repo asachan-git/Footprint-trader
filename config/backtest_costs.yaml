@@ -1,0 +1,37 @@
+# Broker parameters for the grid backtest.
+#
+# MEASURED, not assumed. Every value here was extracted from real /exec/poll bodies
+# captured from the live EA (FB_CAPTURE_POLLS=1), because none of it is recoverable
+# from stored history — stops_pts and the live quote only ever exist inside a poll.
+#
+# Hardcoding these is what made scripts/grid_sim.py diverge from live, so the harness
+# reads them from here instead.
+
+XAUUSD+:
+  # --- measured 2026-07-22, Vantage demo 25798248, 53 polls, Asia session ---
+  source: "live poll capture 2026-07-22 (n=53)"
+  point: 0.01
+  # SYMBOL_TRADE_STOPS_LEVEL in POINTS. Freeze band = stops_pts * point = $0.20.
+  # A pending stop inside this band is rejected by the broker (ExecPlacePending's
+  # guard), and the server also floors the grid step by it.
+  # NOTE: an earlier guess of 150 was 7.5x too large and degraded every metric.
+  stops_pts: 20
+  # Bid/ask spread in price units. Extremely stable in this sample: median 0.13,
+  # p10 0.12, p90 0.13, min 0.12, max 0.13.
+  spread_median: 0.13
+  spread_p90: 0.13
+  # Session caveat: this sample is Asia-session only. London/NY spreads are
+  # typically wider and news spikes wider still. Re-measure across sessions before
+  # trusting any cost-sensitive result; report P&L at 1x / 1.5x / 2x spread.
+  spread_sample_session: "Asia"
+
+  # --- NOT yet measured; must not be presented as results until they are ---
+  commission_per_lot_per_side: null   # from a broker statement / deal history
+  swap_long: null                     # triple on Wednesday
+  swap_short: null
+  contract_size: null                 # for margin: lots * size * price / leverage
+  leverage: null
+
+account:
+  # Real account size from the poll body (balance/equity), not a round default.
+  balance: 25000.0
