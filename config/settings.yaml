@@ -28,7 +28,13 @@ cycle:
 # Event-driven decide trigger — fires Mode 1 + Mode 2 instantly when a new TF
 # bar is emitted by mtf_aggregator (replaces wall-clock cron loops in start.sh).
 decide_on_bar_close:
-  enabled: true
+  # 2026-07-22 demo run: DISABLED. This drives the legacy paper-strategy fleet
+  # (democracy / VA / hedge-eval), which is unrelated to the grid and only added
+  # log noise + 'ANTHROPIC_API_KEY' warnings on every bar close. The grid arms via
+  # the emitter's /exec/emit_grid POSTs and never reads this key (verified: no
+  # reference in exec_bridge.py or grid_planner.py), so this is log hygiene only.
+  # Set back to true to resume the paper fleet.
+  enabled: false
   tf: 15m            # legacy default decide TF (Claude per-bar + fallback gate)
   tfs: [5m, 15m]     # strategy-manager ENTRY ticks fire on each of these synthetic closes;
                      # each strategy enters only on its own decide_tf/vote_tf (manager-gated)
@@ -121,7 +127,14 @@ grid_levels:
   htf_bias_map: {1m: "15m", 5m: "15m", 15m: "1h", 1h: "4h"}
   bb_edge_enabled: true
   bb_edge_sigma: 2.5
-  cycle_net_target_usd: 1250.0      # base net floating-$ target; tune on demo (micro-lot swings are small)
+  # 2026-07-22: raised 1250 -> 5000 (user). Effective target still decays with hedging
+  # (hedged/n * 33%), so a fully-hedged 4-leg side exits at ~3350 rather than 5000.
+  # CONSEQUENCE: bias_trail_activate_usd (1800) now sits WELL BELOW this, so the per-side
+  # trail — not net_target — becomes the working exit; net_target is the stretch backstop.
+  # Deliberate (user call). For reference the trail-off session booked 5/5 net_target
+  # exits at net 1052-1273, so none of those would reach 5000; expect longer holds and
+  # more trail/full_hedge exits instead.
+  cycle_net_target_usd: 5000.0      # base net floating-$ target (hedge-decayed below)
   cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full
   cycle_min_target_usd: 0.20     # floor; must be >0 so a hedged cycle still has a positive net-$ exit
   cycle_close_on_full_hedge: true  # cut a fully-hedged (delta-neutral) cycle to free margin
@@ -130,15 +143,28 @@ grid_levels:
   # BOOK a fraction of that side and move the rest to breakeven (risk-free runner).
   # Captures directional profit the net-basket exit masks (a hedge leg drags net down →
   # target never hits).
+  # 2026-07-22: RE-ENABLED, with the trail reverted to Jun22's PER-SIDE form.
+  # History: the trail predates the Jun22 base — added d32794c (2026-06-19) and ON at
+  # 4f387b7 with activate_usd 5.0 (USD account). 8766961 (2026-06-27) later rewrote it
+  # cycle-wide. So "Jun22 behaviour" IS trailing, per-side, not the cycle-wide version
+  # this branch inherited and not trail-off.
   bias_trail_enabled: true
-  # fill_frac was 100% (ALL legs) — on a 5-6 leg ladder that's rarely reached, so a side
-  # could swing well past bias_trail_activate_usd and back to a loss with NOTHING
-  # tracking it. Lowered to 50%: the trail arms once half that side's legs are filled,
-  # tracking peak/giveback from there. bias_booked is also now PER-SIDE (bias_booked_buy/
-  # sell), not one cycle-wide flag — booking one side no longer blocks the trail from
-  # ever tracking the other side later in the same cycle.
+  # UNUSED as of the 2026-07-22 per-side revert. Jun22's trail gates on a side having
+  # ALL its legs filled (buys >= buy_n), not on a fraction — this key was introduced by
+  # the cycle-wide rewrite (8766961) and nothing reads it now. Left in place so
+  # re-enabling the cycle-wide form does not need the key re-added.
+  # (The old comment here also claimed per-side bias_booked_buy/sell flags — that was
+  # never implemented in either version; bias_booked is a single cycle-wide one-shot.)
   bias_trail_fill_frac: 0.5
-  bias_trail_activate_usd: 200.0   # bias-side floating must PEAK ≥ this ($) to arm the trail
+  # 2026-07-22 (user): 1000 USC, paired with cycle_net_target_usd 5000.
+  # This is a PER-SIDE peak, not net — the hedged side drags net down, so one side can
+  # peak well above the net figure. At 1000 vs a 5000 net target the trail is the
+  # WORKING exit (books 50% of the committed side on a 40% giveback) and net_target is
+  # the stretch backstop, reached only by a strongly directional cycle.
+  # Reference: Jun22's own value was 5.0 USD = 500 USC; the trail-off session booked
+  # 5/5 net_target exits at net 1052-1273 USC (+6029), so at 1000 expect the trail to
+  # fire on most cycles before that path completes.
+  bias_trail_activate_usd: 1000.0  # bias-side floating must PEAK ≥ this to arm the trail
   bias_trail_giveback_pct: 40    # fire when floating retraces this % off the peak
   bias_book_frac: 0.5            # fraction of the bias side's positions to book at the trigger
   # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
@@ -240,7 +266,10 @@ execution:
   broker: vantage_mt5
   tradable_symbols: [XAUTUSDT, BTCUSDT]
   symbol_map:
-    XAUTUSDT: "XAUUSD.pc"
+    # 2026-07-21 demo run: account 25798248 lists gold as XAUUSD+, not the
+    # XAUUSD.pc of the old live USC cent account. Broker-account fact, not a
+    # strategy change — the Jun22 trading behaviour is untouched.
+    XAUTUSDT: "XAUUSD+"
     BTCUSDT:  "BTCUSD"
   # Risk-adjusted sizing: lots = (balance × risk_per_trade_pct) / (SL_distance × contract_size)
   # Set risk_per_trade_pct = 0 to disable; falls back to default_lots.
