@@ -2,7 +2,26 @@
 code and dumps every command the server would return.
 
 Run once per git ref (old vs new) into separate output files, then diff the two.
-Byte-identical command streams prove the Phase-0 seam refactor changed no behaviour.
+
+*** KNOWN LIMITATION — READ BEFORE TRUSTING A DIFF ***
+This does NOT produce a clean pass against a live audit, and cannot, because the
+server is stateful while the capture is a fixed recording:
+
+  - The recorded `magics[]` describes the LIVE server's positions. The replay server
+    arms its own cycles, and after the first divergence the recorded state no longer
+    corresponds to anything the replay did.
+  - The replay holds no positions (it acks commands but nothing fills), so its cycles
+    never progress to an exit and it keeps arming.
+
+Measured on a 21.8 min capture (977 polls): live enqueued 154 legs across 25 arm
+batches; the replay produced 873 legs — 5.7x over-arming — even though the set of
+magics matched almost exactly (12 of 13; the missing one is a candle_sweep magic that
+needs venue bars). Acking commands cut the replay from 38,758 to 1,038, but the
+residual gap is structural, not a missing ack.
+
+Use this to compare TWO CHECKOUTS against each other (same capture, same divergence,
+so the divergence cancels) — that is a valid A/B. Do not read it as "replay reproduces
+live". For a real fill-driven comparison use backtest/harness.py + fidelity_check.py.
 
 Usage:
     FB_DATA_DIR=<scratch> python scripts/parity_replay.py \
@@ -82,6 +101,7 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
 
     n_polls = n_cmds = 0
+    seen_ids: set[str] = set()
     with cap.open() as fh, out.open("w") as ofh:
         for line in fh:
             line = line.strip()
@@ -96,14 +116,33 @@ def main() -> int:
             # The poll returns queued commands under a stable key; capture whatever
             # command list it hands the EA, cleaned of volatile ids.
             cmds = data.get("commands") or data.get("cmds") or []
+            acks = []
             for c in cmds:
-                if isinstance(c, dict):
-                    ofh.write(json.dumps(_clean(c), sort_keys=True,
-                                         separators=(",", ":")) + "\n")
-                    n_cmds += 1
+                if not isinstance(c, dict):
+                    continue
+                cid = c.get("id")
+                # Record each command ONCE, by id. poll() re-sends an IN_FLIGHT command
+                # after _RECLAIM_AFTER_S, and the live audit logs one `enqueue` row per
+                # command, so counting every re-send would inflate the replay side and
+                # guarantee a false diff.
+                if cid and cid in seen_ids:
+                    continue
+                if cid:
+                    seen_ids.add(cid)
+                ofh.write(json.dumps(_clean(c), sort_keys=True,
+                                     separators=(",", ":")) + "\n")
+                n_cmds += 1
+                if cid:
+                    acks.append({"id": cid, "ok": True, "ticket": 0, "retcode": 10009})
+            # Ack every command so the server marks it DONE. Without this it stays
+            # PENDING, is re-sent on the next poll, and the cycle never progresses —
+            # which produced 38,758 replay commands against live's 223.
+            if acks:
+                client.post("/exec/ack",
+                            json={"account": body.get("account"), "results": acks})
 
     clock.reset()
-    print(f"replayed {n_polls} polls → {n_cmds} commands → {out}")
+    print(f"replayed {n_polls} polls → {n_cmds} distinct commands → {out}")
     return 0
 
 

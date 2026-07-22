@@ -9,9 +9,13 @@ Why a module seam instead of monkeypatching `time`: patching the global module a
 warps lock timeouts, logging stamps and anything else that reads the clock, which
 makes replay nondeterministic in ways that are very hard to attribute.
 
-Scope note: the strategy brain (`execution/zone_triggers.py`, `execution/grid_planner.py`)
-contains no clock calls at all — it is a pure function of (bar store, VP cache, config)
-and needs nothing from here. Only lifecycle plumbing does.
+Scope note: `execution/grid_planner.py` has no clock calls — it is a pure function of
+(bar store, VP cache, config). `execution/zone_triggers.py` was ALSO believed clock-free
+when this module was written; that was wrong. `_cached_hvn`/`_cached_lvn` branch on the
+IST hour via the aliased `_dt.now()`, which an initial grep for `time.time`/`datetime.now`
+missed, and under replay they read the live hour and selected the wrong VP source. Both
+now call clock.now(). Lesson: grep for aliased imports too before declaring a path
+clock-free.
 """
 from __future__ import annotations
 
