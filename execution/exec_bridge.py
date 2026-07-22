@@ -41,6 +41,32 @@ def _emit_exit_audit(row: dict) -> None:
         pass  # audit must never break execution
 
 
+# Placement failures that are TRANSIENT — the leg was rejected because of where price
+# happened to be at that instant, not because the leg itself is malformed. All of them
+# are worth re-attempting once the quote has moved clear; monitor_cycle's retry gate
+# re-checks the live quote before re-sending, so a still-bad leg simply stays queued.
+#
+#   "inside freeze"  EA client-side pre-check: stop too close to market. Never reaches
+#                    the broker, so the EA's own 200ms transient retry never sees it.
+#   "invalid price"  MT5 retcode 10015 — e.g. a sell_stop at/above market. Observed as
+#                    the SECOND failure on a leg whose freeze-retry fired after price
+#                    had moved past it (FB|hvn|1m|s1 @ 4116.1912: freeze, freeze, then
+#                    invalid price).
+#   "invalid stops"  MT5 retcode 10016 — the attached TP sits inside the broker's
+#                    minimum stop distance from entry. Retrying helps when price drifts
+#                    away from the TP; it does NOT fix a structurally too-close TP, so
+#                    persistent cases want a min-TP-distance guard at plan time instead.
+#
+# Anything else (bad volume, disabled trading, no money) is a real rejection and is left
+# dropped — retrying it would just loop.
+_RETRYABLE_PLACE_ERRORS = ("inside freeze", "invalid price", "invalid stops")
+
+
+def _is_retryable_place_error(err) -> bool:
+    e = str(err or "").lower()
+    return any(k in e for k in _RETRYABLE_PLACE_ERRORS)
+
+
 # ── fractal→VP→TP study (LOG-ONLY, no execution effect) ──────────────────────
 _FRACTAL_LOG = _ROOT / "data" / "fractal_tp_study.jsonl"
 
@@ -206,6 +232,10 @@ _RECLAIM_AFTER_S = 10.0   # IN_FLIGHT with no ack this long → back to PENDING
 # evaluation until it confirms (positions→0) or this grace lapses, then re-issue.
 # Must exceed _RECLAIM_AFTER_S so the queue's own re-send isn't double-stacked.
 _FLATTEN_GRACE_S = 12.0
+# Max re-placement attempts for a transiently-rejected leg. Freeze rejects usually clear
+# on the first or second retry once price drifts; "invalid stops" (TP inside the broker's
+# min distance) may never clear, so the bound stops a doomed leg re-sending every poll.
+_MAX_LEG_RETRIES = 3
 
 
 @dataclass
@@ -227,6 +257,8 @@ class Command:
     ts_created: float = 0.0
     ts_sent: float = 0.0
     result: dict = field(default_factory=dict)
+    retry_n: int = 0          # placement attempts already spent on this leg (bounded
+                              # re-placement of transient rejects; not sent to the EA)
 
     def to_wire(self) -> dict:
         """Flat dict the EA's JSON parser consumes (only execution fields)."""
@@ -406,10 +438,20 @@ class ExecBridge:
                     if not clear:
                         still_frozen.append(leg)
                         continue
+                    # Bounded attempts. The stash now also holds "invalid stops" legs,
+                    # whose TP can be structurally inside the broker's min distance — that
+                    # never clears on its own, so an unbounded retry would re-send the same
+                    # doomed leg every poll for the life of the cycle. Drop after
+                    # _MAX_LEG_RETRIES and leave buy_n/sell_n decremented, which is the
+                    # honest state: that leg is not coming back.
+                    tries = int(leg.get("tries") or 0)
+                    if tries >= _MAX_LEG_RETRIES:
+                        continue
+                    leg["tries"] = tries + 1
                     cls.enqueue(account, PLACE_PENDING, symbol, order_type=order_type,
                                price=price, lot=float(leg.get("lot") or 0.0),
                                tp=float(leg.get("tp") or 0.0), comment=leg.get("comment", ""),
-                               magic=magic, now=t)
+                               magic=magic, now=t, retry_n=tries + 1)
                     bumped["buy" if order_type == "buy_stop" else "sell"] += 1
                 if len(still_frozen) != len(retry_legs):
                     updated = dict(cyc, pending_retry=still_frozen)
@@ -665,12 +707,12 @@ class ExecBridge:
     def enqueue(cls, account: str, type: str, symbol: str, *, order_type: str = "",
                 price: float = 0.0, lot: float = 0.0, sl: float = 0.0, tp: float = 0.0,
                 comment: str = "", magic: int = 0, side: str = "", frac: float = 0.0,
-                now: float | None = None) -> Command:
+                now: float | None = None, retry_n: int = 0) -> Command:
         cmd = Command(
             id=uuid.uuid4().hex[:12], account=str(account), type=type, symbol=symbol,
             order_type=order_type, price=round(float(price), 5), lot=round(float(lot), 2),
             sl=round(float(sl), 5), tp=round(float(tp), 5), comment=comment,
-            magic=int(magic), side=side, frac=float(frac),
+            magic=int(magic), side=side, frac=float(frac), retry_n=int(retry_n),
             ts_created=now if now is not None else time.time(),
         )
         with cls._lock:
@@ -791,10 +833,14 @@ class ExecBridge:
                         side = "buy" if c.order_type == "buy_stop" else "sell"
                         key = (c.account, c.symbol, c.magic)
                         arm_decrements.setdefault(key, {"buy": 0, "sell": 0})[side] += 1
-                        if "inside freeze" in str(r.get("error") or ""):
+                        if _is_retryable_place_error(r.get("error")):
+                            # `tries` is carried on the command so a leg that fails again
+                            # after a retry keeps its count — otherwise re-stashing here
+                            # would reset it to 0 every round and the bound never binds.
                             arm_retries.setdefault(key, []).append({
                                 "order_type": c.order_type, "price": c.price, "lot": c.lot,
                                 "tp": c.tp, "comment": c.comment,
+                                "tries": int(getattr(c, "retry_n", 0) or 0),
                             })
                 cls._audit("ack", c)
         for key in set(arm_decrements) | set(arm_retries):
