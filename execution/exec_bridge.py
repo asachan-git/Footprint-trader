@@ -376,7 +376,19 @@ class ExecBridge:
                 cls.set_last_arm(account, symbol, **{**cyc, "active": False})
             return None
 
-        n = int(cyc.get("n_per_side") or 0)
+        # n for the exit gates = the LONGEST side actually laddered, not the pre-skew
+        # n_per_side. _build_legs gives the favoured side n+1 legs, so a skewed cycle
+        # has buy_n != sell_n and n_per_side understates the real ladder.
+        #
+        # 2026-07-22: this was reading n_per_side, which made full_hedge fire one leg
+        # early on every skewed cycle — observed live on magic 770052 (n_per_side 2,
+        # buy_n 2, sell_n 3): min(buys=2, sells=2) >= 2 and 4 >= 4 tripped the gate at
+        # 4 of 5 legs, declaring "delta-neutral" while the sell ladder was still a leg
+        # short. full_hedge has NO profit floor, so it cut the cycle at -521.
+        # The same n is the decay divisor for net_target, where too small an n
+        # overstates decay and lowers the effective target.
+        n = max(int(cyc.get("buy_n") or 0), int(cyc.get("sell_n") or 0),
+                int(cyc.get("n_per_side") or 0))
         tp_up = float(cyc.get("tp_up") or 0.0)
         tp_down = float(cyc.get("tp_down") or 0.0)
         q = cls.get_quote(account, symbol) or {}

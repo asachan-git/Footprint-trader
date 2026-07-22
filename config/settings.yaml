@@ -96,7 +96,13 @@ grid_levels:
   base_lot: 0.25
   lot_step: 0.25
   tp_atr_mult: 2
-  hvn_max_legs: 8
+  # Leg cap per side. This is a CAP for width-driven kinds (hvn_inside_touch computes
+  # n = node_width/step then clamps here); other kinds clamp to regime.max_legs instead.
+  # Floor is always 2, so a small node still gets a 2-leg ladder.
+  # 2026-07-22: 8 -> 6 (user), and made per-TF overridable. A TF missing from the map
+  # falls back to the flat value below, so clearing the map restores flat behaviour.
+  hvn_max_legs: 6
+  hvn_max_legs_by_tf: {1m: 6, 5m: 6, 15m: 6, 1h: 6}
   max_fulcrum_dist_pct: 0.05
   # Cycle exit (server-side cycle monitor). DEMO ONLY — strategy is -EV.
   # Net-profit-exit-only: place legs with NO per-order TP so the winning side can't book

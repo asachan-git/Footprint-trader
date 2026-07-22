@@ -407,31 +407,40 @@ def _resolve_tps(symbol: str, fulcrum: float, buy_legs: list[Leg],
 
 def _rebase_to_venue(plan: GridPlan, analysis_anchor: float, venue_price: float) -> GridPlan:
     """Re-anchor a plan computed in the analysis frame (Binance/Bybit) onto the
-    execution venue's live price (Vantage). Every absolute level — fulcrum, each
-    leg, both TPs, the step — is scaled by the ratio venue/analysis, preserving the
-    structural % geometry while moving it to where the broker actually quotes. Same
-    principle as execution.venue_translator, applied to the neutral grid.
+    execution venue's live price (Vantage). Every absolute level — fulcrum, each leg,
+    both TPs — is TRANSLATED by the ADDITIVE basis shift (venue − analysis), the SAME
+    transform the chart uses to draw the zones (vp_cache._shift_vp adds an offset).
+    Widths (step, and thus leg SPACING) are frame-invariant differences → NOT shifted.
 
-    Why this is mandatory: a BuyStop must sit above the venue ask and a SellStop
-    below the venue bid. Binance-frame absolute prices won't satisfy that on Vantage
-    → MT5 rejects the orders. (Tick-rounding + broker min-stop-distance are enforced
-    EA-side, since only the terminal knows the symbol's stopsLevel.)
+    2026-07-22 (ported from the current branch's 2026-07-14 fix): switched from the old
+    MULTIPLICATIVE ratio (level * venue/analysis) to additive. The ratio anchored the
+    scaling at LIVE price, so a fulcrum far from spot landed at edge*(venue/analysis)
+    while the chart drew edge+offset — the two diverged by ~shift*(edge_distance/price),
+    i.e. the fulcrum-vs-drawn-edge gap GREW with the edge's distance from spot. That is
+    the "fulcrum and edges don't line up on the MT5 chart" symptom. Gold basis is a
+    near-constant additive offset (XAUUSD+ − Binance), not a percentage, so additive is
+    the physically correct frame map AND it makes fulcrum == drawn edge exactly.
+
+    Why rebasing is mandatory at all: a BuyStop must sit above the venue ask and a
+    SellStop below the venue bid. Binance-frame absolute prices won't satisfy that on
+    Vantage → MT5 rejects the orders. (Tick-rounding + broker min-stop-distance are
+    enforced EA-side, since only the terminal knows the symbol's stopsLevel.)
     """
     if analysis_anchor <= 0 or venue_price <= 0:
         return plan
-    ratio = venue_price / analysis_anchor
-    if abs(ratio - 1.0) < 1e-9:
+    shift = venue_price - analysis_anchor
+    if abs(shift) < 1e-9:
         # in-frame caller (dashboard/sim) — identity, just stamp the anchors
         return replace(plan, analysis_anchor=round(analysis_anchor, 4),
                        venue_anchor=round(venue_price, 4), rebased=False)
     return replace(
         plan,
-        fulcrum=round(plan.fulcrum * ratio, 4),
-        step=round(plan.step * ratio, 4),
-        buy_legs=[Leg(price=round(l.price * ratio, 4), lot=l.lot) for l in plan.buy_legs],
-        sell_legs=[Leg(price=round(l.price * ratio, 4), lot=l.lot) for l in plan.sell_legs],
-        buy_tp=round(plan.buy_tp * ratio, 4),
-        sell_tp=round(plan.sell_tp * ratio, 4),
+        fulcrum=round(plan.fulcrum + shift, 4),
+        step=plan.step,   # width — frame-invariant, do NOT shift
+        buy_legs=[Leg(price=round(l.price + shift, 4), lot=l.lot) for l in plan.buy_legs],
+        sell_legs=[Leg(price=round(l.price + shift, 4), lot=l.lot) for l in plan.sell_legs],
+        buy_tp=round(plan.buy_tp + shift, 4),
+        sell_tp=round(plan.sell_tp + shift, 4),
         analysis_anchor=round(analysis_anchor, 4),
         venue_anchor=round(venue_price, 4),
         rebased=True,
@@ -456,7 +465,11 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     base_lot = float(grid_cfg.get("base_lot", 0.01))
     lot_step = float(grid_cfg.get("lot_step", 0.01))
     tp_mult = float(grid_cfg.get("tp_atr_mult", 1.5))
-    hvn_max_legs = int(grid_cfg.get("hvn_max_legs", 8))
+    # Per-TF leg cap (2026-07-22): hvn_max_legs_by_tf overrides the flat hvn_max_legs
+    # for the TF being planned. A TF absent from the map falls back to the flat value,
+    # so an empty/missing map preserves the original behaviour exactly.
+    _legs_by_tf = grid_cfg.get("hvn_max_legs_by_tf") or {}
+    hvn_max_legs = int(_legs_by_tf.get(tf, grid_cfg.get("hvn_max_legs", 8)))
     lvn_legs_per_side = int(grid_cfg.get("lvn_legs_per_side", 1))
     max_fulcrum_dist_pct = float(grid_cfg.get("max_fulcrum_dist_pct", 0.05))
 
@@ -534,12 +547,14 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
                          hvn_max_legs=hvn_max_legs,
                          lvn_legs_per_side=lvn_legs_per_side)
     # Freeze-aware floor: ensure the innermost leg (fulcrum ± step) clears the broker's
-    # min-stop distance. min_step_venue is in the VENUE frame; convert to the analysis
-    # frame here (× current/venue) since the step is rebased back by venue/current later.
-    if min_step_venue > 0 and venue_price and venue_price > 0:
-        min_step_analysis = min_step_venue * (current_price / venue_price)
-        if step < min_step_analysis:
-            step = round(min_step_analysis, 4)
+    # min-stop distance. 2026-07-22: with the ADDITIVE rebase, step is a width and is
+    # frame-invariant — _rebase_to_venue no longer scales it — so min_step_venue applies
+    # directly with no frame conversion. (It was × current/venue to undo the old
+    # multiplicative rebase; keeping that would now under-floor the step by the basis
+    # ratio and let the innermost leg land back inside the broker's freeze band.)
+    if min_step_venue > 0:
+        if step < min_step_venue:
+            step = round(min_step_venue, 4)
 
     # Ladder-span gate: a neutral straddle only works if price sits INSIDE the ladder
     # [fulcrum − n·step, fulcrum + n·step]. If the fulcrum is a level price has already
