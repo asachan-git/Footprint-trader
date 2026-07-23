@@ -168,15 +168,14 @@ grid_levels:
   # (The old comment here also claimed per-side bias_booked_buy/sell flags — that was
   # never implemented in either version; bias_booked is a single cycle-wide one-shot.)
   bias_trail_fill_frac: 0.5
-  # 2026-07-22 (user): 1000 USC, paired with cycle_net_target_usd 5000.
-  # This is a PER-SIDE peak, not net — the hedged side drags net down, so one side can
-  # peak well above the net figure. At 1000 vs a 5000 net target the trail is the
-  # WORKING exit (books 50% of the committed side on a 40% giveback) and net_target is
-  # the stretch backstop, reached only by a strongly directional cycle.
-  # Reference: Jun22's own value was 5.0 USD = 500 USC; the trail-off session booked
-  # 5/5 net_target exits at net 1052-1273 USC (+6029), so at 1000 expect the trail to
-  # fire on most cycles before that path completes.
-  bias_trail_activate_usd: 1000.0  # bias-side floating must PEAK ≥ this to arm the trail
+  # 2026-07-23 (user): 250 USC, down from 1000 (and 5000 net target unchanged).
+  # PER-SIDE peak, not net — the hedged side drags net down, so one side peaks well
+  # before the net figure. At 250 the trail arms early and books 50% of the committed
+  # side on a 40% giveback, so it fires on far more cycles than at 1000; net_target 5000
+  # becomes a distant backstop only a strongly directional cycle reaches. Books smaller,
+  # more often — protects gains sooner at the cost of capping the runners.
+  # Reference: Jun22's own value was 5.0 USD = 500 USC, so 250 is below even that.
+  bias_trail_activate_usd: 250.0   # bias-side floating must PEAK ≥ this to arm the trail
   bias_trail_giveback_pct: 40    # fire when floating retraces this % off the peak
   bias_book_frac: 0.5            # fraction of the bias side's positions to book at the trigger
   # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
