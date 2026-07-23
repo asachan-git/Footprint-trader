@@ -168,14 +168,13 @@ grid_levels:
   # (The old comment here also claimed per-side bias_booked_buy/sell flags — that was
   # never implemented in either version; bias_booked is a single cycle-wide one-shot.)
   bias_trail_fill_frac: 0.5
-  # 2026-07-23 (user): 250 USC, down from 1000 (and 5000 net target unchanged).
-  # PER-SIDE peak, not net — the hedged side drags net down, so one side peaks well
-  # before the net figure. At 250 the trail arms early and books 50% of the committed
-  # side on a 40% giveback, so it fires on far more cycles than at 1000; net_target 5000
-  # becomes a distant backstop only a strongly directional cycle reaches. Books smaller,
-  # more often — protects gains sooner at the cost of capping the runners.
-  # Reference: Jun22's own value was 5.0 USD = 500 USC, so 250 is below even that.
-  bias_trail_activate_usd: 250.0   # bias-side floating must PEAK ≥ this to arm the trail
+  # 2026-07-23: back to 1000 for the squeeze-gate run (was 250). Rationale: with
+  # require_squeeze_gate true, cycles arm ONLY on a coil/release, so each one should ride
+  # the expansion it was armed for — a 250 trail books half the side before that move
+  # completes, defeating the point of waiting for the coil. At 1000 the trail is a
+  # backstop for a decent side-peak that then reverses, while net_target 5000 catches the
+  # full directional runners the gate is meant to select for. PER-SIDE peak, not net.
+  bias_trail_activate_usd: 1000.0  # bias-side floating must PEAK ≥ this to arm the trail
   bias_trail_giveback_pct: 40    # fire when floating retraces this % off the peak
   bias_book_frac: 0.5            # fraction of the bias side's positions to book at the trigger
   # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
@@ -205,7 +204,14 @@ grid_levels:
   # each tagged squeeze_ok in the arm + exit audits (data/exec_emit.jsonl) so outcomes can
   # be bucketed squeeze-pass vs squeeze-fail. Flip to true to ENFORCE (skip uncoiled) once
   # the data favours the gate. The label is stamped either way.
-  require_squeeze_gate: false
+  # 2026-07-23: ENFORCED (Phase 1 of the squeeze-gate rollout). The 07-22 session's
+  # cycle_outcomes bucketed squeeze_ok=True at +12,506 (avg +625, n=20) vs squeeze_ok=False
+  # -524 (avg -35, n=15), and 4 of 6 full_hedge losses were uncoiled arms. So the data
+  # favours the gate: arm ONLY on a coil/release, sit out the chop that whipsaw-fills both
+  # sides. Paired with the trail raised back to 1000 (a gated cycle should RIDE its
+  # expansion, not book at 250). Time-based close for now (gate_max); the BBW-peak close
+  # is Phase 2. Revert to false to compare against the ungated baseline.
+  require_squeeze_gate: true
   squeeze_gate_max_bars: 10  # how stale a just-ended coil may be and still pass the gate
 
 # Startup preflight — server REFUSES to start unless footprint + VP data are present.
