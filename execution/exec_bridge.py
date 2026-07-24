@@ -367,6 +367,14 @@ class ExecBridge:
             return dict(best) if best else None
 
     @classmethod
+    def active_magics(cls, account: str, broker_symbol: str) -> list[int]:
+        """Magics with an ACTIVE arm record on (account, symbol). Used by the
+        absent-magic reap: any of these the EA didn't report this poll is flat in MT5."""
+        with cls._lock:
+            return [mg for (acc, sym, mg), m in cls._last_arm.items()
+                    if acc == str(account) and sym == broker_symbol and m.get("active")]
+
+    @classmethod
     def _save_cyc(cls, account: str, symbol: str, magic: int, cyc: dict, **updates) -> None:
         """set_last_arm for a reloaded cycle dict. Strips cyc's own 'magic' before the
         spread and passes magic= explicitly — mandatory once arm state persists to disk:

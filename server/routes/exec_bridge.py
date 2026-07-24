@@ -206,6 +206,41 @@ def exec_poll():
             ExecBridge.monitor_cycle(account, sym, settings_cfg, pnl=pnl, buys=buys, sells=sells)
         except Exception:
             LOG.exception("[exec] cycle monitor error")  # never break the poll
+
+    # Reap absent magics: any cycle the server still holds ACTIVE but the EA did NOT
+    # report THIS poll has zero live positions AND pendings in MT5 — the EA's magics array
+    # lists a magic only when it iterates a live order/position, so absence == flat. Retire
+    # it so phantom cycles (manually flattened in the terminal) can't linger active or leave
+    # a stale fulcrum dedup. Runs whenever the EA sends a magics array — INCLUDING empty [] —
+    # so a whole-account manual flatten is caught; never on the legacy single-pool path.
+    if sym and isinstance(magics, list):
+        try:
+            _now = time.time()
+            _reap_grace = 30.0   # s — let a freshly-armed cycle place + report its legs first
+            # Whole-account-flat: EA reports zero at the top level AND an empty magics array →
+            # MT5 holds nothing for us. Unambiguous; reap WITHOUT the placement grace.
+            _flat_all = (int(body.get("buys", 0) or 0) == 0
+                         and int(body.get("sells", 0) or 0) == 0
+                         and int(body.get("pendings", 0) or 0) == 0
+                         and not magics)
+            _reported = {int(m.get("magic", 0)) for m in magics}
+            for _mg in ExecBridge.active_magics(account, sym):
+                if _mg in _reported:
+                    continue
+                _cyc = ExecBridge.get_last_arm(account, sym, magic=_mg) or {}
+                # Placement-window guard: skip a just-armed cycle whose EA legs haven't been
+                # reported yet — else we'd retire a fresh arm before it places. Skipped when
+                # the EA reports the whole account flat (no fresh arm can have legs then).
+                if not _flat_all and (_now - float(_cyc.get("ts", 0.0) or 0.0)) < _reap_grace:
+                    continue
+                if _cyc:
+                    ExecBridge._save_cyc(account, sym, _mg, _cyc, active=False)
+                ExecBridge.clear_emit(account, sym, magic=_mg)
+                ExecBridge.set_open(account, sym, 0, 0, magic=_mg)
+                LOG.info(f"[exec] reaped absent magic {_mg} (flat in MT5) for {account}/{sym}")
+        except Exception:
+            LOG.exception("[exec] absent-magic reap error")  # never break the poll
+
     commands = ExecBridge.poll(account)
     if commands:
         LOG.info(f"[exec] poll account={account} → {len(commands)} command(s)")
