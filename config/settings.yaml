@@ -175,13 +175,12 @@ grid_levels:
   # (The old comment here also claimed per-side bias_booked_buy/sell flags — that was
   # never implemented in either version; bias_booked is a single cycle-wide one-shot.)
   bias_trail_fill_frac: 0.5
-  # 2026-07-23: back to 1000 for the squeeze-gate run (was 250). Rationale: with
-  # require_squeeze_gate true, cycles arm ONLY on a coil/release, so each one should ride
-  # the expansion it was armed for — a 250 trail books half the side before that move
-  # completes, defeating the point of waiting for the coil. At 1000 the trail is a
-  # backstop for a decent side-peak that then reverses, while net_target 5000 catches the
-  # full directional runners the gate is meant to select for. PER-SIDE peak, not net.
-  bias_trail_activate_usd: 1000.0  # bias-side floating must PEAK ≥ this to arm the trail
+  # 2026-07-24 (user): 200. With the squeeze gate OFF again (observe mode), cycles arm
+  # on any structure, so a tight trail protects the committed side's gains sooner rather
+  # than riding for a big expansion that may not come. PER-SIDE peak (this branch's trail
+  # is the committed side's own P&L, not net); books bias_book_frac of that side on a 40%
+  # giveback, rest to breakeven. net_target 5000 stays the stretch backstop.
+  bias_trail_activate_usd: 200.0   # bias-side floating must PEAK ≥ this to arm the trail
   bias_trail_giveback_pct: 40    # fire when floating retraces this % off the peak
   bias_book_frac: 0.5            # fraction of the bias side's positions to book at the trigger
   # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
