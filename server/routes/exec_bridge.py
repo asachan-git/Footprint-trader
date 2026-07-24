@@ -175,6 +175,12 @@ def exec_poll():
         except Exception:
             LOG.debug("[exec] feed_hedge stash/rehydrate skipped")
     if sym and isinstance(magics, list) and magics:
+        # Re-adopt any live magic orphaned/reaped across a restart BEFORE the monitor
+        # loop, so its arm record exists when monitor_cycle looks it up.
+        try:
+            ExecBridge.reconcile_from_poll(account, sym, magics)
+        except Exception:
+            LOG.exception("[exec] reconcile_from_poll error")
         for m in magics:
             try:
                 mg = int(m.get("magic", 0))

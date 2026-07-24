@@ -26,6 +26,10 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+from execution.arm_state_store import (
+    persist_arm, persist_emit, load as _load_arm_state,
+)
+
 _ROOT = Path(__file__).resolve().parent.parent
 _AUDIT_LOG = _ROOT / "data" / "exec_bridge.jsonl"
 _EMIT_LOG = _ROOT / "data" / "exec_emit.jsonl"   # ground-truth arm/exit decisions
@@ -328,8 +332,16 @@ class ExecBridge:
         # Keyed by magic. The internal monitor calls re-pass the stored cyc via **cyc, so
         # `magic` arrives either as the named arg or inside meta — accept both.
         key_magic = int(magic or meta.get("magic", 0) or 0)
+        state = dict(meta, tf=tf, magic=key_magic)
         with cls._lock:
-            cls._last_arm[(str(account), broker_symbol, key_magic)] = dict(meta, tf=tf, magic=key_magic)
+            cls._last_arm[(str(account), broker_symbol, key_magic)] = state
+        # Crash-safe: mirror to disk so a Flask restart re-adopts this cycle instead of
+        # orphaning it (no arm persistence was the reason a restart lost all live cycles).
+        # A persistence failure must never block execution.
+        try:
+            persist_arm(account, broker_symbol, key_magic, state)
+        except Exception:
+            pass
 
     @classmethod
     def get_last_arm(cls, account: str, broker_symbol: str, tf: str = "", magic: int = 0) -> dict | None:
@@ -353,6 +365,18 @@ class ExecBridge:
                 if ts >= best_ts:
                     best, best_ts = m, ts
             return dict(best) if best else None
+
+    @classmethod
+    def _save_cyc(cls, account: str, symbol: str, magic: int, cyc: dict, **updates) -> None:
+        """set_last_arm for a reloaded cycle dict. Strips cyc's own 'magic' before the
+        spread and passes magic= explicitly — mandatory once arm state persists to disk:
+        a disk-restored cyc has magic stripped from its body, so a bare **cyc spread
+        would collapse the write to magic=0 and corrupt a DIFFERENT cycle's slot. And if
+        cyc DOES still carry magic, passing magic= too raises TypeError on every poll
+        (the monitor then never exits). This helper makes both impossible."""
+        body = {k: v for k, v in cyc.items() if k != "magic"}
+        body.update(updates)
+        cls.set_last_arm(account, symbol, magic=int(magic), **body)
 
     # ── cycle monitor (server-side exit brain) ─────────────────────────────────
     @classmethod
@@ -399,12 +423,12 @@ class ExecBridge:
         fts = float(cyc.get("flatten_ts") or 0.0)
         if fts > 0:
             if positions == 0:
-                cls.set_last_arm(account, symbol, **{**cyc, "active": False, "flatten_ts": 0.0})
+                cls._save_cyc(account, symbol, magic, cyc, active=False, flatten_ts=0.0)
             elif (t - fts) > _FLATTEN_GRACE_S:
                 # close demonstrably didn't land (past the queue's reclaim window) → re-issue once
                 cls.enqueue(account, CLOSE_ALL, symbol,
                            comment=f"FB|flatten|{cyc.get('armed_tf') or tf}|retry", magic=magic, now=t)
-                cls.set_last_arm(account, symbol, **{**cyc, "flatten_ts": t})
+                cls._save_cyc(account, symbol, magic, cyc, flatten_ts=t)
             return None
 
         # 0.1) retry legs that failed placement with "inside freeze" (ack() stashed them —
@@ -459,7 +483,7 @@ class ExecBridge:
                         if bumped[side]:
                             ckey = f"{side}_n"
                             updated[ckey] = int(updated.get(ckey) or 0) + bumped[side]
-                    cls.set_last_arm(account, symbol, **updated)
+                    cls._save_cyc(account, symbol, magic, updated)
                     cyc = updated
 
         # track high-water of open positions (basis for flatten-rest) + resting pendings
@@ -471,7 +495,7 @@ class ExecBridge:
             pend_seen = max(pend_seen, pendings)
             cyc["max_pos_seen"] = max_seen
             cyc["pend_seen"] = pend_seen
-            cls.set_last_arm(account, symbol, **cyc)
+            cls._save_cyc(account, symbol, magic, cyc)
 
         if positions <= 0:
             # flat. Retire the cycle once it had something live (positions filled OR
@@ -479,7 +503,7 @@ class ExecBridge:
             # symbol for a new arm by either tf. The (max/pend)_seen high-water avoids
             # the placement-window race (active set before the EA reports pendings).
             if (max_seen > 0 or pend_seen > 0) and pendings == 0:
-                cls.set_last_arm(account, symbol, **{**cyc, "active": False})
+                cls._save_cyc(account, symbol, magic, cyc, active=False)
             return None
 
         # n for the exit gates = the LONGEST side actually laddered, not the pre-skew
@@ -605,7 +629,7 @@ class ExecBridge:
         # broker-visible comment is shortened.
         cls.enqueue(account, CLOSE_ALL, symbol,
                    comment=f"FB|flatten|{cyc.get('armed_tf') or tf}|{reason}"[:31], magic=magic, now=t)
-        cls.set_last_arm(account, symbol, **{**cyc, "flatten_ts": t})
+        cls._save_cyc(account, symbol, magic, cyc, flatten_ts=t)
         _emit_exit_audit({"account": str(account), "broker_symbol": symbol, "tf": tf, "magic": magic,
                           "exit_reason": reason, "armed_tf": cyc.get("armed_tf", ""),
                           "positions": positions, "pendings": pendings,
@@ -633,11 +657,19 @@ class ExecBridge:
     @classmethod
     def mark_emit(cls, account: str, symbol: str, fulcrum: float, magic: int = 0) -> None:
         cls._last_emit[(str(account), symbol, int(magic))] = fulcrum
+        try:
+            persist_emit(account, symbol, int(magic), fulcrum)
+        except Exception:
+            pass
 
     @classmethod
     def clear_emit(cls, account: str, symbol: str, magic: int = 0) -> None:
         """Episode ended (no arm this bar) → next arm is a fresh touch."""
         cls._last_emit.pop((str(account), symbol, int(magic)), None)
+        try:
+            persist_emit(account, symbol, int(magic), None)   # None = cleared
+        except Exception:
+            pass
 
     # ── venue quote cache (EA reports its live price on each poll) ─────────────
     @classmethod
@@ -856,8 +888,94 @@ class ExecBridge:
                     updated[ckey] = max(0, int(updated.get(ckey) or 0) - dec[side])
             if key in arm_retries:
                 updated["pending_retry"] = list(updated.get("pending_retry") or []) + arm_retries[key]
-            cls.set_last_arm(acct, sym, **updated)
+            cls._save_cyc(acct, sym, magic, updated)
         return {"done": done, "failed": failed, "unknown": unknown}
+
+    # ── crash-safe persistence (restore live cycles after a Flask restart) ──────
+    @classmethod
+    def load_persisted_state(cls) -> dict:
+        """Restore _last_arm and _last_emit from disk after a Flask restart. Call once
+        at app startup (before the first poll) so live cycles aren't orphaned. Returns
+        counts for logging. Records are loaded verbatim — active:false entries are kept
+        (reconcile_from_poll reactivates any that still have live MT5 positions)."""
+        import logging
+        log = logging.getLogger(__name__)
+        try:
+            arms, emits = _load_arm_state()
+        except Exception as e:
+            log.warning(f"[exec_bridge] load_persisted_state failed: {e}")
+            return {"arms": 0, "emits": 0, "error": str(e)}
+        with cls._lock:
+            for (account, broker_symbol, magic), state in arms.items():
+                cls._last_arm[(account, broker_symbol, magic)] = state
+            for (account, symbol, magic), fulcrum in emits.items():
+                if fulcrum is not None:
+                    cls._last_emit[(account, symbol, magic)] = fulcrum
+        active = sum(1 for s in arms.values() if s.get("active"))
+        log.info(f"[exec_bridge] restored {len(arms)} arm records ({active} active), "
+                 f"{len(emits)} emit records from disk")
+        return {"arms": len(arms), "emits": len(emits), "active": active}
+
+    @classmethod
+    def reconcile_from_poll(cls, account: str, broker_symbol: str,
+                            magics: list[dict]) -> list[int]:
+        """On each EA poll, re-adopt any magic with live positions whose _last_arm entry
+        is missing or flagged inactive (orphaned/reaped across a restart), and correct
+        stale buy_n/sell_n from the EA's ground-truth counts. Returns magics touched."""
+        import logging
+        log = logging.getLogger(__name__)
+        touched: list[int] = []
+        for m in magics or []:
+            try:
+                mg = int(m.get("magic", 0))
+                if not mg:
+                    continue
+                ea_buys, ea_sells = int(m.get("buys", 0)), int(m.get("sells", 0))
+                positions = ea_buys + ea_sells
+                if positions <= 0:
+                    continue
+                existing = cls.get_last_arm(account, broker_symbol, magic=mg)
+                if existing and existing.get("active"):
+                    # tracked — but counts can drift (partial manual close, missed reap).
+                    if int(existing.get("buy_n") or 0) != ea_buys or int(existing.get("sell_n") or 0) != ea_sells:
+                        cls._save_cyc(account, broker_symbol, mg, existing,
+                                      buy_n=ea_buys, sell_n=ea_sells,
+                                      max_pos_seen=max(int(existing.get("max_pos_seen") or 0), positions))
+                        log.info(f"[exec_bridge] reconcile: corrected counts for magic {mg} "
+                                 f"→ {ea_buys}/{ea_sells} on {account}/{broker_symbol}")
+                    continue
+                if existing and not existing.get("active"):
+                    # reaped/inactive but MT5 still holds positions → reactivate with its
+                    # original arm metadata so net_target/bias_trail manage it.
+                    cls._save_cyc(account, broker_symbol, mg, existing, active=True,
+                                  max_pos_seen=max(int(existing.get("max_pos_seen") or 0), positions))
+                    touched.append(mg)
+                    log.warning(f"[exec_bridge] reconcile: reactivated magic {mg} "
+                                f"({positions} pos) on {account}/{broker_symbol}")
+                    continue
+                # no entry at all (disk record lost / never persisted) → minimal stub so
+                # monitor_cycle tracks P&L and position_open gates correctly. fulcrum/tp
+                # unknown, so it can only exit via net_target/full_hedge, not tp-refresh.
+                tf_stub = tf_from_magic(mg) or "1m"
+                stub = {
+                    "active": True, "armed_tf": tf_stub,
+                    "fulcrum": 0.0, "trigger_kind": "recovered",
+                    "tp_up": 0.0, "tp_down": 0.0, "net_target_usd": 0.0,
+                    "n_per_side": 0, "step": 0.0,
+                    "buy_n": ea_buys, "sell_n": ea_sells,
+                    "bias_peak": 0.0, "bias_booked": False,
+                    "max_pos_seen": positions, "pend_seen": 0, "flatten_ts": 0.0,
+                    "node_low": 0.0, "node_high": 0.0,
+                    "squeeze_ok": False, "squeeze_rank": 1.0,
+                    "ts": time.time(), "recovered": True,
+                }
+                cls.set_last_arm(account, broker_symbol, magic=mg, **stub)
+                touched.append(mg)
+                log.warning(f"[exec_bridge] reconcile: stubbed orphaned magic {mg} "
+                            f"({positions} pos) on {account}/{broker_symbol}")
+            except Exception:
+                pass
+        return touched
 
     # ── introspection (tests / dashboard) ──────────────────────────────────────
     @classmethod
