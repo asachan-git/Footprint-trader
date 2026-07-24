@@ -35,10 +35,9 @@ from pipeline.types import Bar
 # ~24h trailing VP window per TF (matches reversal_hvn / continuation_hvn).
 _VP_WIN = {"15m": 96, "5m": 288, "1m": 1440, "1h": 24}
 
-# Which HVN source(s) feed the inside-touch trigger, per session. London/Overlap
-# (deep, two-sided liquidity) use BOTH the price-tracking rolling profile and the
-# stable cached-daily node; NY trusts the rolling profile; the thin Asia/Off books
-# use only the cached structural node.
+# Legacy per-session source map (pre 2026-07-24). Kept for reference; the live routing
+# is now in _session_hvn_zones per the session-aware model. "cached" here meant TODAY's
+# daily VP, not prior-day — which was the divergence from intent.
 _SESSION_HVN_SRC = {
     "NY":      ("rolling",),
     "London":  ("rolling", "cached"),
@@ -46,6 +45,19 @@ _SESSION_HVN_SRC = {
     "Asia":    ("cached",),
     "Off":     ("cached",),
 }
+
+
+def _zone_cfg() -> dict:
+    """Read grid_levels config lazily (this module isn't handed the settings dict).
+    Mirrors vp_cache._resolve_bin_size's direct-yaml approach."""
+    try:
+        import yaml as _yaml
+        from pathlib import Path as _Path
+        _root = _Path(__file__).resolve().parent.parent
+        cfg = _yaml.safe_load((_root / "config" / "settings.yaml").read_text()) or {}
+        return cfg.get("grid_levels", {}) or {}
+    except Exception:
+        return {}
 
 
 @dataclass
@@ -162,6 +174,22 @@ def _rolling_hvn(symbol: str, tf: str, bars: list[Bar]) -> list[tuple[float, flo
         return []
 
 
+def _rolling_hvn_zonetf(symbol: str) -> list[tuple[float, float]]:
+    """Rolling-VP HVN zones pinned to the ZONE tf (default 15m), independent of the
+    cycle's own tf. This is what makes every hvn_inside_touch cycle (1m/5m/15m) share
+    ONE zone set that also matches the 15m chart — instead of each tf reading its own
+    finer window (5m→288×5m bars) whose edges are never drawn. Fetches the zone-tf bars
+    itself rather than reusing the cycle's bars."""
+    zone_tf = str(_zone_cfg().get("vp_zone_tf", "15m"))
+    win = _VP_WIN.get(zone_tf, 96)
+    try:
+        from pipeline.state_store import store
+        zbars = store().recent(symbol, zone_tf, win + 5)
+    except Exception:
+        return []
+    return _rolling_hvn(symbol, zone_tf, zbars)
+
+
 def _cached_hvn(symbol: str) -> list[tuple[float, float]]:
     """Stable cached-daily HVN zones (the session-anchored structural node)."""
     try:
@@ -178,8 +206,13 @@ def _merge_zone_tuples(zones: list[tuple[float, float]]) -> list[tuple[float, fl
     collapse them so the grid straddles ONE fulcrum, not two near-duplicate edges."""
     if not zones:
         return zones
-    out: list[list[float]] = [list(zones[0])]
-    for lo, hi in sorted(zones):
+    # Seed from the SORTED list, not zones[0]. Seeding from the unsorted first element
+    # while iterating sorted made the lowest real node get compared against an arbitrary
+    # seed and swallowed (the merge-zone seed bug). Concatenating prior-day + rolling in
+    # either order must not lose a disjoint node.
+    ordered = sorted(zones)
+    out: list[list[float]] = [list(ordered[0])]
+    for lo, hi in ordered[1:]:
         if lo <= out[-1][1]:                       # overlap or touch
             out[-1][1] = max(out[-1][1], hi)
         else:
@@ -200,45 +233,126 @@ def _outside_daily_va(symbol: str, price: float) -> bool:
     return price > float(vah) or price < float(val)
 
 
-def _prior_day_hvn(symbol: str, price: float) -> list[tuple[float, float]]:
-    """Borrow HVN structure from the most recent PRIOR-DAY profile whose value area
-    still brackets `price`. When price has run into a thin tail outside today's value,
-    today's profile offers no node to straddle — but a previous session that traded
-    AROUND this price did build one. Venue-offset is already applied by get_history."""
+def _outside_daily_range(symbol: str, price: float) -> bool:
+    """True when price sits beyond today's full traded RANGE (above high / below low).
+    The NY-breakout trigger: 'price moved beyond today's range' → borrow a prior day.
+    Uses price_range_high/low, wider than the value area _outside_daily_va checks."""
     try:
-        from pipeline.features.vp_cache import get_history
-        hist = get_history(symbol, "daily", n=5)
+        from pipeline.features.vp_cache import get as vp_get
+        vp = vp_get(symbol, "daily") or {}
+    except Exception:
+        return False
+    lo, hi = vp.get("price_range_low"), vp.get("price_range_high")
+    if lo is None or hi is None:
+        return False
+    return price > float(hi) or price < float(lo)
+
+
+def _prev_day_hvn_asof(symbol: str, price: float | None = None,
+                       bracket: str = "range") -> list[tuple[float, float]]:
+    """HVN structure borrowed from a PRIOR calendar day (excludes today).
+
+    price=None  → the most recent prior day's HVN zones (Asia/London base layer).
+    price set   → the newest prior day whose FULL RANGE (bracket="range", default) or
+                  value area (bracket="va") still contains `price` — the NY-breakout
+                  rule: a past session that traded AROUND this price built a node worth
+                  straddling, where today's profile has none.
+
+    Excludes today's entry by session-day key so it borrows YESTERDAY, not itself.
+    Venue-offset is already applied by get_history."""
+    try:
+        from pipeline.features.vp_cache import get_history, today_day_key
+        hist = get_history(symbol, "daily", n=6)
+        today = today_day_key(symbol)
     except Exception:
         return []
-    for e in reversed(hist):   # newest prior day first
-        val, vah = e.get("val"), e.get("vah")
-        if val is None or vah is None:
-            continue
-        if float(val) <= price <= float(vah):
-            return [(float(z["low"]), float(z["high"]))
-                    for z in (e.get("hvn_zones") or [])]
+    prior = [e for e in hist if e.get("period_key") != today]
+    for e in reversed(prior):   # newest prior day first
+        if price is not None:
+            if bracket == "va":
+                lo, hi = e.get("val"), e.get("vah")
+            else:
+                lo, hi = e.get("price_range_low"), e.get("price_range_high")
+            if lo is None or hi is None or not (float(lo) <= price <= float(hi)):
+                continue
+        return [(float(z["low"]), float(z["high"])) for z in (e.get("hvn_zones") or [])]
     return []
 
 
+def _prior_day_hvn(symbol: str, price: float) -> list[tuple[float, float]]:
+    """Back-compat shim: the vacuum fallback's prior-day borrow, now RANGE-bracketed
+    and today-excluding (was VA-bracketed and could re-borrow today)."""
+    return _prev_day_hvn_asof(symbol, price, bracket="range")
+
+
+def _session_bars_15m(symbol: str, now_ts: int | None = None) -> int:
+    """How many 15m bars have closed since the current session opened — the warmup
+    counter. Below the configured floor, Asia trusts prior-day VP over today's."""
+    try:
+        from pipeline.state_store import store
+        from pipeline.features.session import session_start_ts
+        start = session_start_ts(now_ts)
+        bars = store().recent(symbol, "15m", 96 + 5)
+        return sum(1 for b in bars if int(b.close_ts) >= start)
+    except Exception:
+        return 999   # unknown → treat as warmed (don't strand on missing data)
+
+
 def _session_hvn_zones(symbol: str, tf: str, bars: list[Bar]) -> tuple[list[tuple[float, float]], str]:
-    """HVN zones for the current session per `_SESSION_HVN_SRC`. Returns (zones, session)."""
+    """Session-aware HVN zone set for hvn_inside_touch. Returns (zones, session).
+
+    2026-07-24 — rewired from the old _SESSION_HVN_SRC map (where "cached" meant TODAY's
+    daily) to the user's intended model:
+
+      Asia    — PRIOR-day VP until the session has warmed (vp_session_warmup_bars 15m
+                bars formed), then today's cached daily.
+      London  — PRIOR-day VP + current rolling VP.
+      Overlap — same as London (or NY, per overlap_like config).
+      NY      — rolling VP; if price ran BEYOND today's full range, add a prior-day node
+                whose range brackets price.
+      Off     — today's cached daily (unchanged).
+
+    Rolling VP is pinned to the ZONE tf (default 15m) for every cycle tf via
+    _rolling_hvn_zonetf, so 1m/5m/15m share one zone set that matches the 15m chart.
+    _merge_zone_tuples collapses near-duplicate nodes from the concatenated sources.
+
+    FRAME NOTE (pre-existing): _rolling_* is analysis-frame, _cached_/_prev_day_ are
+    venue-shifted — a rolling edge can sit ~basis off a cached edge. Not introduced here.
+    """
     from pipeline.features.session import current_session
     ts = bars[-1].close_ts if bars else None
     sess = current_session(ts, symbol).session
-    srcs = _SESSION_HVN_SRC.get(sess, ("cached",))
-    zones: list[tuple[float, float]] = []
-    if "rolling" in srcs:
-        zones += _rolling_hvn(symbol, tf, bars)
-    if "cached" in srcs:
-        zones += _cached_hvn(symbol)
-    zones = _merge_zone_tuples(zones)   # collapse rolling/cached near-duplicate nodes
-
-    # Vacuum fallback: price ran outside today's value AND no current node holds it →
-    # borrow the most recent prior-day node whose value area still brackets price.
     price = bars[-1].ohlc.c if bars else 0.0
+
+    cfg = _zone_cfg()
+    warmup_bars = int(cfg.get("vp_session_warmup_bars", 8) or 0)
+    overlap_like = str(cfg.get("overlap_like", "london")).lower()
+
+    eff = sess
+    if sess == "Overlap":
+        eff = "NY" if overlap_like == "ny" else "London"
+
+    zones: list[tuple[float, float]] = []
+    if eff == "Asia":
+        warmed = _session_bars_15m(symbol, int(ts) if ts else None) >= warmup_bars
+        zones += _cached_hvn(symbol) if warmed else _prev_day_hvn_asof(symbol)
+    elif eff == "London":
+        zones += _prev_day_hvn_asof(symbol)
+        zones += _rolling_hvn_zonetf(symbol)
+    elif eff == "NY":
+        zones += _rolling_hvn_zonetf(symbol)
+        if price > 0 and _outside_daily_range(symbol, price):
+            zones += _prev_day_hvn_asof(symbol, price, bracket="range")
+    else:   # Off
+        zones += _cached_hvn(symbol)
+
+    zones = _merge_zone_tuples(zones)
+
+    # Vacuum fallback (all sessions): no current node holds price AND price is beyond
+    # today's value → borrow a prior-day node whose RANGE brackets price.
     if price > 0 and not any(lo <= price <= hi for lo, hi in zones) \
        and _outside_daily_va(symbol, price):
-        zones = _merge_zone_tuples(zones + _prior_day_hvn(symbol, price))
+        zones = _merge_zone_tuples(zones + _prev_day_hvn_asof(symbol, price, bracket="range"))
 
     return zones, sess
 

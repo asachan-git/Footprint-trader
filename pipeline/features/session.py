@@ -63,6 +63,25 @@ def current_session(ts: int | None = None, symbol: str | None = None) -> Session
     return SessionContext(session=session, in_active_hours=active, utc_hour=utc_hour)
 
 
+# Session start hour (UTC) for each label — the lower bound of the windows above.
+_SESSION_START_HOUR = {"Asia": 0, "London": 7, "Overlap": 12, "NY": 16, "Off": 21}
+
+
+def session_start_ts(ts: int | None = None) -> int:
+    """UTC epoch of the START of the session containing `ts` (default now).
+
+    Used to count how many bars have formed since the session opened — e.g. a
+    warmup gate that waits N bars into the session before trusting today's VP.
+    Derived from the fixed UTC boundary table, so it is the same clock
+    current_session() reads (which is NOT the vp_cache per-symbol day anchor —
+    the two notions of 'day' differ near boundaries; acceptable for a bar count)."""
+    t = int(ts if ts is not None else time.time())
+    tm = time.gmtime(t)
+    start_hour = _SESSION_START_HOUR[current_session(t).session]
+    midnight = t - (tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec)
+    return midnight + start_hour * 3600
+
+
 def sma(values: list[float], n: int) -> float | None:
     """Simple moving average of last N values."""
     if len(values) < n:

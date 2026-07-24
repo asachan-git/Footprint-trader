@@ -344,6 +344,18 @@ def poc_sequence(symbol: str, period: str, n: int = 5) -> list[float | None]:
     return [e.get("poc") for e in get_history(symbol, period, n)]
 
 
+def today_day_key(symbol: str, now_ts: int | None = None) -> str:
+    """The session-day key for `symbol` right now — the same string get_history uses
+    as `period_key` for today's entry. Consumers that want PRIOR days only (borrow
+    yesterday's structure, not re-borrow today's) filter get_history against this.
+    Uses the symbol's own session anchor, so 'today' matches the cache's day, not UTC
+    midnight."""
+    cache = _load()
+    sym = cache.get(symbol, {})
+    anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
+    return _session_day_key(int(now_ts if now_ts is not None else time.time()), anchor)
+
+
 def period_profile(symbol: str, period: str) -> dict | None:
     """Per-price volume histogram for the symbol's CURRENT period, venue-offset applied.
 

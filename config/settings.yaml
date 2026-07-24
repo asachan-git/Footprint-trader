@@ -214,6 +214,19 @@ grid_levels:
   require_squeeze_gate: true
   squeeze_gate_max_bars: 10  # how stale a just-ended coil may be and still pass the gate
 
+  # Session-aware VP sourcing for hvn_inside_touch zones (2026-07-24). The HVN zone set
+  # each cycle straddles is assembled per session:
+  #   Asia    — prior-day VP until vp_session_warmup_bars 15m bars form, then today's.
+  #   London  — prior-day + rolling VP.
+  #   Overlap — like London (or NY, per overlap_like).
+  #   NY      — rolling; beyond today's RANGE, add a prior-day node bracketing price.
+  #   Off     — today's cached daily.
+  vp_zone_tf: "15m"            # TF the rolling zone VP is computed on — pins ALL cycles
+                              # (1m/5m/15m) to one 15m zone set that matches the chart.
+  vp_session_warmup_bars: 8   # 15m bars into the session before Asia trusts today's VP
+                              # (8 = 2h). Below this, Asia uses the prior day.
+  overlap_like: "london"      # Overlap session sources zones like london | ny
+
 # Startup preflight — server REFUSES to start unless footprint + VP data are present.
 startup_check:
   enabled: true
