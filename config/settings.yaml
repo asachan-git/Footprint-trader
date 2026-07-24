@@ -146,14 +146,11 @@ grid_levels:
   htf_bias_map: {1m: "15m", 5m: "15m", 15m: "1h", 1h: "4h"}
   bb_edge_enabled: true
   bb_edge_sigma: 2.5
-  # 2026-07-22: raised 1250 -> 5000 (user). Effective target still decays with hedging
-  # (hedged/n * 33%), so a fully-hedged 4-leg side exits at ~3350 rather than 5000.
-  # CONSEQUENCE: bias_trail_activate_usd (1800) now sits WELL BELOW this, so the per-side
-  # trail — not net_target — becomes the working exit; net_target is the stretch backstop.
-  # Deliberate (user call). For reference the trail-off session booked 5/5 net_target
-  # exits at net 1052-1273, so none of those would reach 5000; expect longer holds and
-  # more trail/full_hedge exits instead.
-  cycle_net_target_usd: 5000.0      # base net floating-$ target (hedge-decayed below)
+  # 2026-07-24: 1250 = JUN22-EQUIVALENT at this lot scale. Jun22 cutoff (9590331) ran
+  # base_lot 0.01 with cycle_net_target_usd 50. This branch runs 0.25 (25x, cent acct),
+  # so the risk-equivalent target is 50 × 25 = 1250. Restores Jun22's actual profit-take
+  # threshold (was 5000 = 4x Jun22's relative level). Decays with hedging (hedged/n × 33%).
+  cycle_net_target_usd: 1250.0      # base net floating-$ target (hedge-decayed below)
   cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full
   cycle_min_target_usd: 0.20     # floor; must be >0 so a hedged cycle still has a positive net-$ exit
   cycle_close_on_full_hedge: true  # cut a fully-hedged (delta-neutral) cycle to free margin
@@ -175,12 +172,13 @@ grid_levels:
   # (The old comment here also claimed per-side bias_booked_buy/sell flags — that was
   # never implemented in either version; bias_booked is a single cycle-wide one-shot.)
   bias_trail_fill_frac: 0.5
-  # 2026-07-24 (user): 200. With the squeeze gate OFF again (observe mode), cycles arm
-  # on any structure, so a tight trail protects the committed side's gains sooner rather
-  # than riding for a big expansion that may not come. PER-SIDE peak (this branch's trail
-  # is the committed side's own P&L, not net); books bias_book_frac of that side on a 40%
-  # giveback, rest to breakeven. net_target 5000 stays the stretch backstop.
-  bias_trail_activate_usd: 200.0   # bias-side floating must PEAK ≥ this to arm the trail
+  # 2026-07-24: 125 = JUN22-EQUIVALENT at this lot scale. Jun22 cutoff (9590331) ran
+  # base_lot 0.01 with bias_trail_activate_usd 5.0; at 0.25 lots (25x) that's 5 × 25 = 125.
+  # Restores Jun22's actual per-side book threshold. PER-SIDE peak (committed side's own
+  # P&L, not net); books bias_book_frac of that side on a 40% giveback, rest to breakeven.
+  # Paired with net_target 1250 (also Jun22-equivalent) — Jun22 was a TIGHT system: book
+  # the winning side early, cut the basket at a low net bar.
+  bias_trail_activate_usd: 125.0   # bias-side floating must PEAK ≥ this to arm the trail
   bias_trail_giveback_pct: 40    # fire when floating retraces this % off the peak
   bias_book_frac: 0.5            # fraction of the bias side's positions to book at the trigger
   # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
