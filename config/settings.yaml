@@ -128,6 +128,13 @@ grid_levels:
   # far next-HVN target). Directional inventory → a net-profit exit price exists. false =
   # symmetric HVN→HVN straddle.
   hvn_reversion_bias: true
+  # hvn_inside_touch wick-tap buffer (2026-07-24, ported from feat/backtest-seams). Fire
+  # if the wick comes within this many $ of the node edge, not only on an exact touch —
+  # a candle that stops 0.1pt short still counts as a tap. 0.0 = exact touch (Jun22
+  # native). hvn_touch_buffer_pct adds a width-relative floor so a WIDE node's edge stays
+  # reachable (a flat 0.2 never taps a 49pt node): effective = max(buffer, width × pct).
+  hvn_touch_buffer: 0.2
+  hvn_touch_buffer_pct: 0.10
   # Directional skew votes (skew-only — both sides still placed, favoured side heavier):
   # HTF Bollinger bias reads the NEXT TF up's 20-SMA (5m→15m, 15m→1h…) — price above a
   # rising 20MA = bull vote, below a falling one = bear. 2.5σ "edge" votes mean-reversion

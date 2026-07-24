@@ -383,6 +383,15 @@ def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger |
     cur = bars[-1]
     c, h, lo_p = cur.ohlc.c, cur.ohlc.h, cur.ohlc.l
 
+    # Touch buffer (2026-07-24, ported from feat/backtest-seams). A wick that stops a
+    # hair short of the edge still counts as a tap: fire if it comes within `buffer`
+    # units of the edge, not only on an exact h>=hi / lo<=lo touch. Width-relative floor
+    # so a wide node's edge stays reachable (a flat 0.2 buffer never taps a 49pt node).
+    # 0.0 = exact touch only (original Jun22 behaviour). Edge stays the fulcrum price.
+    _cfg = _zone_cfg()
+    _buf = float(_cfg.get("hvn_touch_buffer", 0.0) or 0.0)
+    _buf_pct = float(_cfg.get("hvn_touch_buffer_pct", 0.0) or 0.0)
+
     best = None   # (dist_to_close, edge, width, edge_side, reject_frac)
     for lo, hi in zones:
         width = hi - lo
@@ -390,9 +399,10 @@ def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger |
             continue
         if not (lo < c < hi):            # the candle must CLOSE inside this node
             continue
-        touch_top = h >= hi
-        touch_bot = lo_p <= lo
-        if not (touch_top or touch_bot):  # …and tap an edge with its wick
+        buf = max(_buf, width * _buf_pct)   # effective buffer for THIS node
+        touch_top = h >= hi - buf
+        touch_bot = lo_p <= lo + buf
+        if not (touch_top or touch_bot):  # …and tap an edge with its wick (± buffer)
             continue
         # which edge: if both wicks pierced, take the one the close sits nearer
         if touch_top and touch_bot:
