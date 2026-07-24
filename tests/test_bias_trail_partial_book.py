@@ -1,9 +1,9 @@
-"""Trail-SL must COLLAPSE the whole cycle, not partial-book.
+"""Trail-SL books the winning side partially and leaves a BE runner (Jun22-initial).
 
 When bias_book_trail fires (a filled side's floating P&L gives back >= giveback%
-from its peak), monitor_cycle must enqueue ONE CLOSE_ALL that flattens both sides +
-pendings + hedge — then the cycle ends and waits for a fresh trigger. The old
-behaviour (CLOSE_SIDE half + MOVE_BE runner, cycle continues) is retired.
+from its peak), monitor_cycle books half that side (CLOSE_SIDE) and moves the rest to
+breakeven (MOVE_BE) — the cycle CONTINUES; net_target / full_hedge / flatten-rest own
+the final close. It must NOT flatten the whole cycle on the trail hit.
 """
 
 import tempfile
@@ -36,7 +36,7 @@ def _settings(**over):
     return {"grid_levels": g}
 
 
-def test_trail_hit_enqueues_close_all_not_close_side(bridge):
+def test_trail_hit_books_side_and_moves_be_not_close_all(bridge):
     E = bridge
     acct, sym, magic = "ACC", "XAUUSD+", 770013
     E.set_quote(acct, sym, 4000.0, 4000.2)
@@ -60,13 +60,13 @@ def test_trail_hit_enqueues_close_all_not_close_side(bridge):
 
     cmds = E.snapshot(acct)
     types = [c["type"] for c in cmds]
-    assert "CLOSE_ALL" in types, f"expected CLOSE_ALL, got {types}"
-    assert "CLOSE_SIDE" not in types, "trail must NOT partial-book anymore"
-    assert "MOVE_BE" not in types, "trail must NOT leave a BE runner anymore"
+    assert "CLOSE_SIDE" in types, f"expected partial book (CLOSE_SIDE), got {types}"
+    assert "MOVE_BE" in types, "expected the rest moved to breakeven"
+    assert "CLOSE_ALL" not in types, "trail must NOT collapse the whole cycle"
 
-    # cycle marked flattening (flatten_ts set) so it won't re-fire every poll
+    # booked once (guard), but cycle CONTINUES — no flatten_ts
     c = E.get_last_arm(acct, sym, magic=magic)
-    assert c.get("bias_booked") is True and float(c.get("flatten_ts") or 0) > 0
+    assert c.get("bias_booked") is True and float(c.get("flatten_ts") or 0) == 0
 
 
 def test_trail_does_not_fire_below_activate(bridge):
