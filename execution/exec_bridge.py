@@ -560,14 +560,13 @@ class ExecBridge:
                 peak = max(float(cyc.get("bias_peak") or 0.0), side_pnl)
                 if peak != float(cyc.get("bias_peak") or 0.0):
                     cyc["bias_peak"] = peak
-                    # `cyc` carries its own "magic" key, so it must be stripped before
-                    # the spread or the explicit magic= kwarg collides with it and
-                    # set_last_arm raises TypeError. That exception fires on EVERY poll,
-                    # before any exit check runs — the cycle then never exits, however
-                    # far past net_target it goes (observed 2026-07-22: a cycle sat at
-                    # +6463 against a 5000 target with 23.7k logged monitor errors).
-                    cls.set_last_arm(account, symbol, magic=magic,
-                                     **{k: v for k, v in cyc.items() if k != "magic"})
+                    # Route through _save_cyc — strips cyc's own magic and applies updates
+                    # via dict.update, so neither the explicit magic= NOR any update key
+                    # (e.g. bias_booked already in the restored body) can collide. Both
+                    # collisions raise TypeError on every poll and stall all exits
+                    # (magic-collision was the c5ed565 crash; bias_booked-collision was the
+                    # same shape the persistence port re-exposed on 2026-07-24).
+                    cls._save_cyc(account, symbol, magic, cyc)
                 activate = float(grid_cfg.get("bias_trail_activate_usd", 5.0) or 0.0)
                 giveback = float(grid_cfg.get("bias_trail_giveback_pct", 40.0) or 0.0)
                 book_frac = float(grid_cfg.get("bias_book_frac", 0.5) or 0.5)
@@ -578,9 +577,7 @@ class ExecBridge:
                                 frac=book_frac, comment=f"FB|book|{comment_tf}|{bias}", now=t)
                     cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=bias,
                                 comment=f"FB|be|{comment_tf}|{bias}", now=t)
-                    cls.set_last_arm(account, symbol, magic=magic,
-                                     **{k: v for k, v in cyc.items() if k != "magic"},
-                                     bias_booked=True)
+                    cls._save_cyc(account, symbol, magic, cyc, bias_booked=True)
                     _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
                                       "tf": tf, "magic": magic, "exit_reason": "bias_book_trail",
                                       "bias": bias, "peak": round(peak, 2),

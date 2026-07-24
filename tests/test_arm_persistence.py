@@ -99,3 +99,19 @@ def test_emit_dedup_survives_restart(store_tmp):
     E._last_emit.clear()
     E.load_persisted_state()
     assert ("A", "S", 7713) not in E._last_emit
+
+
+def test_save_cyc_no_collision_when_update_key_already_in_body(store_tmp):
+    # bias_booked lives in the restored body AND is passed as an update — a manual
+    # magic=magic, **{...}, bias_booked=True spread raised "multiple values for
+    # bias_booked" on every poll (the persistence port re-exposed the c5ed565 shape).
+    # _save_cyc's dict.update must absorb it silently.
+    E = store_tmp
+    E.set_last_arm("A", "S", magic=7713, active=True, bias_booked=False,
+                   bias_peak=5.0, ts=1.0)
+    E._last_arm.clear()
+    E.load_persisted_state()
+    cyc = E.get_last_arm("A", "S", magic=7713)      # bias_booked in body, magic stripped
+    E._save_cyc("A", "S", 7713, cyc, bias_booked=True)   # update key already present
+    r = E.get_last_arm("A", "S", magic=7713)
+    assert r["bias_booked"] is True and r["magic"] == 7713
