@@ -577,32 +577,33 @@ class ExecBridge:
                     cls._save_cyc(account, symbol, magic, cyc)
                 activate = float(grid_cfg.get("bias_trail_activate_usd", 5.0) or 0.0)
                 giveback = float(grid_cfg.get("bias_trail_giveback_pct", 40.0) or 0.0)
+                book_frac = float(grid_cfg.get("bias_book_frac", 0.5) or 0.5)
                 if (activate > 0 and peak >= activate
                         and side_pnl <= peak * (1.0 - giveback / 100.0)):
-                    # Trail hit → COLLAPSE THE ENTIRE CYCLE (both sides + pendings +
-                    # any hedge), then wait for a fresh trigger. No half-book / BE-runner:
-                    # one exit trigger closes everything, matching the net_target path.
+                    # Jun22-initial form: BOOK half the winning side (CLOSE_SIDE) and move
+                    # the rest to breakeven (MOVE_BE, risk-free runner). Cycle CONTINUES —
+                    # the runner + opposite side + any hedge stay live; the remaining exit
+                    # gates (net_target / full_hedge / flatten-rest) own the final close.
                     comment_tf = cyc.get("armed_tf") or tf
-                    cls.enqueue(account, CLOSE_ALL, symbol,
-                                comment=f"FB|flatten|{comment_tf}|bias_trail"[:31],
-                                magic=magic, now=t)
-                    cls._save_cyc(account, symbol, magic, cyc,
-                                  bias_booked=True, flatten_ts=t)
+                    cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic, side=bias,
+                                frac=book_frac, comment=f"FB|book|{comment_tf}|{bias}", now=t)
+                    cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=bias,
+                                comment=f"FB|be|{comment_tf}|{bias}", now=t)
+                    cls._save_cyc(account, symbol, magic, cyc, bias_booked=True)
                     _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
                                       "tf": tf, "magic": magic, "exit_reason": "bias_book_trail",
                                       "bias": bias, "peak": round(peak, 2),
-                                      "side_pnl": round(side_pnl, 2),
-                                      "positions": positions, "pendings": pendings,
+                                      "side_pnl": round(side_pnl, 2), "book_frac": book_frac,
                                       "squeeze_ok": cyc.get("squeeze_ok"),
                                       "squeeze_rank": cyc.get("squeeze_rank")})
-                    # durable per-cycle record (full collapse — cycle ends here)
+                    # durable per-cycle record (partial: cycle continues)
                     _emit_cycle_outcome(cyc, account=str(account), symbol=symbol,
                                         magic=magic, tf=tf,
-                                        exit_reason="bias_book_trail",
+                                        exit_reason="bias_book_trail", partial=True,
                                         bias=bias, peak=round(peak, 2),
                                         pnl_at_exit=round(side_pnl, 2),
-                                        buys=buys, sells=sells)
-                    return "bias_book_trail"   # full CLOSE_ALL; cycle collapses
+                                        book_frac=book_frac, buys=buys, sells=sells)
+                    return "bias_book_trail"   # cycle continues (runner + hedge); no flatten
 
         reason: str | None = None
         detail: dict = {}
