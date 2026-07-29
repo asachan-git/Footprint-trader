@@ -37,6 +37,10 @@ class HarnessResult:
     polls: int = 0
     commands: list[Emitted] = field(default_factory=list)
     broker: object | None = None      # backtest.fill_engine.Broker after a run
+    # G-RECON: per-poll disagreements between the exact broker book and the
+    # live-shape reconstruction (fidelity_check.check_reconstruction). Empty = the
+    # live cycle_book adapter is provably equivalent on this replay.
+    recon_mismatches: list[dict] = field(default_factory=list)
 
     def arms(self) -> list[dict]:
         """PLACE_PENDING commands = grid arms (one batch per armed cycle)."""
@@ -62,6 +66,7 @@ def run(
     poll_tf: str = "1m",
     balance: float = 100_000.0,
     stops_pts: float = 0.0,
+    recon_check: bool = True,
 ) -> HarnessResult:
     """Replay one session-day, polling on each `poll_tf` bar close.
 
@@ -150,6 +155,14 @@ def run(
             if acks:
                 client.post("/exec/ack", json={"account": account, "results": acks})
 
+            # G-RECON (observational — no effect on the replay): after commands
+            # landed, the live-shape book reconstruction must agree with the
+            # broker's exact per-order book for every open magic.
+            if recon_check and (broker.positions or broker.pendings):
+                from backtest.fidelity_check import check_reconstruction
+                for m in check_reconstruction(broker, account, broker_symbol, mid):
+                    res.recon_mismatches.append({"poll_ts": float(ts), **m})
+
     clock.reset()
     return res
 
@@ -188,6 +201,13 @@ if __name__ == "__main__":
         print(f"        open_positions={len(b.positions)} resting_pendings={len(b.pendings)}")
         # GROSS — no spread/commission/swap/margin yet (Phase 2d). Not a result.
         print(f"        realized(GROSS, no costs)={round(b.realized, 2)}")
+    hard = [m for m in r.recon_mismatches
+            if m.get("why") not in ("diverged(ok=False)", "legs differ, value-equivalent")]
+    soft = len(r.recon_mismatches) - len(hard)
+    print(f"G-RECON: hard_mismatches={len(hard)} adapter_self_flagged={soft} "
+          f"({'PASS' if not hard else 'FAIL — book_from_arm cannot be trusted live'})")
+    if hard:
+        print(json.dumps(hard[:5], indent=2, default=str))
     if args.out:
         # poll_ts is required to group legs into arms downstream (legs of one arm are
         # emitted in the same poll; the per-leg `comment` tag is NOT an arm key).

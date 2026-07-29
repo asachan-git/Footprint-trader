@@ -52,6 +52,49 @@ def _last_account_file() -> Path:
 from execution.arm_state_store import persist_arm, persist_emit, load as _load_arm_state  # noqa: E402
 
 
+def _cv_note_closes(cyc: dict, side: str, cur_n: int, mid: float, tp: float,
+                    contract: float) -> bool:
+    """Event-source cv_realized for one side from a poll-to-poll count drop.
+
+    Cycle-value (execution/cycle_value.py, execution/cycle_book.py) needs a running
+    realized figure it can trust — aggregates alone can't tell a TP-flat side from an
+    SL-flat one (see cycle_book.book_from_arm docstring). This runs every poll while
+    cycle_value is enabled and prices each newly-closed leg the moment it's observed,
+    using mid captured AT THAT POLL — the only price this process ever actually saw
+    for the close, and strictly better than reconstructing it later from a stale TP
+    guess. Innermost-first identity mirrors book_from_arm exactly, so the two stay
+    consistent. Mutates `cyc` in place; returns True if anything changed.
+    """
+    ladder = list(cyc.get(f"book_{side}_legs") or [])
+    if not ladder:
+        return False
+    fulcrum = float(cyc.get("fulcrum") or 0.0)
+    ladder.sort(key=lambda pl: abs(float(pl[0]) - fulcrum))
+    prev_n = int(cyc.get(f"cv_last_{side}s", cyc.get(f"max_{side}s_seen", 0)) or 0)
+    if cur_n >= prev_n:
+        if cur_n != prev_n:
+            cyc[f"cv_last_{side}s"] = cur_n
+            return True
+        return False
+    closed_before = int(cyc.get(f"cv_closed_{side}_n") or 0)
+    newly = prev_n - cur_n
+    slice_ = ladder[closed_before:closed_before + newly]
+    if not slice_:
+        cyc[f"cv_last_{side}s"] = cur_n
+        return True
+    tol = max(mid * 1e-4, 1e-6) if mid > 0 else 1e-6
+    at_tp = tp > 0 and (
+        (side == "buy" and mid >= tp - tol) or (side == "sell" and 0 < mid <= tp + tol))
+    exit_px = tp if at_tp else mid
+    sign = 1.0 if side == "buy" else -1.0
+    delta = sum(sign * (exit_px - float(price)) * float(lot) * contract
+               for price, lot in slice_)
+    cyc["cv_realized"] = float(cyc.get("cv_realized") or 0.0) + delta
+    cyc[f"cv_closed_{side}_n"] = closed_before + newly
+    cyc[f"cv_last_{side}s"] = cur_n
+    return True
+
+
 def _emit_exit_audit(row: dict) -> None:
     """Append one cycle-exit decision — same log the emit route uses for arms."""
     try:
@@ -564,6 +607,11 @@ class ExecBridge:
         never holds cls._lock while enqueuing (cls._lock is non-reentrant).
 
         Called once per EA poll (the only ~1s cadence). Exit order, first wins:
+          0. cycle_value  — when grid_levels.cycle_value.enabled AND the live book
+             reconstruction is trustworthy this poll (cv_active): cv_kill (projected
+             loss ≥ max_loss_usd_by_tf) or cv_trail (armed trail retraced d from peak)
+             REPLACE 1 and the bias_trail block above for this cycle. See
+             execution/cycle_value.py + execution/cycle_book.py.
           1. net-$ target — basket floating ≥ effective (hedge-decayed) per-TF target
           2. flatten-rest — a leg closed mid-cycle while the opposite ladder rests
           3. full-hedge   — delta-neutral basket cut to free margin (realizes loss)
@@ -627,6 +675,30 @@ class ExecBridge:
                 _cyc_hw_dirty = True
         if _cyc_hw_dirty:
             cls.set_last_arm(account, symbol, magic=magic, **cyc)
+
+        # Cycle-value realized tracking (execution/cycle_value.py). Gated on
+        # cycle_value.enabled: writing cv_realized unconditionally would make
+        # book_from_arm start TRUSTING it (skipping its own ok=False self-flag) for
+        # every cycle, flag or not — verified as a live regression against G-RECON
+        # (hard_mismatches 0 -> 1073) before this gate was added. When the feature is
+        # off, this must be a byte-for-byte no-op on cyc.
+        grid_cfg_cv = (settings.get("grid_levels") or {}) if isinstance(settings, dict) else {}
+        _cv_gate_enabled = bool((grid_cfg_cv.get("cycle_value") or {}).get("enabled", False))
+        if _cv_gate_enabled and buys is not None and sells is not None:
+            q_cv = cls.get_quote(account, symbol) or {}
+            mid_cv = float(q_cv.get("mid") or 0.0)
+            if mid_cv > 0:
+                contract_cv = float(((settings.get("execution") or {}) if isinstance(settings, dict)
+                                     else {}).get("contract_size", {}).get(symbol, 1.0) or 1.0)
+                _cv_dirty = False
+                if _cv_note_closes(cyc, "buy", int(buys), mid_cv,
+                                   float(cyc.get("tp_up") or 0.0), contract_cv):
+                    _cv_dirty = True
+                if _cv_note_closes(cyc, "sell", int(sells), mid_cv,
+                                   float(cyc.get("tp_down") or 0.0), contract_cv):
+                    _cv_dirty = True
+                if _cv_dirty:
+                    cls.set_last_arm(account, symbol, magic=magic, **cyc)
 
         # FREEZE the VP/HVN structure on FIRST leg fill. Until a position opens the cycle
         # tracks live VP (cheap re-anchor of resting pendings); once committed, we manage
@@ -846,9 +918,81 @@ class ExecBridge:
         # clears the flag for the side it backfills, so each side gets its own trail.
         # The double-fire bug the cycle-wide flag was added to prevent is still covered:
         # a side's flag is only cleared when that side went FLAT and is re-armed fresh.
+        reason: str | None = None
+        detail: dict = {}
+
+        # ── cycle_value: deterministic trail/kill from the reconstructed order book
+        # (execution/cycle_value.py + execution/cycle_book.py) — see
+        # project_cycle_value_function memory. Config-gated, OFF by default
+        # (grid_levels.cycle_value.enabled); when on and the live reconstruction is
+        # trustworthy this poll, it REPLACES bias_trail + net_target below (cv_active).
+        # A reconstruction that can't be trusted this poll (book_ok False — e.g. a
+        # partial CLOSE_SIDE just landed) falls through to the legacy exits unchanged,
+        # exactly as designed: cv never runs on a book it isn't sure about.
+        cv_cfg = grid_cfg.get("cycle_value") or {}
+        cv_enabled = bool(cv_cfg.get("enabled", False))
+        cv_active = False
+        if cv_enabled and buys is not None and sells is not None and mid > 0:
+            from execution.cycle_book import book_from_arm
+            from execution.cycle_value import UP, DOWN, pnl_at, trail_activation
+            _contract = float(((settings.get("execution") or {}) if isinstance(settings, dict)
+                               else {}).get("contract_size", {}).get(symbol, 1.0) or 1.0)
+            _row = {"buys": int(buys), "sells": int(sells),
+                    "buy_lots": float(buy_lots or 0.0), "sell_lots": float(sell_lots or 0.0),
+                    "buy_pendings": int(open_state.get("buy_pendings", 0) or 0),
+                    "sell_pendings": int(open_state.get("sell_pendings", 0) or 0)}
+            _book, _book_ok, _notes = book_from_arm(
+                cyc, _row, mid=mid, contract=_contract,
+                lots_tol=float(cv_cfg.get("recon_lots_tol", 0.005) or 0.005))
+            cv_active = _book_ok
+            if _book_ok:
+                _net = sum((l.qty if l.side == "buy" else -l.qty)
+                          for l in _book.legs if l.filled)
+                _d = float(cv_cfg.get("trail_step_mult", 1.0) or 1.0) * float(cyc.get("step") or 0.0)
+                _F = float((cv_cfg.get("floor_usd_by_tf") or {}).get(tf, 0.0) or 0.0)
+                _L = float((cv_cfg.get("max_loss_usd_by_tf") or {}).get(tf, 0.0) or 0.0)
+                if _L > 0 and pnl_at(_book, mid) <= -_L:
+                    reason = "cv_kill"
+                elif abs(_net) > 1e-9 and _d > 0:
+                    _dir = UP if _net > 0 else DOWN
+                    _armed = bool(cyc.get("cv_armed"))
+                    if not _armed:
+                        _p_act = trail_activation(_book, _d, _F, _dir)
+                        _reached = _p_act is not None and (
+                            mid >= _p_act if _dir == UP else mid <= _p_act)
+                        if _reached:
+                            cyc["cv_armed"] = True
+                            cyc["cv_peak"] = mid
+                            _adv_side = "sell" if _net > 0 else "buy"
+                            cls.enqueue(account, CANCEL_PENDINGS, symbol, magic=magic,
+                                       side=_adv_side, comment="FB|cv_arm_cancel_adverse", now=t)
+                            if bool(cv_cfg.get("broker_sl_backstop", True)):
+                                _sl_side = "buy" if _net > 0 else "sell"
+                                _sl_px = mid - _d if _dir == UP else mid + _d
+                                _sl_tp = tp_up if _sl_side == "buy" else tp_down
+                                cls.enqueue_modify_sl(account, symbol, magic, _sl_px,
+                                                      side=_sl_side, comment="FB|cv_backstop",
+                                                      tp=_sl_tp)
+                            cls.set_last_arm(account, symbol, magic=magic, **cyc)
+                            _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
+                                              "tf": tf, "magic": magic, "exit_reason": "cv_armed",
+                                              "direction": _dir, "p_act": round(_p_act, 5),
+                                              "mid": mid, "floor_usd": _F})
+                    else:
+                        _peak = float(cyc.get("cv_peak") or mid)
+                        _new_peak = max(_peak, mid) if _dir == UP else min(_peak, mid)
+                        if _new_peak != _peak:
+                            cyc["cv_peak"] = _new_peak
+                            cls.set_last_arm(account, symbol, magic=magic, **cyc)
+                            _peak = _new_peak
+                        _retraced = (mid <= _peak - _d) if _dir == UP else (mid >= _peak + _d)
+                        if _retraced:
+                            reason = "cv_trail"
+
         _bias_done_buy  = bool(cyc.get("bias_trail_done_buy")  or cyc.get("bias_trail_done"))
         _bias_done_sell = bool(cyc.get("bias_trail_done_sell") or cyc.get("bias_trail_done"))
-        if (bool(grid_cfg.get("bias_trail_enabled", True))
+        if (not cv_active and reason is None
+                and bool(grid_cfg.get("bias_trail_enabled", True))
                 and not (_bias_done_buy and _bias_done_sell)
                 and buy_pnl is not None and sell_pnl is not None):
             net_pnl = float(buy_pnl) + float(sell_pnl)
@@ -929,9 +1073,6 @@ class ExecBridge:
                                     buys=buys, sells=sells)
                 return "bias_book_trail"   # cycle continues (runner + hedge); no flatten
 
-        reason: str | None = None
-        detail: dict = {}
-
         # 1) net-$ target — the whole basket (this magic = this TF cycle) is floating
         # ≥ its effective target. Base target is per-TF (cycle_net_target_by_tf, keyed by
         # the TF recovered from the magic) with cycle_net_target_usd as fallback. The
@@ -947,8 +1088,8 @@ class ExecBridge:
         if cyc.get("squeeze_ok"):
             sq_mult = float(grid_cfg.get("squeeze_target_mult", 1.0) or 1.0)
             base_target *= sq_mult
-        if reason is None and base_target > 0 and pnl is not None \
-                and buys is not None and sells is not None:
+        if (not cv_active and reason is None and base_target > 0 and pnl is not None
+                and buys is not None and sells is not None):
             decay = float(grid_cfg.get("cycle_hedge_decay_pct", 0.0) or 0.0) / 100.0
             min_target = float(grid_cfg.get("cycle_min_target_usd", 0.0) or 0.0)
             hi = max(int(buys), int(sells))
@@ -975,7 +1116,8 @@ class ExecBridge:
         if bias_booked and 0 < positions < max_seen:
             cls.set_last_arm(account, symbol, magic=magic, **{**cyc,
                              "max_seen": positions, "bias_booked": False})
-        if reason is None and 0 < positions < max_seen and pendings > 0 and not bias_booked:
+        if (reason is None and bool(grid_cfg.get("flatten_rest_enabled", True))
+                and 0 < positions < max_seen and pendings > 0 and not bias_booked):
             tol = max(mid * 1e-4, 1e-6) if mid > 0 else 1e-6
             confirms = (tp_up > 0 and mid >= tp_up - tol) or (tp_down > 0 and 0 < mid <= tp_down + tol)
             reason = "leg_tp" if confirms else "leg_closed_other"

@@ -162,6 +162,21 @@ def _trigger_tfs(grid_cfg: dict, kind: str) -> list:
     return list(tfs) if tfs else ["1m", "5m", "15m", "1h"]
 
 
+def _placed_ladder(cmds, side: str) -> list[list[float]]:
+    """[[price, lot], ...] actually enqueued for one side of a grid arm.
+
+    From the PLACE_PENDING commands, not plan.*_legs — behind-market skips and the
+    skew extra leg make cmds the ground truth. Persisted at arm as book_buy_legs /
+    book_sell_legs so cycle_book.book_from_arm can reconstruct the live order book
+    from the poll's per-magic aggregate counts. EVERY arm path (fresh straddle,
+    intrabar touch/lvn/sweep/hvn_edge, side backfill) must persist these or the
+    cycle is invisible to the cycle-value reconstruction (G-RECON flags it).
+    """
+    from execution.exec_bridge import PLACE_PENDING as _PP
+    want = f"{side}_stop"
+    return [[c.price, c.lot] for c in cmds if c.type == _PP and c.order_type == want]
+
+
 def _htf_expansion_blocks(grid_cfg: dict, kind: str, tf: str, analysis_symbol: str) -> bool:
     """True when the htf_expansion_gate should BLOCK a fresh arm for (kind, tf): the gate is
     enabled + covers this kind + this entry tf, AND the higher TF is currently COILED (its
@@ -746,7 +761,15 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                    # the new legs ride untrailed — and since legs place sl=0.0 they would
                    # have no protection at all. Scoped to flat_side, so the still-live
                    # side's own flag (and the double-fire guard it provides) is untouched.
-                   f"bias_trail_done_{flat_side}": False}
+                   f"bias_trail_done_{flat_side}": False,
+                   # side backfill replaces ONLY this side's persisted ladder; the
+                   # live side's book_*_legs must survive (cycle_book reconstruction).
+                   f"book_{flat_side}_legs": _placed_ladder(cmds, flat_side),
+                   # cv_closed_{side}_n indexes into book_{side}_legs — a fresh ladder
+                   # means index 0 again, or a stale index would misalign against the
+                   # NEW legs and silently under/over-count cv_realized on the next
+                   # close. cv_last_{side}s resets to 0 (the fresh legs start unfilled).
+                   f"cv_closed_{flat_side}_n": 0, f"cv_last_{flat_side}s": 0}
         # Everything else (the live side's counts/lots/TP, bias_peak/bias_booked, the
         # OTHER side's bias_trail_done_*, max_*_seen, fulcrum, node_low/high) is left
         # exactly as-is — that state belongs to the still-open side and must survive.
@@ -822,6 +845,9 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                             buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
                             buy_lots_total=round(sum(l.lot for l in plan.buy_legs), 4),
                             sell_lots_total=round(sum(l.lot for l in plan.sell_legs), 4),
+                            book_buy_legs=_placed_ladder(cmds, "buy"),
+                            book_sell_legs=_placed_ladder(cmds, "sell"),
+                            base_lot=plan.base_lot, lot_step=plan.lot_step,
                             bias_peak=0.0, bias_booked=False, bias_trail_done=False,
                             be_done_buy=False, be_done_sell=False,
                             node_low=round(node_low, 5), node_high=round(node_high, 5),
@@ -967,7 +993,15 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                    f"be_done_{flat_side}": False,
                    # see _touch_arm_tf: clear the backfilled side's spent trail one-shot
                    # so the fresh legs are managed, not naked (legs place sl=0.0).
-                   f"bias_trail_done_{flat_side}": False}
+                   f"bias_trail_done_{flat_side}": False,
+                   # side backfill replaces ONLY this side's persisted ladder; the
+                   # live side's book_*_legs must survive (cycle_book reconstruction).
+                   f"book_{flat_side}_legs": _placed_ladder(cmds, flat_side),
+                   # cv_closed_{side}_n indexes into book_{side}_legs — a fresh ladder
+                   # means index 0 again, or a stale index would misalign against the
+                   # NEW legs and silently under/over-count cv_realized on the next
+                   # close. cv_last_{side}s resets to 0 (the fresh legs start unfilled).
+                   f"cv_closed_{flat_side}_n": 0, f"cv_last_{flat_side}s": 0}
         _cyc_body = {k: v for k, v in _cyc.items() if k != "magic"}
         ExecBridge.set_last_arm(account, broker_symbol, magic=leg_magic,
                                 **{**_cyc_body, **_update})
@@ -1020,6 +1054,9 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                             buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
                             buy_lots_total=round(sum(l.lot for l in plan.buy_legs), 4),
                             sell_lots_total=round(sum(l.lot for l in plan.sell_legs), 4),
+                            book_buy_legs=_placed_ladder(cmds, "buy"),
+                            book_sell_legs=_placed_ladder(cmds, "sell"),
+                            base_lot=plan.base_lot, lot_step=plan.lot_step,
                             bias_peak=0.0, bias_booked=False, bias_trail_done=False,
                             be_done_buy=False, be_done_sell=False,
                             node_low=round(node_low, 5), node_high=round(node_high, 5),
@@ -1231,6 +1268,9 @@ def _sweep_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                             buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
                             buy_lots_total=round(sum(l.lot for l in plan.buy_legs), 4),
                             sell_lots_total=round(sum(l.lot for l in plan.sell_legs), 4),
+                            book_buy_legs=_placed_ladder(cmds, "buy"),
+                            book_sell_legs=_placed_ladder(cmds, "sell"),
+                            base_lot=plan.base_lot, lot_step=plan.lot_step,
                             bias_peak=0.0, bias_booked=False, bias_trail_done=False,
                             be_done_buy=False, be_done_sell=False,
                             node_low=round(node_low, 5), node_high=round(node_high, 5),
@@ -1376,6 +1416,9 @@ def _hvn_edge_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
                             buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
                             buy_lots_total=round(sum(l.lot for l in plan.buy_legs), 4),
                             sell_lots_total=round(sum(l.lot for l in plan.sell_legs), 4),
+                            book_buy_legs=_placed_ladder(cmds, "buy"),
+                            book_sell_legs=_placed_ladder(cmds, "sell"),
+                            base_lot=plan.base_lot, lot_step=plan.lot_step,
                             bias_peak=0.0, bias_booked=False, bias_trail_done=False,
                             be_done_buy=False, be_done_sell=False,
                             node_low=round(node_low, 5), node_high=round(node_high, 5),
@@ -1939,6 +1982,8 @@ def exec_emit_grid():
     # (near-fulcrum legs are lighter under _ladder's far-side-heavy scaling).
     _buy_lots_total  = round(sum(l.lot for l in plan.buy_legs), 4)
     _sell_lots_total = round(sum(l.lot for l in plan.sell_legs), 4)
+    _book_buy_legs = _placed_ladder(cmds, "buy")
+    _book_sell_legs = _placed_ladder(cmds, "sell")
     ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum, edge=edge,
                             trigger_kind=plan.trigger_kind, venue_mid=quote["mid"], magic=leg_magic,
                             n_per_side=plan.n_per_side, step=plan.step, ts=clock.now(),
@@ -1954,7 +1999,9 @@ def exec_emit_grid():
                             skew=plan.skew, skew_reason=plan.skew_reason, skew_votes=plan.skew_votes,
                             sweep_be_usd=float(plan.trigger_context.get("sweep_be_usd") or 0.0),
                             sweep_vwap=float(plan.trigger_context.get("sweep_vwap") or 0.0),
-                            breakout_bias=str(plan.trigger_context.get("breakout_bias") or ""))
+                            breakout_bias=str(plan.trigger_context.get("breakout_bias") or ""),
+                            book_buy_legs=_book_buy_legs, book_sell_legs=_book_sell_legs,
+                            base_lot=plan.base_lot, lot_step=plan.lot_step)
     ExecBridge.mark_emit(account, symbol, plan.fulcrum, magic=leg_magic)   # dedup: this fulcrum is now armed
     _of = _orderflow_snapshot(symbol, tf)
     _emit_audit({"account": account, "symbol": symbol, "broker_symbol": broker_symbol,
