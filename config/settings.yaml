@@ -35,7 +35,8 @@ decide_on_bar_close:
 
 instrument:
   symbol: XAUTUSDT
-  timeframes: [1m, 3m, 5m, 10m, 15m, 1h]   # 3m/10m added 2026-07-20 for the TF-efficiency run (need backfill on first run, like 1h)
+  timeframes: [1m, 5m, 15m, 1h]   # dropped 3m/10m (added 2026-07-20, not part of the Jul09 replica
+                                   # anyway, and stale — startup_check blocks boot on stale required-TF data)
   primary_tf: 1m           # decision fires on close of this TF; higher TFs join as-of
 
 # Feed-gap monitor + self-heal (pipeline/feed_monitor.py). Watches the primary-TF series;
@@ -58,39 +59,33 @@ monitor:
 # Planner reads these via .get() defaults — block is optional but canonical here.
 grid_levels:
 
+  # ── JUL09 "RESTORED SKEW" REPLICA (branched 2026-07-29) ───────────────────────
+  # Config-shape from the best "leave-it-alone" day: no same-day config change, ran
+  # clean on Jul07/08's fixes, htf_bias/bb_edge skew restored (Jun22-style, after
+  # Jul06's brief "SIMPLE" symmetric experiment), squeeze back on (a call made
+  # AGAINST Jul07's own data showing squeeze net-negative on 1m/5m — flagged, not
+  # silently carried forward). +38,931, 70% WR. Wider 5m/15m ladders were active
+  # this day (5/7/9/7) — later (Jul14 postmortem) found to be the worst-performing
+  # leg-count/TF combination; kept here for historical accuracy, not endorsement.
+  # Running on today's code, not literal Jul09 code — see crude-hvn-rotation branch
+  # header. Same deliberate deviation: flatten_rest_enabled stays false. Broker-side
+  # hard SL still NOT implemented — config-only.
   # ── TUNING (adjust frequently based on account size / market conditions) ─────
   # Position sizing
-  base_lot: 0.01          # smallest leg lot; ladder scales up by lot_step per leg
-  lot_step: 0.01           # lot increment per leg (leg_i = base + i×step, capped at max_lots)
-  max_lots: 0.04          # hard cap per leg regardless of risk math
+  base_lot: 1.0          # smallest leg lot; ladder scales up by lot_step per leg
+  lot_step: 1.0           # lot increment per leg (leg_i = base + i×step, capped at max_lots)
+  max_lots: 8.0            # covers base+7legs*step comfortably
 
-  # Ladder shape — step is BTC Jun22 flat 0.50×ATR (consistent ~3×ATR span, scales with each
-  # TF's own ATR). Leg count is per-TF: a CAP for width-driven strats (hvn_inside_touch,
-  # lvn_edge_touch, bb_expansion_touch — n = node_width/step clamped here) and the EXACT
-  # count for fixed-n strats (hvn_edge, candle_sweep). Step stays flat (do NOT re-add the
-  # inverted per-TF step map — it over-compressed higher TFs → full_hedge).
-  # 2026-07-20 TF-efficiency run: n FIXED at 5 on every TF so TIMEFRAME is the only
-  # variable. (Was {1m:4, 5m:5, 15m:6, 1h:7} — n co-varied with TF, confounding the two.)
-  # The cycle log records the n the planner actually chose after the node_width/step
-  # clamp, so a later run can sweep n from that evidence.
-  hvn_max_legs_by_tf: {1m: 5, 3m: 5, 5m: 5, 10m: 5, 15m: 5, 1h: 5}
-  mean_rev_step_mult: 0.50    # step = this × ATR between legs (BTC Jun22 flat value)
-  mean_rev_step_mult_by_tf: {}   # empty → flat 0.50 all TFs (was inverted per-TF, over-tight on higher TFs)
+  hvn_max_legs_by_tf: {1m: 5, 5m: 7, 15m: 9, 1h: 7}   # Jul09 value — widened from Jul08, see note above
+  mean_rev_step_mult: 0.50
+  mean_rev_step_mult_by_tf: {}
 
-  # Cycle profit targets — primary basket exit (net floating ≥ target → CLOSE_ALL)
-  # Values are in native account currency (USC cents for Vantage XAUUSD.pc cent account;
-  # plain USD for a standard USD account). 1 USD = 100 USC on a cent account.
-  # EVERY live TF must appear here — a TF missing from this map silently falls back to
-  # cycle_net_target_usd below, which is NOT tuned per TF. 3m/10m interpolated
-  # on the existing 1m->15m ladder.
-  cycle_net_target_by_tf: {1m: 20.0, 3m: 30.0, 5m: 40.0, 10m: 53.0, 15m: 66.0, 1h: 20.0}
-  cycle_net_target_usd: 50.0   # fallback when TF not in by_tf map
+  cycle_net_target_by_tf: {1m: 2000.0, 5m: 4000.0, 15m: 7500.0, 1h: 3000.0}   # Jul09 value
+  cycle_net_target_usd: 10000.0   # fallback when TF not in by_tf map
 
-  # Bias trail — arms when peak floating ≥ activate, fires on giveback% retrace.
-  # Values are in native account currency (same note as cycle_net_target above).
-  bias_trail_activate_by_tf: {}   # empty → BTC Jun22 exact: flat bias_trail_activate_usd (5.0) for all TFs
-  bias_trail_giveback_pct: 35    # fire when floating retraces this % off the peak (Jun19: 40 — books sooner)
-  bias_book_frac: 0.5            # fraction of bias-side positions to close at trail trigger (Jun19: 0.5 — keep a BE runner)
+  bias_trail_activate_by_tf: {}   # empty → flat bias_trail_activate_usd below (Jul07 emptied this map)
+  bias_trail_giveback_pct: 40    # Jul09 value (Jul10 later loosens this to 50)
+  bias_book_frac: 0.5
 
   # Squeeze multiplier — when a cycle was armed on a confirmed squeeze (squeeze_ok=True),
   # scale up targets so the system holds the runner longer into the expansion move.
@@ -109,13 +104,13 @@ grid_levels:
   # keeps riding to its normal exit (gate blocks new entries only). Thesis: trade the fast
   # 1m mean-revert straddle only while the higher TF is actively expanding, not when it coils.
   htf_expansion_gate:
-    enabled: true
-    kinds: [hvn_inside_touch]    # which touch strats the gate applies to
-    tfs: [1m]                    # which entry TFs are gated (only 1m for now)
-    htf: 5m                      # the higher TF whose squeeze_gate defines expansion/squeeze
+    enabled: false                # didn't exist yet on Jul09 (introduced 2026-07-10)
+    kinds: [hvn_inside_touch]
+    tfs: [1m]
+    htf: 5m
 
   # Arm filter
-  require_squeeze_gate: false    # OFF (2026-07-09, user relaxed) — data (2026-07-07): squeeze_ok arms net-NEGATIVE on 1m/5m (5m sqOK -733 avg / 20.8% full_hedge vs noSQ +433 / 9.1%); gate only helped 15m. Not earning its keep. Use per-side loss-cap / regime instead.
+  require_squeeze_gate: false    # OFF (2026-07-09, user relaxed) — data (2026-07-07): squeeze_ok arms net-NEGATIVE on 1m/5m (5m sqOK -733 avg / 20.8% full_hedge vs noSQ +433 / 9.1%); gate only helped 15m. Not earning its keep.
 
   # Safety
   # 2026-07-21: full-fill BE + cancel-opposite ON (was OFF, 9590331 baseline). Live -249
@@ -126,8 +121,8 @@ grid_levels:
   # the opposite side's pendings so the reverse ladder can't re-load. cancel_opposite is
   # gated INSIDE the fullfill_be block, so BOTH must be true to fire. Tracking result on
   # exp/pre-server-tp-8d9f546.
-  fullfill_be_enabled: true
-  fullfill_cancel_opposite: true
+  fullfill_be_enabled: false     # OFF — stayed off through Jul09 (didn't flip true until much later, Jul21)
+  fullfill_cancel_opposite: false
   # After bias_trail books a side, also cancel THAT side's own resting pendings so the
   # just-booked direction can't re-load at worse prices once the BE-SL scratches the
   # runner (the re-loaded legs get no trail — bias_trail_done is spent — and no SL).
@@ -175,11 +170,11 @@ grid_levels:
   # not collapse to symmetric buy_n==sell_n, which is net-neg at any single exit under
   # net_profit_exit_only. Revert to true, or split into a separate hvn_reversion_tp_poc
   # key, if the lost skew hurts more than the farther TP helps.
-  hvn_reversion_bias: true        # ON (2026-07-28, user) — fade-side skew +2 vote / +1 leg into node, POC TP on reversion side
+  hvn_reversion_bias: true        # unchanged throughout — fade-side skew +2 vote, POC TP on reversion side
   # Wick proximity buffer for hvn_inside_touch: fire if wick came within this many price
   # units of the edge even without crossing it (e.g. 0.5pt catches near-misses on gold).
   # 0.0 = exact touch only (original behaviour). Edge is still the fulcrum price.
-  hvn_touch_buffer: 0.2
+  hvn_touch_buffer: 0.2    # Jul07-09 value, unchanged this stretch
   hvn_edge_lookback: 3           # bars to scan back for a prior breakout close outside HVN (fallback when TF not in _by_tf)
   # NOTE (2026-07-14): hvn_edge arms per-TF using that TF's SESSION HVN window (_VP_WIN:
   # 5m=288 bars, 15m=96), while the MT5 chart draws ONLY InpZoneTF (default 15m) zones. So a
@@ -252,11 +247,11 @@ grid_levels:
   # rising 20MA = bull vote, below a falling one = bear. 2.5σ "edge" votes mean-reversion
   # when price is stretched ≥ bb_edge_sigma from the basis on the grid TF. (3.0σ stays the
   # squeeze.) Net vote sign skews the ladder → directional inventory → net-profit exit exists.
-  htf_bias_enabled: true          # ON (2026-07-10, Jun22 restore) — HTF-20MA vote skews ladder → directional inventory
+  htf_bias_enabled: true          # ON — Jun22-style skew restored this day, "SIMPLE" abandoned
   htf_bias_period: 20
   htf_bias_slope_bars: 3
   htf_bias_map: {1m: "5m", 3m: "15m", 5m: "15m", 10m: "1h", 15m: "1h", 1h: "4h"}
-  bb_edge_enabled: true           # ON (2026-07-10, Jun22 restore) — 2.5σ mean-rev edge vote
+  bb_edge_enabled: true           # ON — Jun22-style skew restored this day
   bb_edge_sigma: 2.5
   # cycle_net_target_* and bias_trail_* moved to TUNING block at top of grid_levels
   cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full (Jun19: 33 — hedged basket finds green exit sooner)
@@ -290,32 +285,27 @@ grid_levels:
   # that way), track its peak floating P&L; on a give-back from peak, BOOK a fraction of
   # that side and move the rest to breakeven (risk-free runner). Captures directional
   # profit the net-basket exit masks (a hedge leg drags net down → target never hits).
-  bias_trail_enabled: false     # OFF (2026-07-28, user) — isolating today's run to per-leg TP / net_target / full_hedge only
-  flatten_rest_enabled: false   # OFF (2026-07-28, user) — disables the leg_tp/leg_closed_other basket flatten (same-day toggle)
-  bias_trail_activate_usd: 6.67   # 2026-07-10: 500 USC = BTC Jun22 $5 logic scaled to this lot size (USD acct 1 lot=0.01). Flat all TFs (by_tf empty).
-  # ── Active trigger list — single source of truth for which strategies run and on which TFs.
-  # Each entry: kind (required), tfs (required), enabled (default true), touch_only (default false).
-  # touch_only=true → arm via intrabar price tap only (not bar-close emit).
-  # To disable a kind without removing it: set enabled: false.
+  bias_trail_enabled: true      # Jul09 value
+  flatten_rest_enabled: false   # deliberate deviation, not Jul09-literal — see branch header
+  bias_trail_activate_usd: 1000   # Jul09 value (750→1000 that day), flat across TFs
+  # ── Active trigger list — Jul09 shape: hvn_inside_touch, hvn_edge, candle_sweep,
+  # lvn_edge_touch (added Jul07) all live. hvn_displacement didn't exist yet (Jul10).
   triggers:
     - kind: hvn_inside_touch
-      tfs: [1m, 3m, 5m, 10m, 15m]   # 3m/10m added 2026-07-20 for the TF-efficiency run; 1m gated by htf_expansion_gate below
-      touch_only: true           # arm on candle close (bar-close emit)
+      tfs: [1m, 5m, 15m, 1h]
+      touch_only: true
     - kind: hvn_edge
-      tfs: [3m, 5m, 10m, 15m]    # breakout-retest: prior close outside HVN + bar tap + rejection close
-      enabled: true             # ON 2026-07-20: re-measure on the TF-efficiency run (was OFF — worst live strat, PF 0.37/0.70; re-enabled to gather fresh data across all TFs)
+      tfs: [1m, 5m, 15m, 1h]
+      enabled: true
     - kind: candle_sweep
-      tfs: [3m, 5m, 10m, 15m]
-      enabled: true              # ON — data run (clean July: 5m PF 0.73, 15m 0.93 — re-measuring)
+      tfs: [1m, 5m, 15m, 1h]
+      enabled: true
     - kind: lvn_edge_touch
-      tfs: [1m, 3m, 5m, 10m, 15m]
-      touch_only: true           # arm via intrabar price tap only, same as hvn_inside_touch
-      enabled: true             # ON 2026-07-20: clean July had 15m PF 1.40 (BEST in book); prior -18.7k was 1m/5m. Re-measuring per TF.
-    - kind: hvn_displacement
-      tfs: [5m, 15m]             # A→B displacement: prev candle opens in HVN-A, closes in HVN-B (bar-close arm, strat 10 → magic 7701xx)
-      enabled: false            # OFF 2026-07-14: 0 cycles on 07-13 (unproven). Clean Jun-22-style setup = hvn_inside_touch + candle_sweep only.
-  candle_sweep_cooldown_bars: 0   # 0 = NO post-arm cooldown (2026-07-09: user "no cooldown"); default was 3 → 45min lockout on 15m suppressed fresh sweeps
-  touch_arm_confirm_ticks: 0      # 0 = NO reversal wait — arm on the raw edge tap (2026-07-10, user)
+      tfs: [1m, 5m, 15m, 1h]
+      touch_only: true
+      enabled: true
+  candle_sweep_cooldown_bars: 0   # 0 = NO post-arm cooldown (2026-07-09: user "no cooldown")
+  touch_arm_confirm_ticks: 0.02   # Jul09 value (0.2→0.02 on Jul07; 0.02→0 didn't happen until Jul10)
   # lvn_edge_touch tap tolerances — mirror hvn_touch_buffer/_pct/hvn_lookback_bars but
   # independently tunable. 0.10 = tap within 10% of node width counts (same width-relative
   # logic as HVN).
@@ -332,7 +322,9 @@ grid_levels:
   # Volatility compression→expansion via Bollinger BANDWIDTH PERCENTILE (vol-regime
   # gate): compression = BBW in the bottom squeeze_bbw_pct of its trailing window; fire
   # on RELEASE after a run. Neutral straddle positions before the displacement.
-  squeeze_enabled: true           # ON (2026-07-09, user override) — see require_squeeze_gate note
+  squeeze_enabled: true           # ON (2026-07-09, user override) — AGAINST Jul07's own data showing
+                                   # squeeze_ok arms net-negative on 1m/5m. Flagged here on purpose,
+                                   # not silently carried forward as if it were settled.
   squeeze_bb_period: 20
   squeeze_bb_mult: 3.0        # Bollinger band = 3·stdev
   squeeze_bbw_pct: 0.15       # compression = BBW in bottom 15% of the trailing window
