@@ -463,7 +463,9 @@ execution:
   broker_utc_offset_hours: 3      # Vantage server time = UTC+3 (EET); used to shift CVD arrow timestamps
   tradable_symbols: [XAUTUSDT, BTCUSDT]
   symbol_map:
-    XAUTUSDT: "XAUUSD+"          # DEMO account (2026-07-20 test run). Live USC cent used XAUUSD.pc.
+    XAUTUSDT: "XAUUSD.pc"         # LIVE — real USC cent account broker symbol (was XAUUSD+, the
+                                   # demo symbol, on this branch's inherited HEAD; fixed 2026-07-29
+                                   # before going live — same class of bug 7991bc9 fixed once before)
     BTCUSDT:  "BTCUSD"
   # Risk-adjusted sizing: lots = (balance × risk_per_trade_pct) / (SL_distance × contract_size)
   # Set risk_per_trade_pct = 0 to disable; falls back to default_lots.
