@@ -35,9 +35,12 @@ decide_on_bar_close:
 
 instrument:
   symbol: XAUTUSDT
-  timeframes: [1m, 3m, 5m, 10m, 15m, 1h]   # kept full — mtf_aggregator/backfill/other subsystems
-                                            # expect this list; the crude restriction to 15m lives
-                                            # entirely in grid_levels.triggers below, not here
+  timeframes: [1m, 5m, 15m, 1h]   # dropped 3m/10m (2026-07-29): added Jul20 for a since-abandoned
+                                   # TF-efficiency run, footprint data for them is 7.2d stale, and
+                                   # this crude system doesn't trade them — startup preflight blocks
+                                   # boot on stale required-TF data, so trim rather than backfill
+                                   # data we don't need. The crude restriction to 15m for actual
+                                   # trading lives in grid_levels.triggers below, not here.
   primary_tf: 1m           # raw feed is always 1m; server aggregates up (unchanged from before)
 
 # Feed-gap monitor + self-heal (pipeline/feed_monitor.py). Watches the primary-TF series;
