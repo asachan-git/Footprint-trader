@@ -432,15 +432,11 @@ def _build_legs(fulcrum: float, n: int, step: float, skew: str,
     """fulcrum ± i·step prices. Favoured side gets the heavier/longer ladder."""
     buy_n = n
     sell_n = n
-    # Skew adds one extra leg + heavier ladder to the favoured side.
-    if skew == "buy":
-        buy_n = n + 1
-    elif skew == "sell":
-        sell_n = n + 1
+    # Skew's +1-leg asymmetry disabled (2026-07-28, user) — flat n both sides regardless
+    # of skew direction. Skew still exists elsewhere (TP/vote context) but no longer
+    # changes leg count.
 
     # Both sides increase with distance from fulcrum (light near mid, heavy far).
-    # The bias side still gets the extra leg and wider total exposure via skew;
-    # accumulating more size as price moves deeper is better than front-loading the first fill.
     buy_lots = _ladder(buy_n, base_lot, lot_step, heavy_near_mid=False)
     sell_lots = _ladder(sell_n, base_lot, lot_step, heavy_near_mid=False)
 

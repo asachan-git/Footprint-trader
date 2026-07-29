@@ -175,7 +175,7 @@ grid_levels:
   # not collapse to symmetric buy_n==sell_n, which is net-neg at any single exit under
   # net_profit_exit_only. Revert to true, or split into a separate hvn_reversion_tp_poc
   # key, if the lost skew hurts more than the farther TP helps.
-  hvn_reversion_bias: false        # was true (BTC regime: fade-side skew +2 vote / +1 leg into node)
+  hvn_reversion_bias: true        # ON (2026-07-28, user) — fade-side skew +2 vote / +1 leg into node, POC TP on reversion side
   # Wick proximity buffer for hvn_inside_touch: fire if wick came within this many price
   # units of the edge even without crossing it (e.g. 0.5pt catches near-misses on gold).
   # 0.0 = exact touch only (original behaviour). Edge is still the fulcrum price.
@@ -199,7 +199,7 @@ grid_levels:
   # counts — lets a wide node's edge register on rotational days WITHOUT changing node
   # geometry / grid sizing / structural-TP (exits are net-$ targets, so this is surgical).
   hvn_touch_buffer_pct: 0.02
-  hvn_lookback_bars: 3          # candle-close trigger scans last N bars (restart recovery)
+  hvn_lookback_bars: 1          # candle-close trigger scans last N bars (restart recovery)
   # BROKER ORDER-RATE THROTTLE: min seconds between MODIFY_PENDING/MODIFY_POSITION per
   # (cycle, side). Built for Vantage's HFT-abuse limit (account 26443422 got algo-trading
   # disabled over ~1500 mods/hr). Account is now direct MT5 — throttle kept as a safety
@@ -262,6 +262,17 @@ grid_levels:
   cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full (Jun19: 33 — hedged basket finds green exit sooner)
   cycle_min_target_usd: 0.33     # floor; must be >0 so a hedged cycle still has a positive net-$ exit
   cycle_close_on_full_hedge: true  # cut a fully-hedged (delta-neutral) cycle to free margin
+  # Cycle value function (execution/cycle_value.py) — deterministic trail/kill prices
+  # computed from the cycle's reconstructed order book (execution/cycle_book.py) instead
+  # of fixed-USD bias_trail/net_target knobs. NOT live-wired yet: validation-only stub;
+  # monitor_cycle integration is gated on the backtest reconstruction gate passing.
+  cycle_value:
+    enabled: false
+    trail_step_mult: 1.0        # trail distance d = mult × cycle step (price units)
+    floor_usd_by_tf: {}         # F — min locked profit at trail fire, per TF
+    max_loss_usd_by_tf: {}      # L_max — kill_price bound, per TF
+    broker_sl_backstop: true    # one enqueue_modify_sl at trail activation (server-death floor)
+    recon_lots_tol: 0.005       # book_from_arm reconstructed-vs-reported lots tolerance
   # Orphan-pending sweep: a never-filled pending leg anchored on a fulcrum HVN that has
   # since DISAPPEARED from the live VP gets cancelled — but ONLY once the cycle's other
   # positions have all closed (no open legs left). Frees a stale dangling order whose
@@ -279,7 +290,8 @@ grid_levels:
   # that way), track its peak floating P&L; on a give-back from peak, BOOK a fraction of
   # that side and move the rest to breakeven (risk-free runner). Captures directional
   # profit the net-basket exit masks (a hedge leg drags net down → target never hits).
-  bias_trail_enabled: true      # SIMPLE: no trail — CLOSE_ALL only on net_target
+  bias_trail_enabled: false     # OFF (2026-07-28, user) — isolating today's run to per-leg TP / net_target / full_hedge only
+  flatten_rest_enabled: false   # OFF (2026-07-28, user) — disables the leg_tp/leg_closed_other basket flatten (same-day toggle)
   bias_trail_activate_usd: 6.67   # 2026-07-10: 500 USC = BTC Jun22 $5 logic scaled to this lot size (USD acct 1 lot=0.01). Flat all TFs (by_tf empty).
   # ── Active trigger list — single source of truth for which strategies run and on which TFs.
   # Each entry: kind (required), tfs (required), enabled (default true), touch_only (default false).
