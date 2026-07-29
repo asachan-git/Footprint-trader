@@ -72,9 +72,9 @@ grid_levels:
   # hard SL still NOT implemented — config-only.
   # ── TUNING (adjust frequently based on account size / market conditions) ─────
   # Position sizing
-  base_lot: 1.0          # smallest leg lot; ladder scales up by lot_step per leg
-  lot_step: 1.0           # lot increment per leg (leg_i = base + i×step, capped at max_lots)
-  max_lots: 8.0            # covers base+7legs*step comfortably
+  base_lot: 0.25          # unified across all 3 branches (2026-07-29, user) — was 1.0 (Jul09 value)
+  lot_step: 0.25           # lot increment per leg (leg_i = base + i×step, capped at max_lots)
+  max_lots: 1.0            # matches crude-hvn-rotation's cap
 
   hvn_max_legs_by_tf: {1m: 5, 5m: 7, 15m: 9, 1h: 7}   # Jul09 value — widened from Jul08, see note above
   mean_rev_step_mult: 0.50
