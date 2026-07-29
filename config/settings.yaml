@@ -466,9 +466,11 @@ execution:
   broker_utc_offset_hours: 3      # Vantage server time = UTC+3 (EET); used to shift CVD arrow timestamps
   tradable_symbols: [XAUTUSDT, BTCUSDT]
   symbol_map:
-    XAUTUSDT: "XAUUSD.pc"         # LIVE — real USC cent account broker symbol (was XAUUSD+, the
-                                   # demo symbol, on this branch's inherited HEAD; fixed 2026-07-29
-                                   # before going live — same class of bug 7991bc9 fixed once before)
+    # DEMO VALIDATION PHASE (2026-07-29): account 25798248 confirmed demo by user. Pointed
+    # at XAUUSD+ to match what's actually connected right now — proving out the crude Jun22
+    # HVN-rotation system here before any real capital. Flip to "XAUUSD.pc" (the real USC
+    # cent account symbol) only once the EA is re-attached to the real account's chart.
+    XAUTUSDT: "XAUUSD+"
     BTCUSDT:  "BTCUSD"
   # Risk-adjusted sizing: lots = (balance × risk_per_trade_pct) / (SL_distance × contract_size)
   # Set risk_per_trade_pct = 0 to disable; falls back to default_lots.
