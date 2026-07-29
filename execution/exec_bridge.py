@@ -21,6 +21,7 @@ cycles are not orphaned.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -197,7 +198,11 @@ MODIFY_POSITION = "MODIFY_POSITION"  # refresh TP on one side's filled positions
 # pool to the TF cycle that owns it (enables parallel per-TF cycles). NOTE: strat_code can
 # exceed 9 (hvn_displacement=10 → 7701xx), so the owned upper bound is derived from the max
 # strat code below — NOT a hardcoded +100 (that silently dropped displacement cycles).
-MAGIC_BASE = 770000
+# Overridable via FB_MAGIC_BASE so multiple branch checkouts can run against the same
+# MT5 account simultaneously without their magics colliding (2026-07-29, multi-branch
+# live A/B). Default unchanged. Offsets go up to strat*10+tf ~= 139 at most (hvn_displacement
+# decade + max tf code), so a 1000-spaced base per instance leaves plenty of headroom.
+MAGIC_BASE = int(os.environ.get("FB_MAGIC_BASE", "770000"))
 _STRAT_CODE = {
     "hvn_inside_touch": 1, "squeeze": 2, "vp_level_touch": 3, "imbalance": 4,
     "hvn_edge": 5, "anchor": 6, "va": 7, "cvd_div": 8, "hvn_displacement": 10,
