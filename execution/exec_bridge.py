@@ -908,21 +908,22 @@ class ExecBridge:
         # see project memory). Track the cycle's peak net P&L; when it gives back
         # ≥ giveback% from the peak, BOOK half of whichever side is net-winning AT
         # THAT MOMENT and move the rest of that side to breakeven (risk-free runner).
-        # Fires once per cycle — guarded by bias_trail_done, a PRIVATE one-shot flag
-        # (NOT bias_booked, which the flatten-rest suppression below resets one poll
-        # after booking; gating on bias_booked let the trail double/triple-fire within
-        # seconds of the first book, each time at a worse price).
-        # PER-SIDE one-shot (2026-07-21): bias_trail_done was cycle-wide, so the FIRST
-        # side to book consumed the trail for the whole cycle. Two consequences:
-        #   (a) the OTHER side could later fill, peak, and give it all back with no trail
-        #       to book it — TP/net_target only;
-        #   (b) when the side-only re-arm backfills a booked-flat side (_touch_arm_tf),
-        #       those fresh legs inherited the spent flag → re-filled, untrailed, and
-        #       (legs place sl=0.0) unprotected.
-        # Now the flag is per-side (bias_trail_done_buy / _sell) and the side-only re-arm
-        # clears the flag for the side it backfills, so each side gets its own trail.
-        # The double-fire bug the cycle-wide flag was added to prevent is still covered:
-        # a side's flag is only cleared when that side went FLAT and is re-armed fresh.
+        # REPEATABLE RATCHET (2026-07-29, user): after a book, bias_peak resets to 0.0
+        # instead of setting a permanent per-side done-flag. That alone re-arms the
+        # trail correctly and safely: peak = max(0.0, net_pnl) means the fire condition
+        # (peak >= activate AND net_pnl has given back giveback% off peak) can't be true
+        # again until net PnL climbs back up to `activate` from scratch and THEN gives
+        # back — i.e. "wait for net P&L to reach the trail amount again, then re-equip."
+        # This also naturally prevents the immediate double-fire the old one-shot flag
+        # guarded against: right after a book, net_pnl is still near the value that just
+        # triggered it, so on the very next poll peak resets to (at minimum) that same
+        # net_pnl — requiring a FRESH giveback from there, not an instant re-fire.
+        # bias_trail_done_buy/_sell are still set at the moment of firing (dashboard/audit
+        # only) but no longer gate anything — the peak reset is the sole re-arm mechanism,
+        # and it's symmetric: whichever side is winning when a fire condition is next met
+        # gets booked, repeatedly, for as long as net P&L keeps re-cycling through
+        # `activate`. bias_book_frac shrinks what's left each time it re-fires on the same
+        # side (0.5 -> 0.25 -> 0.125 ...), which is the intended ratchet behavior.
         reason: str | None = None
         detail: dict = {}
 
@@ -994,11 +995,8 @@ class ExecBridge:
                         if _retraced:
                             reason = "cv_trail"
 
-        _bias_done_buy  = bool(cyc.get("bias_trail_done_buy")  or cyc.get("bias_trail_done"))
-        _bias_done_sell = bool(cyc.get("bias_trail_done_sell") or cyc.get("bias_trail_done"))
         if (not cv_active and reason is None
                 and bool(grid_cfg.get("bias_trail_enabled", True))
-                and not (_bias_done_buy and _bias_done_sell)
                 and buy_pnl is not None and sell_pnl is not None):
             net_pnl = float(buy_pnl) + float(sell_pnl)
             peak = max(float(cyc.get("bias_peak") or 0.0), net_pnl)
@@ -1025,16 +1023,7 @@ class ExecBridge:
                     and net_pnl <= peak * (1.0 - giveback / 100.0)):
                 # Book whichever side is net-winning RIGHT NOW — the trail fired off
                 # combined P&L, but CLOSE_SIDE/MOVE_BE are inherently directional.
-                # Skip a side whose per-side one-shot is already spent, else the trail
-                # would re-book a side it has already booked (the double-fire the
-                # cycle-wide flag originally guarded against).
                 bias = "buy" if float(buy_pnl) >= float(sell_pnl) else "sell"
-                if bias == "buy" and _bias_done_buy:
-                    bias = "sell"
-                elif bias == "sell" and _bias_done_sell:
-                    bias = "buy"
-                if (bias == "buy" and _bias_done_buy) or (bias == "sell" and _bias_done_sell):
-                    return None   # both sides already booked — nothing left to trail
                 cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic, side=bias,
                             frac=book_frac, comment=f"FB|book|{bias}", now=t)
                 cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=bias,
@@ -1051,18 +1040,19 @@ class ExecBridge:
                 # OPPOSITE ladder on a full-fill — this kills the booked side's own.
                 # DEFAULT OFF: cancelling the booked side's pendings also removes what the
                 # side-only re-arm (_touch_arm_tf) would backfill, killing the harvest
-                # loop. With the per-side trail flag below, a re-loaded side is managed
-                # again rather than naked — so re-loading is now the intended behaviour.
+                # loop. With the peak reset below, a re-loaded side is managed by the
+                # ratchet again rather than naked — so re-loading is the intended behaviour.
                 if bool(grid_cfg.get("book_cancel_own_pendings", False)):
                     cls.enqueue(account, CANCEL_PENDINGS, symbol, magic=magic, side=bias,
                                 comment=f"FB|book_cancel_own|{bias}", now=t)
-                # PER-SIDE one-shot: only the side we just booked is spent. The other side
-                # keeps its own trail, and a side-only re-arm clears this flag when it
-                # backfills that side. bias_booked stays cycle-wide (flatten-rest
-                # suppression, reset by that block below).
+                # REPEATABLE RATCHET: reset bias_peak to 0.0 instead of a permanent
+                # done-flag — net P&L has to climb back up to `activate` from scratch
+                # before the trail can fire again (either side). bias_trail_done_{bias}
+                # still set for dashboard/audit visibility only, no longer gates re-fire.
+                # bias_booked stays cycle-wide (flatten-rest suppression, reset below).
                 cls.set_last_arm(account, symbol, magic=magic,
                                  **{**cyc, "bias_side": bias, "bias_booked": True,
-                                    f"bias_trail_done_{bias}": True})
+                                    "bias_peak": 0.0, f"bias_trail_done_{bias}": True})
                 _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
                                   "tf": tf, "magic": magic, "exit_reason": "bias_book_trail",
                                   "bias": bias, "peak": round(peak, 2),
