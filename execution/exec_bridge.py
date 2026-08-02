@@ -165,6 +165,11 @@ def _emit_cycle_outcome(cyc: dict, *, account: str, symbol: str, magic: int,
             "max_pos_seen": cyc.get("max_pos_seen"), "pend_seen": cyc.get("pend_seen"),
             "bias_booked": bool(cyc.get("bias_booked")),
             "bias_peak": cyc.get("bias_peak"),
+            # Running MINIMUM basket floating P&L over the cycle's life. bias_peak is
+            # reset to 0.0 by the repeatable trail ratchet, so it is not a drawdown
+            # record; trough never resets. Exists to calibrate cycle_max_loss_usd from
+            # measured intra-cycle drawdown instead of a guess.
+            "trough": cyc.get("trough"),
             # exit outcome
             "exit_reason": exit_reason,
             **outcome,
@@ -261,6 +266,32 @@ def _modify_cooldown_s() -> float:
             v = 0.0
         _MODIFY_COOLDOWN_CACHE = max(0.0, v)
     return _MODIFY_COOLDOWN_CACHE
+
+
+_DISASTER_SL_CACHE: float | None = None
+
+
+def _disaster_sl_usd() -> float:
+    """Broker-side disaster stop distance ($/oz) from each leg's OWN entry price.
+
+    Read once from grid_levels.disaster_sl_usd (default 0.0 = disabled). Sized in
+    learnings §18: recovering cycles' max ladder span was 15.4, so $20 cuts zero of
+    them. Broker-native by design — it is the only exit that survives a server or
+    bridge freeze; every monitor_cycle exit does not."""
+    global _DISASTER_SL_CACHE
+    if _DISASTER_SL_CACHE is None:
+        v = 0.0
+        try:
+            import yaml as _yaml
+            import pathlib as _pl
+            _cfg = _yaml.safe_load(
+                (_pl.Path(__file__).resolve().parent.parent / "config" / "settings.yaml").read_text()
+            ) or {}
+            v = float((_cfg.get("grid_levels") or {}).get("disaster_sl_usd", 0.0) or 0.0)
+        except Exception:
+            v = 0.0
+        _DISASTER_SL_CACHE = max(0.0, v)
+    return _DISASTER_SL_CACHE
 
 
 _RECLAIM_AFTER_S = 10.0   # IN_FLIGHT with no ack this long → back to PENDING
@@ -677,6 +708,16 @@ class ExecBridge:
                 _cyc_hw_dirty = True
             if int(sells) > _ms:
                 cyc["max_sells_seen"] = int(sells)
+                _cyc_hw_dirty = True
+        # low-water: running MIN basket floating P&L. Tracked next to the other
+        # high-water marks so it shares their single set_last_arm write. Unlike
+        # bias_peak (which the repeatable trail ratchet resets to 0.0 after each book)
+        # this never resets — it is the cycle's true max drawdown, and the input needed
+        # to set cycle_max_loss_usd from data rather than inference.
+        if pnl is not None:
+            _tr = cyc.get("trough")
+            if _tr is None or float(pnl) < float(_tr):
+                cyc["trough"] = round(float(pnl), 2)
                 _cyc_hw_dirty = True
         if _cyc_hw_dirty:
             cls.set_last_arm(account, symbol, magic=magic, **cyc)
@@ -1117,6 +1158,25 @@ class ExecBridge:
             confirms = (tp_up > 0 and mid >= tp_up - tol) or (tp_down > 0 and 0 < mid <= tp_down + tol)
             reason = "leg_tp" if confirms else "leg_closed_other"
 
+        # 2.5) HARD PER-CYCLE LOSS CAP — the grid's only bounded loss exit besides the
+        # broker SL. Must be evaluated BEFORE full_hedge: full_hedge only fires once both
+        # sides are FULLY loaded, i.e. after the damage is done. Live evidence
+        # (2026-07-29→08-01, flatten_rest_enabled false): 25 cycles booked +4,545 via
+        # bias_book_trail and ONE cycle lost -10,424 via full_hedge — a 96% win rate that
+        # was still net negative, because nothing bounded the loser. That cycle held 70
+        # minutes, filled all 12 legs, and its bias_peak reached 11.5 against a trail
+        # arming at 250, so no profit exit was ever reachable.
+        #
+        # NOTE the value is NOT backtested and cannot be from existing data: cycle logs
+        # carry only final P&L, not intra-cycle drawdown, so cycles that dipped below the
+        # cap and recovered are invisible. Shipped WIDE (2x net_target) and paired with
+        # `trough` logging below so it can be set from measurement in a couple of weeks.
+        # `cycle_value.max_loss_usd_by_tf` (cv_kill) is the richer future replacement —
+        # not used here because enabling it also swaps bias_trail/net_target wholesale.
+        max_loss = float(grid_cfg.get("cycle_max_loss_usd", 0.0) or 0.0)
+        if reason is None and max_loss > 0 and pnl is not None and float(pnl) <= -max_loss:
+            reason = "max_loss"
+
         # 3) full-hedge backstop (delta-neutral → cut to free margin; realizes a loss)
         if reason is None and close_on_full_hedge and n > 0 \
                 and buys is not None and sells is not None:
@@ -1297,6 +1357,22 @@ class ExecBridge:
         else:
             buy_sl  = getattr(plan, "buy_sl",  0.0)
             sell_sl = getattr(plan, "sell_sl", 0.0)
+        # Broker-side DISASTER stop, per leg, measured from that leg's OWN entry.
+        # Applies only where no structural SL exists — a structural SL (candle_sweep's
+        # sweep-candle extreme, displacement's BB mid) is deliberate and tighter, so it
+        # wins and fires first. This fills the hvn_inside_touch/lvn_edge_touch case,
+        # where the SL is otherwise 0.0 on every leg and the cycle has NO broker-side
+        # protection at all (only 15.7% of live positions ever carried one).
+        # Per-leg, not a shared level: with a shared price the near leg would risk $20
+        # while the outermost risked $20 + ladder span. See learnings §18.
+        _dsl = _disaster_sl_usd()
+
+        def _leg_sl(leg_price: float, structural: float, is_buy: bool) -> float:
+            if structural:
+                return structural
+            if _dsl <= 0:
+                return 0.0
+            return round(leg_price - _dsl if is_buy else leg_price + _dsl, 4)
         # Order type per leg based on current market price:
         #   buy leg above ask  → buy_stop  (price must rise to trigger)
         #   buy leg below ask  → buy_limit (price already above level → limit entry on pullback)
@@ -1313,7 +1389,8 @@ class ExecBridge:
                 _otype = "buy_stop"
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type=_otype,
-                price=leg.price, lot=leg.lot, sl=buy_sl, tp=buy_tp,
+                price=leg.price, lot=leg.lot,
+                sl=_leg_sl(leg.price, buy_sl, True), tp=buy_tp,
                 comment=f"FB|{tag}|{tf_tag}|b{i + 1}", magic=magic))
         for i, leg in enumerate(getattr(plan, "sell_legs", []) or [] if "sell" in sides else []):
             if _bid > 0 and leg.price > _bid:
@@ -1322,7 +1399,8 @@ class ExecBridge:
                 _otype = "sell_stop"
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type=_otype,
-                price=leg.price, lot=leg.lot, sl=sell_sl, tp=sell_tp,
+                price=leg.price, lot=leg.lot,
+                sl=_leg_sl(leg.price, sell_sl, False), tp=sell_tp,
                 comment=f"FB|{tag}|{tf_tag}|s{i + 1}", magic=magic))
         return out
 

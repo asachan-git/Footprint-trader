@@ -272,10 +272,21 @@ def _candle_conviction(symbol: str, tf: str) -> float:
         return 0.5
 
 
+def _clamp_step(step: float, max_usd: float) -> float:
+    """Absolute CEILING on grid step ($). 0 = no ceiling.
+
+    Per-TF live data (keeper set, 240 cycles) puts the 3.5-5.0 step band at the bottom
+    on BOTH timeframes — 15m +40/cyc and 5m -104/cyc, against +1,258 (15m, step <2.0)
+    and +901 (5m, 2.0-3.5). A ceiling is supported; a FLOOR is not (it would push 15m's
+    best-performing band into a worse one). See learnings §22 + plan review round 1."""
+    return min(step, max_usd) if max_usd > 0 else step
+
+
 def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
                conviction: float, hvn_max_legs: int = 8,
                lvn_legs_per_side: int = 1,
-               mean_rev_step_mult: float = MEAN_REV_STEP_MULT) -> tuple[int, float]:
+               mean_rev_step_mult: float = MEAN_REV_STEP_MULT,
+               mean_rev_step_max_usd: float = 0.0) -> tuple[int, float]:
     """N (capped by regime.max_legs) and step ($) from ATR + swing range +
     candle conviction. HVN node width floors the step so legs span the node."""
     rtype = getattr(regime, "type", "uncertain")
@@ -303,22 +314,25 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
         step = max((step_mult * atr) if atr > 0 else 1.0, 1e-4)
         return n, round(step, 4)
 
-    # hvn_inside_touch: WIDTH-DRIVEN sizing (BTC Jun22 regime). step = ATR × mult; leg
-    # count = node_width / step so a WIDER node gets MORE legs (legs span the whole node),
-    # capped at hvn_max_legs (per-TF). raw_range = node width for this trigger.
+    # hvn_inside_touch: FIXED n = hvn_max_legs (crude default, 2026-07-30 — was
+    # width-driven node_width/step; user wants a flat leg count regardless of node
+    # width). step stays ATR-driven so spacing still adapts to volatility.
     if trigger.kind == "hvn_inside_touch":
         step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
-        n = int(round(trigger.raw_range / step)) if step > 0 else 2
-        n = max(2, min(hvn_max_legs, n))
+        step = _clamp_step(step, mean_rev_step_max_usd)
+        n = max(2, hvn_max_legs)
         return n, round(step, 4)
 
-    # lvn_edge_touch: same width-driven sizing as hvn_inside_touch — reuses the same
-    # hvn_max_legs/mean_rev_step_mult knobs (no separate LVN sizing config), per the
-    # "like hvn_inside_touch position management" design.
+    # lvn_edge_touch: FIXED n = hvn_max_legs, matching hvn_inside_touch above
+    # (2026-08-03, feat/final-v1). Was width-driven (n = round(raw_range/step) clamped
+    # 2..hvn_max_legs), which produced n=2 on EVERY live cycle — a 2-leg ladder where a
+    # 6-leg one was intended. Live data (240-cycle keeper set) shows deeper ladders do
+    # better, not worse: by legs filled, 2-3 → +135/cyc, 4-5 → +224, 6-8 → +679,
+    # 9-11 → +2,274. Safe only because cycle_max_loss_usd now bounds the downside.
     if trigger.kind == "lvn_edge_touch":
         step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
-        n = int(round(trigger.raw_range / step)) if step > 0 else 2
-        n = max(2, min(hvn_max_legs, n))
+        step = _clamp_step(step, mean_rev_step_max_usd)
+        n = max(2, hvn_max_legs)
         return n, round(step, 4)
 
     # candle_sweep / engulf: WIDTH-DRIVEN sizing (matches hvn_inside_touch/lvn_edge_touch).
@@ -540,6 +554,7 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     # global hvn_max_legs. Any TF absent falls back to the global.
     hvn_max_legs = int(grid_cfg.get("hvn_max_legs", 8))
     mean_rev_step_mult = float(grid_cfg.get("mean_rev_step_mult") or MEAN_REV_STEP_MULT)
+    mean_rev_step_max_usd = float(grid_cfg.get("mean_rev_step_max_usd") or 0.0)
     _legs_by_tf = grid_cfg.get("hvn_max_legs_by_tf") or {}
     if isinstance(_legs_by_tf, dict) and tf and tf in _legs_by_tf:
         hvn_max_legs = int(_legs_by_tf.get(tf) or hvn_max_legs)
@@ -681,7 +696,8 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     n, step = _size_grid(fulcrum_t, regime, atr, swing_range, conviction,
                          hvn_max_legs=hvn_max_legs,
                          lvn_legs_per_side=lvn_legs_per_side,
-                         mean_rev_step_mult=mean_rev_step_mult)
+                         mean_rev_step_mult=mean_rev_step_mult,
+                         mean_rev_step_max_usd=mean_rev_step_max_usd)
     # Freeze-aware floor: ensure the innermost leg (fulcrum ± step) clears the broker's
     # min-stop distance. min_step_venue is in the VENUE frame; convert to the analysis
     # frame here (× current/venue) since the step is rebased back by venue/current later.
@@ -747,8 +763,15 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     if 0.0 < tp_down < bot_leg - min_tp_dist:
         sell_tp = round(tp_down, 4)
 
+    # POC TP snap on the fade side. Gated by its OWN key (2026-08-03, feat/final-v1) —
+    # previously it rode on hvn_reversion_bias, so you could not keep the skew votes
+    # without also taking this. Default false: the snap OVERWRITES the next-HVN far-edge
+    # TP at arm time, and the refresh path never reads the flag, so arm and refresh
+    # disagree and the TP silently shifts on the first poll. POC also sits INSIDE the
+    # node (nearer than the far edge), so this systematically shortens the fade TP —
+    # and learnings §20 measured the short-TP band at -67,002 over 1,094 positions.
     if (fulcrum_t.kind == "hvn_inside_touch"
-            and bool(grid_cfg.get("hvn_reversion_bias", True))):
+            and bool(grid_cfg.get("hvn_reversion_tp_poc", False))):
         poc  = float((daily_vp or {}).get("poc", 0.0) or 0.0)
         edge = (fulcrum_t.context or {}).get("edge", "")
         if poc > 0:

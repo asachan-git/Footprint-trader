@@ -30,7 +30,7 @@
 //|    POST {url}/exec/ack   {account, results:[...]}                |
 //+------------------------------------------------------------------+
 #property copyright "Aniket"
-#property version   "1.08"
+#property version   "1.10"
 #property strict
 // FBExecBridge_Jul06 — pre-set for feat/jul06-simple-mode, port 5001, magic base 771000.
 // Single-branch config (URL2/3 left blank); attach directly, no input editing needed.
@@ -709,7 +709,7 @@ bool ExecModifyPending(const string cmd, int &modified, string &err)
    string sym        = JsonGetString(cmd, "symbol");
    long   cmdMagic   = (long)JsonGetNumber(cmd, "magic");
    double priceDelta = JsonGetNumber(cmd, "price_delta");  // shift all legs by this amount
-   double newTp      = JsonGetNumber(cmd, "tp");           // 0 = leave TP unchanged
+   double newTp      = JsonGetNumber(cmd, "tp");           // 0 = leave unchanged, <0 = clear to 0
    string side       = JsonGetString(cmd, "side");         // "buy","sell","" = both
    modified = 0; err = ""; bool allOk = true;
 
@@ -719,7 +719,7 @@ bool ExecModifyPending(const string cmd, int &modified, string &err)
    double minStop   = stopsPts * point;
 
    ulong tickets[];
-   double prices[], tps[];
+   double prices[], tps[], sls[];
    for(int i = 0; i < OrdersTotal(); i++)
    {
       if(!orderInfo.SelectByIndex(i)) continue;
@@ -732,7 +732,15 @@ bool ExecModifyPending(const string cmd, int &modified, string &err)
       if(side == "sell" && !isSell) continue;
       double newPrice = NormalizeDouble(orderInfo.PriceOpen() + priceDelta, digits);
       double useTp    = (newTp > 0) ? NormalizeDouble(newTp, digits)
+                                    : (newTp < 0) ? 0.0
                                     : NormalizeDouble(orderInfo.TakeProfit(), digits);
+      // SL rides the shift. Previously this passed 0.0 to OrderModify, which WIPED the
+      // broker-side disaster stop on every fulcrum shift / pending TP refresh — the leg
+      // then sat unprotected for the rest of the cycle. Translate it by the same delta
+      // as the price so the stop distance from entry stays constant (the ladder shifts
+      // rigidly; the stop must shift with it). 0 stays 0.
+      double curSl    = orderInfo.StopLoss();
+      double useSl    = (curSl > 0) ? NormalizeDouble(curSl + priceDelta, digits) : 0.0;
       // freeze guard: buy_stop must be above ask+minStop; sell_stop below bid-minStop
       double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
       double bid = SymbolInfoDouble(sym, SYMBOL_BID);
@@ -740,11 +748,12 @@ bool ExecModifyPending(const string cmd, int &modified, string &err)
       if(isSell && newPrice > bid - minStop - point) continue;
       int n = ArraySize(tickets);
       ArrayResize(tickets, n+1); ArrayResize(prices, n+1); ArrayResize(tps, n+1);
-      tickets[n] = orderInfo.Ticket(); prices[n] = newPrice; tps[n] = useTp;
+      ArrayResize(sls, n+1);
+      tickets[n] = orderInfo.Ticket(); prices[n] = newPrice; tps[n] = useTp; sls[n] = useSl;
    }
    for(int i = 0; i < ArraySize(tickets); i++)
    {
-      if(trade.OrderModify(tickets[i], prices[i], 0.0, tps[i], ORDER_TIME_GTC, 0)) modified++;
+      if(trade.OrderModify(tickets[i], prices[i], sls[i], tps[i], ORDER_TIME_GTC, 0)) modified++;
       else { allOk = false; err = "modify fail #" + IntegerToString((long)tickets[i]); }
    }
    return allOk;
@@ -808,7 +817,9 @@ bool ExecModifyPosition(const string cmd, int &modified, string &err)
    double newSl = NormalizeDouble(JsonGetNumber(cmd, "sl"), digits);
    modified = 0; err = ""; bool allOk = true;
    // Require at least one of tp or sl to be set.
-   if(newTp <= 0 && newSl <= 0) { err = "no tp or sl"; return false; }
+   bool clearTp = (newTp < 0);
+   bool clearSl = (newSl < 0);
+   if(newTp <= 0 && newSl <= 0 && !clearTp && !clearSl) { err = "no tp or sl"; return false; }
 
    for(int i = 0; i < PositionsTotal(); i++)
    {
@@ -817,8 +828,8 @@ bool ExecModifyPosition(const string cmd, int &modified, string &err)
       bool isBuy = (posInfo.PositionType() == POSITION_TYPE_BUY);
       if(side == "buy"  && !isBuy) continue;
       if(side == "sell" &&  isBuy) continue;
-      double sl = (newSl > 0) ? newSl : posInfo.StopLoss();    // use cmd SL or keep existing
-      double tp = (newTp > 0) ? newTp : posInfo.TakeProfit();  // use cmd TP or keep existing
+      double sl = clearSl ? 0.0 : ((newSl > 0) ? newSl : posInfo.StopLoss());    // use cmd SL, clear (<0), or keep existing
+      double tp = clearTp ? 0.0 : ((newTp > 0) ? newTp : posInfo.TakeProfit());  // use cmd TP, clear (<0), or keep existing
       double curTp = NormalizeDouble(posInfo.TakeProfit(), digits);
       double curSl = NormalizeDouble(posInfo.StopLoss(), digits);
       double pt    = SymbolInfoDouble(sym, SYMBOL_POINT);

@@ -11,25 +11,42 @@
 //|    PLACE_PENDING  buy_stop / sell_stop @ price, lot, sl, tp      |
 //|    CLOSE_ALL      close positions + cancel pendings (this magic) |
 //|                                                                  |
-//|  Endpoints (whitelist InpBridgeURL host under                    |
+//|  MULTI-BRANCH (v1.08, 2026-07-29): one EA instance can poll up   |
+//|  to 3 independent Python bridges (e.g. 3 branch checkouts on     |
+//|  ports 5000/5001/5002), as long as each was started with a       |
+//|  DISTINCT FB_MAGIC_BASE so their magics never collide. Slot 2/3  |
+//|  are optional — leave InpBridgeURL2/3 blank to run single-branch |
+//|  exactly as before. Every branch is polled + executed on the     |
+//|  same timer tick, in sequence, each scoped by its own magic       |
+//|  range (IsMine() reads a per-iteration active base, not a fixed  |
+//|  input). Chart drawing (zones/VP/dashboard) stays tied to slot 1 |
+//|  only — three overlapping zone sets on one chart isn't useful;   |
+//|  this only affects what's DRAWN, not what trades. The equity-    |
+//|  target hard-stop flattens ALL active branches when it fires.    |
+//|                                                                  |
+//|  Endpoints (whitelist EVERY InpBridgeURL* host under              |
 //|    Tools -> Options -> Expert Advisors -> Allow WebRequest):     |
-//|    POST {InpBridgeURL}/exec/poll  {account}  -> {commands:[...]} |
-//|    POST {InpBridgeURL}/exec/ack   {account, results:[...]}        |
+//|    POST {url}/exec/poll  {account}  -> {commands:[...]}          |
+//|    POST {url}/exec/ack   {account, results:[...]}                |
 //+------------------------------------------------------------------+
 #property copyright "Aniket"
-#property version   "1.05"
+#property version   "1.10"
 #property strict
 
 #include <Trade\Trade.mqh>
 #include <Trade\OrderInfo.mqh>
 #include <Trade\PositionInfo.mqh>
 
-input string InpBridgeURL   = "http://127.0.0.1:5000"; // Python bridge base URL (whitelist host!)
-input int    InpPollMs      = 1000;                    // Poll interval (ms)
-input int    InpTimeoutMs   = 4000;                    // WebRequest timeout (ms)
-input string InpToken       = "";                      // X-FB-Token (must match server FB_EXEC_TOKEN; blank = none)
-input int    InpMagic       = 770000;                  // Magic BASE; server sends base+strat*10+tf (1m/5m/15m/1H × strategy)
-input int    InpMagicRange   = 150;                    // EA owns magics [InpMagic, InpMagic+InpMagicRange) — covers strat decades 0-13 (lvn_edge_touch=13 needs up to 770134)
+input string InpBridgeURL   = "http://127.0.0.1:5000"; // Branch 1 bridge URL (whitelist host!)
+input int    InpMagic       = 770000;                  // Branch 1 magic BASE (server FB_MAGIC_BASE must match)
+input string InpBridgeURL2  = "";                       // Branch 2 bridge URL — blank = disabled (single-branch mode)
+input int    InpMagic2      = 771000;                   // Branch 2 magic BASE
+input string InpBridgeURL3  = "";                       // Branch 3 bridge URL — blank = disabled
+input int    InpMagic3      = 772000;                   // Branch 3 magic BASE
+input int    InpPollMs      = 1000;                    // Poll interval (ms) — applies to the whole cycle (all branches)
+input int    InpTimeoutMs   = 4000;                    // WebRequest timeout (ms), per branch
+input string InpToken       = "";                      // X-FB-Token (must match server FB_EXEC_TOKEN; blank = none; same token used for all branches)
+input int    InpMagicRange   = 150;                    // Each branch owns [its base, base+InpMagicRange) — covers strat decades 0-13 (lvn_edge_touch=13 needs up to base+134)
 input int    InpSlippage    = 20;                      // Deviation (points)
 input bool   InpVerbose     = true;                    // Log every command
 
@@ -74,6 +91,15 @@ CPositionInfo posInfo;
 string   gAccount       = "";
 datetime gLastZoneFetch = 0;
 bool     gHalted        = false;   // equity target reached → flattened, no more polling/placing
+
+//--- multi-branch: built once in OnInit from the non-blank InpBridgeURL* inputs.
+//    gActiveMagicBase is the ownership scope IsMine()/counters read RIGHT NOW —
+//    set at the top of each per-branch iteration in OnTimer, so every existing
+//    function that filters "is this position/order mine" stays branch-correct
+//    without itself knowing about the loop.
+string   gBridgeURLs[];
+long     gMagicBases[];
+long     gActiveMagicBase = 0;   // set from InpMagic in OnInit; reassigned per iteration
 
 //--- last-armed grid metadata (cached from /exec/zones) for the corner dashboard
 double   gFulcrum       = 0.0;
@@ -215,7 +241,7 @@ int HttpPost(const string url, const string body, string &response)
    {
       int err = GetLastError();
       Print("❌ WebRequest ", url, " failed (err ", err,
-            "). If 4060: whitelist ", InpBridgeURL,
+            "). If 4060: whitelist ", url,
             " under Tools->Options->Expert Advisors->Allow WebRequest.");
       response = "";
       return -1;
@@ -251,8 +277,10 @@ bool ExecPlacePending(const string cmd, ulong &ticket, int &retcode, string &err
    long   stopsLevelPts = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
    double minStop      = stopsLevelPts * point;
 
-   //--- stamp the per-order magic (squeeze legs carry their own); restored after place
-   trade.SetExpertMagicNumber(magic > 0 ? magic : InpMagic);
+   //--- stamp the per-order magic (squeeze legs carry their own); restored after place.
+   //    Fallback is the CURRENT branch's base (gActiveMagicBase), not the fixed InpMagic —
+   //    a magic=0 command during a branch-2/3 iteration must not fall back to branch 1.
+   trade.SetExpertMagicNumber(magic > 0 ? magic : gActiveMagicBase);
 
    //--- place with one bounded retry on TRANSIENT broker rejects (off-quotes / price-off
    //    / requote / price-changed / dropped trade-link). The live quote is re-read each
@@ -389,7 +417,7 @@ bool ExecCloseAll(const string cmd, int &closed, int &cancelled, string &err)
 //+------------------------------------------------------------------+
 bool IsMine(long magic)
 {
-   return (magic >= InpMagic && magic < InpMagic + InpMagicRange);
+   return (magic >= gActiveMagicBase && magic < gActiveMagicBase + InpMagicRange);
 }
 
 //--- scope a sweep: an explicit cmdMagic (>0) targets ONE cycle's pool; 0 = any of ours.
@@ -430,11 +458,10 @@ double PnlForMagic(long magic)
 }
 
 //+------------------------------------------------------------------+
-//| Flatten EVERYTHING this EA owns on this chart's symbol: cancel    |
-//| all our pendings + close all our positions. Used by the equity    |
-//| target hard-stop (local failsafe, independent of the server).     |
+//| Flatten everything owned by the CURRENT gActiveMagicBase's range  |
+//| on this chart's symbol: cancel pendings + close positions.        |
 //+------------------------------------------------------------------+
-void CloseAllMine(int &closed, int &cancelled)
+void CloseAllMineForActiveBase(int &closed, int &cancelled)
 {
    closed = 0; cancelled = 0;
    ulong pend[];
@@ -450,6 +477,27 @@ void CloseAllMine(int &closed, int &cancelled)
       { int n = ArraySize(pos); ArrayResize(pos, n + 1); pos[n] = posInfo.Ticket(); }
    for(int i = 0; i < ArraySize(pos); i++)
       if(trade.PositionClose(pos[i], InpSlippage)) closed++;
+}
+
+//+------------------------------------------------------------------+
+//| Flatten EVERYTHING this EA owns across ALL active branches on     |
+//| this chart's symbol. Used by the equity target hard-stop (local   |
+//| failsafe, independent of any one server) — an account-wide equity |
+//| breach should nuke every branch, not just whichever was active on |
+//| the poll-loop iteration that happened to be running.               |
+//+------------------------------------------------------------------+
+void CloseAllMine(int &closed, int &cancelled)
+{
+   closed = 0; cancelled = 0;
+   long savedBase = gActiveMagicBase;
+   for(int b = 0; b < ArraySize(gMagicBases); b++)
+   {
+      gActiveMagicBase = gMagicBases[b];
+      int c = 0, x = 0;
+      CloseAllMineForActiveBase(c, x);
+      closed += c; cancelled += x;
+   }
+   gActiveMagicBase = savedBase;
 }
 
 //--- Per-side open counts + basket floating P&L (for the server cycle monitor).
@@ -659,7 +707,7 @@ bool ExecModifyPending(const string cmd, int &modified, string &err)
    string sym        = JsonGetString(cmd, "symbol");
    long   cmdMagic   = (long)JsonGetNumber(cmd, "magic");
    double priceDelta = JsonGetNumber(cmd, "price_delta");  // shift all legs by this amount
-   double newTp      = JsonGetNumber(cmd, "tp");           // 0 = leave TP unchanged
+   double newTp      = JsonGetNumber(cmd, "tp");           // 0 = leave unchanged, <0 = clear to 0
    string side       = JsonGetString(cmd, "side");         // "buy","sell","" = both
    modified = 0; err = ""; bool allOk = true;
 
@@ -669,7 +717,7 @@ bool ExecModifyPending(const string cmd, int &modified, string &err)
    double minStop   = stopsPts * point;
 
    ulong tickets[];
-   double prices[], tps[];
+   double prices[], tps[], sls[];
    for(int i = 0; i < OrdersTotal(); i++)
    {
       if(!orderInfo.SelectByIndex(i)) continue;
@@ -682,7 +730,15 @@ bool ExecModifyPending(const string cmd, int &modified, string &err)
       if(side == "sell" && !isSell) continue;
       double newPrice = NormalizeDouble(orderInfo.PriceOpen() + priceDelta, digits);
       double useTp    = (newTp > 0) ? NormalizeDouble(newTp, digits)
+                                    : (newTp < 0) ? 0.0
                                     : NormalizeDouble(orderInfo.TakeProfit(), digits);
+      // SL rides the shift. Previously this passed 0.0 to OrderModify, which WIPED the
+      // broker-side disaster stop on every fulcrum shift / pending TP refresh — the leg
+      // then sat unprotected for the rest of the cycle. Translate it by the same delta
+      // as the price so the stop distance from entry stays constant (the ladder shifts
+      // rigidly; the stop must shift with it). 0 stays 0.
+      double curSl    = orderInfo.StopLoss();
+      double useSl    = (curSl > 0) ? NormalizeDouble(curSl + priceDelta, digits) : 0.0;
       // freeze guard: buy_stop must be above ask+minStop; sell_stop below bid-minStop
       double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
       double bid = SymbolInfoDouble(sym, SYMBOL_BID);
@@ -690,11 +746,12 @@ bool ExecModifyPending(const string cmd, int &modified, string &err)
       if(isSell && newPrice > bid - minStop - point) continue;
       int n = ArraySize(tickets);
       ArrayResize(tickets, n+1); ArrayResize(prices, n+1); ArrayResize(tps, n+1);
-      tickets[n] = orderInfo.Ticket(); prices[n] = newPrice; tps[n] = useTp;
+      ArrayResize(sls, n+1);
+      tickets[n] = orderInfo.Ticket(); prices[n] = newPrice; tps[n] = useTp; sls[n] = useSl;
    }
    for(int i = 0; i < ArraySize(tickets); i++)
    {
-      if(trade.OrderModify(tickets[i], prices[i], 0.0, tps[i], ORDER_TIME_GTC, 0)) modified++;
+      if(trade.OrderModify(tickets[i], prices[i], sls[i], tps[i], ORDER_TIME_GTC, 0)) modified++;
       else { allOk = false; err = "modify fail #" + IntegerToString((long)tickets[i]); }
    }
    return allOk;
@@ -758,7 +815,9 @@ bool ExecModifyPosition(const string cmd, int &modified, string &err)
    double newSl = NormalizeDouble(JsonGetNumber(cmd, "sl"), digits);
    modified = 0; err = ""; bool allOk = true;
    // Require at least one of tp or sl to be set.
-   if(newTp <= 0 && newSl <= 0) { err = "no tp or sl"; return false; }
+   bool clearTp = (newTp < 0);
+   bool clearSl = (newSl < 0);
+   if(newTp <= 0 && newSl <= 0 && !clearTp && !clearSl) { err = "no tp or sl"; return false; }
 
    for(int i = 0; i < PositionsTotal(); i++)
    {
@@ -767,8 +826,8 @@ bool ExecModifyPosition(const string cmd, int &modified, string &err)
       bool isBuy = (posInfo.PositionType() == POSITION_TYPE_BUY);
       if(side == "buy"  && !isBuy) continue;
       if(side == "sell" &&  isBuy) continue;
-      double sl = (newSl > 0) ? newSl : posInfo.StopLoss();    // use cmd SL or keep existing
-      double tp = (newTp > 0) ? newTp : posInfo.TakeProfit();  // use cmd TP or keep existing
+      double sl = clearSl ? 0.0 : ((newSl > 0) ? newSl : posInfo.StopLoss());    // use cmd SL, clear (<0), or keep existing
+      double tp = clearTp ? 0.0 : ((newTp > 0) ? newTp : posInfo.TakeProfit());  // use cmd TP, clear (<0), or keep existing
       double curTp = NormalizeDouble(posInfo.TakeProfit(), digits);
       double curSl = NormalizeDouble(posInfo.StopLoss(), digits);
       double pt    = SymbolInfoDouble(sym, SYMBOL_POINT);
@@ -782,7 +841,7 @@ bool ExecModifyPosition(const string cmd, int &modified, string &err)
 //+------------------------------------------------------------------+
 //| Poll the queue, execute commands, build + POST the ack array.    |
 //+------------------------------------------------------------------+
-void PollAndExecute()
+void PollAndExecute(const string url)
 {
    //--- report live quote (rebasing) + open-state (cycle monitor): per-side counts
    //    and basket floating P&L drive the server-side exit triggers.
@@ -810,7 +869,7 @@ void PollAndExecute()
       gAccount, _Symbol, bid, ask, buys + sells, CountMyPendings(), buys, sells, SumMyPnL(),
       (int)stopsPts, point, acctBalance, acctEquity, magicsJson, bars5m, bars15m);
    string resp;
-   int code = HttpPost(InpBridgeURL + "/exec/poll", pollBody, resp);
+   int code = HttpPost(url + "/exec/poll", pollBody, resp);
    if(code != 200) return;
 
    //--- cache per-magic fulcrums (every poll, even with no commands) for the
@@ -922,9 +981,9 @@ void PollAndExecute()
 
    string ackBody = StringFormat("{\"account\":\"%s\",\"results\":[%s]}", gAccount, results);
    string ackResp;
-   int ackCode = HttpPost(InpBridgeURL + "/exec/ack", ackBody, ackResp);
+   int ackCode = HttpPost(url + "/exec/ack", ackBody, ackResp);
    if(ackCode != 200)
-      Print("⚠️  ack POST returned ", ackCode, " — commands executed but not confirmed: ",
+      Print("⚠️  ack POST (", url, ") returned ", ackCode, " — commands executed but not confirmed: ",
             StringSubstr(ackResp, 0, 200));
 }
 
@@ -1846,6 +1905,14 @@ void ClearDashboard()
    for(int r = 0; r <= 30; r++) ObjectDelete(0, DASH_PREFIX + IntegerToString(r));
 }
 
+//--- append one (url, magicBase) pair to the active-branch arrays.
+void AddBranch(const string url, const long magicBase)
+{
+   int n = ArraySize(gBridgeURLs);
+   ArrayResize(gBridgeURLs, n + 1); ArrayResize(gMagicBases, n + 1);
+   gBridgeURLs[n] = url; gMagicBases[n] = magicBase;
+}
+
 //+------------------------------------------------------------------+
 int OnInit()
 {
@@ -1855,27 +1922,44 @@ int OnInit()
 
    gAccount = IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN));
 
+   //--- build the active-branch list: slot 1 always on, slots 2/3 only if a URL
+   //    was given. Duplicate-base check is a startup safety net — running two
+   //    slots with the same magic base would make them silently fight over the
+   //    same positions.
+   ArrayResize(gBridgeURLs, 0); ArrayResize(gMagicBases, 0);
+   AddBranch(InpBridgeURL, InpMagic);
+   if(StringLen(InpBridgeURL2) > 0) AddBranch(InpBridgeURL2, InpMagic2);
+   if(StringLen(InpBridgeURL3) > 0) AddBranch(InpBridgeURL3, InpMagic3);
+   for(int a = 0; a < ArraySize(gMagicBases); a++)
+      for(int b2 = a + 1; b2 < ArraySize(gMagicBases); b2++)
+         if(gMagicBases[a] == gMagicBases[b2])
+            Print("⚠️  Branches ", a + 1, " and ", b2 + 1, " share magic base ",
+                  gMagicBases[a], " — they WILL collide. Fix FB_MAGIC_BASE on one server.");
+   gActiveMagicBase = gMagicBases[0];
+
    bool tradeAllowed = TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) &&
                        MQLInfoInteger(MQL_TRADE_ALLOWED);
    Print("─────────────────────────────────────────────");
-   Print("✅ FBExecBridge v1.05 — executor + labels + VP histogram + BB/squeeze pane + black panel (bars_5m/15m oldest-first fix)");
+   Print("✅ FBExecBridge v1.08 — multi-branch executor (up to 3) + labels + VP histogram + BB/squeeze pane + black panel");
    Print("    Account:   ", gAccount);
-   Print("    Bridge:    ", InpBridgeURL, "  (poll ", InpPollMs, "ms)");
-   Print("    Magic:     ", InpMagic, "..", InpMagic + InpMagicRange - 1, " (strategy×TF range)");
+   Print("    Branches:  ", ArraySize(gBridgeURLs), "  (poll ", InpPollMs, "ms, all branches per tick)");
    Print("    AutoTrade: ", tradeAllowed ? "✅ ENABLED" : "❌ DISABLED (Ctrl+E)");
    Print("    Token:     ", (InpToken == "" ? "none" : "set"));
 
-   //--- health probe: one poll (also surfaces a missing WebRequest whitelist
-   //    and seeds the server's venue-quote cache)
-   string resp;
-   int code = HttpPost(InpBridgeURL + "/exec/poll",
-                       StringFormat("{\"account\":\"%s\",\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f}",
-                                    gAccount, _Symbol,
-                                    SymbolInfoDouble(_Symbol, SYMBOL_BID),
-                                    SymbolInfoDouble(_Symbol, SYMBOL_ASK)), resp);
-   if(code == 200) Print("    Bridge health: ✅ reachable");
-   else            Print("⚠️  Bridge UNREACHABLE (code ", code,
-                         "). Whitelist the URL and start the Python server.");
+   //--- health probe: one poll per branch (also surfaces a missing WebRequest
+   //    whitelist and seeds each server's venue-quote cache)
+   for(int i = 0; i < ArraySize(gBridgeURLs); i++)
+   {
+      string resp;
+      int code = HttpPost(gBridgeURLs[i] + "/exec/poll",
+                          StringFormat("{\"account\":\"%s\",\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f}",
+                                       gAccount, _Symbol,
+                                       SymbolInfoDouble(_Symbol, SYMBOL_BID),
+                                       SymbolInfoDouble(_Symbol, SYMBOL_ASK)), resp);
+      Print("    Branch ", i + 1, ": ", gBridgeURLs[i], "  magic ", gMagicBases[i], "..",
+            gMagicBases[i] + InpMagicRange - 1,
+            code == 200 ? "  ✅ reachable" : StringFormat("  ⚠️ UNREACHABLE (code %d) — whitelist the URL and start its Python server.", code));
+   }
 
    //--- chart overlays: native 3σ Bollinger Bands on the price chart + the FBSqueeze
    //    BBW-percentile subwindow (visual twin of the server squeeze gate). OnDeinit
@@ -1934,9 +2018,19 @@ void OnTimer()
       }
    }
 
-   PollAndExecute();
+   //--- poll + execute EVERY active branch this tick, each scoped to its own magic
+   //    range. gActiveMagicBase is set per-iteration so IsMine()/counters/CloseAllMine
+   //    all filter correctly without needing to know about the loop themselves.
+   for(int b = 0; b < ArraySize(gBridgeURLs); b++)
+   {
+      gActiveMagicBase = gMagicBases[b];
+      PollAndExecute(gBridgeURLs[b]);
+   }
+   gActiveMagicBase = gMagicBases[0];   // restore branch-1 scope for zones/dashboard below
 
-   //--- redraw HVN/LVN zones on a slower cadence (they change per bar, not per tick)
+   //--- redraw HVN/LVN zones on a slower cadence (they change per bar, not per tick).
+   //    Branch 1 only — three overlapping zone sets on one chart isn't readable, and
+   //    this doesn't affect what trades, only what's drawn.
    if(InpDrawZones && TimeCurrent() - gLastZoneFetch >= InpZoneRefreshSec)
    {
       FetchAndDrawZones();
@@ -1945,6 +2039,7 @@ void OnTimer()
 
    //--- dashboard refreshes every poll: hedged loss tracks fills in near-real-time,
    //    while trigger/HVN come from the cached arm metadata (updated on zone fetch).
+   //    Branch 1 only, same reasoning as zone drawing above.
    UpdateDashboard();
 }
 

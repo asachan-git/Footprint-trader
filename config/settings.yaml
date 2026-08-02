@@ -63,19 +63,32 @@ monitor:
 # Planner reads these via .get() defaults — block is optional but canonical here.
 grid_levels:
 
-  # ── CRUDE JUN22 HVN-ROTATION SYSTEM (branched 2026-07-29) ─────────────────────
-  # Thesis: price travels HVN-to-HVN and rotates inside HVNs. One strategy
-  # (hvn_inside_touch), one TF (15m — the only TF net-positive across the real
-  # Jun22-Jul20 trade-level data), candle-close confirmation only (no touch-arm),
-  # Jun22-shaped exit stack. base_lot scaled 0.01->0.25 (25x) using the same
-  # methodology as 7991bc9's historical 25x scale-up: every $-denominated knob
-  # scales with lot size, every price-domain knob (min_tp_dist, step mults) does
-  # NOT. One deliberate deviation from literal Jun22: flatten_rest_enabled stays
-  # false — Jun22 never had this flag, but leaving the flatten-rest/leg_closed_other
-  # path active is the exact mechanism that dumped 6 buy legs for -$110k in under
-  # 4 seconds on 2026-07-14 (verified from the raw broker deal log). Broker-side
-  # hard SL is NOT yet implemented (still sl=0.0 on every leg) — this branch is
-  # config-only; do not treat it as live-ready until that lands separately.
+  # ── FINAL v1 (branched 2026-08-03 off feat/crude-hvn-rotation) ───────────────
+  # Setup list chosen from the ONLY four net-positive strat×TF cells across 616 live
+  # cycles (Jun22-Jul20, 4 accounts): hvn_inside_touch 15m (+1,058/cyc, 67%),
+  # hvn_inside_touch 5m (+432/cyc, 69% — best win rate in the dataset), lvn_edge_touch
+  # 15m (+1,007/cyc, 65%). hvn_edge 15m EXCLUDED: +258/cyc over 24 cycles whose worst
+  # single cycle (-7,421) exceeds its whole contribution, and it sign-flips by era.
+  # 240 cycles · +166,560 · +694/cyc · 68% win.
+  #
+  # Every FILTER tried against this system (squeeze, expansion, HTF expansion,
+  # CVD-divergence, coil-no-release) raised win rate and CUT total profit — the cycles
+  # they removed were profitable. Setup selection is the only lever that improved both.
+  # Do not re-add gates without re-reading docs/learnings_2026-07-30.md §23-§25.
+  # Inherited from the crude Jun22 HVN-rotation branch (2026-07-29):
+  # Thesis: price travels HVN-to-HVN and rotates inside HVNs. Candle-close confirmation
+  # only (no touch-arm), Jun22-shaped exit stack. base_lot scaled 0.01->0.25 (25x) using
+  # 7991bc9's methodology: every $-denominated knob scales with lot size, every
+  # price-domain knob (min_tp_dist, step mults) does NOT.
+  #
+  # flatten_rest_enabled stays FALSE, deviating from literal Jun22 (which had no such
+  # flag, so the code default True applied — every one of the 616 historical cycles ran
+  # with leg-TP-closes-cycle ACTIVE). Two reasons it stays off: the flatten-rest /
+  # leg_closed_other path is what dumped 6 buy legs for -$110k in under 4 seconds on
+  # 2026-07-14, and leg_tp as a full-cycle exit measured 20% win / -21.5 mean over 44
+  # live exits. The cost of turning it off — no loss-side exit at all — is now covered
+  # by disaster_sl_usd (broker-side) and cycle_max_loss_usd (server-side), both below.
+  # Do NOT set it true again without restoring one of those.
   # ── TUNING (adjust frequently based on account size / market conditions) ─────
   # Position sizing
   base_lot: 0.25          # smallest leg lot; ladder scales up by lot_step per leg
@@ -94,21 +107,34 @@ grid_levels:
   hvn_max_legs_by_tf: {}   # empty → flat hvn_max_legs (below) — Jun22 never had a per-TF leg map
   mean_rev_step_mult: 0.50    # step = this × ATR between legs (BTC Jun22 flat value)
   mean_rev_step_mult_by_tf: {}   # empty → flat 0.50 all TFs (was inverted per-TF, over-tight on higher TFs)
+  # Absolute CEILING on step ($). NOT a floor — per-TF live data inverts: 15m does best
+  # with step <2.0 (+1,258/cyc, 73%) while 5m does best at 2.0-3.5 (+901/cyc, 75%), so a
+  # floor would push 15m's best band into a worse one. The 3.5-5.0 band is the weakest on
+  # BOTH TFs (15m +40, 5m -104) — hence a ceiling only. 0 = off.
+  mean_rev_step_max_usd: 3.50
 
   # Cycle profit target — primary basket exit (net floating ≥ target → CLOSE_ALL).
   # Flat, not per-TF: only 15m is live in this system, so a by_tf map is pure noise.
   # 1250 = 25x scale of the 0.01-lot-era 50.0 flat target (7991bc9 precedent).
-  cycle_net_target_by_tf: {}   # empty on purpose — single active TF, flat target below owns it
-  cycle_net_target_usd: 1250.0
+  # Per-TF now that 15m AND 5m are live. 5m = 15m x 0.55, the measured ATR ratio at
+  # actual arm times (5m median ATR 4.02 / 15m 7.25). Both knobs are $-denominated, so a
+  # flat value silently means something different on each TF.
+  cycle_net_target_by_tf: {15m: 1250.0, 5m: 690.0}
+  cycle_net_target_usd: 1250.0   # fallback for any TF absent from the map above
 
   # Bias trail — arms when peak floating ≥ activate, fires on giveback% retrace.
-  bias_trail_activate_by_tf: {}   # empty → flat bias_trail_activate_usd below, Jun22-style
+  bias_trail_activate_by_tf: {15m: 250.0, 5m: 140.0}   # same 0.55 ATR ratio as net_target
   bias_trail_giveback_pct: 40    # Jun22 exact value
   bias_book_frac: 0.5            # Jun22 exact value — keep a BE runner
 
   # Squeeze multiplier — when a cycle was armed on a confirmed squeeze (squeeze_ok=True),
   # scale up targets so the system holds the runner longer into the expansion move.
-  squeeze_target_mult: 2.0       # multiply cycle_net_target when squeeze_ok (Jun19: no mult — 2.0 stranded winners e.g. 1m +1000 vs target 2000)
+  # 1.0 (2026-08-03) — was 2.0. Doubling net_target on coiled-armed cycles demanded 2x
+  # from the WORST cohort: learnings §25 measured squeeze-armed cycles at 58% win (vs 70%
+  # expanding) and a 4.3% TP-hit rate, so the multiplier pushed them toward a flatten
+  # exit instead of a target. INFERENCE, not a measured isolation — revert to 2.0 if the
+  # coiled cohort starts stranding.
+  squeeze_target_mult: 1.0       # multiply cycle_net_target when squeeze_ok
   squeeze_trail_mult: 1.0        # multiply bias_trail_activate when squeeze_ok
 
   # Runtime expansion upgrade — flip squeeze_ok=True on a live cycle when expansion fires:
@@ -150,6 +176,33 @@ grid_levels:
   # at 9590331. false = committed side can't be stopped out; net_target/full_hedge own the exit.
   # (This is the gap a real broker-side SL needs to fill — see the branch header note above.)
   defer_sl_on_half_fill: false
+  # Broker-side DISASTER stop, placed with every leg at order time ($ per oz from that
+  # leg's OWN entry). This is the gap defer_sl_on_half_fill leaves open: every
+  # server-side exit (net_target/bias_trail/full_hedge) dies with the server, and the
+  # deferred SL above is both OFF and server-side. This one is broker-native — it
+  # survives a bridge/terminal freeze, which is the case it exists for.
+  #
+  # Sized from ladder-span data (learnings §18, 832 same-side records, golden run):
+  # cycles that RECOVERED had max span 15.4, p99 12.2. At $20 the count of recovering
+  # sides that would have been cut is ZERO — it is a disaster bound, not a strategy
+  # stop, and in normal operation must never fire. At base_lot 0.25 → $500/leg,
+  # ~$3,000 per fully-filled 6-leg side.
+  #
+  # NOT a gap defence: Jul14 was +63pt in one minute; a $20 stop triggers inside the
+  # gap and fills at the far side. Only position size defends against that (§18).
+  # 0.0 disables.
+  disaster_sl_usd: 20.0
+  # HARD per-cycle loss cap ($ floating). The grid's only SERVER-side bounded loss exit;
+  # circuit_breaker_r / max_dd_r live under `risk:` and are read ONLY by hedge_manager
+  # and router — never by this path. Before this, the sole loss exits were full_hedge
+  # (which needs BOTH sides fully loaded, i.e. it fires after the damage) and the broker
+  # SL above. Live proof (07-29→08-01): 25 cycles booked +4,545 on the trail and ONE lost
+  # -10,424 on full_hedge — 96% win rate, net NEGATIVE.
+  # Shipped WIDE at 2x net_target and deliberately NOT tuned: cycle logs carry only final
+  # P&L, so cycles that dipped past a cap and recovered are invisible and the right value
+  # cannot be backtested. The new `trough` field logs running-min floating P&L per cycle;
+  # set this from that data in ~2 weeks. 0.0 disables.
+  cycle_max_loss_usd: 2500.0
   # ─────────────────────────────────────────────────────────────────────────────
 
   tp_atr_mult: 1.5
@@ -177,20 +230,20 @@ grid_levels:
   # structure. The basket net_target stays primary (it's closer → fires first in the
   # common case); the leg TP is the backstop. false = truly TP-less legs.
   leg_tp_ceiling: true
-  # HVN inside-touch reversion bias: a rejection at an edge is a fade INTO the node, so
-  # skew lots to the into-node side + target POC on that side (breakout side stays light,
-  # far next-HVN target). Directional inventory → a net-profit exit price exists. false =
-  # symmetric HVN→HVN straddle.
-  # 2026-07-21: flipped to FALSE — the POC snap (grid_planner.py:754-763) was OVERWRITING
-  # the next-HVN far-edge TP on the fade side at arm time. HVN-edge is the better target
-  # and is already what the REFRESH path computes (it never reads this flag), so arm and
-  # refresh now agree instead of TP silently shifting on the first poll.
-  # COUPLED EFFECT (accepted): also drops the weight-2 fade-skew vote (grid_planner.py:373)
-  # → possibly no +1 leg / different favoured side. Watch that hvn_inside_touch cycles do
-  # not collapse to symmetric buy_n==sell_n, which is net-neg at any single exit under
-  # net_profit_exit_only. Revert to true, or split into a separate hvn_reversion_tp_poc
-  # key, if the lost skew hurts more than the farther TP helps.
-  hvn_reversion_bias: true        # ON (2026-07-28, user) — fade-side skew +2 vote / +1 leg into node, POC TP on reversion side
+  # HVN inside-touch reversion bias: a rejection at an edge is a fade INTO the node.
+  # SPLIT INTO TWO KEYS 2026-08-03 — they used to ride together, so you could not keep
+  # the directional read without also taking the POC TP snap.
+  #   hvn_reversion_bias   → the ±2 fade-side skew vote (_resolve_skew). Note the
+  #     +1-leg asymmetry it once carried was disabled 2026-07-28 (446caed); _build_legs
+  #     now forces buy_n == sell_n, so this only feeds TP context / _opposing_swing_range.
+  #   hvn_reversion_tp_poc → the POC TP snap on the fade side, now OFF by default.
+  # Why the snap is off: it overwrites the next-HVN far-edge TP at arm, and the REFRESH
+  # path never reads the flag — so arm and refresh disagree and the TP shifts on the
+  # first poll. POC also sits INSIDE the node, i.e. nearer than the far edge, so the snap
+  # systematically SHORTENS the fade TP; learnings §20 measured the short-TP band at
+  # -67,002 across 1,094 positions. Reasoned, not isolated-measured.
+  hvn_reversion_bias: true        # skew vote only (2026-07-28, user)
+  hvn_reversion_tp_poc: false     # POC TP snap — OFF (2026-08-03)
   # Wick proximity buffer for hvn_inside_touch: fire if wick came within this many price
   # units of the edge even without crossing it (e.g. 0.5pt catches near-misses on gold).
   # 0.0 = exact touch only (original behaviour). Edge is still the fulcrum price.
@@ -309,16 +362,39 @@ grid_levels:
   flatten_rest_enabled: false   # OFF, deliberately NOT Jun22-literal — see branch header note:
                                  # this is the leg_closed_other mass-flatten path, verified as the
                                  # exact mechanism behind the -$110k Jul14 buy-side dump.
-  bias_trail_activate_usd: 166.75   # 25x scale of the 0.01-lot-era 6.67 (Jun22 $5 logic). Flat all TFs.
-  # ── Active trigger list — CRUDE: one strategy, one TF, on purpose.
-  # Every other kind (hvn_edge, candle_sweep, lvn_edge_touch, hvn_displacement, squeeze,
-  # vp_level_touch) removed rather than disabled — this branch is meant to be read in full
-  # in under a minute. Re-add deliberately, one at a time, with real data behind each.
+  # 2026-07-30: re-derived in ATR/lot units instead of the inherited fixed-$ figure.
+  #   activate = k · ATR(tf) · base_lot · contract · expected_legs
+  #            = 0.5 · 5.0    · 0.25     · 100      · 4   = 250
+  # Rationale (docs/learnings_2026-07-30.md §19): this knob took EIGHT different values
+  # (5 → 750 → 1000 → 500 → 250 → 200 → 10 → 166.75) because a fixed dollar threshold
+  # silently changes meaning every time base_lot or volatility moves. Expressed against
+  # ATR × lot it is scale-free. 15m ATR(14) measured 5.00 over Jul06-13.
+  # Trail books were profitable at EVERY historical setting (+30k..+68k/day); 40% giveback
+  # had the best per-book average (+1,181 vs +875 at 50%), so giveback stays 40.
+  bias_trail_activate_usd: 250.0
+  # ── Active trigger list — the two setups that made money, 15m only.
+  # Derived 2026-07-30 from the broker Positions table of live account 32255364
+  # (3,959 positions, Jul06-20) — see docs/learnings_2026-07-30.md §3:
+  #   hvn_inside_touch  15m  +29,010   |  1m −27,462  5m +9,311
+  #   lvn_edge_touch    15m  +23,956   |  1m  −9,170  5m −6,846
+  #   hvn_edge          −45,838 lifetime (5m −41,742)   → NOT re-added
+  #   candle_sweep      −53,102 lifetime (5m −46,377)   → NOT re-added
+  #   hvn_displacement   −4,332 / 11 positions          → NOT re-added
+  #   squeeze            −1,735 / 36 positions          → NOT re-added
+  # 15m is the ONLY net-positive TF on the whole account (+39,396 vs 1m −36,522,
+  # 5m −88,859). Win rates were 60-66% on every strategy AND every TF — the
+  # difference is loss magnitude, not hit rate: a 15m node is wide enough that the
+  # ladder spans real price and reversion has room before a side fully commits.
   triggers:
     - kind: hvn_inside_touch
-      tfs: [15m]
+      tfs: [15m, 5m]
       # touch_only omitted (defaults false) → candle-close confirmation only. Jun22 had no
       # intrabar touch-arm mechanism at all; this system doesn't reintroduce one.
+    - kind: lvn_edge_touch
+      tfs: [15m]
+      # touch_only omitted deliberately → candle-close, same as above. Live history ran
+      # this touch_only:true from 07-07; keeping it bar-close here matches the Jun22
+      # confirmation regime (the highest win-rate era, 78% on 06-22).
   candle_sweep_cooldown_bars: 0   # 0 = NO post-arm cooldown (2026-07-09: user "no cooldown"); default was 3 → 45min lockout on 15m suppressed fresh sweeps
   touch_arm_confirm_ticks: 0      # 0 = NO reversal wait — arm on the raw edge tap (2026-07-10, user)
   # lvn_edge_touch tap tolerances — mirror hvn_touch_buffer/_pct/hvn_lookback_bars but

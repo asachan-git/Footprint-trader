@@ -32,15 +32,19 @@
 #property copyright "Aniket"
 #property version   "1.10"
 #property strict
-// FBExecBridge_Jul09 — pre-set for feat/jul09-restored-skew, port 5002, magic base 772000.
+// FBExecBridge_Final — pre-set for feat/final-v1, port 5004, magic base 774000.
 // Single-branch config (URL2/3 left blank); attach directly, no input editing needed.
+// Magic base 774000 is distinct from every other branch (crude 770000, jul06 771000,
+// jul09 772000, jun22exact 773000) so this EA can run alongside them during cutover
+// without ever touching their orders — MagicMatch scopes to [base, base+range).
+// Server must be launched with FB_MAGIC_BASE=774000 on port 5004 to match.
 
 #include <Trade\Trade.mqh>
 #include <Trade\OrderInfo.mqh>
 #include <Trade\PositionInfo.mqh>
 
-input string InpBridgeURL   = "http://127.0.0.1:5002"; // Branch 1 bridge URL (whitelist host!)
-input int    InpMagic       = 772000;                  // Branch 1 magic BASE (server FB_MAGIC_BASE must match)
+input string InpBridgeURL   = "http://127.0.0.1:5004"; // Branch 1 bridge URL (whitelist host!)
+input int    InpMagic       = 774000;                  // Branch 1 magic BASE (server FB_MAGIC_BASE must match)
 input string InpBridgeURL2  = "";                       // Branch 2 bridge URL — blank = disabled (single-branch mode)
 input int    InpMagic2      = 771000;                   // Branch 2 magic BASE
 input string InpBridgeURL3  = "";                       // Branch 3 bridge URL — blank = disabled
