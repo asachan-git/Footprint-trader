@@ -76,12 +76,17 @@ grid_levels:
   lot_step: 0.25           # lot increment per leg (leg_i = base + i×step, capped at max_lots)
   max_lots: 1.0            # matches crude-hvn-rotation's cap
 
-  hvn_max_legs_by_tf: {1m: 5, 5m: 7, 15m: 9, 1h: 7}   # Jul09 value — widened from Jul08, see note above
+  # 2026-08-03: narrowed from the original Jul09 {5,7,9,7} to jul06's {4,5,6,7} — the
+  # widened map was in force during the account's worst historical drawdown stretch
+  # (07-08→07-10, DD 44,707→56,257, docs/learnings_2026-07-30.md §12). jul09 is
+  # currently profitable WITH that same widened map active — this removes that risk
+  # rather than waiting to find out if it repeats.
+  hvn_max_legs_by_tf: {1m: 4, 5m: 5, 15m: 6, 1h: 7}
   mean_rev_step_mult: 0.50
   mean_rev_step_mult_by_tf: {}
 
-  cycle_net_target_by_tf: {1m: 2000.0, 5m: 4000.0, 15m: 7500.0, 1h: 3000.0}   # Jul09 value
-  cycle_net_target_usd: 10000.0   # fallback when TF not in by_tf map
+  cycle_net_target_by_tf: {1m: 500.0, 5m: 1000.0, 15m: 1875.0, 1h: 750.0}   # Jul09 value ÷4 (base_lot 1.0→0.25, 2026-07-30)
+  cycle_net_target_usd: 2500.0   # fallback when TF not in by_tf map, ÷4
 
   bias_trail_activate_by_tf: {}   # empty → flat bias_trail_activate_usd below (Jul07 emptied this map)
   bias_trail_giveback_pct: 40    # Jul09 value (Jul10 later loosens this to 50)
@@ -287,7 +292,7 @@ grid_levels:
   # profit the net-basket exit masks (a hedge leg drags net down → target never hits).
   bias_trail_enabled: true      # Jul09 value
   flatten_rest_enabled: false   # deliberate deviation, not Jul09-literal — see branch header
-  bias_trail_activate_usd: 1000   # Jul09 value (750→1000 that day), flat across TFs
+  bias_trail_activate_usd: 250    # lowered from 1000, 2026-07-30 (user)
   # ── Active trigger list — Jul09 shape: hvn_inside_touch, hvn_edge, candle_sweep,
   # lvn_edge_touch (added Jul07) all live. hvn_displacement didn't exist yet (Jul10).
   triggers:
