@@ -41,8 +41,13 @@ instrument:
 # Footprint-driven neutral-grid placement (/exec/emit_grid + FBExecBridge EA).
 # Planner reads these via .get() defaults — block is optional but canonical here.
 grid_levels:
-  base_lot: 0.01
-  lot_step: 0.01
+  # SIZING CHANGE (2026-08-03, user) — 25x scale up from literal Jun22 (0.01), matching
+  # the same methodology used for crude/final-v1's own scale-up. lot_step scaled
+  # identically (not requested explicitly, but leaving it at 0.01 against a 0.25 base_lot
+  # would flatten the ladder to near-uniform sizing, breaking the Jun22 leg-shape this
+  # branch exists to preserve).
+  base_lot: 0.25
+  lot_step: 0.25
   tp_atr_mult: 1.5
   hvn_max_legs: 8
   max_fulcrum_dist_pct: 0.05
@@ -75,7 +80,7 @@ grid_levels:
   htf_bias_map: {1m: "15m", 5m: "15m", 15m: "1h", 1h: "4h"}
   bb_edge_enabled: true
   bb_edge_sigma: 2.5
-  cycle_net_target_usd: 50.0      # base net floating-$ target; tune on demo (micro-lot swings are small)
+  cycle_net_target_usd: 2000.0    # SIZING CHANGE (2026-08-03, user) — was 50.0 (40x, not the 25x lot ratio)
   cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full
   cycle_min_target_usd: 0.20     # floor; must be >0 so a hedged cycle still has a positive net-$ exit
   cycle_close_on_full_hedge: true  # cut a fully-hedged (delta-neutral) cycle to free margin
@@ -84,7 +89,7 @@ grid_levels:
   # that side and move the rest to breakeven (risk-free runner). Captures directional
   # profit the net-basket exit masks (a hedge leg drags net down → target never hits).
   bias_trail_enabled: true
-  bias_trail_activate_usd: 5.0   # bias-side floating must PEAK ≥ this ($) to arm the trail
+  bias_trail_activate_usd: 200.0  # SIZING CHANGE (2026-08-03, user) — was 5.0 (40x, not the 25x lot ratio)
   bias_trail_giveback_pct: 40    # fire when floating retraces this % off the peak
   bias_book_frac: 0.5            # fraction of the bias side's positions to book at the trigger
   # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
