@@ -722,6 +722,21 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
         # TP/bias-trail state are never touched. No same-fulcrum dedup here: this isn't
         # "re-arming the same level", it's replacing the side that just closed.
         flat_side = "sell" if buy_live else "buy"
+        # COOLDOWN (2026-08-03): a backfilled ladder carries no trail history of its own —
+        # only whatever placement-time SL exists (disaster_sl_usd). Real incident: magic
+        # 774013 booked via bias_trail, backfilled 12 minutes later, and the fresh ladder
+        # reversed into a loss the trail couldn't catch (see execution/exec_bridge.py's
+        # reversal_cut for the other half of this fix). Block the backfill for a window
+        # after that side's last book so a continuing move has time to show itself before
+        # fresh, trail-less size commits. 0 disables (immediate re-arm, prior behavior).
+        _cooldown_s = float((settings.get("grid_levels") or {}).get("side_rearm_cooldown_s", 0.0) or 0.0)
+        if _cooldown_s > 0:
+            _last_book_ts = float(_cyc.get(f"last_book_ts_{flat_side}") or 0.0)
+            if _last_book_ts > 0 and (clock.now() - _last_book_ts) < _cooldown_s:
+                LOG.info(f"[exec] TOUCH-ARM-SIDE {account} {broker_symbol} {tf} → "
+                        f"skip: {flat_side} re-arm on cooldown "
+                        f"({clock.now() - _last_book_ts:.0f}s of {_cooldown_s:.0f}s)")
+                return
         min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
         # RE-ANCHOR TO ORIGINAL FULCRUM (2026-07-10, user): the backfilled side must straddle
         # the SAME center as the still-live side, else the two ladders bracket different prices
@@ -962,6 +977,16 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
 
     if (buy_live or sell_live) and _cyc.get("active"):
         flat_side = "sell" if buy_live else "buy"
+        # COOLDOWN (2026-08-03) — mirrors the hvn_inside_touch backfill gate above; see
+        # that block's comment for the incident this addresses.
+        _cooldown_s = float((settings.get("grid_levels") or {}).get("side_rearm_cooldown_s", 0.0) or 0.0)
+        if _cooldown_s > 0:
+            _last_book_ts = float(_cyc.get(f"last_book_ts_{flat_side}") or 0.0)
+            if _last_book_ts > 0 and (clock.now() - _last_book_ts) < _cooldown_s:
+                LOG.info(f"[exec] TOUCH-ARM-SIDE-LVN {account} {broker_symbol} {tf} → "
+                        f"skip: {flat_side} re-arm on cooldown "
+                        f"({clock.now() - _last_book_ts:.0f}s of {_cooldown_s:.0f}s)")
+                return
         min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
         # RE-ANCHOR to original fulcrum (same fix as hvn_inside_touch side-rearm) — keep the
         # backfilled side symmetric with the still-live side; ladder-span gate skips if too far.

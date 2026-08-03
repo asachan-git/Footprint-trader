@@ -1126,7 +1126,8 @@ class ExecBridge:
                 # bias_booked stays cycle-wide (flatten-rest suppression, reset below).
                 cls.set_last_arm(account, symbol, magic=magic,
                                  **{**cyc, "bias_side": bias, "bias_booked": True,
-                                    "bias_peak": 0.0, f"bias_trail_done_{bias}": True})
+                                    "bias_peak": 0.0, f"bias_trail_done_{bias}": True,
+                                    f"last_book_ts_{bias}": t})
                 _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
                                   "tf": tf, "magic": magic, "exit_reason": "bias_book_trail",
                                   "bias": bias, "peak": round(peak, 2),
@@ -1141,6 +1142,43 @@ class ExecBridge:
                                     pnl_at_exit=round(net_pnl, 2), book_frac=book_frac,
                                     buys=buys, sells=sells)
                 return "bias_book_trail"   # cycle continues (runner + hedge); no flatten
+
+        # REVERSAL CUT (2026-08-03) — closes the gap the trail's own `net_pnl > 0` floor
+        # leaves open. Real incident: magic 774013 booked +323.75 via bias_trail (peak
+        # 758, correctly retraced and fired), then the side-only re-arm backfilled a
+        # fresh ladder on the same side 12 minutes later (see server/routes/
+        # exec_bridge.py's harvest-loop cooldown, added alongside this). That fresh
+        # ladder reversed and the cycle round-tripped to -2545.75 before cycle_max_loss_
+        # usd finally caught it — net_pnl crossed from positive straight past the trail's
+        # giveback window into negative in one poll, and once net_pnl <= 0 the trail's
+        # own guard (deliberately, so it never books a loss as a fake profit-lock) will
+        # not fire again. Nothing managed the cycle in that gap.
+        #
+        # This targets ONLY that specific shape: a cycle that has ALREADY booked at
+        # least once this cycle (bias_trail_done_buy or _sell — set once at fire time,
+        # never cleared until a fresh arm) and has now given ALL of it back plus gone
+        # negative. A cycle that never won doesn't qualify here — that's what
+        # cycle_max_loss_usd (below) still owns, unchanged, as the wide backstop for a
+        # cycle that was never ahead.
+        if (reason is None and bool(grid_cfg.get("reversal_cut_enabled", True))
+                and (cyc.get("bias_trail_done_buy") or cyc.get("bias_trail_done_sell"))
+                and buy_pnl is not None and sell_pnl is not None):
+            _rev_net_pnl = float(buy_pnl) + float(sell_pnl)
+            _rev_floor = float(grid_cfg.get("reversal_cut_usd", -50.0) or -50.0)
+            if _rev_net_pnl <= _rev_floor:
+                reason = "reversal_cut"
+                cls.enqueue(account, CLOSE_ALL, symbol,
+                            comment="FB|flatten|reversal_cut", magic=magic, now=t)
+                cls.set_last_arm(account, symbol, magic=magic, **{**cyc, "flatten_ts": t})
+                _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
+                                  "tf": tf, "magic": magic, "exit_reason": "reversal_cut",
+                                  "net_pnl": round(_rev_net_pnl, 2),
+                                  "squeeze_ok": cyc.get("squeeze_ok"),
+                                  "squeeze_rank": cyc.get("squeeze_rank")})
+                _emit_cycle_outcome(cyc, account=str(account), symbol=symbol, magic=magic,
+                                    tf=tf, exit_reason="reversal_cut", partial=False,
+                                    pnl_at_exit=round(_rev_net_pnl, 2), buys=buys, sells=sells)
+                return "reversal_cut"
 
         # 1) net-$ target — the whole basket (this magic = this TF cycle) is floating
         # ≥ its effective target. Base target is per-TF (cycle_net_target_by_tf, keyed by

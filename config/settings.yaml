@@ -203,6 +203,26 @@ grid_levels:
   # cannot be backtested. The new `trough` field logs running-min floating P&L per cycle;
   # set this from that data in ~2 weeks. 0.0 disables.
   cycle_max_loss_usd: 2500.0
+  # REVERSAL CUT (2026-08-03), ON by default — closes the specific gap cycle_max_loss_usd
+  # left open. Real incident: magic 774013 booked +323.75 via bias_trail (a real win),
+  # then round-tripped to -2545.75 before the wide $2500 cap caught it — the trail's own
+  # `net_pnl > 0` floor (deliberately, so it never books a loss as a fake profit-lock)
+  # refuses to fire once net_pnl goes negative, so nothing managed the cycle in between.
+  # Fires ONLY for a cycle that has ALREADY booked at least once (bias_trail_done_buy/
+  # _sell) and has now given it all back plus gone slightly negative — NOT a cycle that
+  # was never ahead, which cycle_max_loss_usd (above) still owns unchanged as the wide
+  # backstop. reversal_cut_usd is a small negative buffer, not the -2500 cap distance.
+  reversal_cut_enabled: true
+  reversal_cut_usd: -50.0
+  # SIDE-ONLY RE-ARM COOLDOWN (2026-08-03) — the harvest-loop backfill (server/routes/
+  # exec_bridge.py _touch_arm_tf / _lvn_touch_arm_tf) replaces a side's ladder with a
+  # FRESH one carrying no trail history, only whatever placement-time SL exists
+  # (disaster_sl_usd). Same real incident: the backfill fired 12 minutes after the book,
+  # into a ladder that then lost. This doesn't remove the backfill (it's how a winning
+  # side keeps riding a continuing move — see magic 774133's +1428 net_target win the
+  # same session) — it just blocks it immediately after a book, giving the move time to
+  # show it's continuing before committing fresh, unprotected-by-trail size.
+  side_rearm_cooldown_s: 1800.0
   # ─────────────────────────────────────────────────────────────────────────────
 
   tp_atr_mult: 1.5
@@ -558,11 +578,12 @@ execution:
   broker_utc_offset_hours: 3      # Vantage server time = UTC+3 (EET); used to shift CVD arrow timestamps
   tradable_symbols: [XAUTUSDT, BTCUSDT]
   symbol_map:
-    # DEMO VALIDATION PHASE (2026-07-29): account 25798248 confirmed demo by user. Pointed
-    # at XAUUSD+ to match what's actually connected right now — proving out the crude Jun22
-    # HVN-rotation system here before any real capital. Flip to "XAUUSD.pc" (the real USC
-    # cent account symbol) only once the EA is re-attached to the real account's chart.
-    XAUTUSDT: "XAUUSD+"
+    # LIVE (2026-08-03): EA re-attached to the real account (24678823), USC cent symbol
+    # XAUUSD.pc. Was XAUUSD+ during demo validation on 25798248 — flipped per the plan
+    # already noted here. Without this, venue-to-analysis rebasing reads analysis_ref=0
+    # for every quote (broker_symbol from the EA no longer matches this map's value),
+    # which breaks zone_shift and every HVN/LVN edge computed from it.
+    XAUTUSDT: "XAUUSD.pc"
     BTCUSDT:  "BTCUSD"
   # Risk-adjusted sizing: lots = (balance × risk_per_trade_pct) / (SL_distance × contract_size)
   # Set risk_per_trade_pct = 0 to disable; falls back to default_lots.
