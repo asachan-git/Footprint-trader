@@ -441,14 +441,48 @@ def _ladder(n: int, base_lot: float, lot_step: float, heavy_near_mid: bool) -> l
     return lots
 
 
+def _cvd_div_bias(symbol: str, tf: str, cfg: dict | None = None) -> str:
+    """CVD-divergence leg-count bias: bearish div -> "sell", bullish div -> "buy",
+    else "none". Re-enables the +1-leg asymmetry disabled 2026-07-28 (446caed), but
+    driven by CVD-div specifically rather than the hvn_reversion/htf_bias/bb_edge
+    skew vote — that vote still only affects TP context and _opposing_swing_range,
+    unchanged. Uses the same window/floor validated for the CVD gate (learnings §21:
+    window=30, min_delta=500 is where both June and July eras turn net-positive;
+    shorter windows fire on ~30% of bars and are noise)."""
+    cfg = cfg or {}
+    if not bool(cfg.get("cvd_div_leg_bias_enabled", False)):
+        return "none"
+    from pipeline.features.delta_divergence import from_store
+    window = int(cfg.get("cvd_div_leg_bias_window", 30) or 30)
+    min_delta = float(cfg.get("cvd_div_leg_bias_min_delta", 500.0) or 0.0)
+    d = from_store(symbol, tf, window=window)
+    if not d.fired or d.delta_vs_window < min_delta:
+        return "none"
+    if d.direction == "bearish":
+        return "sell"
+    if d.direction == "bullish":
+        return "buy"
+    return "none"
+
+
 def _build_legs(fulcrum: float, n: int, step: float, skew: str,
-                base_lot: float, lot_step: float) -> tuple[list[Leg], list[Leg]]:
+                base_lot: float, lot_step: float,
+                cvd_bias: str = "none") -> tuple[list[Leg], list[Leg]]:
     """fulcrum ± i·step prices. Favoured side gets the heavier/longer ladder."""
     buy_n = n
     sell_n = n
     # Skew's +1-leg asymmetry disabled (2026-07-28, user) — flat n both sides regardless
     # of skew direction. Skew still exists elsewhere (TP/vote context) but no longer
     # changes leg count.
+    #
+    # RE-ENABLED (2026-08-03), CVD-div-specific, config-gated off by default
+    # (cvd_div_leg_bias_enabled). Bearish div -> +1 sell leg; bullish div -> +1 buy leg.
+    # Deliberately NOT tied to the general skew vote that was disabled — this is a new,
+    # separately-measurable mechanism, not a silent revert of the 07-28 decision.
+    if cvd_bias == "buy":
+        buy_n = n + 1
+    elif cvd_bias == "sell":
+        sell_n = n + 1
 
     # Both sides increase with distance from fulcrum (light near mid, heavy far).
     buy_lots = _ladder(buy_n, base_lot, lot_step, heavy_near_mid=False)
@@ -736,7 +770,9 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         sell_legs = [Leg(price=round(_cl - i * step, 4), lot=_sell_lots[i])
                      for i in range(0, n)]
     else:
-        buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
+        cvd_bias = _cvd_div_bias(symbol, tf, grid_cfg)
+        buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step,
+                                          cvd_bias=cvd_bias)
 
     # TP cascade — BTC Jun22 regime + min_tp_dist guard. STRUCTURE over ATR:
     #   1) base    = outer leg ± tp_atr_mult·ATR, snapped to the nearest strong structural

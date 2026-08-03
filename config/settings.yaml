@@ -244,6 +244,15 @@ grid_levels:
   # -67,002 across 1,094 positions. Reasoned, not isolated-measured.
   hvn_reversion_bias: true        # skew vote only (2026-07-28, user)
   hvn_reversion_tp_poc: false     # POC TP snap — OFF (2026-08-03)
+  # CVD-divergence leg-count bias (2026-08-03), OFF by default. Re-enables the +1-leg
+  # asymmetry disabled 2026-07-28 (446caed), but driven by CVD-div specifically, not the
+  # hvn_reversion/htf_bias/bb_edge skew vote (which still only affects TP context, not
+  # leg count, unchanged). Bearish div -> +1 sell leg; bullish div -> +1 buy leg.
+  # window/min_delta match the CVD gate validated in learnings §21 (window=30 is where
+  # both June and July eras turn net-positive; shorter windows fire on ~30% of bars).
+  cvd_div_leg_bias_enabled: false
+  cvd_div_leg_bias_window: 30
+  cvd_div_leg_bias_min_delta: 500.0
   # Wick proximity buffer for hvn_inside_touch: fire if wick came within this many price
   # units of the edge even without crossing it (e.g. 0.5pt catches near-misses on gold).
   # 0.0 = exact touch only (original behaviour). Edge is still the fulcrum price.
