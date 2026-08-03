@@ -20,6 +20,7 @@ drops the queue — order intents are ephemeral); the audit log is durable.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -58,7 +59,13 @@ MOVE_BE = "MOVE_BE"              # move one side's positions' SL to breakeven (r
 # squeeze·1h = 770024. The EA owns the whole [MAGIC_BASE, MAGIC_BASE+99] range; the
 # tf is recoverable as magic % 10, so the server can attribute each EA-reported
 # position pool to the TF cycle that owns it (enables parallel per-TF cycles).
-MAGIC_BASE = 770000
+MAGIC_BASE = int(os.environ.get("FB_MAGIC_BASE", "770000"))
+# OPERATIONAL-ONLY CHANGE (2026-08-03, feat/jun22-literal) — literal Jun22 (9590331)
+# hardcoded 770000, colliding with feat/crude-hvn-rotation's magic range. Env-override
+# only, so this can run as a distinct branch without touching any live position under
+# 770000. Default unchanged (770000) if FB_MAGIC_BASE isn't set. No strategy/exit/TP/
+# sizing logic in this file was touched — see the branch's own commit for the complete,
+# minimal diff against 9590331.
 _STRAT_CODE = {
     "hvn_inside_touch": 1, "squeeze": 2, "vp_level_touch": 3, "imbalance": 4,
     "hvn_edge": 5, "anchor": 6, "va": 7, "cvd_div": 8,

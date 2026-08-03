@@ -180,7 +180,11 @@ execution:
   broker: vantage_mt5
   tradable_symbols: [XAUTUSDT, BTCUSDT]
   symbol_map:
-    XAUTUSDT: "XAUUSD+"
+    # OPERATIONAL-ONLY CHANGE (2026-08-03) — literal Jun22 pointed at XAUUSD+ (the old
+    # demo account symbol). Flipped to XAUUSD.pc to match the currently-live account
+    # (24678823). Without this, venue-to-analysis rebasing reads analysis_ref=0 for
+    # every quote — the exact bug found and fixed on final-v1 this same session.
+    XAUTUSDT: "XAUUSD.pc"
     BTCUSDT:  "BTCUSD"
   # Risk-adjusted sizing: lots = (balance × risk_per_trade_pct) / (SL_distance × contract_size)
   # Set risk_per_trade_pct = 0 to disable; falls back to default_lots.
