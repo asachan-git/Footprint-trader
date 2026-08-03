@@ -529,10 +529,12 @@ vp_cache:
   # Per-symbol daily session anchor. Two forms accepted:
   #   <int>             — static UTC hour (DST-naive; fine for 24/7 crypto)
   #   {tz, hour}        — local-time anchor, automatically DST-adjusted via zoneinfo
-  # XAUTUSDT anchor moved off CME's 18:00 ET open (22:00 UTC) to midnight UTC 2026-07-08.
+  # XAUTUSDT uses CME Gold's 18:00 ET session open:
+  #   EDT (Mar–Nov): 18:00 ET = 22:00 UTC = 03:30 IST next day
+  #   EST (Nov–Mar): 18:00 ET = 23:00 UTC = 04:30 IST next day
   session_start_utc:
     BTCUSDT: 0      # UTC 00:00 = IST 05:30 → session 05:30 IST – 05:29 IST (24h)
-    XAUTUSDT: 0     # UTC 00:00 = IST 05:30 → session 05:30 IST – 05:29 IST (24h)
+    XAUTUSDT: 22    # UTC 22:00 = IST 03:30 → session 03:30 IST – 02:30 IST next day (23h, CME EDT)
   # Tick-aligned VP bin width (institutional convention).
   # Falls back to range/68 if symbol not declared. Set in floats matching tick:
   #   XAU tick = 0.1 → 0.5 = 5-tick bins

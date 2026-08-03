@@ -49,6 +49,11 @@ def _vp_min_bars() -> int:
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
+# Symbols that legitimately trade through the weekend — everything else (gold via
+# Binance's XAUUSDT perp) is exempted from Sat/Sun VP builds since the real market
+# is closed and that volume doesn't reflect genuine price discovery.
+_ALWAYS_24_7 = {"BTCUSDT", "BTCUSD"}
+
 
 # Session anchor type:
 #   int               → static UTC hour (e.g. 0 for BTC) — DST-naive, fine for 24/7 markets
@@ -300,11 +305,21 @@ def build_and_save(
             sym_cache["bin_size"] = bin_size
         computed = 0
 
-        for days_back in range(5):
+        # 7 calendar days always contain exactly 5 weekdays (one full weekly cycle),
+        # so this still yields exactly 5 trading-day periods for non-24/7 symbols
+        # once weekends are excluded below.
+        for days_back in range(7):
             ts_for_day = now_ts - days_back * 86400
             date_key = _session_day_key(ts_for_day, anchor)
-            if date_key in sym_cache["daily"] and days_back > 0:
+            # Real gold is closed weekends; Binance's XAUUSDT perp keeps ticking, so a
+            # Sat/Sun session would be built from contaminated volume. Skip it entirely
+            # (crypto symbols trade 24/7 and are exempt).
+            if symbol.upper() not in _ALWAYS_24_7 and datetime.strptime(date_key, "%Y-%m-%d").weekday() >= 5:
+                sym_cache["daily"].pop(date_key, None)  # purge a stale pre-fix weekend entry, if any
                 continue
+            # Always recompute — a day cached mid-session (e.g. a restart during a feed
+            # gap) freezes a partial profile forever otherwise; the store may hold more
+            # real bars for that date by the time we start again.
             start_ts, end_ts = _day_bounds(date_key, anchor)
             vp = _compute_period_vp(all_bars, start_ts, min(end_ts, now_ts), bin_size=bin_size)
             if vp:
