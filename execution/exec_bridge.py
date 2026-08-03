@@ -1065,6 +1065,39 @@ class ExecBridge:
                 # Book whichever side is net-winning RIGHT NOW — the trail fired off
                 # combined P&L, but CLOSE_SIDE/MOVE_BE are inherently directional.
                 bias = "buy" if float(buy_pnl) >= float(sell_pnl) else "sell"
+
+                # FULL-CLOSE variant (2026-08-03), config-gated, OFF by default. Same
+                # net-pnl giveback trigger as the partial-book path above, but instead
+                # of CLOSE_SIDE+MOVE_BE (cycle continues), CLOSE_ALL the whole cycle here
+                # — tagged with its own exit_reason so it is never conflated with
+                # net_target (whole-basket ≥ target) or the partial bias_book_trail rows.
+                #
+                # HISTORY: a whole-cycle-collapse variant of this trail was tried before
+                # (c34949b, 2026-07-24) and reverted the SAME DAY back to partial-book,
+                # which was then locked in by a test (tests/execution/test_monitor_cycle_
+                # cv.py asserts CLOSE_ALL only for cv_trail, a different/unrelated path —
+                # nothing here re-touches that assertion). No documented reason for the
+                # revert survives beyond "reverted"; this is a fresh, separately-tagged
+                # attempt, not a blind repeat — measure before trusting it.
+                if bool(grid_cfg.get("bias_trail_full_close", False)):
+                    cls.enqueue(account, CLOSE_ALL, symbol,
+                                comment=f"FB|flatten|net_pnl_trail_close", magic=magic, now=t)
+                    cls.set_last_arm(account, symbol, magic=magic,
+                                     **{**cyc, "flatten_ts": t})
+                    _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
+                                      "tf": tf, "magic": magic,
+                                      "exit_reason": "net_pnl_trail_close",
+                                      "bias": bias, "peak": round(peak, 2),
+                                      "net_pnl": round(net_pnl, 2),
+                                      "squeeze_ok": cyc.get("squeeze_ok"),
+                                      "squeeze_rank": cyc.get("squeeze_rank")})
+                    _emit_cycle_outcome(cyc, account=str(account), symbol=symbol,
+                                        magic=magic, tf=tf,
+                                        exit_reason="net_pnl_trail_close", partial=False,
+                                        bias=bias, peak=round(peak, 2),
+                                        pnl_at_exit=round(net_pnl, 2),
+                                        buys=buys, sells=sells)
+                    return "net_pnl_trail_close"
                 cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic, side=bias,
                             frac=book_frac, comment=f"FB|book|{bias}", now=t)
                 cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=bias,

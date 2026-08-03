@@ -359,6 +359,13 @@ grid_levels:
   # that side and move the rest to breakeven (risk-free runner). Captures directional
   # profit the net-basket exit masks (a hedge leg drags net down → target never hits).
   bias_trail_enabled: true      # ON — Jun22 had this on ($5 activate / 40% giveback / half-book)
+  # NEW (2026-08-03), OFF by default: when the net-pnl giveback trigger fires, CLOSE_ALL
+  # the whole cycle instead of CLOSE_SIDE+MOVE_BE (which books a fraction and continues).
+  # Tagged exit_reason "net_pnl_trail_close" so it is never conflated with net_target
+  # (only fires on a whole-basket ≥ target, different trigger) or the default partial
+  # bias_book_trail rows. A whole-cycle version of this was tried once before (c34949b,
+  # 07-24) and reverted same day; measure this before trusting it — see exec_bridge.py.
+  bias_trail_full_close: false
   flatten_rest_enabled: false   # OFF, deliberately NOT Jun22-literal — see branch header note:
                                  # this is the leg_closed_other mass-flatten path, verified as the
                                  # exact mechanism behind the -$110k Jul14 buy-side dump.
