@@ -125,6 +125,12 @@ def create_app(settings: dict | None = None, start_background: bool = True) -> F
         except Exception as e:
             import logging as _l
             _l.getLogger(__name__).warning(f"[startup] gap-monitor failed to start (non-fatal): {e}")
+        try:
+            from execution.peak_audit import start as _start_peak_audit
+            _start_peak_audit(settings)
+        except Exception as e:
+            import logging as _l
+            _l.getLogger(__name__).warning(f"[startup] peak-audit failed to start (non-fatal): {e}")
     app.register_blueprint(health_bp)
     app.register_blueprint(ingest_bp)
     app.register_blueprint(decide_bp)

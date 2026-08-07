@@ -51,6 +51,15 @@ monitor:
                                    # (a multi-day hole = cold-start; use scripts/backfill_binance.py)
   # gap_alert_secs: 180            # override: stall threshold (default 3× the primary-TF period)
   # gap_check_secs: 30             # override: how often to poll feed health
+  # peak-tracking audit (2026-08-07) — independent watchdog, separate broker query on its
+  # own cadence, re-verifies sidefull_trail/bias_trail's own recorded peak so a stale
+  # source (or a future bug in the peak-update path itself) surfaces as a loud alert
+  # instead of a silently-missed exit. See execution/peak_audit.py. Alert-only, never
+  # mutates arm state.
+  peak_audit_enabled: true
+  peak_audit_interval_s: 15
+  peak_audit_tolerance_usd: 20     # min $ divergence before flagging (floor for small peaks)
+  peak_audit_tolerance_pct: 0.05   # or 5% of the audited peak, whichever is larger
   # backfill_feeds:                # override store_symbol → Binance fetch symbol + price bucket
   #   XAUTUSDT: {binance_symbol: XAUUSDT, price_step: 0.1}
   #   BTCUSDT:  {binance_symbol: BTCUSDT, price_step: 1.0}

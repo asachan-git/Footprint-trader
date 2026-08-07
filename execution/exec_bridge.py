@@ -638,8 +638,23 @@ class ExecBridge:
                     "buy_n":   int(m.get("buy_n") or 0),
                     "sell_n":  int(m.get("sell_n") or 0),
                     "squeeze_ok": bool(m.get("squeeze_ok")),
+                    # 2026-08-07 (peak_audit) — trail peak fields + arm timestamp, so an
+                    # external watchdog can independently re-verify sidefull_trail/bias_trail's
+                    # own peak tracking without reaching into private _last_arm state.
+                    "sidefull_peak": float(m.get("sidefull_peak") or 0.0),
+                    "bias_peak": float(m.get("bias_peak") or 0.0),
+                    "ts": float(m.get("ts") or 0.0),
                 })
         return out
+
+    @classmethod
+    def active_accounts_symbols(cls) -> list[tuple[str, str]]:
+        """Distinct (account, broker_symbol) pairs holding at least one active cycle right
+        now. Lets a background watchdog (peak_audit) discover what to check without needing
+        to know the account ahead of time."""
+        with cls._lock:
+            return sorted({(acc, sym) for (acc, sym, _mg), m in cls._last_arm.items()
+                           if m.get("active")})
 
     # ── cycle monitor (server-side exit brain) ─────────────────────────────────
     @classmethod

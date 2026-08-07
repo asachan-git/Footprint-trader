@@ -1,5 +1,9 @@
 # FootprintBiot
 
+> **For the live grid-execution system actually running on this branch (start/stop/restart,
+> install, architecture, cold-start), see [`RUNBOOK.md`](RUNBOOK.md).** This doc below is an
+> older architecture record from an earlier (non-grid, Claude-decision) phase of the project.
+
 > Living architecture doc. Updated each turn. Scan top-down. Implementation Log at bottom.
 
 ---
