@@ -312,13 +312,17 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
         n = max(2, min(hvn_max_legs, n))
         return n, round(step, 4)
 
-    # lvn_edge_touch: same width-driven sizing as hvn_inside_touch — reuses the same
-    # hvn_max_legs/mean_rev_step_mult knobs (no separate LVN sizing config), per the
-    # "like hvn_inside_touch position management" design.
+    # lvn_edge_touch: FULL per-TF ladder (2026-08-06, user) — n = hvn_max_legs_by_tf,
+    # NOT width-driven. The width-driven formula was already IDENTICAL to
+    # hvn_inside_touch's; only the INPUT differed. An HVN node is wide (~22pt today) so
+    # round(width/step) saturates the per-TF cap, while an LVN vacuum is narrow (~2.4pt)
+    # so it always floored to the min of 2. Same code, opposite outcome — LVN cycles ran
+    # ~a third the size of HVN ones. Step stays ATR-driven (unchanged), so the ladder now
+    # extends BEYOND the vacuum instead of fitting inside it. Deliberate: the LVN thesis
+    # is that price LEAVES the vacuum fast, so outer legs catch the displacement.
     if trigger.kind == "lvn_edge_touch":
         step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
-        n = int(round(trigger.raw_range / step)) if step > 0 else 2
-        n = max(2, min(hvn_max_legs, n))
+        n = max(2, hvn_max_legs)
         return n, round(step, 4)
 
     # candle_sweep / engulf: WIDTH-DRIVEN sizing (matches hvn_inside_touch/lvn_edge_touch).
@@ -736,15 +740,31 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     # the primary exit. (Dropped: VP 1×/2×step refinement, BB 2.5σ/mid, session extension.)
     top_leg = max((l.price for l in buy_legs),  default=fulcrum)
     bot_leg = min((l.price for l in sell_legs), default=fulcrum)
+    # Inner (closest-to-fulcrum) leg on each side — the distance gates below must clear
+    # THIS one, since every other leg on the side sits farther out by construction
+    # (fulcrum ± i*step). Anchoring the gate to the outer leg let a shared per-side TP
+    # land near-zero distance from the inner legs (observed live 2026-08-05:
+    # FB|hvn|5m|b3 dist 0.21) — that's what actually produced the "very small TP"
+    # symptom, not the min_tp_dist floor value itself. Used only in the two acceptance
+    # tests below; _resolve_tps()'s own baseline stays outer-leg-anchored (out of scope).
+    inner_top_leg = min((l.price for l in buy_legs),  default=fulcrum)
+    inner_bot_leg = max((l.price for l in sell_legs), default=fulcrum)
     min_tp_dist = float(grid_cfg.get("min_tp_dist", 0.0) or 0.0)
 
     buy_tp, sell_tp = _resolve_tps(symbol, fulcrum, buy_legs, sell_legs, atr, tp_mult)
 
+    # lvn_edge_touch gets its own (lower) override floor: LVN zones are much narrower than
+    # HVN's, so the genuine next-edge target routinely lost to the 8pt hvn_inside_touch
+    # floor and fell back to the generic ATR/zone-snap baseline instead of real structure.
+    tp_override_dist = min_tp_dist
+    if fulcrum_t.kind == "lvn_edge_touch":
+        tp_override_dist = float(grid_cfg.get("min_tp_dist_lvn_edge", min_tp_dist) or 0.0)
+
     tp_up   = float((fulcrum_t.context or {}).get("tp_up", 0.0) or 0.0)
     tp_down = float((fulcrum_t.context or {}).get("tp_down", 0.0) or 0.0)
-    if tp_up > top_leg + min_tp_dist:
+    if tp_up > inner_top_leg + tp_override_dist:
         buy_tp = round(tp_up, 4)
-    if 0.0 < tp_down < bot_leg - min_tp_dist:
+    if 0.0 < tp_down < inner_bot_leg - tp_override_dist:
         sell_tp = round(tp_down, 4)
 
     if (fulcrum_t.kind == "hvn_inside_touch"
@@ -752,9 +772,9 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         poc  = float((daily_vp or {}).get("poc", 0.0) or 0.0)
         edge = (fulcrum_t.context or {}).get("edge", "")
         if poc > 0:
-            if edge == "top" and poc < bot_leg - min_tp_dist:
+            if edge == "top" and poc < inner_bot_leg - min_tp_dist:
                 sell_tp = round(poc, 4)
-            elif edge == "bottom" and poc > top_leg + min_tp_dist:
+            elif edge == "bottom" and poc > inner_top_leg + min_tp_dist:
                 buy_tp = round(poc, 4)
 
     # Structural SL for each setup.

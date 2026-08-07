@@ -13,13 +13,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 
 from flask import Blueprint, current_app, jsonify, request
 
 from execution import clock
-from execution.exec_bridge import ExecBridge, magic_for, tf_from_magic, _emit_log
+from execution.exec_bridge import (ExecBridge, magic_for, tf_from_magic, _emit_log,
+                                   MAGIC_BASE, _MAGIC_MAX)
 
 bp = Blueprint("exec_bridge", __name__)
 # Same log the exec-bridge exit path writes; resolved per call via FB_DATA_DIR.
@@ -162,6 +164,19 @@ def _trigger_tfs(grid_cfg: dict, kind: str) -> list:
     return list(tfs) if tfs else ["1m", "5m", "15m", "1h"]
 
 
+def _min_step_venue(tf: str, quote: dict | None, grid_cfg: dict) -> float:
+    """Floor for leg spacing (venue $), passed to plan_grid_levels as min_step_venue —
+    it REPLACES the computed step wholesale (grid_planner.py ~line 690-695), so leg
+    count stays whatever _size_grid picked but spacing widens uniformly to clear this.
+    max() of the existing broker freeze-band floor (1.5x stops_dist) and a NEW per-TF
+    configured floor (2026-08-07, user: "$1 min distance grid for 1m") — 1m's tight
+    ATR-driven step was landing legs closer together than made sense to trade individually."""
+    freeze = float((quote or {}).get("stops_dist", 0.0) or 0.0) * 1.5
+    _by_tf = grid_cfg.get("min_step_price_by_tf") or {}
+    configured = float(_by_tf.get(tf, 0.0) or 0.0)
+    return max(freeze, configured)
+
+
 def _placed_ladder(cmds, side: str) -> list[list[float]]:
     """[[price, lot], ...] actually enqueued for one side of a grid arm.
 
@@ -175,6 +190,23 @@ def _placed_ladder(cmds, side: str) -> list[list[float]]:
     from execution.exec_bridge import PLACE_PENDING as _PP
     want = f"{side}_stop"
     return [[c.price, c.lot] for c in cmds if c.type == _PP and c.order_type == want]
+
+
+def _ladder_matches_book(plan_legs, book_legs, price_tol: float = 0.01, lot_tol: float = 1e-4) -> bool:
+    """True when a freshly-computed leg list matches the persisted book_buy_legs/
+    book_sell_legs (2026-08-05, no-op cancel+replace guard — see call site). `plan_legs`
+    is a list of Leg(price, lot); `book_legs` is [[price, lot], ...] as persisted by
+    _placed_ladder. Empty-vs-empty (no legs on this side either way) counts as a match;
+    a missing/malformed book (None, or count mismatch) is NOT a match — err toward
+    allowing the cancel+replace rather than silently skipping a real change."""
+    if not book_legs:
+        return not plan_legs
+    if len(plan_legs) != len(book_legs):
+        return False
+    for leg, (b_price, b_lot) in zip(plan_legs, book_legs):
+        if abs(leg.price - float(b_price)) > price_tol or abs(leg.lot - float(b_lot)) > lot_tol:
+            return False
+    return True
 
 
 def _htf_expansion_blocks(grid_cfg: dict, kind: str, tf: str, analysis_symbol: str) -> bool:
@@ -477,6 +509,19 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
     # side — drop it to 0 (leave the existing TP untouched) rather than set an inside-ladder TP.
     if not (raw_tp_up   and raw_tp_up   > _top_leg):       raw_tp_up   = 0.0
     if not (raw_tp_down and 0 < raw_tp_down < _bot_leg):   raw_tp_down = 0.0
+    # 2026-08-07 (user: "hvn edge has TPs, remove it") — this refresh runs for EVERY
+    # trigger_kind (hvn_edge, hvn_inside_touch, lvn_edge_touch all share this function)
+    # but had NO check against net_profit_exit_only/leg_tp_ceiling, unlike arm-time's
+    # leg_tp flag. It was silently re-adding individual-leg TPs the arm-time policy had
+    # correctly omitted — only visible on hvn_edge tonight because that's where a valid
+    # structural target happened to compute; hvn_inside_touch/lvn_edge were exposed to
+    # the same gap, just hadn't hit a qualifying target yet. Gate matches arm-time exactly.
+    _grid_cfg_tp = settings.get("grid_levels") or {}
+    _tp_policy_allows = ((not bool(_grid_cfg_tp.get("net_profit_exit_only", False)))
+                        or bool(_grid_cfg_tp.get("leg_tp_ceiling", False)))
+    if not _tp_policy_allows:
+        raw_tp_up = 0.0
+        raw_tp_down = 0.0
     new_tp_up = round(raw_tp_up * ratio, 4) if raw_tp_up else 0.0
     new_tp_down = round(raw_tp_down * ratio, 4) if raw_tp_down else 0.0
     old_up = float(arm.get("tp_up") or 0.0)
@@ -722,7 +767,20 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
         # TP/bias-trail state are never touched. No same-fulcrum dedup here: this isn't
         # "re-arming the same level", it's replacing the side that just closed.
         flat_side = "sell" if buy_live else "buy"
-        min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
+        # EMERGENCY COOLDOWN (2026-08-03): this block had NO rate limit at all — a touch
+        # confirming on nearly every poll near a chopping edge re-armed a fresh ladder every
+        # time (measured 201 cmds/min live on lvn_edge_touch|1m). Gates off the magic's last
+        # arm ts (always stamped by set_last_arm), not a book event, since the churn wasn't
+        # preceded by any book. 0 disables.
+        _cooldown_s = float((settings.get("grid_levels") or {}).get("side_rearm_cooldown_s", 0.0) or 0.0)
+        if _cooldown_s > 0:
+            _last_arm_ts = float(_cyc.get("ts") or 0.0)
+            if _last_arm_ts > 0 and (clock.now() - _last_arm_ts) < _cooldown_s:
+                LOG.info(f"[exec] TOUCH-ARM-SIDE {account} {broker_symbol} {tf} → "
+                        f"skip: {flat_side} re-arm on cooldown "
+                        f"({clock.now() - _last_arm_ts:.0f}s of {_cooldown_s:.0f}s)")
+                return
+        min_step_venue = _min_step_venue(tf, quote, grid_cfg)
         # RE-ANCHOR TO ORIGINAL FULCRUM (2026-07-10, user): the backfilled side must straddle
         # the SAME center as the still-live side, else the two ladders bracket different prices
         # → a large inner dead zone (observed: b1↔s1 ~$18 while same-side legs ~$2-3). The fresh
@@ -804,6 +862,17 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     # this, a subsequent touch could stack a second straddle on the same node before the first
     # cycle's legs surface. Re-arm is freed only when the cycle retires (active→False on
     # completion / reap / fade). Subsequent touches → only ONE grid per TF.
+    # EMERGENCY COOLDOWN (2026-08-03, user "update orders only once per 5m"): a just-closed
+    # cycle's dedup mark is cleared below (by design, see next comment), so nothing else
+    # throttled a fresh re-arm at the same still-touched edge — this was the second churn
+    # source alongside the side-rearm gate above. Same magic, same clock.
+    _fresh_cooldown_s = float((grid_cfg or {}).get("side_rearm_cooldown_s", 0.0) or 0.0)
+    if _fresh_cooldown_s > 0:
+        _last_ts = float(_cyc.get("ts") or 0.0)
+        if _last_ts > 0 and (clock.now() - _last_ts) < _fresh_cooldown_s:
+            LOG.info(f"[exec] TOUCH-ARM {account} {broker_symbol} {tf} → "
+                    f"skip: fresh re-arm on cooldown ({clock.now() - _last_ts:.0f}s of {_fresh_cooldown_s:.0f}s)")
+            return
     # Completed-cycle release: we got here flat AND with no active arm → any cycle that armed
     # at this fulcrum is fully closed. Its stale dedup mark would otherwise block re-arm at the
     # same edge forever while price camps there. Drop it so a fresh touch can take orders again.
@@ -814,7 +883,7 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     if not ExecBridge.should_emit(account, broker_symbol, fulcrum_venue, dedup_tol, magic=leg_magic):
         return
 
-    min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
+    min_step_venue = _min_step_venue(tf, quote, grid_cfg)
     plan = plan_grid_levels(analysis, tf, live_analysis,
                             trigger_hint="hvn_inside_touch", settings=settings,
                             venue_price=venue_mid, min_step_venue=min_step_venue,
@@ -823,6 +892,20 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
         _emit_audit({"account": account, "symbol": analysis, "tf": tf, "verdict": "skip",
                      "skip_reason": f"touch_arm:{plan.skip_reason or 'no_plan'}",
                      "touch_armed": True})
+        return
+
+    # NO-OP GUARD (2026-08-05): skip a cancel+replace that would just re-place the SAME
+    # ladder already resting in MT5. A wrongful reap (single-poll `magics` reporting gap)
+    # used to flip active=False on a still-live cycle, and this branch would then
+    # unconditionally cancel+replace an unchanged ladder every side_rearm_cooldown_s
+    # (observed live: identical 6-leg ladder redone every 5min, magic 776013). The reaper
+    # now requires N consecutive misses before retiring (see exec_poll), but a stale
+    # book_*_legs from the LAST real placement survives a reap either way — compare
+    # against it here as a second, independent guard.
+    if _ladder_matches_book(plan.buy_legs, _cyc.get("book_buy_legs")) and \
+       _ladder_matches_book(plan.sell_legs, _cyc.get("book_sell_legs")):
+        _emit_audit({"account": account, "symbol": analysis, "tf": tf, "verdict": "skip",
+                     "skip_reason": "touch_arm:unchanged_ladder", "touch_armed": True})
         return
 
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
@@ -962,7 +1045,18 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
 
     if (buy_live or sell_live) and _cyc.get("active"):
         flat_side = "sell" if buy_live else "buy"
-        min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
+        # EMERGENCY COOLDOWN (2026-08-03): see _touch_arm_tf's identical gate — this is the
+        # block that actually produced the measured 201 cmds/min (lvn_edge_touch|1m, magic
+        # 776131). 0 disables.
+        _cooldown_s = float((grid_cfg or {}).get("side_rearm_cooldown_s", 0.0) or 0.0)
+        if _cooldown_s > 0:
+            _last_arm_ts = float(_cyc.get("ts") or 0.0)
+            if _last_arm_ts > 0 and (clock.now() - _last_arm_ts) < _cooldown_s:
+                LOG.info(f"[exec] TOUCH-ARM-SIDE-LVN {account} {broker_symbol} {tf} → "
+                        f"skip: {flat_side} re-arm on cooldown "
+                        f"({clock.now() - _last_arm_ts:.0f}s of {_cooldown_s:.0f}s)")
+                return
+        min_step_venue = _min_step_venue(tf, quote, grid_cfg)
         # RE-ANCHOR to original fulcrum (same fix as hvn_inside_touch side-rearm) — keep the
         # backfilled side symmetric with the still-live side; ladder-span gate skips if too far.
         import dataclasses as _dc
@@ -1016,6 +1110,15 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
 
     if _cyc.get("active"):
         return
+    # EMERGENCY COOLDOWN (2026-08-03, user "update orders only once per 5m") — mirrors
+    # _touch_arm_tf's identical gate; same magic, same clock.
+    _fresh_cooldown_s = float((grid_cfg or {}).get("side_rearm_cooldown_s", 0.0) or 0.0)
+    if _fresh_cooldown_s > 0:
+        _last_ts = float(_cyc.get("ts") or 0.0)
+        if _last_ts > 0 and (clock.now() - _last_ts) < _fresh_cooldown_s:
+            LOG.info(f"[exec] TOUCH-ARM-LVN {account} {broker_symbol} {tf} → "
+                    f"skip: fresh re-arm on cooldown ({clock.now() - _last_ts:.0f}s of {_fresh_cooldown_s:.0f}s)")
+            return
     ExecBridge.clear_emit(account, broker_symbol, magic=leg_magic)
     dedup_pct = float(grid_cfg.get("emit_dedup_pct", 0.0007) or 0.0)
     dedup_tol = venue_mid * dedup_pct
@@ -1023,7 +1126,7 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
     if not ExecBridge.should_emit(account, broker_symbol, fulcrum_venue, dedup_tol, magic=leg_magic):
         return
 
-    min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
+    min_step_venue = _min_step_venue(tf, quote, grid_cfg)
     plan = plan_grid_levels(analysis, tf, live_analysis,
                             trigger_hint="lvn_edge_touch", settings=settings,
                             venue_price=venue_mid, min_step_venue=min_step_venue,
@@ -1032,6 +1135,14 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
         _emit_audit({"account": account, "symbol": analysis, "tf": tf, "verdict": "skip",
                      "skip_reason": f"touch_arm_lvn:{plan.skip_reason or 'no_plan'}",
                      "touch_armed": True})
+        return
+
+    # NO-OP GUARD (2026-08-05) — see the identical guard in _touch_arm_tf for the full
+    # rationale (wrongful single-poll reap → unchanged-ladder cancel+replace churn).
+    if _ladder_matches_book(plan.buy_legs, _cyc.get("book_buy_legs")) and \
+       _ladder_matches_book(plan.sell_legs, _cyc.get("book_sell_legs")):
+        _emit_audit({"account": account, "symbol": analysis, "tf": tf, "verdict": "skip",
+                     "skip_reason": "touch_arm_lvn:unchanged_ladder", "touch_armed": True})
         return
 
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
@@ -1238,7 +1349,7 @@ def _sweep_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
             return
 
     ExecBridge.clear_emit(account, broker_symbol, magic=leg_magic)
-    min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5 if quote else 0.0
+    min_step_venue = _min_step_venue(tf, quote, grid_cfg)
     plan = plan_grid_levels(analysis, tf, live_analysis,
                             trigger_hint="candle_sweep", settings=settings,
                             venue_price=venue_mid, min_step_venue=min_step_venue,
@@ -1385,7 +1496,7 @@ def _hvn_edge_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
         return
 
     ExecBridge.clear_emit(account, broker_symbol, magic=leg_magic)
-    min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5 if quote else 0.0
+    min_step_venue = _min_step_venue(tf, quote, grid_cfg)
     plan = plan_grid_levels(analysis, tf, live_analysis,
                             trigger_hint="hvn_edge", settings=settings,
                             venue_price=venue_mid, min_step_venue=min_step_venue,
@@ -1440,6 +1551,171 @@ def _hvn_edge_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
              f"[fulcrum={plan.fulcrum} edge={plan.trigger_context.get('edge','')}], {len(cmds)} command(s)")
 
 
+# --- broker-truth magic fallback ------------------------------------------------
+# The EA emits a magic in its `magics` array ONLY when InpMagic/InpMagicRange own it.
+# A mis-set chart input (e.g. range 100 while strat 13 lands at base+13x) makes live
+# cycles INVISIBLE to the server: reconcile_from_poll can't adopt them, monitor_cycle
+# returns early on the inactive arm, and the absent-magic reaper retires them. The
+# cycle then runs with NO exit logic at all — no net_target, no trail, no full_hedge.
+# Observed 2026-08-06: 16 "reaped absent" / 0 "reconcile" while +9k floating went
+# unbooked. This queries the broker directly and injects any owned magic the EA
+# omitted, so every downstream consumer sees ground truth instead of the EA's view.
+_BROKER_MAGICS: dict[str, object] = {"ts": 0.0, "rows": [], "pos": 0, "pend": 0, "last_ok_ts": 0.0}
+_BROKER_MAGICS_LOCK = threading.Lock()
+_BROKER_STALE_WARN_S = 15.0   # 2026-08-07 (user: "make sure the pnl diff bug does not
+# happen again"). The whole broker-truth fix (magic detection, exit closing, PEAK-
+# TRACKING) goes silently dark if the wine mt5_direct bridge dies — it did once tonight
+# for ~1h, unnoticed until directly investigated. On that failure, _merge_broker_magics
+# falls back to pure EA-self-report with ZERO correction: the exact condition that let
+# magic 776132's real $1,018.75 peak get recorded as $128. A buried LOG.exception isn't
+# enough — this makes an outage LOUD (once per _BROKER_STALE_WARN_S while it persists)
+# so it gets fixed in minutes (`scripts/mt5_server.sh`), not discovered an hour later.
+_BROKER_LAST_STALE_WARN_TS = 0.0
+
+
+def _broker_magics(sym: str, cfg: dict) -> tuple[list[dict], int, int]:
+    """EA-shaped magic rows built from mt5_direct, for magics this server owns.
+    Range is [MAGIC_BASE, _MAGIC_MAX) — the SAME bound tf_from_magic uses, so every
+    injected magic resolves a tf (the per-magic monitor loop skips those that don't).
+    Returns (rows, total_pos, total_pend). Cached — the poll runs ~1s but the broker
+    round-trip need not."""
+    grid_cfg = (cfg or {}).get("grid_levels", {}) or {}
+    if not bool(grid_cfg.get("broker_magic_fallback_enabled", True)):
+        return [], 0, 0
+    interval = float(grid_cfg.get("broker_magic_fallback_interval_s", 5.0) or 5.0)
+    now = time.time()
+    with _BROKER_MAGICS_LOCK:
+        if now - float(_BROKER_MAGICS["ts"]) < interval:
+            return list(_BROKER_MAGICS["rows"]), int(_BROKER_MAGICS["pos"]), int(_BROKER_MAGICS["pend"])
+        # stamp BEFORE the call so a slow/hung broker can't stampede every poll thread
+        _BROKER_MAGICS["ts"] = now
+    global _BROKER_LAST_STALE_WARN_TS
+    try:
+        from execution.mt5_direct import get_client
+        cli = get_client()
+        pos = [p for p in cli.positions(sym) if MAGIC_BASE <= int(p.get("magic", 0) or 0) < _MAGIC_MAX]
+        pend = [o for o in cli.pendings(sym) if MAGIC_BASE <= int(o.get("magic", 0) or 0) < _MAGIC_MAX]
+        with _BROKER_MAGICS_LOCK:
+            _BROKER_MAGICS["last_ok_ts"] = now
+    except Exception:
+        LOG.exception("[exec] broker magic fallback query failed")
+        last_ok = float(_BROKER_MAGICS.get("last_ok_ts") or 0.0)
+        stale_for = now - last_ok if last_ok > 0 else -1.0
+        if stale_for > _BROKER_STALE_WARN_S and (now - _BROKER_LAST_STALE_WARN_TS) > _BROKER_STALE_WARN_S:
+            _BROKER_LAST_STALE_WARN_TS = now
+            LOG.error("[exec] *** BROKER-TRUTH FALLBACK DOWN for %.0fs *** — mt5_direct "
+                     "bridge unreachable. Cycle exits are now running on EA-self-report "
+                     "ALONE, unverified (the exact gap that let a peak get under-recorded "
+                     "and a trail miss its exit). Check/restart scripts/mt5_server.sh.",
+                     stale_for)
+        return [], 0, 0
+
+    agg: dict[int, dict] = {}
+
+    def _row(mg: int) -> dict:
+        return agg.setdefault(mg, {"magic": mg, "buys": 0, "sells": 0, "pendings": 0,
+                                   "buy_pendings": 0, "sell_pendings": 0, "pnl": 0.0,
+                                   "buy_pnl": 0.0, "sell_pnl": 0.0,
+                                   "buy_lots": 0.0, "sell_lots": 0.0})
+
+    for p in pos:
+        r = _row(int(p["magic"]))
+        # match the EA's pnl definition: floating profit incl. swap
+        net = float(p.get("profit", 0.0) or 0.0) + float(p.get("swap", 0.0) or 0.0)
+        vol = float(p.get("volume", 0.0) or 0.0)
+        if str(p.get("type", "")).startswith("buy"):
+            r["buys"] += 1; r["buy_pnl"] += net; r["buy_lots"] += vol
+        else:
+            r["sells"] += 1; r["sell_pnl"] += net; r["sell_lots"] += vol
+        r["pnl"] += net
+    for o in pend:
+        r = _row(int(o["magic"]))
+        r["pendings"] += 1
+        if str(o.get("type", "")).startswith("buy"):
+            r["buy_pendings"] += 1
+        else:
+            r["sell_pendings"] += 1
+
+    rows = [{k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()}
+            for r in agg.values()]
+    with _BROKER_MAGICS_LOCK:
+        _BROKER_MAGICS["rows"], _BROKER_MAGICS["pos"], _BROKER_MAGICS["pend"] = rows, len(pos), len(pend)
+    return rows, len(pos), len(pend)
+
+
+def _merge_broker_magics(body: dict, sym: str, cfg: dict) -> None:
+    """Ground-truth `body["magics"]` against a live mt5_direct poll, in place. This IS
+    the "polling mechanism" for exact per-magic cycle data (2026-08-07, user) — it
+    piggybacks on the EA's own ~1s /exec/poll cadence (no separate thread/loop needed)
+    and cross-checks against a broker-truth read (cached _broker_magics_LOCK-protected,
+    refreshed every broker_magic_fallback_interval_s) on every single one.
+
+    Three failure modes, all fixed here:
+      1. EA OMITS a magic entirely (own InpMagicRange too narrow) → injected from broker.
+      2. EA REPORTS a magic but with WRONG counts (observed live: buys=0/sells=0 while
+         broker showed real open exposure) → previously this function did nothing (only
+         ADDED omissions), so monitor_cycle / sidefull_trail / combined_target all
+         consumed the wrong (zero) counts.
+      3. 2026-08-07 (user, "I don't want such issues") — EA's counts can be RIGHT while
+         its P&L is STALE. Observed live: magic 776132's true peak (reconstructed from
+         real venue price crossings) was +$1,018.75; the arm's own `sidefull_peak` only
+         ever recorded $128 — the EA's buy_pnl/sell_pnl snapshot at the critical instant
+         lagged, so sidefull_trail's peak-tracker never saw the real high and never armed
+         its giveback correctly. Comparing counts for equality doesn't catch a stale PNL
+         VALUE (a continuously-fluctuating $ figure will almost never match bit-for-bit
+         between two sources anyway — that comparison was only ever meaningful for counts).
+         Fix: whenever a broker row exists for a magic, the ENTIRE row (counts AND pnl)
+         is now broker truth, unconditionally — not just on a detected count mismatch.
+
+    Broker wins outright because it's the same source of truth /exec/poll's balance/
+    equity already trusts, and it's the freshest read available (cached
+    broker_magic_fallback_interval_s, refreshed every EA poll if expired) — a stale EA
+    snapshot is a worse failure than a couple-seconds-stale broker cache.
+
+    cycle-level handling (monitor_cycle, sidefull_trail, bias_trail, net_target) all read
+    straight from `body["magics"]` post-merge — this function is their single choke point
+    for exact live per-magic buys/sells/pnl, no code changes needed downstream."""
+    rows, tot_pos, tot_pend = _broker_magics(sym, cfg)
+    ea = body.get("magics")
+    ea = ea if isinstance(ea, list) else []
+    if not rows:
+        return
+    broker_by_magic = {int(r["magic"]): r for r in rows}
+    ea_by_magic = {int(m.get("magic", 0) or 0): m for m in ea if m.get("magic")}
+
+    missing = [broker_by_magic[mg] for mg in broker_by_magic if mg not in ea_by_magic]
+    corrected = []   # (magic, old_ea_row, new_broker_row) — count mismatches, for the log only
+    adopted = []     # every magic where broker's row is being used (counts matched or not)
+    for mg, ea_row in ea_by_magic.items():
+        br = broker_by_magic.get(mg)
+        if br is None:
+            continue
+        ea_buys, ea_sells = int(ea_row.get("buys", 0) or 0), int(ea_row.get("sells", 0) or 0)
+        ea_pend = int(ea_row.get("pendings", 0) or 0)
+        if (ea_buys, ea_sells, ea_pend) != (br["buys"], br["sells"], br["pendings"]):
+            corrected.append((mg, dict(ea_row), br))
+        adopted.append(mg)   # broker's pnl always wins regardless of count agreement
+
+    if missing or adopted:
+        merged = [ea_by_magic[mg] for mg in ea_by_magic if mg not in set(adopted)]
+        merged += [broker_by_magic[mg] for mg in adopted]
+        merged += missing
+        body["magics"] = merged
+        if missing:
+            LOG.warning("[exec] broker poll: EA omitted %d live magic(s) %s — injected from "
+                        "broker. CHECK EA InpMagic/InpMagicRange on the chart.",
+                        len(missing), [r["magic"] for r in missing])
+        if corrected:
+            LOG.warning("[exec] broker poll: EA reported STALE counts for magic(s) %s "
+                        "(EA said b/s/p, broker says b/s/p) — %s → corrected to broker truth.",
+                        [c[0] for c in corrected],
+                        [(c[1].get("buys"), c[1].get("sells"), c[1].get("pendings"),
+                          "->", c[2]["buys"], c[2]["sells"], c[2]["pendings"]) for c in corrected])
+    if tot_pos or tot_pend:
+        body["positions"] = max(int(body.get("positions", 0) or 0), tot_pos)
+        body["pendings"] = max(int(body.get("pendings", 0) or 0), tot_pend)
+
+
 @bp.post("/exec/poll")
 def exec_poll():
     if not _auth_ok():
@@ -1491,6 +1767,14 @@ def exec_poll():
             except Exception:
                 LOG.exception(f"[exec] venue bars parse error ({_tf})")
 
+    # Ground-truth the magics array BEFORE anything reads it (daily_target, combined_target,
+    # reconcile, per-magic monitor_cycle, absent-magic reaper all consume body["magics"]).
+    if sym:
+        try:
+            _merge_broker_magics(body, sym, settings_cfg or {})
+        except Exception:
+            LOG.exception("[exec] broker magic merge error")  # never break the poll
+
     # Daily floating P&L target — check on every poll that carries balance/equity.
     balance = body.get("balance")
     equity  = body.get("equity")
@@ -1498,17 +1782,59 @@ def exec_poll():
         target_pct = float((settings_cfg or {}).get("daily_target_pct", 0.0) or 0.0)
         result = ExecBridge.update_account_balance(
             account, float(balance), float(equity), target_pct)
+        magics_body = body.get("magics") or []
+        active_magics = [int(m["magic"]) for m in magics_body
+                         if int(m.get("buys", 0)) + int(m.get("sells", 0)) > 0]
+        # 2026-08-07 (user) — CLOSING must use broker truth, not the EA's self-reported
+        # counts, even after _merge_broker_magics: that only injects magics the EA
+        # OMITTED entirely; it does nothing for a magic the EA reports but with wrong
+        # (e.g. stale-zero) buys/sells. Observed live: combined_target correctly detected
+        # pnl_usd=9668.50 >= 5000 (equity-balance is broker-native, always correct) but
+        # active_magics came back EMPTY that poll — "closing 0 magic(s)" — and never
+        # retried; floating ran to $13k+ before a manual close. Union broker-truth magics
+        # in so detection and execution are both ground-truth, not just detection.
+        try:
+            _broker_rows, _broker_tot_pos, _broker_tot_pend = _broker_magics(sym, settings_cfg or {})
+        except Exception:
+            _broker_rows, _broker_tot_pos, _broker_tot_pend = [], 0, 0
+        _broker_magic_ids = [int(r["magic"]) for r in _broker_rows]
+        active_magics = sorted(set(active_magics) | set(_broker_magic_ids))
         if result["hit"] and sym:
             # enqueue CLOSE_ALL for every active magic and log once per trigger
-            magics_body = body.get("magics") or []
-            active_magics = [int(m["magic"]) for m in magics_body
-                             if int(m.get("buys", 0)) + int(m.get("sells", 0)) > 0]
             for mg in active_magics:
                 ExecBridge.enqueue(account, "CLOSE_ALL", sym, magic=mg,
                                    comment="FB|daily_target|flatten")
             if active_magics or result["pnl_pct"] >= target_pct:
                 LOG.info(f"[daily_target] account={account} pnl={result['pnl_pct']:.2f}% "
                          f">= target={target_pct}% — closing {len(active_magics)} magic(s)")
+        # COMBINED net target (2026-08-05, user) — account-wide floating P&L summed across
+        # EVERY open cycle (not per-magic like cycle_net_target_usd), flattens everything
+        # once the combined total crosses this $ figure. Independent of daily_target_pct
+        # (that's a %% check); this is a flat $ check. cycle_net_target_usd is UNCHANGED
+        # and still lets an individual cycle book early on its own — this is an overlay,
+        # not a replacement.
+        combined_target_usd = float((settings_cfg or {}).get("combined_net_target_usd", 0.0) or 0.0)
+        if combined_target_usd > 0:
+            # "flat" = no open positions AND no resting pendings anywhere on the account.
+            # 2026-08-07 (user) — was the EA's self-reported top-level counts only. A
+            # false-positive "flat" here silently rebases _combined_start_balance to the
+            # CURRENT balance while real floating profit is still open, permanently
+            # absorbing that gain into the new baseline — the target would then need
+            # another full $X of NEW gain to fire again, explaining a detected-but-never-
+            # retried hit. Broker truth (same cached call as active_magics above) so a
+            # single glitchy EA poll can't reset the whole target silently.
+            _is_flat = (int(body.get("positions", 0) or 0) == 0
+                       and int(body.get("pendings", 0) or 0) == 0
+                       and _broker_tot_pos == 0 and _broker_tot_pend == 0)
+            combined_result = ExecBridge.check_combined_target(
+                account, float(balance), float(equity), combined_target_usd, _is_flat)
+            if combined_result["hit"] and sym:
+                for mg in active_magics:
+                    ExecBridge.enqueue(account, "CLOSE_ALL", sym, magic=mg,
+                                       comment="FB|combined_target|flatten")
+                if active_magics or combined_result["pnl_usd"] >= combined_target_usd:
+                    LOG.info(f"[combined_target] account={account} pnl_usd={combined_result['pnl_usd']:.2f} "
+                             f">= target={combined_target_usd:.2f} — closing {len(active_magics)} magic(s)")
     # Per-magic open-state + cycle monitor. The EA sends a `magics` array — one entry
     # per (strategy×TF) pool it holds — so each TF cycle is tracked and exited in
     # isolation. tf is recovered from the magic. A flatten ships in the same response
@@ -1584,20 +1910,63 @@ def exec_poll():
                          and int(body.get("pendings", 0) or 0) == 0
                          and not magics)
             _reported = {int(m.get("magic", 0)) for m in magics}
+            _gcfg_reap = (settings_cfg or {}).get("grid_levels") or {}
+            _reap_confirm_n = int(_gcfg_reap.get("reap_confirm_n", 3) or 3)
+            _reap_strike_gap = float(_gcfg_reap.get("reap_strike_min_gap_s", 2.0) or 2.0)
             for _mg in list(ExecBridge.active_fulcrums(account, sym).keys()):
                 if _mg in _reported:
+                    # Magic reported again — clear any absence strikes it was accumulating,
+                    # a transient report gap resolved on its own.
+                    _cyc_seen = ExecBridge.get_last_arm(account, sym, magic=_mg) or {}
+                    if _cyc_seen.get("absent_strikes"):
+                        _cyc_seen.pop("magic", None)
+                        ExecBridge.set_last_arm(account, sym, magic=_mg,
+                                                **{**_cyc_seen, "absent_strikes": 0})
                     continue
                 _cyc = ExecBridge.get_last_arm(account, sym, magic=_mg) or {}
-                # Placement-window guard: skip a just-armed cycle whose EA legs haven't
-                # been reported yet (else we'd retire a fresh arm before it places).
-                # Skipped entirely when the EA reports the whole account flat.
-                if not _flat_all and (_now - float(_cyc.get("ts", 0.0) or 0.0)) < _reap_grace:
+                # Placement-window guard: NEVER reap a cycle armed less than _reap_grace ago,
+                # regardless of _flat_all.
+                #
+                # This used to read `if not _flat_all and ...`, i.e. a whole-account-flat
+                # report bypassed the grace. That is precisely BACKWARDS: the instant after
+                # an arm, the PLACE_PENDING commands are still sitting in the queue, so the
+                # EA legitimately reports buys=0 sells=0 pendings=0 magics=[] — _flat_all is
+                # TRUE exactly when the guard is most needed. Result: every cycle was reaped
+                # ~1s after arming. Observed live 2026-08-06:
+                #     14:23:08  magic 776012 active=True      (armed)
+                #     14:23:09  reaped absent magic 776012 (flat in MT5)
+                # The orders then placed normally but the arm was already active=False, so
+                # monitor_cycle returned early and never managed them — jul09 accumulated 14
+                # positions / 12 pendings with ZERO active arms and no net_target/full_hedge.
+                # Grace is a function of ARM AGE, not of what the EA currently sees; only the
+                # strike counter below is safe to skip when the account is genuinely flat.
+                if (_now - float(_cyc.get("ts", 0.0) or 0.0)) < _reap_grace:
                     continue
+                # STRIKE-COUNTER (2026-08-05): a magic missing from a SINGLE poll's `magics`
+                # array (payload-size/enumeration hiccup) was retiring a still-live cycle
+                # immediately, which then let a same-price re-arm cancel+replace an unchanged
+                # resting ladder every ~side_rearm_cooldown_s (observed live: identical 6-leg
+                # ladder cancel+replaced every 5min, magic 776013). Require the absence to
+                # persist across reap_confirm_n polls (mirrors hvn_fade_confirm_n's pattern)
+                # before actually retiring. _flat_all is already unambiguous (whole account
+                # reports zero everything) — skip the counter and reap immediately there.
+                if not _flat_all:
+                    _strikes = int(_cyc.get("absent_strikes") or 0)
+                    if _now - float(_cyc.get("absent_last_strike_ts") or 0.0) >= _reap_strike_gap:
+                        _strikes += 1
+                        if _cyc:
+                            _cyc_upd = {k: v for k, v in _cyc.items() if k != "magic"}
+                            ExecBridge.set_last_arm(account, sym, magic=_mg, **{
+                                **_cyc_upd, "absent_strikes": _strikes,
+                                "absent_last_strike_ts": _now})
+                    if _strikes < _reap_confirm_n:
+                        continue   # suspect absence — don't reap yet, wait for confirmation
                 if _cyc:
                     # explicit magic=_mg: persisted arms may lack a `magic` key, which would
                     # otherwise default set_last_arm's key to 0 and leave the real entry active.
                     _cyc.pop("magic", None)
-                    ExecBridge.set_last_arm(account, sym, magic=_mg, **{**_cyc, "active": False})
+                    ExecBridge.set_last_arm(account, sym, magic=_mg, **{**_cyc, "active": False,
+                                            "absent_strikes": 0})
                 ExecBridge.clear_emit(account, sym, magic=_mg)
                 ExecBridge.set_open(account, sym, 0, 0, magic=_mg)
                 LOG.info(f"[exec] reaped absent magic {_mg} (flat in MT5) for {account}/{sym}")
@@ -1609,7 +1978,7 @@ def exec_poll():
     # Pass the raw venue mid from this poll so touch_arm uses the LIVE intrabar price,
     # not the last bar close (which would miss intrabar edge taps).
     _poll_venue_mid = (float(bid) + float(ask)) / 2.0 if (bid and ask) else None
-    if sym and not ExecBridge.daily_target_hit(account):
+    if sym and not ExecBridge.daily_target_hit(account) and not ExecBridge.combined_target_hit(account):
         _touch_tfs = _trigger_tfs((settings_cfg or {}).get("grid_levels", {}), "hvn_inside_touch")
         for _tf in _touch_tfs:
             try:
@@ -1705,6 +2074,9 @@ def exec_emit_grid():
     if ExecBridge.daily_target_hit(account):
         return jsonify({"ok": True, "verdict": "skip",
                         "skip_reason": "daily_target_hit"})
+    if ExecBridge.combined_target_hit(account):
+        return jsonify({"ok": True, "verdict": "skip",
+                        "skip_reason": "combined_target_hit"})
 
     # broker↔analysis symbol resolution (same map as /grid_levels)
     symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
@@ -1728,7 +2100,7 @@ def exec_emit_grid():
 
     # Freeze-aware step floor: clear the broker's min-stop distance (×1.5 margin) so the
     # innermost leg can't land inside the freeze band and get silently rejected.
-    min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
+    min_step_venue = _min_step_venue(tf, quote, _gl_cfg)
     # Rebase reference: the closed Vantage candle on THIS TF (EA CopyRates via bars_5m/
     # bars_15m), not the instantaneous live mid — fixed once per bar-close instead of
     # drifting tick-to-tick, matching the cadence this endpoint itself fires on. Falls
@@ -2156,7 +2528,13 @@ def exec_zones():
     from pipeline.features import vp_cache
     from pipeline.state_store import store as _store
     _prev_daily, _today_daily = vp_cache.get_prev_and_today(symbol)
-    daily = _prev_daily or _today_daily or vp_cache.get(symbol, "daily") or {}
+    # 2026-08-06 (user, jun22 parity bug): was `_prev_daily or _today_daily or ...` —
+    # `or` picks prev-day FIRST whenever it exists (i.e. always past day 1), so POC/VAH/VAL
+    # and the LVN-context filter silently used YESTERDAY's value area instead of today's.
+    # Confirmed live: poc 4195/vah 4234/val 4116 (yesterday) shown while price traded
+    # 4250-4280 today. jun22 has no prev/today split at all — always reads today's cache
+    # directly — so this divergence is what the side-by-side chart comparison was seeing.
+    daily = _today_daily or _prev_daily or vp_cache.get(symbol, "daily") or {}
 
     # FRAME: draw zones in VENUE frame using the SAME additive zone_shift the detector uses
     # (venue_ref − analysis_ref, both same-candle closes) — NOT a multiplicative ratio. The
@@ -2214,6 +2592,56 @@ def exec_zones():
                 zones.append({"kind": "lvn", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
     except Exception:
         LOG.exception("[exec_zones] detector-zone build failed")
+
+    # Prior days' cached HVN/LVN (up to 4 more trading days) — tagged "hvn_prev"/"lvn_prev",
+    # ported from jun22-literal (2026-08-06, user: chart parity). Each carries its own "day"
+    # (period_key). The active prior day (the one hvn_inside_touch's vacuum-fallback would
+    # borrow from right now, per execution.zone_triggers._outside_daily_va) is tagged
+    # "hvn_prev_active"/"lvn_prev_active" so the chart can highlight it distinctly.
+    try:
+        _hist = vp_cache.get_history(symbol, "daily", n=5)  # oldest → newest
+        _prior_days = _hist[:-1] if len(_hist) > 1 else []
+        _latest_bar = _store().latest(symbol, "1m")
+        _cur_price = float(_latest_bar.ohlc.c) if _latest_bar else 0.0
+        _active_day_key = None
+        if _cur_price > 0:
+            from execution.zone_triggers import _outside_daily_va
+            if _outside_daily_va(symbol, _cur_price):
+                for e in reversed(_prior_days):
+                    val, vah = e.get("val"), e.get("vah")
+                    if val is None or vah is None:
+                        continue
+                    if float(val) <= _cur_price <= float(vah):
+                        _active_day_key = e.get("period_key")
+                        break
+        for e in _prior_days:
+            day_key = e.get("period_key", "")
+            is_active = day_key == _active_day_key and day_key is not None
+            hvn_kind = "hvn_prev_active" if is_active else "hvn_prev"
+            lvn_kind = "lvn_prev_active" if is_active else "lvn_prev"
+            for z in (e.get("hvn_zones") or []):
+                zones.append({"kind": hvn_kind, "lo": _rebase_price(float(z["low"])),
+                              "hi": _rebase_price(float(z["high"])), "day": day_key})
+            for z in (e.get("lvn_zones") or []):
+                zones.append({"kind": lvn_kind, "lo": _rebase_price(float(z["low"])),
+                              "hi": _rebase_price(float(z["high"])), "day": day_key})
+    except Exception:
+        LOG.exception("[exec_zones] prev-day zone build failed")
+
+    # Rolling (price-tracking) HVN/LVN — visual-only, tagged "hvn_roll"/"lvn_roll". Ported
+    # from jun22-literal (2026-08-06). NOT what the grid trigger uses for arming (that's
+    # session-gated via _SESSION_HVN_SRC) — always computed here so rolling vs cached can
+    # be eyeballed regardless of session. Withheld until the TF has enough bars for its window.
+    try:
+        from execution.zone_triggers import _rolling_hvn, _rolling_lvn, _VP_WIN
+        _roll_tf = tf if tf in _VP_WIN else "15m"
+        _roll_bars = _store().recent(symbol, _roll_tf, _VP_WIN.get(_roll_tf, 96))
+        for lo, hi in _rolling_hvn(symbol, _roll_tf, _roll_bars):
+            zones.append({"kind": "hvn_roll", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+        for lo, hi in _rolling_lvn(symbol, _roll_tf, _roll_bars):
+            zones.append({"kind": "lvn_roll", "lo": _rebase_price(lo), "hi": _rebase_price(hi)})
+    except Exception:
+        LOG.exception("[exec_zones] rolling-zone build failed")
 
     # Fine-resolution HVN/LVN (tick-bin vp_profile_bin, e.g. 0.1) computed over the last
     # session's bars and drawn as kind hvn_fine / lvn_fine — a TradingView-style A/B

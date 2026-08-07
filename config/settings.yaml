@@ -59,6 +59,22 @@ monitor:
 # Planner reads these via .get() defaults — block is optional but canonical here.
 grid_levels:
 
+  # ── BROKER-TRUTH MAGIC FALLBACK (2026-08-06) ─────────────────────────────────
+  # Safety net for the EA hiding live cycles. The EA only reports a magic when
+  # InpMagic/InpMagicRange own it; a stale saved chart input therefore makes real
+  # exposure invisible to reconcile / monitor_cycle / the reaper, so the cycle runs
+  # with NO exit logic (no net_target, no trail, no full_hedge). Cost that day:
+  # +9k floating went unbooked, 16 "reaped absent" / 0 "reconcile".
+  # This queries mt5_direct and injects any owned magic the EA omitted.
+  # Exits still EXECUTE fine — a magic-scoped CLOSE_ALL is an exact match in the
+  # EA's MagicMatch(), which bypasses the InpMagicRange gate. Only detection broke.
+  broker_magic_fallback_enabled: true
+  broker_magic_fallback_interval_s: 2.0   # 2026-08-07 (user): was 5.0. This now backs
+                                          # live cycle-level decisions (monitor_cycle,
+                                          # sidefull_trail, combined_target), not just an
+                                          # occasional omission fallback — tightened
+                                          # closer to the EA's own ~1s poll cadence.
+
   # ── JUL09 "RESTORED SKEW" REPLICA (branched 2026-07-29) ───────────────────────
   # Config-shape from the best "leave-it-alone" day: no same-day config change, ran
   # clean on Jul07/08's fixes, htf_bias/bb_edge skew restored (Jun22-style, after
@@ -82,11 +98,20 @@ grid_levels:
   # currently profitable WITH that same widened map active — this removes that risk
   # rather than waiting to find out if it repeats.
   hvn_max_legs_by_tf: {1m: 4, 5m: 5, 15m: 6, 1h: 7}
+  min_step_price_by_tf: {1m: 1.0}   # 2026-08-07 (user) — $1 min distance between grid
+                                    # legs on 1m. 1m's tight ATR-driven step was landing
+                                    # legs closer than made sense to trade individually.
+                                    # REPLACES the computed step wholesale (like the
+                                    # existing broker freeze-band floor already did) —
+                                    # leg COUNT is unchanged (still from hvn_max_legs_by_tf),
+                                    # only spacing widens, so the ladder spans further out.
   mean_rev_step_mult: 0.50
   mean_rev_step_mult_by_tf: {}
 
-  cycle_net_target_by_tf: {1m: 500.0, 5m: 1000.0, 15m: 1875.0, 1h: 750.0}   # Jul09 value ÷4 (base_lot 1.0→0.25, 2026-07-30)
-  cycle_net_target_usd: 2500.0   # fallback when TF not in by_tf map, ÷4
+  cycle_net_target_by_tf: {}   # emptied 2026-08-03 (user) — flat cycle_net_target_usd below applies to all TFs
+  cycle_net_target_usd: 1000.0   # 2026-08-06 (user) — was 1250.0. jul09 has NO trail and no
+                                 # leg TP, so net_target + full_hedge are its ONLY exits;
+                                 # a lower bar gives cycles a reachable green exit.
 
   bias_trail_activate_by_tf: {}   # empty → flat bias_trail_activate_usd below (Jul07 emptied this map)
   bias_trail_giveback_pct: 40    # Jul09 value (Jul10 later loosens this to 50)
@@ -142,7 +167,12 @@ grid_levels:
   # Minimum TP distance ($) beyond the outermost leg — a structural level closer than
   # this is skipped (keep walking out to the next). Stops the tiny-TP-into-own-node bug
   # (a fulcrum on an HVN edge had its into-node TP land ~2pt away). 0 = no floor.
-  min_tp_dist: 8.0
+  min_tp_dist: 8.0   # kept for hvn_inside_touch (protects against the tiny-TP-into-own-node bug)
+  min_tp_dist_lvn_edge: 0   # ADDED 2026-08-04 (user, "issue is only with lvn edge setup") —
+                    # LVN zones are ~2pt wide vs HVN's ~10pt, so the genuine next-edge target
+                    # kept losing to the 8pt floor and falling back to the generic ATR/zone-snap
+                    # baseline. Scoped override for lvn_edge_touch only; hvn_inside_touch keeps
+                    # the 8.0 floor above, unchanged.
   # Coarse outer guard: reject a fulcrum sitting >this fraction of price away from spot
   # (a stale/far cached-HVN edge) before any ladder math. The ladder-span gate
   # (|fulcrum-px| ≤ n·step) is the precise "is price actually at the edge" check; this is
@@ -161,7 +191,11 @@ grid_levels:
   # as a FAR ceiling — so the targets show on the chart/orders and a runaway move books at
   # structure. The basket net_target stays primary (it's closer → fires first in the
   # common case); the leg TP is the backstop. false = truly TP-less legs.
-  leg_tp_ceiling: true
+  leg_tp_ceiling: false   # 2026-08-05 (user): TP-less legs. With net_profit_exit_only=true
+                          # above, leg_tp = (not True) or False = False → NO per-order TP on
+                          # any leg. Exits are net_target + full_hedge ONLY (trail also off,
+                          # see bias_trail_enabled). NOTE: legs also carry no SL, so nothing
+                          # broker-side manages a position if this server stops.
   # HVN inside-touch reversion bias: a rejection at an edge is a fade INTO the node, so
   # skew lots to the into-node side + target POC on that side (breakout side stays light,
   # far next-HVN target). Directional inventory → a net-profit exit price exists. false =
@@ -180,6 +214,11 @@ grid_levels:
   # units of the edge even without crossing it (e.g. 0.5pt catches near-misses on gold).
   # 0.0 = exact touch only (original behaviour). Edge is still the fulcrum price.
   hvn_touch_buffer: 0.2    # Jul07-09 value, unchanged this stretch
+  # Acceptance window for the INTRABAR touch-arm (2026-08-05, user): a candle must have
+  # CLOSED inside the HVN within this many closed bars before a tap can arm. Live price
+  # inside the node is not enough — that also matches a wick through an untested node.
+  # The close-driven _t_hvn_inside_touch always required this; the touch path did not.
+  hvn_accept_lookback_bars: 3
   hvn_edge_lookback: 3           # bars to scan back for a prior breakout close outside HVN (fallback when TF not in _by_tf)
   # NOTE (2026-07-14): hvn_edge arms per-TF using that TF's SESSION HVN window (_VP_WIN:
   # 5m=288 bars, 15m=96), while the MT5 chart draws ONLY InpZoneTF (default 15m) zones. So a
@@ -205,7 +244,14 @@ grid_levels:
   # disabled over ~1500 mods/hr). Account is now direct MT5 — throttle kept as a safety
   # margin, not because MT5 polices mod-rate the same way. 60 = re-track at most once/min
   # per side. 0 = no throttle.
-  modify_cooldown_s: 0
+  modify_cooldown_s: 300   # EMERGENCY (2026-08-03): was 0/no-throttle, live at ~201 cmds/min on the
+                            # side-rearm churn below — same abuse pattern that got algo trading
+                            # disabled before. Restored to the proven-safe value.
+  side_rearm_cooldown_s: 300   # EMERGENCY (2026-08-03, ported from feat/final-v1): the side-only
+                            # re-arm block had ZERO rate limit — a touch confirming on nearly every
+                            # poll near a chopping edge re-armed a fresh ladder every time (measured
+                            # 201 cmds/min, magic 776131). Blocks a side re-arm within this many
+                            # seconds of that magic's last arm.
   # HVN ZONE STABILIZATION (hysteresis on _session_hvn_zones output, zone_triggers.
   # _stabilize_zones). Rolling-VP recomputes are stateless → edges jitter and borderline
   # nodes flicker in/out, which downstream became fulcrum shifts / TP modifies / false
@@ -290,27 +336,54 @@ grid_levels:
   # that way), track its peak floating P&L; on a give-back from peak, BOOK a fraction of
   # that side and move the rest to breakeven (risk-free runner). Captures directional
   # profit the net-basket exit masks (a hedge leg drags net down → target never hits).
-  bias_trail_enabled: true      # Jul09 value
+  # ── TWO independent trails (2026-08-06, user) ─────────────────────────────────────
+  # 1) SIDE-COMPLETION trail: arms the instant one side is FULLY filled (structural event,
+  #    no $ threshold). Baseline = cycle NET P&L captured at that exact moment; peak tracked
+  #    from there; a giveback retrace FLATTENS THE WHOLE CYCLE. Requires net > 0 to fire.
+  sidefull_trail_enabled: true
+  sidefull_trail_giveback_pct: 40
+  sidefull_trail_activate_usd: 150   # 2026-08-06 (user: "fast fills and exits") — was 0
+                                     # (fires on ANY peak, even $0.50). 776011 flattened
+                                     # 4x in 10min. Below bias_trail's 500 floor since this
+                                     # trail is meant to stay the faster of the two.
+  # 2) CYCLE-LEVEL trail: the pre-existing bias_trail — arms on an absolute NET $ peak
+  #    (activate) and fires on the same % giveback. Re-enabled at 500 (was off since
+  #    2026-08-05). NOTE this one BOOKS bias_book_frac of the winning side + moves the rest
+  #    to breakeven; it does NOT flatten. Whichever trail's condition is met first wins,
+  #    and side-completion is evaluated first.
+  bias_trail_enabled: true
+  bias_trail_activate_usd: 250   # 2026-08-06 (user) — was 500
   flatten_rest_enabled: false   # deliberate deviation, not Jul09-literal — see branch header
-  bias_trail_activate_usd: 250    # lowered from 1000, 2026-07-30 (user)
+  # (bias_trail_activate_usd moved up to the trails block above and set to 500 — 2026-08-06.
+  #  It was duplicated here at 125 and, being later in the file, silently won.)
   # ── Active trigger list — Jul09 shape: hvn_inside_touch, hvn_edge, candle_sweep,
   # lvn_edge_touch (added Jul07) all live. hvn_displacement didn't exist yet (Jul10).
+  # TRIMMED 2026-08-03 (user, "too heavy for the account/lot size"). hvn_edge (worst
+  # single cycle exceeds its entire historical contribution) and candle_sweep (never
+  # net-positive in the 616-cycle review) dropped entirely.
+  # 1m DROPPED 2026-08-05 (user) from both survivors — never in the 616-cycle keeper
+  # set for either trigger, and it's exactly where the 201 cmds/min churn incident
+  # fired (magic 776131, lvn_edge_touch|1m). hvn_inside_touch and lvn_edge_touch now
+  # 5m/15m only. 16 possible magics → 4.
   triggers:
     - kind: hvn_inside_touch
-      tfs: [1m, 5m, 15m, 1h]
+      tfs: [1m, 5m, 15m]   # 1m added 2026-08-06 (user). hvn_max_legs_by_tf caps 1m at 4.
       touch_only: true
     - kind: hvn_edge
-      tfs: [1m, 5m, 15m, 1h]
-      enabled: true
+      tfs: [5m, 15m]       # 5m added + enabled 2026-08-06 (user). Bar-close arm via
+      enabled: true        # _hvn_edge_arm_tf in the poll loop — server-side, no EA change.
+                           # Own magic (strat 5): 776052 / 776053.
     - kind: candle_sweep
-      tfs: [1m, 5m, 15m, 1h]
-      enabled: true
+      tfs: [15m]
+      enabled: false
     - kind: lvn_edge_touch
-      tfs: [1m, 5m, 15m, 1h]
+      tfs: [1m, 5m, 15m]   # 1m added 2026-08-06 (user)
       touch_only: true
       enabled: true
   candle_sweep_cooldown_bars: 0   # 0 = NO post-arm cooldown (2026-07-09: user "no cooldown")
-  touch_arm_confirm_ticks: 0.02   # Jul09 value (0.2→0.02 on Jul07; 0.02→0 didn't happen until Jul10)
+  touch_arm_confirm_ticks: 0.2   # 2026-08-07 (user) — back to pre-Jul07 value (was 0.02).
+                                 # Requires a real reversal off the tapped edge, not a
+                                 # near-zero tick, before hvn_inside_touch/lvn_edge_touch arm.
   # lvn_edge_touch tap tolerances — mirror hvn_touch_buffer/_pct/hvn_lookback_bars but
   # independently tunable. 0.10 = tap within 10% of node width counts (same width-relative
   # logic as HVN).
@@ -371,7 +444,15 @@ grid_levels:
 # profile is a single-cluster degenerate, so /exec/zones returns empty. Was hardcoded 30
 # (~30min into a session before zones appear). 5 = zones ~5min after a session roll; thinner
 # structure but avoids the 1-bar degenerate. Read fresh by pipeline/features/vp_cache.py.
-vp_min_bars: 5
+vp_min_bars: 30   # 2026-08-06 (user: "use the same VP as Jun22"). jun22 HARDCODES 30
+                  # (`if len(period_bars) < 30`); jul09 made it configurable and shipped 5.
+                  # At 5, today's thin session profile built ONE 15.2pt HVN blob
+                  # (4266.00-4281.20, 1 zone vs 8 the day before). Price then sat mid-node
+                  # with no edge in tap range, AND both nearby LVNs fell fully inside it so
+                  # _filter_lvn_zones_by_hvn_context deleted them → hvn_inside_touch,
+                  # hvn_edge and lvn_edge ALL structurally dead for ~40min, 0 arms.
+                  # 30 withholds a degenerate profile and falls back to prev-day structure.
+                  # Cost: zones appear ~30min after a session roll instead of ~5min.
 
 # Startup preflight — server REFUSES to start unless footprint + VP data are present.
 startup_check:
@@ -409,10 +490,14 @@ vp_cache:
   # Per-symbol daily session anchor. Two forms accepted:
   #   <int>             — static UTC hour (DST-naive; fine for 24/7 crypto)
   #   {tz, hour}        — local-time anchor, automatically DST-adjusted via zoneinfo
-  # XAUTUSDT anchor moved off CME's 18:00 ET open (22:00 UTC) to midnight UTC 2026-07-08.
+  # XAUTUSDT uses CME Gold's 18:00 ET session open:
+  #   EDT (Mar–Nov): 18:00 ET = 22:00 UTC = 03:30 IST next day
+  #   EST (Nov–Mar): 18:00 ET = 23:00 UTC = 04:30 IST next day
+  # Reverted 2026-08-04 (ported from jun22-literal/final-v1 fix) — was silently moved to
+  # midnight UTC 2026-07-08, same bug found and reverted on final-v1 earlier the same day.
   session_start_utc:
     BTCUSDT: 0      # UTC 00:00 = IST 05:30 → session 05:30 IST – 05:29 IST (24h)
-    XAUTUSDT: 0     # UTC 00:00 = IST 05:30 → session 05:30 IST – 05:29 IST (24h)
+    XAUTUSDT: 22    # UTC 22:00 = IST 03:30 → session 03:30 IST – 02:30 IST next day (23h, CME EDT)
   # Tick-aligned VP bin width (institutional convention).
   # Falls back to range/68 if symbol not declared. Set in floats matching tick:
   #   XAU tick = 0.1 → 0.5 = 5-tick bins
@@ -458,7 +543,7 @@ execution:
   broker_utc_offset_hours: 3      # Vantage server time = UTC+3 (EET); used to shift CVD arrow timestamps
   tradable_symbols: [XAUTUSDT, BTCUSDT]
   symbol_map:
-    XAUTUSDT: "XAUUSD+"          # DEMO account (2026-07-20 test run). Live USC cent used XAUUSD.pc.
+    XAUTUSDT: "XAUUSD.pc"        # Live USC-cent account 24678823 (2026-08-03 jul09 parallel run).
     BTCUSDT:  "BTCUSD"
   # Risk-adjusted sizing: lots = (balance × risk_per_trade_pct) / (SL_distance × contract_size)
   # Set risk_per_trade_pct = 0 to disable; falls back to default_lots.
@@ -502,7 +587,17 @@ risk:
 # Daily floating P&L target — close all grid positions and block new arms for the day
 # once equity rises by this % above the session-open balance.
 # 0 = disabled. Example: 1.5 = close everything once up 1.5% on the day.
-daily_target_pct: 100.0
+daily_target_pct: 30.0   # SIZING CHANGE (2026-08-04, user) — was 100.0
+
+# Combined net target (2026-08-05, user: "net target needs to be combined pnl") — account-
+# wide floating P&L summed across EVERY open cycle (all magics together), closes
+# everything + blocks new arms once crossed. Independent of daily_target_pct ($ not %%) and
+# does NOT replace grid_levels.cycle_net_target_usd above (that still lets one cycle book
+# early on its own; this is an overlay on top). 0 = disabled.
+combined_net_target_usd: 5000.0   # 2026-08-06 (user) — back to 5000.0 (was 3000.0).
+                                  # Measured from ACCOUNT equity. jun22 is stopped, so
+                                  # jul09 is the only branch on this account now and the
+                                  # cross-branch attribution caveat no longer applies.
 
 # Dhan options trading configuration
 dhan:

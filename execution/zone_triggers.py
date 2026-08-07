@@ -57,12 +57,20 @@ _VP_WIN = {"1m": 1440, "3m": 480, "5m": 288, "10m": 144, "15m": 96, "1h": 24}
 # daily VP via /exec/zones), NOT a rolling per-TF window that adds nodes the chart never
 # draws. Mirrors the LVN switch made 2026-07-09 (_session_lvn_zones cached-only). Re-add
 # "rolling" here to restore the hybrid (drawn≠armed) behaviour.
+# ROLLING RE-ADDED (2026-08-05, user). The cached-only rule above kept armed zones ==
+# drawn zones, but cached daily VP lags a trending session badly: at 20:09 IST price was
+# 4242.4 while the highest CACHED node topped out at 4205.6 — 37pt below, so the detector
+# could not see the node price was actually trading inside, and hvn_inside_touch went
+# dormant for hours. The ROLLING profile had (4231.2, 4242.8), containing price.
+# TRADE-OFF, accepted deliberately: this restores "drawn ≠ armed" — the system can now arm
+# on a rolling node the MT5 chart never draws (the chart renders the cached daily VP via
+# /exec/zones). Revert to ("cached",) to make armed zones match the chart again.
 _SESSION_HVN_SRC = {
-    "NY":      ("cached",),
-    "London":  ("cached",),
-    "Overlap": ("cached",),
-    "Asia":    ("cached",),
-    "Off":     ("cached",),
+    "NY":      ("rolling", "cached"),
+    "London":  ("rolling", "cached"),
+    "Overlap": ("rolling", "cached"),
+    "Asia":    ("rolling", "cached"),
+    "Off":     ("rolling", "cached"),
 }
 
 
@@ -881,7 +889,11 @@ def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger |
                         for z in (_dvp_d.get("hvn_zones") or [])]
     except Exception:
         _daily_zones = list(zones)
-    tp_up, tp_down = compute_hvn_tps(symbol, edge, _daily_zones or list(zones))
+    # NEAR edge of the next HVN (2026-08-05, user) — was far edge (compute_hvn_tps),
+    # switched to compute_lvn_edge_tps's near-edge convention: stop at the entrance of
+    # the next node instead of assuming a full pass-through. Neither call site passes
+    # skip_node (a pre-existing gap, unrelated to this change), so this is a drop-in swap.
+    tp_up, tp_down = compute_lvn_edge_tps(symbol, edge, _daily_zones or list(zones))
 
     node_low  = (edge - width) if side == "top" else edge
     node_high = edge if side == "top" else (edge + width)
@@ -921,6 +933,7 @@ def touch_arm_trigger(symbol: str, tf: str, live_price: float,
         _buf = float(_gcfg2.get("hvn_touch_buffer", 0.0))
         _buf_pct = float(_gcfg2.get("hvn_touch_buffer_pct", 0.0))
     except Exception:
+        _gcfg2 = {}          # must exist — read below for hvn_accept_lookback_bars
         _buf = 0.0
         _buf_pct = 0.0
 
@@ -942,9 +955,21 @@ def touch_arm_trigger(symbol: str, tf: str, live_price: float,
     # approach (price below the node tapping the bottom from below, or above tapping the top
     # from above) is NOT an inside-touch and is excluded (matches the close-driven path,
     # which requires the candle to CLOSE inside the node).
+    # ACCEPTANCE PRECONDITION (2026-08-05, user): "requires a candle to close inside the
+    # HVN first, then it arms on a tap + 0.2$ retracement". Live price merely being inside
+    # the node is NOT enough — that also matches a wick spearing through an untested node.
+    # A prior CLOSE inside means the market actually accepted value there, which is what
+    # makes the edge worth fading, and it restores parity with the close-driven path (whose
+    # whole premise is "the candle closed inside"). Only CLOSED bars count.
+    _accept_lb = int(_gcfg2.get("hvn_accept_lookback_bars", 3) or 3)
+    _closed = [b for b in bars if b.close_ts and b.close_ts < 9_000_000_000][-_accept_lb:]
+
     best = None   # (dist_to_edge, edge, width, side)
     for lo, hi in zones:
         width = hi - lo
+        # a recent candle must have CLOSED inside THIS node (analysis frame)
+        if not any(lo <= float(b.ohlc.c) <= hi for b in _closed):
+            continue
         if width <= 0:
             continue
         if not (lo <= live_price <= hi):       # live price must be INSIDE the node body
@@ -973,7 +998,11 @@ def touch_arm_trigger(symbol: str, tf: str, live_price: float,
                         for z in (_dvp_d.get("hvn_zones") or [])]   # analysis frame (edge is too)
     except Exception:
         _daily_zones = list(zones)
-    tp_up, tp_down = compute_hvn_tps(symbol, edge, _daily_zones or list(zones))
+    # NEAR edge of the next HVN (2026-08-05, user) — was far edge (compute_hvn_tps),
+    # switched to compute_lvn_edge_tps's near-edge convention: stop at the entrance of
+    # the next node instead of assuming a full pass-through. Neither call site passes
+    # skip_node (a pre-existing gap, unrelated to this change), so this is a drop-in swap.
+    tp_up, tp_down = compute_lvn_edge_tps(symbol, edge, _daily_zones or list(zones))
 
     node_low  = (edge - width) if side == "top" else edge
     node_high = edge if side == "top" else (edge + width)

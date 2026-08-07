@@ -330,6 +330,8 @@ class ExecBridge:
     _daily_start_balance: dict[str, float] = {}   # account → balance at first poll of the day
     _daily_start_date: dict[str, str] = {}         # account → YYYY-MM-DD of that first poll
     _daily_target_hit: dict[str, bool] = {}        # account → True once daily target reached
+    _combined_target_hit: dict[str, bool] = {}     # account → True once combined-$ target reached
+    _combined_start_balance: dict[str, float] = {}  # account → balance combined target is measured from (own baseline, NOT shared with daily_target_pct)
     # intrabar touch-arm tick-reversal state — keyed by (account, broker_symbol, tf)
     # tracks an edge tap awaiting a reversal-back-inside confirm (touch-arm path)
     _touch_state: dict[tuple, dict] = {}           # → {edge, side, tapped_px, ts}
@@ -410,20 +412,62 @@ class ExecBridge:
                 cls._daily_start_date[account]   = today
                 cls._daily_start_balance[account] = balance
                 cls._daily_target_hit[account]    = False
+                cls._combined_target_hit[account] = False
 
             start = cls._daily_start_balance.get(account, balance)
             if start <= 0:
-                return {"hit": False, "pnl_pct": 0.0, "start_balance": start}
+                return {"hit": False, "pnl_pct": 0.0, "pnl_usd": 0.0, "start_balance": start}
 
-            pnl_pct = (equity - start) / start * 100.0
+            pnl_usd = equity - start
+            pnl_pct = pnl_usd / start * 100.0
 
             already_hit = cls._daily_target_hit.get(account, False)
             hit = already_hit or (target_pct > 0 and pnl_pct >= target_pct)
             if hit and not already_hit:
                 cls._daily_target_hit[account] = True
 
-        return {"hit": hit, "pnl_pct": round(pnl_pct, 4),
+        return {"hit": hit, "pnl_pct": round(pnl_pct, 4), "pnl_usd": round(pnl_usd, 2),
                 "start_balance": round(start, 2), "equity": round(equity, 2)}
+
+    @classmethod
+    def check_combined_target(cls, account: str, balance: float, equity: float,
+                              target_usd: float, is_flat: bool) -> dict:
+        """Combined-PnL account-wide target (2026-08-05, user: 'net target needs to be
+        combined pnl' — an ADDITIONAL account-wide $ check across every open cycle's
+        floating P&L summed together, on top of the per-cycle cycle_net_target_usd).
+
+        Own baseline (_combined_start_balance), independent of daily_target_pct's —
+        resetting this must not disturb the day's % target tracking.
+
+        RESET RULE (2026-08-05, user: "should be reset once no pending or open orders
+        are present") — NOT sticky-for-the-day like daily_target_pct. Once hit=True has
+        blocked new arms and the account then goes fully flat (is_flat, caller-computed
+        from positions+pendings across every magic), the hit clears AND the baseline
+        re-bases to the CURRENT balance — so the next $target is measured as fresh
+        profit from this flat point forward, not re-triggering instantly off the old
+        baseline (which would still read >= target since the gain is now realized into
+        balance, not lost)."""
+        account = str(account)
+        with cls._lock:
+            if account not in cls._combined_start_balance:
+                cls._combined_start_balance[account] = balance
+
+            already_hit = cls._combined_target_hit.get(account, False)
+            if already_hit and is_flat:
+                cls._combined_target_hit[account] = False
+                cls._combined_start_balance[account] = balance
+                already_hit = False
+
+            start = cls._combined_start_balance.get(account, balance)
+            pnl_usd = equity - start
+            hit = already_hit or (target_usd > 0 and pnl_usd >= target_usd)
+            if hit and not already_hit:
+                cls._combined_target_hit[account] = True
+        return {"hit": hit, "pnl_usd": round(pnl_usd, 2), "start_balance": round(start, 2)}
+
+    @classmethod
+    def combined_target_hit(cls, account: str) -> bool:
+        return cls._combined_target_hit.get(str(account), False)
 
     @classmethod
     def daily_target_hit(cls, account: str) -> bool:
@@ -994,6 +1038,70 @@ class ExecBridge:
                         _retraced = (mid <= _peak - _d) if _dir == UP else (mid >= _peak + _d)
                         if _retraced:
                             reason = "cv_trail"
+
+        # ── SIDE-COMPLETION TRAIL (2026-08-06, user) ────────────────────────────────
+        # Arms the moment ONE SIDE is fully filled — the move has committed that way and
+        # there is no more scaling in on that side. The baseline is the cycle's NET P&L at
+        # exactly that instant (captured once, when the last leg of the side executed);
+        # from there the peak is tracked and a `giveback` retrace flattens the WHOLE cycle.
+        #
+        # Distinct from bias_trail below: that arms on an absolute $ threshold and books a
+        # FRACTION of the winning side. This arms on a STRUCTURAL event (side complete),
+        # measures NET, and exits everything. Guarded by net > 0 so it can only ever realise
+        # a green cycle — the giveback test alone is satisfied by any negative number, which
+        # would silently turn a profit trail into a market stop.
+        if (not cv_active and reason is None
+                and bool(grid_cfg.get("sidefull_trail_enabled", False))
+                and buy_pnl is not None and sell_pnl is not None):
+            _sf_net = float(buy_pnl) + float(sell_pnl)
+            _sf_buy_n = int(cyc.get("buy_n") or 0)
+            _sf_sell_n = int(cyc.get("sell_n") or 0)
+            _sf_side = ""
+            if _sf_buy_n > 0 and int(buys or 0) >= _sf_buy_n:
+                _sf_side = "buy"
+            elif _sf_sell_n > 0 and int(sells or 0) >= _sf_sell_n:
+                _sf_side = "sell"
+            if _sf_side and not cyc.get("sidefull_armed"):
+                # Capture the baseline ONCE, at side completion, and persist immediately so
+                # a restart cannot re-baseline against a later (better or worse) net.
+                cyc["sidefull_armed"] = True
+                cyc["sidefull_side"] = _sf_side
+                cyc["sidefull_base"] = _sf_net
+                cyc["sidefull_peak"] = _sf_net
+                cls.set_last_arm(account, symbol, magic=magic,
+                                 **{k: v for k, v in cyc.items() if k != "magic"})
+                _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
+                                  "tf": tf, "magic": magic,
+                                  "exit_reason": "sidefull_trail_armed",
+                                  "side": _sf_side, "base_net_pnl": round(_sf_net, 2),
+                                  "buys": buys, "sells": sells})
+            if cyc.get("sidefull_armed"):
+                _sf_peak = max(float(cyc.get("sidefull_peak") or 0.0), _sf_net)
+                if _sf_peak != float(cyc.get("sidefull_peak") or 0.0):
+                    cyc["sidefull_peak"] = _sf_peak
+                    cls.set_last_arm(account, symbol, magic=magic,
+                                     **{k: v for k, v in cyc.items() if k != "magic"})
+                _sf_gb = float(grid_cfg.get("sidefull_trail_giveback_pct", 40.0) or 0.0)
+                # Activation floor (2026-08-06, user: "fast fills and exits" — a cycle
+                # was flattening within minutes of arming). Root cause: "side fully
+                # filled" was checked against buy_n/sell_n, but reconcile_from_poll
+                # continuously rewrites buy_n/sell_n to the EA's CURRENT live count on
+                # every poll (see reconcile_from_poll) — as normal fills/cancels thin a
+                # ladder from e.g. 4 legs down to 1 remaining, the "full" target shrinks
+                # right along with it, so the check becomes near-tautological and arms
+                # almost immediately. Independently, giveback had NO minimum peak: a
+                # $0.50 peak could satisfy a 40% giveback exit at $0.30. Mirrors
+                # bias_trail_activate_usd's pattern — peak must clear this floor before
+                # a retrace can flatten the cycle. 0 = old behavior (fires on any peak).
+                _sf_activate = float(grid_cfg.get("sidefull_trail_activate_usd", 0.0) or 0.0)
+                if (_sf_peak > 0 and _sf_net > 0 and _sf_peak >= _sf_activate
+                        and _sf_net <= _sf_peak * (1.0 - _sf_gb / 100.0)):
+                    reason = "sidefull_trail"
+                    detail = {"side": cyc.get("sidefull_side", ""),
+                              "base_net_pnl": round(float(cyc.get("sidefull_base") or 0.0), 2),
+                              "peak_net_pnl": round(_sf_peak, 2),
+                              "net_pnl": round(_sf_net, 2),
+                              "giveback_pct": _sf_gb}
 
         if (not cv_active and reason is None
                 and bool(grid_cfg.get("bias_trail_enabled", True))
