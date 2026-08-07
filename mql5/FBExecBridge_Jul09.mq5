@@ -405,11 +405,25 @@ bool ExecCloseAll(const string cmd, int &closed, int &cancelled, string &err)
             pos[n] = posInfo.Ticket(); posVol[n] = posInfo.Volume();
          }
    SortTicketsByVolumeDesc(pos, posVol);
+   // ASYNC close (2026-08-07, user): PositionClose() default (sync) blocks until the
+   // broker confirms EACH fill before submitting the next — an 8-leg flatten during a
+   // fast trend took ~2 MINUTES wall-clock to fully unwind (measured live, magic 776011,
+   // 01:14:18-01:16:20), during which price kept running against the not-yet-closed
+   // legs. The exit decision (sidefull_trail, net +135.75) was correct; the sequential
+   // unwind is what turned it into a ~-4,367 realized loss. Async mode submits every
+   // close request back-to-back without waiting for each fill, collapsing n round-trips
+   // into ~1. `closed` below now counts requests successfully SENT, not confirmed filled
+   // (fills land via OnTradeTransaction / are re-derived by the server's broker poll,
+   // same as before) — acceptable since nothing here depended on synchronous confirmation.
+   // Scoped to ONLY this loop (reset after) so PLACE_PENDING and other trade.* calls
+   // elsewhere keep their existing synchronous, ticket-returning behavior.
+   trade.SetAsyncMode(true);
    for(int i = 0; i < ArraySize(pos); i++)
    {
       if(trade.PositionClose(pos[i], InpSlippage)) closed++;
       else { allOk = false; err = "close fail #" + IntegerToString((long)pos[i]); }
    }
+   trade.SetAsyncMode(false);
    return allOk;
 }
 
@@ -477,8 +491,13 @@ void CloseAllMineForActiveBase(int &closed, int &cancelled)
    for(int i = 0; i < PositionsTotal(); i++)
       if(posInfo.SelectByIndex(i) && IsMine(posInfo.Magic()) && posInfo.Symbol() == _Symbol)
       { int n = ArraySize(pos); ArrayResize(pos, n + 1); pos[n] = posInfo.Ticket(); }
+   // ASYNC close (2026-08-07) — same fix as ExecCloseAll. This path (equity hard-stop /
+   // CloseAllMine) can span EVERY magic on the chart at once — the largest leg count of
+   // the three close paths, so the sequential-blocking risk is worst here.
+   trade.SetAsyncMode(true);
    for(int i = 0; i < ArraySize(pos); i++)
       if(trade.PositionClose(pos[i], InpSlippage)) closed++;
+   trade.SetAsyncMode(false);
 }
 
 //+------------------------------------------------------------------+
@@ -689,11 +708,16 @@ bool ExecCloseSide(const string cmd, int &closed, string &err)
    SortTicketsByVolumeDesc(tk, tkVol);   // biggest lots booked first; smallest survive as BE runner
    int total   = ArraySize(tk);
    int toClose = (int)MathCeil(total * frac);
+   // ASYNC close (2026-08-07) — same fix as ExecCloseAll: bias_trail's booking partial-
+   // close has the same sequential-blocking exposure, just over fewer legs (toClose, not
+   // the whole ladder). Scoped to this loop only.
+   trade.SetAsyncMode(true);
    for(int i = 0; i < toClose && i < total; i++)
    {
       if(trade.PositionClose(tk[i], InpSlippage)) closed++;
       else { allOk = false; err = "close fail #" + IntegerToString((long)tk[i]); }
    }
+   trade.SetAsyncMode(false);
    return allOk;
 }
 

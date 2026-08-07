@@ -68,6 +68,9 @@ input color  InpLVNColor       = C'255,228,196'; // LVN zone fill — pale/washe
 input color  InpHVNFineColor   = clrMagenta;    // HVN zone outline (fine tick VP — A/B compare)
 input color  InpLVNFineColor   = clrAqua;       // LVN zone outline (fine tick VP — A/B compare)
 input bool   InpShowZoneLabels = true;          // Label zones/levels with name + value
+input bool   InpShowAllPrevDays = false;        // hvn_prev/lvn_prev: false = only the ONE
+                                                 // vacuum-fallback "active" day (readable);
+                                                 // true = all 4 prior days (clutter, debug only)
 input bool   InpDrawVP         = true;          // Draw computed volume profile
 input int    InpVPMaxBars      = 50;            // VP histogram max width (bars)
 input bool   InpVPLeft         = true;          // Anchor VP to left of visible range (VPFR style); false = right margin
@@ -100,6 +103,9 @@ CPositionInfo posInfo;
 string   gAccount       = "";
 datetime gLastZoneFetch = 0;
 bool     gHalted        = false;   // equity target reached → flattened, no more polling/placing
+datetime gLastEmitBar1m  = 0;      // last 1m/5m/15m bar close we called /exec/emit_grid on
+datetime gLastEmitBar5m  = 0;      // (2026-08-05, user: added 1m/5m coverage per setup —
+datetime gLastEmitBar15m = 0;      // see the per-TF calls in OnTimer below)
 
 //--- multi-branch: built once in OnInit from the non-blank InpBridgeURL* inputs.
 //    gActiveMagicBase is the ownership scope IsMine()/counters read RIGHT NOW —
@@ -848,6 +854,37 @@ bool ExecModifyPosition(const string cmd, int &modified, string &err)
 }
 
 //+------------------------------------------------------------------+
+//| Call /exec/emit_grid on a closed bar. jun22-literal's arming lives
+//| entirely behind this endpoint (unlike the poll-driven intrabar
+//| touch-arm on later branches). trigger_hint is an explicit comma
+//| list (hvn_inside_touch, squeeze, hvn_edge — the latter ADDED
+//| 2026-08-05, user) rather than the "structural" named group
+//| (execution/grid_planner.py's _HINT_GROUPS = {hvn_inside_touch,
+//| squeeze} only) — _hint_set() falls back to a literal comma-split
+//| for any non-group string, so this enables hvn_edge without
+//| redefining the shared "structural" group other callers may still
+//| rely on narrower. Fire-and-forget: the response's verdict
+//| (arm/skip) isn't otherwise consumed here, same as this EA already
+//| treats zone/dashboard fetches — real order commands still only
+//| ever arrive via the next /exec/poll drain.
+//+------------------------------------------------------------------+
+void EmitGrid(const string url, const string tf, const string hint = "hvn_inside_touch,hvn_edge")
+{
+   string body = StringFormat(
+      "{\"account\":\"%s\",\"symbol\":\"%s\",\"tf\":\"%s\",\"trigger_hint\":\"%s\"}",
+      gAccount, _Symbol, tf, hint);
+   string resp;
+   int code = HttpPost(url + "/exec/emit_grid", body, resp);
+   if(InpVerbose)
+   {
+      string verdict = (code == 200) ? JsonGetString(resp, "verdict") : "";
+      Print("[emit_grid] ", tf, " → HTTP ", code,
+            (verdict != "") ? (" verdict=" + verdict) : "",
+            (verdict == "arm") ? (" fulcrum=" + DoubleToString(JsonGetNumber(resp, "fulcrum"), _Digits)) : "");
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Poll the queue, execute commands, build + POST the ack array.    |
 //+------------------------------------------------------------------+
 void PollAndExecute(const string url)
@@ -1085,7 +1122,7 @@ bool IsZoneActive(double lo, double hi)
    return false;
 }
 
-void DrawZone(int idx, const string kind, double lo, double hi, bool isActive = false)
+void DrawZone(int idx, const string kind, double lo, double hi, bool isActive = false, const string dayLbl = "")
 {
    string name  = ZONE_PREFIX + IntegerToString(idx);
    int    secs  = PeriodSeconds(PERIOD_CURRENT);
@@ -1102,7 +1139,20 @@ void DrawZone(int idx, const string kind, double lo, double hi, bool isActive = 
    else if(kind == "lvn_fine")  { clr = InpLVNFineColor; fill = false; }  // fine VOLUME-VP LVN (outline)
    else if(kind == "hvn_tick")  { clr = clrLime;         fill = false; }  // TICK-VP HVN (count-weighted)
    else if(kind == "lvn_tick")  { clr = clrOrange;       fill = false; }  // TICK-VP LVN (count-weighted)
+   else if(kind == "hvn_prev" || kind == "hvn_prev_active")  { clr = clrSteelBlue; fill = false; }  // prior trading days' cached HVN
+   else if(kind == "lvn_prev" || kind == "lvn_prev_active")  { clr = clrYellow;    fill = false; }  // prior trading days' cached LVN
+   // Rolling zones are the ones hvn_inside_touch actually ARMS on during NY/London/Overlap
+   // (see _SESSION_HVN_SRC), so they must be the most legible thing on the chart. They used
+   // to share clrSteelBlue with hvn_prev and clrYellow with lvn_prev — 5 rolling rectangles
+   // hidden among 15-19 identically-coloured prior-day ones, all outline-only. A fulcrum
+   // anchored on a rolling edge therefore looked like it sat on no zone at all.
+   else if(kind == "hvn_roll")  { clr = clrChartreuse;   fill = false; }  // price-tracking rolling HVN (ARMS)
+   else if(kind == "lvn_roll")  { clr = clrViolet;       fill = false; }  // price-tracking rolling LVN (ARMS)
    else                     { clr = InpHVNColor;      fill = false; }
+   // "_active" = the ONE prior day the live hvn_inside_touch vacuum-fallback would
+   // actually borrow from right now (server-computed, mirrors _prior_day_hvn) —
+   // force the same gold-border highlight the price-proximity isActive path uses.
+   if(kind == "hvn_prev_active" || kind == "lvn_prev_active") isActive = true;
 
    if(ObjectFind(0, name) < 0)
    {
@@ -1135,9 +1185,16 @@ void DrawZone(int idx, const string kind, double lo, double hi, bool isActive = 
       else if(kind == "lvn_fine") lbl_prefix = "LVN·F ";
       else if(kind == "hvn_tick") lbl_prefix = "HVN·T ";
       else if(kind == "lvn_tick") lbl_prefix = "LVN·T ";
+      else if(kind == "hvn_prev") lbl_prefix = "HVN·P ";
+      else if(kind == "lvn_prev") lbl_prefix = "LVN·P ";
+      else if(kind == "hvn_prev_active") lbl_prefix = "HVN·P★ ";  // the vacuum-fallback's picked day
+      else if(kind == "lvn_prev_active") lbl_prefix = "LVN·P★ ";
+      else if(kind == "hvn_roll") lbl_prefix = "HVN·R ";
+      else if(kind == "lvn_roll") lbl_prefix = "LVN·R ";
       else                      lbl_prefix = "ZONE ";
+      string day_suffix = (dayLbl != "") ? " [" + dayLbl + "]" : "";
       ZoneText("ztxt_" + IntegerToString(idx), tR, hi,
-               lbl_prefix + DoubleToString(lo, _Digits) + "–" + DoubleToString(hi, _Digits), clr);
+               lbl_prefix + DoubleToString(lo, _Digits) + "–" + DoubleToString(hi, _Digits) + day_suffix, clr);
    }
 }
 
@@ -1564,7 +1621,12 @@ void FetchAndDrawZones()
       string kind = JsonGetString(zs[i], "kind");
       double lo   = JsonGetNumber(zs[i], "lo");
       double hi   = JsonGetNumber(zs[i], "hi");
-      if(lo > 0 && hi > 0) DrawZone(i, kind, lo, hi, IsZoneActive(lo, hi));
+      string day  = JsonGetString(zs[i], "day");
+      // Non-active prior-day zones stack unreadably (rectangles aren't time-anchored to
+      // their own day — they all draw near "now"). Default: only the ONE vacuum-fallback
+      // day (hvn_prev_active/lvn_prev_active) draws; the other 3 skip unless opted in.
+      if(!InpShowAllPrevDays && (kind == "hvn_prev" || kind == "lvn_prev")) continue;
+      if(lo > 0 && hi > 0) DrawZone(i, kind, lo, hi, IsZoneActive(lo, hi), day);
    }
 
    //--- draw the VP point-levels the grid triggers on (POC/VAH/VAL/naked-POC)
@@ -2036,6 +2098,48 @@ void OnTimer()
       PollAndExecute(gBridgeURLs[b]);
    }
    gActiveMagicBase = gMagicBases[0];   // restore branch-1 scope for zones/dashboard below
+
+   //--- emit_grid on 15m bar close (2026-08-05) — jun22-literal's arming logic lives
+   //    entirely behind /exec/emit_grid, unlike the poll-driven intrabar touch-arm on
+   //    later branches; without this call the server never evaluates a single trigger,
+   //    regardless of price. Fires once per NEW 15m bar (matches InpZoneTF's default and
+   //    the chart's own period), branch 1 only — same scope as zones/dashboard below.
+   // 1m: hvn_inside_touch ONLY (2026-08-05, user spec — not bundled w/ hvn_edge)
+   datetime curBar1m = iTime(_Symbol, PERIOD_M1, 0);
+   if(curBar1m != gLastEmitBar1m)
+   {
+      gLastEmitBar1m = curBar1m;
+      EmitGrid(gBridgeURLs[0], "1m", "hvn_inside_touch");
+   }
+
+   // 5m: hvn_inside_touch + hvn_edge (default hint), + lvn_displacement + vp_levels.
+   // squeeze REMOVED 2026-08-05 (user), replaced by vp_levels on the same TFs.
+   datetime curBar5m = iTime(_Symbol, PERIOD_M5, 0);
+   if(curBar5m != gLastEmitBar5m)
+   {
+      gLastEmitBar5m = curBar5m;
+      EmitGrid(gBridgeURLs[0], "5m");
+      EmitGrid(gBridgeURLs[0], "5m", "lvn_displacement");
+      EmitGrid(gBridgeURLs[0], "5m", "vp_levels");
+   }
+
+   datetime curBar15m = iTime(_Symbol, PERIOD_M15, 0);
+   if(curBar15m != gLastEmitBar15m)
+   {
+      gLastEmitBar15m = curBar15m;
+      EmitGrid(gBridgeURLs[0], "15m");
+      // LVN setup (2026-08-05, user) — separate call: plan_grid_levels only narrows
+      // vp_level_touch down to LVN-only (excluding POC/VAH/VAL/naked-POC taps) when
+      // trigger_hint is the EXACT string "lvn_displacement" (execution/grid_planner.py,
+      // string-equality check, not the comma-list membership the other call uses) — so
+      // this can't be folded into the call above, it needs its own request.
+      EmitGrid(gBridgeURLs[0], "15m", "lvn_displacement");
+      // VP-levels setup (2026-08-05, user — replaces squeeze). Also an EXACT-string group
+      // keyword ({va, vp_level_touch}) that additionally selects a dedicated setup magic
+      // (magic_for("vp_levels", tf), strat 9) in exec_emit_grid — so it likewise needs its
+      // own request and must NOT be folded into the comma-list default hint.
+      EmitGrid(gBridgeURLs[0], "15m", "vp_levels");
+   }
 
    //--- redraw HVN/LVN zones on a slower cadence (they change per bar, not per tick).
    //    Branch 1 only — three overlapping zone sets on one chart isn't readable, and
