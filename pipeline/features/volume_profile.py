@@ -333,11 +333,49 @@ def _merge_zones(zones: list[dict], merge_tol: float) -> list[dict]:
     return merged
 
 
+def _merge_peaks_by_trough(
+    peaks: np.ndarray, smoothed: np.ndarray,
+    merge_gap_bins: int, merge_trough_ratio: float,
+) -> list[tuple[int, int]]:
+    """Collapse adjacent HVN peaks that are really SHOULDERS of one broad node into a
+    single (start_peak, end_peak) span. Two peaks merge when BOTH:
+      • gap between them ≤ merge_gap_bins (bins), AND
+      • the SHALLOWEST bin in the gap ≥ merge_trough_ratio × the smaller peak height
+        (a shallow dip = shoulder; a deep trough = a REAL LVN vacuum → keep split).
+
+    This removes the FAKE interior edge a shallow dip would otherwise carve into one HVN
+    (fixes: a wide node split into 2 HVNs, arming on a boundary that sits inside value).
+    Returns a list of merged peak-index ranges [(p_start_idx, p_end_idx), ...] into `peaks`.
+    """
+    if len(peaks) == 0:
+        return []
+    groups: list[list[int]] = [[0]]   # indices into `peaks`
+    for i in range(1, len(peaks)):
+        prev_p = peaks[groups[-1][-1]]
+        cur_p = peaks[i]
+        gap = int(cur_p - prev_p)
+        # shallowest bin strictly between the two peaks
+        seg = smoothed[prev_p + 1:cur_p]
+        trough = float(seg.min()) if len(seg) else 0.0
+        smaller_peak = float(min(smoothed[prev_p], smoothed[cur_p]))
+        shallow = smaller_peak > 0 and trough >= merge_trough_ratio * smaller_peak
+        if gap <= merge_gap_bins and shallow:
+            groups[-1].append(i)          # same broad node → merge
+        else:
+            groups.append([i])            # deep trough or too far → new node
+    return [(g[0], g[-1]) for g in groups]
+
+
 def _find_hvn_zones(
-    bins: np.ndarray, bin_size: float, price_min: float, top_n: int = 8
+    bins: np.ndarray, bin_size: float, price_min: float, top_n: int = 8,
+    merge_gap_bins: int = 20, merge_trough_ratio: float = 0.55,
 ) -> list[dict]:
     """HVN via Gaussian-smoothed bins, prominence ≥ 0.5×avg, height ≥ avg.
-    Adjacent zones within 2×bin_size are merged (Sierra/Bookmap convention).
+
+    Peaks are then collapsed by _merge_peaks_by_trough: adjacent peaks separated by a
+    SHALLOW dip (≥ merge_trough_ratio of the smaller peak, within merge_gap_bins) are one
+    broad node — merged so no fake interior edge is created. A DEEP dip = real LVN vacuum →
+    kept split.
     """
     n = len(bins)
     smoothed = _smooth(bins, n)
@@ -351,9 +389,21 @@ def _find_hvn_zones(
         return []
 
     _, _, left_ips, right_ips = peak_widths(smoothed, peaks, rel_height=0.5)
-    zones = _zones_from_peaks(bins, peaks, left_ips, right_ips, bin_size, price_min, top_n=top_n * 2)
-    merged = _merge_zones(zones, merge_tol=bin_size)  # 1× bin_size gap = same cluster
-    return merged[:top_n]
+    # Trough-aware peak merge FIRST: collapse shoulder sub-peaks into one span so the zone
+    # spans the whole broad node (outer left_ip of the first peak → outer right_ip of the last).
+    spans = _merge_peaks_by_trough(peaks, smoothed, merge_gap_bins, merge_trough_ratio)
+    m_peaks, m_left, m_right = [], [], []
+    for a, b in spans:
+        m_peaks.append(peaks[a])          # representative peak (first) — position only
+        m_left.append(left_ips[a])         # widen span to cover the merged shoulders
+        m_right.append(right_ips[b])
+    zones = _zones_from_peaks(bins, np.array(m_peaks), np.array(m_left), np.array(m_right),
+                              bin_size, price_min, top_n=top_n * 2)
+    # NOTE: no trailing _merge_zones gap-merge here. peak_widths(rel_height=0.5) extends each
+    # kept zone into the trough, so a plain gap-merge would RE-JOIN two peaks the trough test
+    # deliberately split (deep LVN vacuum). _merge_peaks_by_trough is now the sole clustering
+    # authority for HVN — it merges shallow shoulders and preserves deep-trough splits.
+    return zones[:top_n]
 
 
 def _find_lvn_zones(

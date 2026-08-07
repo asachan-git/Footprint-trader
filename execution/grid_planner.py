@@ -86,6 +86,10 @@ _HINT_GROUPS = {
     # vacuum fires. Neutral straddle-in-vacuum: price sits in the LVN, leaves fast one
     # side, that leg fills + runs to the bounding HVN; the opposite leg never triggers.
     "lvn_displacement": {"vp_level_touch"},
+    # LVN EDGE tap (ported from jul09 2026-08-06) — distinct from lvn_displacement above:
+    # that straddles the vacuum MID (step=node_width/2), this arms ON an edge with
+    # near-edge TPs into the next HVN. Separate detector, separate magic (strat 13 vs 3).
+    "lvn_edge": {"lvn_edge_touch"},
     # VP-level setup (parallel setup #3): VAL/VAH reclaim-or-break-sustain (va) + POC /
     # VAH / VAL support-resistance touches (vp_level_touch). Each arms its own magic
     # (va=strat 7, vp=strat 3) so it runs parallel to hvn (1) and squeeze (2).
@@ -251,9 +255,15 @@ def _candle_conviction(symbol: str, tf: str) -> float:
 
 def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
                conviction: float, hvn_max_legs: int = 8,
-               lvn_legs_per_side: int = 1) -> tuple[int, float]:
+               lvn_legs_per_side: int = 1, min_legs: int = 3) -> tuple[int, float]:
     """N (capped by regime.max_legs) and step ($) from ATR + swing range +
-    candle conviction. HVN node width floors the step so legs span the node."""
+    candle conviction. HVN node width floors the step so legs span the node.
+
+    min_legs (2026-08-05, user: "make min as 3") is a FLOOR applied after every cap,
+    so it overrides regime.max_legs when that is lower (uncertain=2 → still 3). The LVN
+    displacement path is exempt — its leg count is the deliberate lvn_legs_per_side and
+    its step is node_width/2 (inner legs sit exactly on the vacuum edges); forcing 3
+    there would push legs to ±1.5×width and break that geometry."""
     rtype = getattr(regime, "type", "uncertain")
     step_mult = TREND_STEP_MULT if rtype in ("trend_up", "trend_down") else MEAN_REV_STEP_MULT
     max_legs = int(getattr(regime, "max_legs", 5) or 5)
@@ -272,16 +282,32 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
             (step_mult * atr) if atr > 0 else swing_range / 5.0, 1e-6)
         return n, round(step, 4)
 
-    # hvn_inside_touch: spacing is pure ATR-mult; leg count = node_width / step so a
-    # WIDER node gets MORE legs (the user's rule). No width-floor on the step (that
-    # would widen spacing on big nodes → fewer legs, the opposite of intended). Uses
-    # its OWN cap (hvn_max_legs), not the regime chop cap — the skip-gate already
-    # filters genuine chop, and width-driven count is the whole point here.
-    if trigger.kind == "hvn_inside_touch":
-        step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
-        n = int(round(trigger.raw_range / step)) if step > 0 else 2
-        n = max(2, min(hvn_max_legs, n))
-        return n, round(step, 4)
+    # HVN rotation / breakout-retest (hvn_inside_touch, hvn_edge): the ladder must FIT THE
+    # NODE, because the fulcrum is a node edge and the far edge is the target.
+    #
+    # Leg count is still ATR-derived (node_width / 0.5·ATR, clamped) so a wider node — or a
+    # calmer regime — still gets more legs. But the STEP is then re-derived from the node so
+    # the ladder actually spans it: step = node_width / (n+1). The +1 leaves the outermost
+    # leg exactly one step short of the far edge, so the far edge stays a TARGET rather than
+    # becoming an entry — which is the whole rotate-across-the-node-then-break thesis. Same
+    # pattern the LVN path above already uses (node_width / 2 puts its inner legs on the
+    # vacuum edges).
+    #
+    # Why (2026-08-06): step was a pure ATR multiple, and on 15m ATR (8.51) can exceed the
+    # node itself. Measured live — ladder span as a % of node width:
+    #     1m  98% / 100%      5m  108% / 92%      15m  125% / 106% / 213%
+    # A 213% span puts every leg in the vacuum OUTSIDE the node, so nothing straddles the
+    # structure, and the far edge (the TP) ends up INSIDE the ladder — which fails the
+    # `tp_up > top_leg` guard and silently drops the structural TP back to the flat ATR
+    # fallback. It also drove the 183 price_outside_ladder skips. With this, span lands at a
+    # consistent 67-86% of node width on every TF.
+    if trigger.kind in ("hvn_inside_touch", "hvn_edge", "lvn_edge_touch"):
+        _atr_step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
+        n = int(round(trigger.raw_range / _atr_step)) if _atr_step > 0 else 2
+        n = max(min_legs, min(hvn_max_legs, n))
+        # Fit the node. Fall back to the ATR step when the trigger carries no width.
+        step = (trigger.raw_range / (n + 1)) if trigger.raw_range > 0 else _atr_step
+        return n, round(max(step, 1e-6), 4)
 
     step = step_mult * atr if atr > 0 else max(trigger.raw_range / 4.0, 1e-6)
 
@@ -292,9 +318,9 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
         step = max(swing_range / 5.0, 1e-6)
 
     legs_to_cover = int(swing_range / step) if step > 0 else max_legs
-    n = max(2, min(max_legs, legs_to_cover))
+    n = max(min_legs, min(max_legs, legs_to_cover))
     # conviction scales N upward toward the cap.
-    n = max(2, min(max_legs, int(round(n * (0.7 + 0.6 * conviction)))))
+    n = max(min_legs, min(max_legs, int(round(n * (0.7 + 0.6 * conviction)))))
     return n, round(step, 4)
 
 
@@ -346,32 +372,35 @@ def _resolve_skew(trigger: Trigger, regime, cfg: dict | None = None,
 
 # ── legs ────────────────────────────────────────────────────────────────────
 
-def _ladder(n: int, base_lot: float, lot_step: float, heavy_near_mid: bool) -> list[float]:
-    """LINEAR_REVERSED (heavy near mid) or LINEAR (light near mid), matching the
-    EA's ResolveLotForIndex semantics. Index 1 = nearest the fulcrum."""
+def _ladder(n: int, base_lot: float, lot_step: float) -> list[float]:
+    """LINEAR: lot size increases with distance from the fulcrum — index 1 (nearest)
+    gets base_lot, each leg outward adds lot_step. ALWAYS increasing outward as of
+    2026-08-05 (user) — previously flipped to LINEAR_REVERSED (heaviest nearest the
+    fulcrum, tapering outward) for whichever side matched the current skew, mirroring
+    the EA's ResolveLotForIndex. User flagged that as backwards for the buy side and
+    asked for a single consistent increasing-with-distance shape on both sides."""
     lots = []
     for i in range(1, n + 1):
-        if heavy_near_mid:
-            raw = base_lot + (n - i) * lot_step
-        else:
-            raw = base_lot + (i - 1) * lot_step
+        raw = base_lot + (i - 1) * lot_step
         lots.append(round(max(base_lot, raw), 2))
     return lots
 
 
 def _build_legs(fulcrum: float, n: int, step: float, skew: str,
                 base_lot: float, lot_step: float) -> tuple[list[Leg], list[Leg]]:
-    """fulcrum ± i·step prices. Favoured side gets the heavier/longer ladder."""
+    """fulcrum ± i·step prices. Favoured side gets one extra leg (skew); both sides'
+    lot ladders always increase with distance from the fulcrum (see _ladder)."""
     buy_n = n
     sell_n = n
-    # Skew adds one extra leg + heavier ladder to the favoured side.
+    # Skew adds one extra leg to the favoured side. (Used to ALSO flip that side's
+    # ladder to heaviest-near-fulcrum — removed 2026-08-05, see _ladder.)
     if skew == "buy":
         buy_n = n + 1
     elif skew == "sell":
         sell_n = n + 1
 
-    buy_lots = _ladder(buy_n, base_lot, lot_step, heavy_near_mid=(skew == "buy"))
-    sell_lots = _ladder(sell_n, base_lot, lot_step, heavy_near_mid=(skew == "sell"))
+    buy_lots = _ladder(buy_n, base_lot, lot_step)
+    sell_lots = _ladder(sell_n, base_lot, lot_step)
 
     buy_legs = [Leg(price=round(fulcrum + i * step, 4), lot=buy_lots[i - 1])
                 for i in range(1, buy_n + 1)]
@@ -444,7 +473,8 @@ def _rebase_to_venue(plan: GridPlan, analysis_anchor: float, venue_price: float)
 def plan_grid_levels(symbol: str, tf: str, current_price: float,
                      trigger_hint: str = "", settings: dict | None = None,
                      venue_price: float | None = None,
-                     min_step_venue: float = 0.0) -> GridPlan:
+                     min_step_venue: float = 0.0,
+                     force_trigger: "Trigger | None" = None) -> GridPlan:
     """Compute a neutral-grid plan for `symbol`/`tf`.
 
     `current_price` is the ANALYSIS-frame price (Binance/Bybit) used for structure.
@@ -459,6 +489,7 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     tp_mult = float(grid_cfg.get("tp_atr_mult", 1.5))
     hvn_max_legs = int(grid_cfg.get("hvn_max_legs", 8))
     lvn_legs_per_side = int(grid_cfg.get("lvn_legs_per_side", 1))
+    min_legs = int(grid_cfg.get("min_legs_per_side", 3))
     max_fulcrum_dist_pct = float(grid_cfg.get("max_fulcrum_dist_pct", 0.05))
 
     from pipeline.state_store import store
@@ -499,17 +530,42 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     if trigger_hint == "lvn_displacement":
         lvn_only = [t for t in triggers if t.context.get("level_type") == "lvn"]
         triggers = lvn_only
+    # vp_levels is the MIRROR of the above: POC/VAH/VAL/naked-POC mean-revert lines only,
+    # LVN excluded. Both hints share the vp_level_touch detector and vp_fulcrum_levels
+    # (which lists lvn), so without this an LVN tap would arm TWICE — once here under the
+    # vp_levels setup magic (strat 9) and again under lvn_displacement's (strat 3) —
+    # doubling exposure on one level. va triggers are unaffected (no level_type).
+    elif trigger_hint == "vp_levels":
+        triggers = [t for t in triggers
+                    if t.context.get("level_type") != "lvn"]
 
-    fulcrum_t = _score_and_pick(triggers, regime, current_price, daily_vp, bars)
+    # force_trigger (2026-08-05): the intrabar touch-arm path resolves the tapped HVN edge
+    # itself and injects that Trigger directly, bypassing the winner-take-all
+    # _score_and_pick. Without this a real tap could be silently beaten by a same-poll
+    # imbalance/anchor trigger and vanish as trigger_mismatch. Everything downstream
+    # (gates, sizing, TP cascade, venue rebase) is untouched and runs identically.
+    fulcrum_t = (force_trigger if force_trigger is not None
+                 else _score_and_pick(triggers, regime, current_price, daily_vp, bars))
 
-    skip, reason = _should_skip(fulcrum_t, regime,
-                                fulcrum_t.fulcrum_price if fulcrum_t else current_price,
-                                daily_vp)
+    # 2026-08-05 (user, "remove the restrictions of any kind"): a hard kill-switch for
+    # every entry-blocking gate below (chop/at-poc, fulcrum-too-far, ladder-span,
+    # require_squeeze_gate enforcement). Does NOT touch position sizing, targets, trail,
+    # or touch_arm_confirm_ticks — those are separate, deliberately-set mechanisms.
+    _no_gates = bool(grid_cfg.get("disable_entry_gates", False))
+    if fulcrum_t is None:
+        # NOT a gate — there is simply nothing to arm. _should_skip owns this check, so
+        # short-circuiting it with disable_entry_gates dropped the None guard too and
+        # execution ran on to `fulcrum_t.fulcrum_price` → AttributeError, a hard 500 on
+        # /exec/emit_grid (observed live 2026-08-06 04:0x). Checked before the flag.
+        skip, reason = True, "no_trigger"
+    else:
+        skip, reason = (False, "") if _no_gates else _should_skip(
+            fulcrum_t, regime, fulcrum_t.fulcrum_price, daily_vp)
     # Proximity gate: reject a fulcrum sitting too far from current price (a stale /
     # far cached-HVN edge). Measured in the ANALYSIS frame, before any rebase. Such a
     # fulcrum both rebases to a garbage offset and places stops far off the venue's
     # market. Catches the stale-HVN bug the honest sim labeler exposed.
-    if not skip and fulcrum_t is not None and current_price > 0 and max_fulcrum_dist_pct > 0:
+    if not _no_gates and not skip and fulcrum_t is not None and current_price > 0 and max_fulcrum_dist_pct > 0:
         dist_pct = abs(fulcrum_t.fulcrum_price - current_price) / current_price
         if dist_pct > max_fulcrum_dist_pct:
             skip, reason = True, f"fulcrum_too_far:{dist_pct:.3f}>{max_fulcrum_dist_pct}"
@@ -529,9 +585,17 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
 
     fulcrum = fulcrum_t.fulcrum_price
     skew, skew_reason = _resolve_skew(fulcrum_t, regime, grid_cfg, symbol=symbol, tf=tf)
+    # 2026-08-05 (user: "do not use the skew, place neutral grid only"). Kept the vote
+    # computation above so skew_reason/skew_votes still land in the audit log for study —
+    # only the ACTING on it is suppressed: _build_legs no longer gets an extra leg on one
+    # side, so buy_n == sell_n and the ladder is symmetric about the fulcrum.
+    if not bool(grid_cfg.get("skew_enabled", True)):
+        skew_reason = f"neutral_forced (would have been {skew or 'none'}: {skew_reason})"
+        skew = "none"
     swing_range = _opposing_swing_range(symbol, fulcrum, skew, daily_vp, atr)
     conviction = _candle_conviction(symbol, tf)
     n, step = _size_grid(fulcrum_t, regime, atr, swing_range, conviction,
+                         min_legs=min_legs,
                          hvn_max_legs=hvn_max_legs,
                          lvn_legs_per_side=lvn_legs_per_side)
     # Freeze-aware floor: ensure the innermost leg (fulcrum ± step) clears the broker's
@@ -548,12 +612,31 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     # (EA freeze guard) rejects them → a one-sided grid. The %-gate above is span-agnostic
     # (max_fulcrum_dist_pct 5% ≈ 3200pts at BTC vs a ~190pt ladder) so it can't catch this;
     # gate here on the ACTUAL span now that n·step is final. Analysis frame throughout.
-    if current_price > 0 and n > 0 and step > 0:
+    #
+    # 2026-08-05: deliberately NOT covered by disable_entry_gates. That flag turns off the
+    # discretionary filters (chop/at-poc, fulcrum-too-far); this one is geometric, not a
+    # preference — it only ever rejects a ladder that CANNOT bracket price, so it can never
+    # block a legitimate straddle. It fired 16× on 2026-08-05 with ratios like 29.6>2.91 and
+    # 87.9>8.77 (price 10× the ladder half-span away from the fulcrum) — i.e. every leg of a
+    # "neutral" straddle landing on one side of market. Opt out via disable_ladder_span_gate.
+    # CENTRE-PROXIMITY (2026-08-06, user): containment alone is too weak. `off <= n*step`
+    # permits price to sit ON the outermost leg and still arm — which is not a straddle, it
+    # is a one-sided grid. Observed live: magic 775052 armed at 12:15:01 with fulcrum
+    # 4262.30, step 2.00, n=3 (half-span 6.00) while price was ~4257 — off 5.3, so it passed
+    # by 0.7. Result: all three buys sat 7-12pt overhead (unreachable) and the sell side
+    # straddled the market instead of the fulcrum (2 legs flipped to sell_limit).
+    # ladder_center_frac scopes the allowed offset to the INNER fraction of the half-span,
+    # so price must genuinely be near the decision point. 1.0 restores the old behaviour.
+    _center_frac = float(grid_cfg.get("ladder_center_frac", 0.5) or 1.0)
+    if (not bool(grid_cfg.get("disable_ladder_span_gate", False))
+            and current_price > 0 and n > 0 and step > 0):
         ladder_half = n * step
+        allowed = ladder_half * max(0.0, min(1.0, _center_frac))
         off = abs(current_price - fulcrum)
-        if off > ladder_half:
+        if off > allowed:
             return GridPlan(verdict="skip",
-                            skip_reason=f"price_outside_ladder:{off:.4f}>{ladder_half:.4f}",
+                            skip_reason=(f"price_outside_ladder:{off:.4f}>{allowed:.4f}"
+                                         f"(half={ladder_half:.2f}x{_center_frac:g})"),
                             regime=getattr(regime, "type", "unknown"),
                             atr=round(atr, 4), plan_id=plan_id)
 

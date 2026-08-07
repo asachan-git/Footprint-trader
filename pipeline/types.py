@@ -12,6 +12,15 @@ Source = Literal["live", "replay"]
 class Level:
     price: float
     vol: float
+    # OPERATIONAL-ONLY (2026-08-03) — literal Jun22 predates this field. The live
+    # footprint files this branch shares with the main repo (via a data/footprint
+    # symlink, so it reads the same real feed rather than a stale duplicate) are
+    # written by the current ingest pipeline and carry `cnt` on every bid/ask level.
+    # Added with the SAME default as the current codebase purely so deserialization
+    # doesn't crash on an unknown field — nothing in Jun22-era strategy code reads
+    # `cnt` (it's a later tick-VP concept), so this cannot change any arm/exit
+    # decision, only whether the file parses at all.
+    cnt: float = 0.0
 
 
 @dataclass(frozen=True)

@@ -119,13 +119,22 @@ def _t_hvn_edge(symbol: str, current_price: float) -> Trigger | None:
         return None
 
     best: tuple[float, float, float] | None = None  # (dist, edge_price, node_width)
-    for period in ("daily", "weekly"):
+    zones: list[tuple[float, float]] = []           # every node seen, for the TP scan below
+    # DAILY ONLY (2026-08-06, user) — "weekly" was also scanned, which let the fulcrum
+    # anchor on a node the chart never draws (/exec/zones renders the daily VP). Measured
+    # 2026-08-05: 6 weekly-only nodes existed, and where they overlapped daily the edges
+    # differed materially — e.g. weekly 4197.6–4206.0 vs daily 4197.6–4214.4, an 8.4pt gap
+    # on the top edge. Arming on the weekly edge put the fulcrum 8.4pt off the drawn zone,
+    # which is the "fulcrum not aligned with the HVN" report. Daily is also the fresher
+    # profile (rebuilt every intraday_refresh_bars); weekly is stale by construction.
+    for period in ("daily",):
         vp = vp_get(symbol, period)
         if not vp:
             continue
         for hvn in vp.get("hvn_zones") or []:
             lo, hi = float(hvn["low"]), float(hvn["high"])
             width = hi - lo
+            zones.append((lo, hi))
             for edge in (lo, hi):
                 d = abs(edge - current_price)
                 if best is None or d < best[0]:
@@ -134,6 +143,19 @@ def _t_hvn_edge(symbol: str, current_price: float) -> Trigger | None:
         return None
 
     _dist, edge, width = best
+    # Structural HVN→HVN targets (2026-08-05, user) — same rule _t_hvn_inside_touch uses:
+    # upside TP = first node-TOP above the tapped edge, downside TP = first node-BOTTOM
+    # below it. When the edge is the NEAR side of its node that's the same node's opposite
+    # edge; when it's the FAR side it's the next HVN's far edge across the LVN between.
+    # Previously hvn_edge supplied NO tp_up/tp_down, so plan_grid_levels fell through to the
+    # flat 1.5×ATR fallback — a breakout-retest setup taking a symmetric mechanical target
+    # while ignoring the very node it broke out of (live 2026-08-05: every hvn_edge arm
+    # showed buy_tp ≈ +9.2 regardless of where structure actually sat). 0.0 = none exists,
+    # which plan_grid_levels treats as "keep the ATR baseline".
+    tops_above = [hi for lo, hi in zones if hi > edge]
+    bots_below = [lo for lo, hi in zones if lo < edge]
+    tp_up = min(tops_above) if tops_above else 0.0
+    tp_down = max(bots_below) if bots_below else 0.0
     # Confidence higher when price is genuinely AT the edge (within ~25% of width).
     proximity = 1.0 - min(1.0, _dist / width) if width > 0 else 0.0
     conf = min(0.9, 0.5 + 0.4 * proximity)
@@ -142,14 +164,22 @@ def _t_hvn_edge(symbol: str, current_price: float) -> Trigger | None:
         fulcrum_price=float(edge),
         raw_range=float(width),
         confidence=float(conf),
-        context={"bias": "none"},
+        context={"bias": "none",
+                 "tp_up": float(tp_up), "tp_down": float(tp_down)},
     )
 
 
 # ── session-aware HVN sources (for the inside-touch trigger) ─────────────────
 
 def _rolling_hvn(symbol: str, tf: str, bars: list[Bar]) -> list[tuple[float, float]]:
-    """Price-tracking rolling-VP HVN zones over the ~24h window for `tf`."""
+    """Price-tracking rolling-VP HVN zones over the ~24h window for `tf`, VENUE frame.
+
+    FRAME (2026-08-05): this computes straight off ANALYSIS (Binance) bars, so the raw
+    zones are analysis-frame — while everything from vp_cache.get() is already shifted to
+    VENUE frame. _session_hvn_zones MERGES the two, so without applying the same offset
+    here the merged list mixes frames ~6pt apart (the basis was measured at −6.14). This
+    was invisible until today only because the stored offset was stuck at 0.0.
+    """
     win = _VP_WIN.get(tf, 96)
     if len(bars) < win:
         return []
@@ -158,6 +188,22 @@ def _rolling_hvn(symbol: str, tf: str, bars: list[Bar]) -> list[tuple[float, flo
         vp = vp_compute(bars[-win:], "daily", bars[-1].ohlc.c,
                         bin_size=DEFAULT_BIN_SIZE.get(symbol))
         return [(float(z["low"]), float(z["high"])) for z in (vp.hvn_zones or [])]
+    except Exception:
+        return []
+
+
+def _rolling_lvn(symbol: str, tf: str, bars: list[Bar]) -> list[tuple[float, float]]:
+    """Price-tracking rolling-VP LVN zones over the ~24h window for `tf`, VENUE frame.
+    Mirrors _rolling_hvn exactly — same VP compute call and the same venue-offset shift
+    (see the frame note there), reads lvn_zones instead of hvn_zones."""
+    win = _VP_WIN.get(tf, 96)
+    if len(bars) < win:
+        return []
+    try:
+        from pipeline.features.volume_profile import compute as vp_compute, DEFAULT_BIN_SIZE
+        vp = vp_compute(bars[-win:], "daily", bars[-1].ohlc.c,
+                        bin_size=DEFAULT_BIN_SIZE.get(symbol))
+        return [(float(z["low"]), float(z["high"])) for z in (vp.lvn_zones or [])]
     except Exception:
         return []
 
@@ -185,6 +231,123 @@ def _merge_zone_tuples(zones: list[tuple[float, float]]) -> list[tuple[float, fl
         else:
             out.append([lo, hi])
     return [(lo, hi) for lo, hi in out]
+
+
+def _cached_lvn(symbol: str) -> list[tuple[float, float]]:
+    """Cached-daily LVN zones. Mirrors this branch's _cached_hvn convention exactly
+    (plain vp_get("daily")); jul09's version additionally folds in a prev-day/today IST
+    band via get_prev_and_today + a clock seam, neither of which exists here."""
+    try:
+        from pipeline.features.vp_cache import get as vp_get
+        vp = vp_get(symbol, "daily") or {}
+        return [(float(z["low"]), float(z["high"])) for z in (vp.get("lvn_zones") or [])]
+    except Exception:
+        return []
+
+
+def _session_lvn_zones(symbol: str, tf: str, bars: list[Bar]) -> tuple[list[tuple[float, float]], str]:
+    """LVN zones for the current session — CACHED DAILY VP ONLY, deliberately (ported from
+    jul09 2026-08-06). The rolling per-TF LVN is NOT blended in: the point is to arm on the
+    LVNs actually drawn on the chart, not a rolling-window edge sitting a few points off the
+    drawn rectangle. The HVN path keeps its rolling∪cached merge — this is LVN-only."""
+    from pipeline.features.session import current_session
+    ts = bars[-1].close_ts if bars else None
+    sess = current_session(ts, symbol).session
+    return _merge_zone_tuples(_cached_lvn(symbol)), sess
+
+
+def compute_lvn_edge_tps(symbol: str, edge: float,
+                         zones: list[tuple[float, float]],
+                         min_dist: float = 0.0) -> tuple[float, float]:
+    """(tp_up, tp_down) for lvn_edge_touch — targets the NEAR edge of the next qualifying
+    HVN (the boundary facing back toward the LVN), not the far edge.
+
+    Deliberately more conservative than hvn_inside_touch's far-edge convention: there is no
+    reversion/continuation thesis behind a vacuum tap that would justify assuming a full
+    pass-through of the next node. The outermost node targets its CENTRE instead (a magnet,
+    since nothing lies beyond it). 0.0 means "none found" — plan_grid_levels then keeps its
+    ATR baseline. Ported from jul09; its _fib_ext_tp last-resort does not exist here, so the
+    cascade ends at POC."""
+    up_zones = sorted([(lo, hi) for lo, hi in zones if hi > edge + min_dist], key=lambda z: z[1])
+    dn_zones = sorted([(lo, hi) for lo, hi in zones if lo < edge - min_dist], key=lambda z: -z[0])
+
+    def _near_target(zs: list, ref: float, sign: int) -> float:
+        if not zs:
+            return 0.0
+        z = zs[0]
+        near_edge = z[0] if sign > 0 else z[1]
+        if len(zs) == 1:          # extreme node → centre, unless it doesn't clear min_dist
+            centre = (z[0] + z[1]) / 2.0
+            return centre if sign * (centre - ref) > min_dist else near_edge
+        return near_edge
+
+    tp_up = _near_target(up_zones, edge, +1)
+    tp_down = _near_target(dn_zones, edge, -1)
+
+    if tp_up == 0.0 or tp_down == 0.0:
+        try:
+            from pipeline.features.vp_cache import get as vp_get
+            _dvp = vp_get(symbol, "daily") or {}
+        except Exception:
+            _dvp = {}
+        _vah = float(_dvp.get("vah") or 0.0)
+        _val = float(_dvp.get("val") or 0.0)
+        _poc = float(_dvp.get("poc") or 0.0)
+        _lvns = [(float(z["low"]), float(z["high"])) for z in (_dvp.get("lvn_zones") or [])]
+        if tp_up == 0.0:
+            if _vah > edge + min_dist:
+                tp_up = _vah
+            else:
+                _above = [lo for lo, hi in _lvns if lo > edge + min_dist]
+                if _above:
+                    tp_up = min(_above)
+            if tp_up == 0.0 and _poc > edge + min_dist:
+                tp_up = _poc
+        if tp_down == 0.0:
+            if 0 < _val < edge - min_dist:
+                tp_down = _val
+            else:
+                _below = [hi for lo, hi in _lvns if hi < edge - min_dist]
+                if _below:
+                    tp_down = max(_below)
+            if tp_down == 0.0 and 0 < _poc < edge - min_dist:
+                tp_down = _poc
+
+    return tp_up, tp_down
+
+
+def _filter_lvn_zones_by_hvn_context(
+    zones: list[tuple[float, float]], hvn_zones: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """LVN edge-touch policy (ported from jul14, 2026-08-05): exclude an LVN ONLY if it is
+    FULLY CONTAINED (surrounded) within a single HVN — that's the true "not a real vacuum,
+    just smoothing noise inside a high-volume node" case. A PARTIAL overlap is allowed: an
+    LVN that pokes into an HVN edge (or straddles it) still carries a genuine vacuum on its
+    non-overlapping side and is a valid edge-touch anchor. When the daily HVN is WIDE/thin
+    (e.g. day-roll VP with one broad node), a sliver overlap on a real LVN would otherwise
+    nuke it entirely — fully-inside is the real exclusion; slivers survive (clipped)."""
+    if not hvn_zones or not zones:
+        return zones
+    allowed = []
+    for lo, hi in zones:
+        # Fully engulfed by a SINGLE HVN → smoothing noise inside a node, drop it.
+        fully_inside = any(h_lo <= lo and hi <= h_hi for h_lo, h_hi in hvn_zones)
+        if fully_inside:
+            continue
+        # PARTIAL overlap: the LVN straddles an HVN edge — its overlapping portion sits
+        # INSIDE the node (a fake vacuum edge there). CLIP the LVN to the HVN boundary so
+        # ONLY the genuine vacuum OUTSIDE the node survives as an arm anchor.
+        clo, chi = lo, hi
+        for h_lo, h_hi in hvn_zones:
+            if chi <= h_lo or clo >= h_hi:
+                continue   # no overlap with this HVN
+            if clo < h_hi <= chi and clo >= h_lo:
+                clo = h_hi
+            elif clo <= h_lo < chi and chi <= h_hi:
+                chi = h_lo
+        if chi - clo > 0:
+            allowed.append((clo, chi))
+    return allowed
 
 
 def _outside_daily_va(symbol: str, price: float) -> bool:
@@ -399,12 +562,229 @@ def _t_va(symbol: str, current_price: float, regime, daily_vp: dict | None) -> T
         return None
 
     va_width = daily_vp.get("va_width") or abs(vah - val)
+    # Structural targets (2026-08-05, user) — nearest real VP structure beyond the VA edge
+    # on each side, built from the same level set _t_vp_level_touch targets: the point
+    # levels (POC/VAH/VAL/naked-POC) plus every HVN and LVN zone boundary. A reclaim fades
+    # back toward the POC/opposite edge; a break-and-sustain runs to the next node beyond —
+    # both are just "nearest structure that way", so one scan serves both interpretations.
+    # Was absent → plan_grid_levels fell through to the flat 1.5×ATR fallback.
+    _levels: list[float] = []
+    for _k in ("poc", "vah", "val", "naked_poc"):
+        _v = daily_vp.get(_k)
+        if isinstance(_v, (int, float)) and _v > 0:
+            _levels.append(float(_v))
+    for _zk in ("hvn_zones", "lvn_zones"):
+        for _z in (daily_vp.get(_zk) or []):
+            _levels += [float(_z["low"]), float(_z["high"])]
+    # Exclude anything sitting on the fulcrum itself (a level can't be its own target).
+    _tol = max(abs(edge) * 1e-4, 1e-6)
+    _above = [p for p in _levels if p > edge + _tol]
+    _below = [p for p in _levels if 0.0 < p < edge - _tol]
+    tp_up = min(_above) if _above else 0.0
+    tp_down = max(_below) if _below else 0.0
     return Trigger(
         kind="va",
         fulcrum_price=float(edge),
         raw_range=float(va_width or 0.0),
         confidence=float(conf),
-        context={"interpretation": interp, "bias": bias},
+        context={"interpretation": interp, "bias": bias,
+                 "tp_up": float(tp_up), "tp_down": float(tp_down)},
+    )
+
+
+def touch_arm_trigger(symbol: str, tf: str, live_price: float, cfg: dict | None = None,
+                      zone_shift: float = 0.0) -> "Trigger | None":
+    """INTRABAR variant of _t_hvn_inside_touch (2026-08-05, user) — arm on LIVE price
+    tapping an HVN edge without waiting for the candle to close. The caller (poll handler)
+    owns the tick-reversal confirm; this only resolves WHICH edge is being tapped and
+    builds the same Trigger the close-driven path would.
+
+    Returns None unless live_price sits INSIDE a session HVN and within the effective
+    buffer of one of its edges — an edge rejection from within value, matching the close
+    path's requirement that the candle close inside the node.
+
+    BUFFER: the close path tests exact wick touch (h >= hi / l <= lo), which works because
+    a candle spans a range. A ~1s point sample almost never lands exactly on an edge, so a
+    tolerance is required. Mirrors the lvn_touch_buffer_price_pct fix: buffer_eff =
+    max(absolute, width-relative, PRICE-relative) — a small fixed absolute alone is
+    unreachable on point sampling and would arm nothing.
+
+    zone_shift: additive (venue − analysis) basis. live_price arrives in VENUE frame; zones
+    are ANALYSIS frame. Subtracted from live_price for the comparison; everything returned
+    stays analysis-frame so plan_grid_levels does the SINGLE venue rebase downstream.
+
+    TP uses this branch's own far-edge convention (first node-TOP above / node-BOTTOM
+    below), identical to _t_hvn_inside_touch — so touch-armed and close-armed cycles get
+    the same geometry and only the trigger MOMENT differs."""
+    cfg = cfg or {}
+    from pipeline.state_store import store
+    bars = store().recent(symbol, tf, 200)
+    if not bars or live_price <= 0:
+        return None
+    zones, sess = _session_hvn_zones(symbol, tf, bars)
+    if not zones:
+        return None
+
+    live_analysis = live_price - zone_shift
+
+    abs_buf = float(cfg.get("hvn_touch_buffer", 0.01) or 0.0)
+    pct_buf = float(cfg.get("hvn_touch_buffer_pct", 0.0) or 0.0)
+    px_pct_buf = float(cfg.get("hvn_touch_buffer_price_pct", 0.0002) or 0.0)
+
+    # ACCEPTANCE PRECONDITION (2026-08-05, user): "requires a candle to close inside the
+    # HVN first, then it arms on a tap + 0.2$ retracement". Live price merely being inside
+    # the node is NOT enough — that also matches a wick spearing through an untested node.
+    # Requiring a prior CLOSE inside means the market actually accepted value there, which
+    # is what makes the edge a level worth fading. Scans the last hvn_accept_lookback_bars
+    # CLOSED bars (the forming bar is excluded — it hasn't closed yet).
+    _accept_lb = int(cfg.get("hvn_accept_lookback_bars", 3) or 3)
+    _closed = [b for b in bars if b.close_ts and b.close_ts < 9_000_000_000][-_accept_lb:]
+
+    best = None   # (dist, edge, width, side)
+    for lo, hi in zones:
+        width = hi - lo
+        if width <= 0:
+            continue
+        if not (lo <= live_analysis <= hi):      # must be INSIDE the node body
+            continue
+        # ...and a recent candle must have CLOSED inside THIS node (analysis frame).
+        if not any(lo <= float(b.ohlc.c) <= hi for b in _closed):
+            continue
+        buf_eff = max(abs_buf, width * pct_buf, abs(live_analysis) * px_pct_buf)
+        touch_top = live_analysis >= hi - buf_eff
+        touch_bot = live_analysis <= lo + buf_eff
+        if not (touch_top or touch_bot):         # inside but not near an edge
+            continue
+        if touch_top and touch_bot:              # degenerate thin node → nearer edge
+            edge, side = ((hi, "top") if abs(hi - live_analysis) <= abs(lo - live_analysis)
+                          else (lo, "bottom"))
+        else:
+            edge, side = (hi, "top") if touch_top else (lo, "bottom")
+        dist = abs(edge - live_analysis)
+        if best is None or dist < best[0]:
+            best = (dist, edge, width, side)
+    if best is None:
+        return None
+    _dist, edge, width, side = best
+
+    tops_above = [hi for lo, hi in zones if hi > edge]
+    bots_below = [lo for lo, hi in zones if lo < edge]
+    tp_up = min(tops_above) if tops_above else 0.0
+    tp_down = max(bots_below) if bots_below else 0.0
+
+    node_low = (edge - width) if side == "top" else edge
+    node_high = edge if side == "top" else (edge + width)
+    return Trigger(
+        kind="hvn_inside_touch",
+        fulcrum_price=float(edge),
+        raw_range=float(width),
+        confidence=0.6,   # touch-armed: no close-rejection depth → fixed mid confidence
+        context={"bias": "none", "edge": side, "session": sess, "touch_armed": True,
+                 "node_low": float(node_low), "node_high": float(node_high),
+                 "tp_up": float(tp_up), "tp_down": float(tp_down)},
+    )
+
+
+def _t_lvn_edge_touch(symbol: str, tf: str, current_price: float) -> Trigger | None:
+    """A recent candle TAPS an LVN (low-volume vacuum) edge — geometrically the LVN twin of
+    _t_hvn_inside_touch, reading LVN bounds instead of HVN. Ported from jul09 2026-08-06.
+
+    Distinct from this branch's existing `lvn_displacement` setup, which straddles the
+    vacuum MID (step = node_width/2, inner legs on the edges). This one arms ON an edge and
+    takes near-edge TPs into the next HVN, so the two run as separate magics (strat 13 vs 3).
+
+    No close-inside gate and no fade/breakout asymmetry: a wick reaching the edge from
+    either side is a valid tap, and both directions take compute_lvn_edge_tps' near-edge
+    rule — there's no reversion thesis here to justify treating one side differently.
+    Stateless / causal: only CLOSED bars are scanned."""
+    import yaml as _yaml
+    from pipeline.state_store import store
+    try:
+        _cfg = _yaml.safe_load(
+            (__import__("pathlib").Path(__file__).resolve().parent.parent
+             / "config" / "settings.yaml").read_text()
+        ) or {}
+        _gcfg = _cfg.get("grid_levels") or {}
+        _buf = float(_gcfg.get("lvn_touch_buffer", 0.01))
+        _buf_pct = float(_gcfg.get("lvn_touch_buffer_pct", 0.0))
+        _buf_ppct = float(_gcfg.get("lvn_touch_buffer_price_pct", 0.0002))
+        _lookback = int(_gcfg.get("lvn_lookback_bars", 3))
+    except Exception:
+        _buf, _buf_pct, _buf_ppct, _lookback = 0.01, 0.0, 0.0002, 3
+
+    win = _VP_WIN.get(tf, 96)
+    bars = store().recent(symbol, tf, win + 5)
+    if len(bars) < 2:
+        return None
+    zones, sess = _session_lvn_zones(symbol, tf, bars)
+    if not zones:
+        return None
+    # Drop LVNs fully engulfed by an HVN (smoothing noise inside a node, not a real
+    # vacuum); clip the ones that merely straddle an HVN edge.
+    try:
+        from pipeline.features.vp_cache import get as vp_get
+        _ctx = [(float(z["low"]), float(z["high"]))
+                for z in ((vp_get(symbol, "daily") or {}).get("hvn_zones") or [])]
+        zones = _filter_lvn_zones_by_hvn_context(zones, _ctx)
+    except Exception:
+        pass
+    if not zones:
+        return None
+
+    candidate_bars = list(reversed(bars[-(1 + _lookback):-1]))
+    best_trigger = None
+    for bar_idx, cur in enumerate(candidate_bars):
+        c, h, lo_p = cur.ohlc.c, cur.ohlc.h, cur.ohlc.l
+        best = None
+        for lo, hi in zones:
+            width = hi - lo
+            if width <= 0:
+                continue
+            # buffer_eff = max(absolute, width-relative, PRICE-relative). The price term is
+            # what makes this reachable at all — a bare 1c absolute armed nothing when the
+            # LVN path was first built (a 0.40 wick INTO the edge still failed a <=0.01 test).
+            _buf_eff = max(_buf, width * _buf_pct, abs(current_price) * _buf_ppct)
+            touch_top = (h >= hi - _buf_eff) and (lo_p <= hi + _buf_eff)
+            touch_bot = (lo_p <= lo + _buf_eff) and (h >= lo - _buf_eff)
+            if not (touch_top or touch_bot):
+                continue
+            if touch_top and touch_bot:
+                edge, side = (hi, "top") if abs(hi - c) <= abs(lo - c) else (lo, "bottom")
+            else:
+                edge, side = (hi, "top") if touch_top else (lo, "bottom")
+            poke = (h - hi) if side == "top" else (lo - lo_p)
+            reject_frac = max(0.0, poke) / width
+            dist = abs(edge - c)
+            if best is None or dist < best[0]:
+                best = (dist, edge, width, side, reject_frac)
+        if best is not None:
+            _dist, edge, width, side, reject_frac = best
+            conf = min(0.9, 0.55 + min(reject_frac, 0.3)) * (1.0 - bar_idx * 0.05)
+            best_trigger = (edge, width, side, reject_frac, conf, sess)
+            break
+    if best_trigger is None:
+        return None
+    edge, width, side, reject_frac, conf, sess = best_trigger
+
+    try:
+        from pipeline.features.vp_cache import get as vp_get
+        _daily_hvn = [(float(z["low"]), float(z["high"]))
+                      for z in ((vp_get(symbol, "daily") or {}).get("hvn_zones") or [])]
+    except Exception:
+        _daily_hvn = []
+    tp_up, tp_down = compute_lvn_edge_tps(symbol, edge, _daily_hvn)
+
+    node_low = (edge - width) if side == "top" else edge
+    node_high = edge if side == "top" else (edge + width)
+    return Trigger(
+        kind="lvn_edge_touch",
+        fulcrum_price=float(edge),
+        raw_range=float(width),
+        confidence=float(conf),
+        context={"bias": "none", "edge": side, "session": sess,
+                 "reject_frac": round(reject_frac, 4),
+                 "node_low": float(node_low), "node_high": float(node_high),
+                 "tp_up": float(tp_up), "tp_down": float(tp_down)},
     )
 
 
@@ -454,9 +834,10 @@ def _t_vp_level_touch(symbol: str, tf: str, current_price: float,
     # VACUUM (step = node_width/2 puts the inner legs on the LVN edges), so the
     # planner needs the node width, not the gap-to-next-level raw_range below.
     lvn_bounds: dict[float, tuple[float, float]] = {}
+    _hvn_ctx = [(float(z["low"]), float(z["high"])) for z in (daily_vp.get("hvn_zones") or [])]
+    _raw_lvn = [(float(z["low"]), float(z["high"])) for z in (daily_vp.get("lvn_zones") or [])]
     if "lvn" in enabled:
-        for z in (daily_vp.get("lvn_zones") or []):
-            lo_z, hi_z = float(z["low"]), float(z["high"])
+        for lo_z, hi_z in _filter_lvn_zones_by_hvn_context(_raw_lvn, _hvn_ctx):
             mid = (lo_z + hi_z) / 2.0
             if mid > 0:
                 cands.append((mid, "lvn", _VP_LEVEL_BASE_CONF["lvn"]))
@@ -502,8 +883,8 @@ def _t_vp_level_touch(symbol: str, tf: str, current_price: float,
             targets.append(float(v))
     for z in (daily_vp.get("hvn_zones") or []):
         targets += [float(z["low"]), float(z["high"])]
-    for z in (daily_vp.get("lvn_zones") or []):
-        targets += [float(z["low"]), float(z["high"])]
+    for lo_z, hi_z in _filter_lvn_zones_by_hvn_context(_raw_lvn, _hvn_ctx):
+        targets += [lo_z, hi_z]
     above = [t for t in targets if t > L + tol]
     below = [t for t in targets if t < L - tol]
     tp_up = min(above) if above else 0.0
@@ -823,6 +1204,7 @@ def detect_all(symbol: str, tf: str, current_price: float, regime,
         _t_imbalance(symbol, tf, current_price),
         _t_hvn_edge(symbol, current_price),
         _t_hvn_inside_touch(symbol, tf, current_price),
+        _t_lvn_edge_touch(symbol, tf, current_price),
         _t_anchor(symbol, current_price, atr, latest),
         _t_va(symbol, current_price, regime, daily_vp),
         _t_vp_level_touch(symbol, tf, current_price, daily_vp, atr, cfg),

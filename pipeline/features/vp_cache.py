@@ -31,6 +31,11 @@ CACHE_FILE = ROOT / "data" / "vp_cache.json"
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
+# Symbols that legitimately trade through the weekend — everything else (gold via
+# Binance's XAUUSDT perp) is exempted from Sat/Sun VP builds since the real market
+# is closed and that volume doesn't reflect genuine price discovery.
+_ALWAYS_24_7 = {"BTCUSDT", "BTCUSD"}
+
 
 # Session anchor type:
 #   int               → static UTC hour (e.g. 0 for BTC) — DST-naive, fine for 24/7 markets
@@ -209,20 +214,61 @@ def _shift_vp(vp: dict, offset: float) -> dict:
     return shifted
 
 
-def _compute_venue_offset(symbol: str, broker_symbol: str, bybit_last_close: float) -> float:
-    """Fetch Vantage mid and return (vantage_mid - bybit_close). Returns 0.0 on failure."""
+_VENUE_QUOTE_MAX_AGE_S = 300.0
+
+
+def _compute_venue_offset(symbol: str, broker_symbol: str,
+                          bybit_last_close: float) -> float | None:
+    """(venue_mid − analysis_close), or None when it cannot be determined.
+
+    Returning None rather than 0.0 is deliberate — see the caller. A failed fetch means
+    "unknown", and overwriting a known-good offset with 0 silently re-introduces the entire
+    Binance↔Vantage basis error.
+
+    Source order (2026-08-05):
+      1. The EA's own bid/ask, cached by ExecBridge on every /exec/poll. This is the exact
+         price orders execute against and needs no external service. PRIMARY.
+      2. venue_translator / MetaAPI — the original path. It has been failing on this branch
+         the whole time with 'METAAPI_TOKEN' (this branch drives MT5 over the EA/rpyc bridge
+         and holds no MetaAPI credentials), which is why the stored offset sat at 0.0 while
+         the real basis was ~5.5pt. Kept only for deployments that do have MetaAPI.
+    """
+    # 1) EA-reported quote (primary)
+    try:
+        from execution.exec_bridge import ExecBridge
+        best = None
+        with ExecBridge._lock:
+            for (_acct, _sym), q in ExecBridge._quotes.items():
+                if _sym != broker_symbol or not q.get("mid"):
+                    continue
+                if best is None or float(q.get("ts", 0) or 0) > float(best.get("ts", 0) or 0):
+                    best = dict(q)
+        if best is not None:
+            age = time.time() - float(best.get("ts", 0) or 0)
+            if age <= _VENUE_QUOTE_MAX_AGE_S:
+                offset = float(best["mid"]) - bybit_last_close
+                LOG.info(f"[vp_cache] {symbol} venue offset (EA quote): "
+                         f"venue_mid={float(best['mid']):.2f} "
+                         f"analysis_close={bybit_last_close:.2f} → offset={offset:+.2f}")
+                return offset
+            LOG.info(f"[vp_cache] {symbol} EA quote stale ({age:.0f}s) — trying fallback")
+    except Exception as e:
+        LOG.info(f"[vp_cache] {symbol} EA quote unavailable ({e}) — trying fallback")
+
+    # 2) MetaAPI (legacy fallback)
     try:
         from execution.venue_translator import fetch_venue_quote
         quote = fetch_venue_quote("vantage_mt5", broker_symbol)
         if quote.get("ok") and quote.get("mid"):
             offset = float(quote["mid"]) - bybit_last_close
-            LOG.info(f"[vp_cache] {symbol} venue offset: vantage_mid={quote['mid']:.2f} "
-                     f"bybit_close={bybit_last_close:.2f} → offset={offset:+.2f}")
+            LOG.info(f"[vp_cache] {symbol} venue offset (metaapi): vantage_mid={quote['mid']:.2f} "
+                     f"analysis_close={bybit_last_close:.2f} → offset={offset:+.2f}")
             return offset
-        LOG.info(f"[vp_cache] {symbol} venue quote unavailable ({quote.get('error')}) — offset=0")
+        LOG.info(f"[vp_cache] {symbol} venue quote unavailable ({quote.get('error')}) "
+                 f"— KEEPING existing offset")
     except Exception as e:
-        LOG.info(f"[vp_cache] {symbol} venue offset fetch failed: {e} — offset=0")
-    return 0.0
+        LOG.info(f"[vp_cache] {symbol} venue offset fetch failed: {e} — KEEPING existing offset")
+    return None
 
 
 def build_and_save(
@@ -270,7 +316,15 @@ def build_and_save(
             broker_sym = sym_map.get(symbol, symbol)
             last_close = all_bars[-1].ohlc.c
             computed_offset = _compute_venue_offset(symbol, broker_sym, last_close)
-            sym_cache["venue_price_offset"] = computed_offset
+            if computed_offset is not None:
+                sym_cache["venue_price_offset"] = computed_offset
+            else:
+                # STICKY (2026-08-05): keep the last known-good offset instead of resetting
+                # to 0. The build runs at startup (before the first EA poll, so no quote
+                # yet) and again on every bar via routes/ingest.py — a transient miss must
+                # not wipe a good value and silently un-shift every zone by the full basis.
+                _kept = float(sym_cache.get("venue_price_offset") or 0.0)
+                LOG.info(f"[vp_cache] {symbol} offset not resolvable now — keeping {_kept:+.2f}")
         elif raw_offset is not None:
             sym_cache["venue_price_offset"] = float(raw_offset)
         # else: leave existing offset in cache untouched (or absent = 0)
@@ -278,11 +332,21 @@ def build_and_save(
             sym_cache["bin_size"] = bin_size
         computed = 0
 
-        for days_back in range(5):
+        # 7 calendar days always contain exactly 5 weekdays (one full weekly cycle),
+        # so this still yields exactly 5 trading-day periods for non-24/7 symbols
+        # once weekends are excluded below.
+        for days_back in range(7):
             ts_for_day = now_ts - days_back * 86400
             date_key = _session_day_key(ts_for_day, anchor)
-            if date_key in sym_cache["daily"] and days_back > 0:
+            # Real gold is closed weekends; Binance's XAUUSDT perp keeps ticking, so a
+            # Sat/Sun session would be built from contaminated volume. Skip it entirely
+            # (crypto symbols trade 24/7 and are exempt).
+            if symbol.upper() not in _ALWAYS_24_7 and datetime.strptime(date_key, "%Y-%m-%d").weekday() >= 5:
+                sym_cache["daily"].pop(date_key, None)  # purge a stale pre-fix weekend entry, if any
                 continue
+            # Always recompute — a day cached mid-session (e.g. a restart during a feed
+            # gap) freezes a partial profile forever otherwise; the store may hold more
+            # real bars for that date by the time we start again.
             start_ts, end_ts = _day_bounds(date_key, anchor)
             vp = _compute_period_vp(all_bars, start_ts, min(end_ts, now_ts), bin_size=bin_size)
             if vp:
@@ -312,13 +376,55 @@ def _get_offset(sym: dict) -> float:
     return float(sym.get("venue_price_offset") or 0.0)
 
 
+_offset_memo: dict[str, tuple[float, float]] = {}   # symbol → (offset, read_ts)
+_OFFSET_MEMO_TTL_S = 10.0
+
+
+def venue_offset(symbol: str) -> float:
+    """Public accessor for the stored (venue − analysis) additive offset.
+
+    For code that builds price levels OUTSIDE the cached VP (e.g. the rolling-window VP in
+    zone_triggers) and therefore has to apply the same shift by hand — otherwise those
+    levels stay in ANALYSIS frame while everything from get() is in VENUE frame, and
+    merging the two silently mixes frames.
+
+    Memoised for _OFFSET_MEMO_TTL_S because _load() re-reads and re-parses the whole cache
+    file on every call, and this is hit on the ~1s poll path. The offset only changes on a
+    VP rebuild (every intraday_refresh_bars minutes), so a few seconds of staleness is free.
+    """
+    now = time.time()
+    hit = _offset_memo.get(symbol)
+    if hit is not None and (now - hit[1]) < _OFFSET_MEMO_TTL_S:
+        return hit[0]
+    try:
+        off = _get_offset(_load().get(symbol, {}) or {})
+    except Exception:
+        off = hit[0] if hit else 0.0
+    _offset_memo[symbol] = (off, now)
+    return off
+
+
 def get(symbol: str, period: str) -> dict | None:
-    """Get cached VP for symbol + period (today / this week), venue-offset applied."""
+    """Get cached VP for symbol + period (today / this week), in ANALYSIS frame.
+
+    NO venue shift is applied here (changed 2026-08-06). The VP is built from analysis
+    (Binance) bars and every detector that reads it — _cached_hvn, _t_hvn_edge, _t_va,
+    _prior_day_hvn, _outside_daily_va, and the `daily_vp` plan_grid_levels threads through
+    for TPs/POC-reversion — operates in analysis frame, because plan_grid_levels performs
+    the SINGLE venue rebase at the end (_rebase_to_venue, the 2026-07-14 design).
+
+    This function used to apply `_shift_vp(vp, offset)`. That was harmless only while the
+    stored offset was stuck at 0.0; once it began resolving (~-5pt) every detector started
+    comparing venue-frame zones against analysis-frame prices. Live symptom: price tapped
+    an HVN top edge (venue 4249.53 vs edge 4249.30) while touch_arm_trigger compared
+    4254.20 and saw nothing — HVN touches silently stopped arming.
+
+    Venue-frame consumers (the /exec/zones chart payload) apply `venue_offset()` themselves.
+    """
     cache = _load()
     sym = cache.get(symbol, {})
     now_ts = int(time.time())
     anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
-    offset = _get_offset(sym)
     if period == "daily":
         key = _session_day_key(now_ts, anchor)
         vp = sym.get("daily", {}).get(key)
@@ -327,17 +433,16 @@ def get(symbol: str, period: str) -> dict | None:
         vp = sym.get("weekly", {}).get(key)
     else:
         return None
-    return _shift_vp(vp, offset) if vp else None
+    return dict(vp) if vp else None
 
 
 def get_history(symbol: str, period: str, n: int = 5) -> list[dict]:
-    """Get last N cached VP snapshots (newest last), venue-offset applied."""
+    """Last N cached VP snapshots (newest last), ANALYSIS frame — see get()."""
     cache = _load()
     sym_cache = cache.get(symbol, {})
-    offset = _get_offset(sym_cache)
     entries = sym_cache.get(period, {})
     sorted_keys = sorted(entries.keys())[-n:]
-    return [{"period_key": k, **_shift_vp(entries[k], offset)} for k in sorted_keys]
+    return [{"period_key": k, **entries[k]} for k in sorted_keys]
 
 
 def poc_sequence(symbol: str, period: str, n: int = 5) -> list[float | None]:
@@ -376,6 +481,49 @@ def period_profile(symbol: str, period: str) -> dict | None:
     profile = [{"price": round(float(centers[i]) + offset, 5), "vol": round(float(bins[i]), 2)}
                for i in range(len(bins)) if bins[i] > 0]
     return {"bin": round(float(bin_size), 5), "profile": profile}
+
+
+def period_profiles_session(symbol: str, days: int = 5) -> list[dict]:
+    """VP histograms for the last `days` trading sessions (oldest first), each with
+    its own {"bin", "profile", "start_ts"} — for the EA to draw one histogram per
+    day, anchored at that day's own session start. Sat/Sun sessions are skipped for
+    non-24/7 symbols (mirrors build_and_save's weekend exclusion)."""
+    from pipeline.state_store import store as _store
+    from .volume_profile import _build_bins
+    cache = _load()
+    sym = cache.get(symbol, {})
+    anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
+    offset = _get_offset(sym)
+    bin_cfg = sym.get("bin_size")
+    now_ts = int(time.time())
+
+    day_keys: list[str] = []
+    i = 0
+    while len(day_keys) < days and i < days + 6:
+        k = _session_day_key(now_ts - i * 86400, anchor)
+        i += 1
+        if symbol.upper() not in _ALWAYS_24_7 and datetime.strptime(k, "%Y-%m-%d").weekday() >= 5:
+            continue
+        if k not in day_keys:
+            day_keys.append(k)
+    day_keys.reverse()
+
+    all_bars = _store().recent(symbol, "1m", 100_000)
+    results: list[dict] = []
+    for day_key in day_keys:
+        st, en = _day_bounds(day_key, anchor)
+        end = min(en, now_ts)
+        bars = [b for b in all_bars if st <= b.close_ts < end]
+        if len(bars) < 30:
+            continue
+        res = _build_bins(bars, bin_size=float(bin_cfg) if bin_cfg else None)
+        if not res:
+            continue
+        bins, centers, bin_size, _pmin, _pmax = res
+        profile = [{"price": round(float(centers[i2]) + offset, 5), "vol": round(float(bins[i2]), 2)}
+                   for i2 in range(len(bins)) if bins[i2] > 0]
+        results.append({"bin": round(float(bin_size), 5), "profile": profile, "start_ts": st})
+    return results
 
 
 def get_va_regime(

@@ -49,7 +49,65 @@ grid_levels:
   base_lot: 0.25
   lot_step: 0.25
   tp_atr_mult: 1.5
-  hvn_max_legs: 8
+  # 8 → 6 (2026-08-05, user). This cap DOES bind on 1m: n = node_width / (0.5×ATR), and 1m
+  # ATR is small enough that a wide node blows past it — magic 775011 armed 8+8 legs at
+  # 18:33 while every 5m/15m arm that hour sized to 3.
+  hvn_max_legs: 6
+  # 2026-08-05 (user): floor of 3 legs/side, applied AFTER every cap — so it overrides
+  # regime.max_legs where that is lower (uncertain=2 → still 3). LVN displacement is
+  # exempt (its count is lvn_legs_per_side; step=node_width/2 puts inner legs exactly on
+  # the vacuum edges, and forcing 3 would push the outer legs to ±1.5×width).
+  # 2 = Jun22 behaviour (2026-08-06). Was raised to 3 then 4 earlier today, which lifted the
+  # MINIMUM per-side exposure 3.3x over scaled-Jun22 (0.75 -> 2.50 lots) and, because this
+  # floor is applied AFTER regime.max_legs, forced 4 legs even in "uncertain" regime where
+  # Jun22 armed 2. Chop is exactly where full_hedge (-3,472 avg) and leg_tp (-1,424 avg)
+  # fire, so the floor was sizing up into the losing conditions. Session 03:30-10:45 IST:
+  # those two paths + leg_closed_other lost 27,103 USC against 10,889 from all 46 winners.
+  # Trail and net_target are Jun22-exact (25x scaled) and profitable — deliberately untouched.
+  min_legs_per_side: 2
+  # Skip reasons dropped from data/exec_emit.jsonl (2026-08-06, user). Routine "nothing to
+  # do this bar" outcomes fire on every emit call × every TF × every hint — 861 skips vs 40
+  # arms in 24h, which buries the rows that matter. Matched on the prefix before ':' so
+  # trigger_mismatch:imbalance / dedup:same_fulcrum collapse to one key. Set to [] to log
+  # everything again. price_outside_ladder is deliberately NOT suppressed — it means the
+  # fulcrum is stale/far and the grid could not bracket price, which is worth seeing.
+  # `chop` suppressed too (user): the chop gates are already off via disable_entry_gates,
+  # so any chop row is noise from a path that no longer blocks anything.
+  audit_suppress_skips: [trigger_mismatch, owned_by_touch_arm, dedup, chop]
+  # ── Intrabar touch-arm (2026-08-05, user) — hvn_inside_touch ONLY ──────────────────
+  # Arms on a LIVE tap of an HVN edge + a 0.2$ reversal back inside, instead of waiting
+  # for the 1m/5m/15m candle to close (latency ~60s → ~1s). hvn_edge, lvn_displacement and
+  # vp_levels deliberately stay bar-close via /exec/emit_grid. While enabled, the bar-close
+  # path SKIPS hvn_inside_touch (skip_reason owned_by_touch_arm) so the two can't contend
+  # for the same magic.
+  # OFF 2026-08-06 (user) — back to Jun22: EVERY trigger arms on candle close only. Jun22
+  # had no intrabar path at all; this was ported 2026-08-05. Session 03:30-10:45 IST split
+  # by arming path: BAR-CLOSE +3,747 USC vs INTRABAR -4,067. Caveat on that read — only one
+  # magic (775013, hvn 15m) actually filled on the intrabar path, and it ran with the
+  # venue-frame bug until ~04:30, so it is suggestive rather than conclusive.
+  # Setting this false ALSO lifts the `owned_by_touch_arm` suppression in exec_emit_grid
+  # (same flag gates both), so the bar-close path resumes arming hvn_inside_touch on
+  # 5m/15m automatically — no other change needed. Flip to true to restore intrabar.
+  touch_arm_enabled: false
+  touch_arm_tfs: [5m, 15m]
+  touch_arm_confirm_ticks: 0.2   # $ price must revert back INSIDE the node to confirm the
+                                 # rejection. 0 = arm on the raw tap (no rejection proof).
+  # Tap tolerance for the INTRABAR path only. The close path tests exact wick touch, which
+  # works for a candle (it spans a range) but never for a ~1s point sample — hence a
+  # buffer. buffer_eff = max(absolute, width×pct, price×price_pct); the PRICE-relative term
+  # is what makes it reachable (0.0002 ≈ 0.84 @4200). A bare 0.01 absolute armed nothing
+  # when this same mistake was made on the LVN path.
+  hvn_touch_buffer: 0.01
+  hvn_touch_buffer_pct: 0.0
+  hvn_touch_buffer_price_pct: 0.0002
+  # Acceptance window for the INTRABAR touch-arm (2026-08-05, user): a candle must have
+  # CLOSED inside the HVN within this many closed bars before a tap can arm. Live price
+  # inside the node is not enough — that also matches a wick through an untested node.
+  hvn_accept_lookback_bars: 3
+  # 2026-08-05 (user): "do not use the skew, place neutral grid only". false → buy_n ==
+  # sell_n always (no extra leg on the favoured side). The skew VOTE is still computed and
+  # logged (skew_reason/skew_votes in the audit) for study — it just isn't acted on.
+  skew_enabled: false
   max_fulcrum_dist_pct: 0.05
   # Cycle exit (server-side cycle monitor). DEMO ONLY — strategy is -EV.
   # Net-profit-exit-only: place legs with NO per-order TP so the winning side can't book
@@ -80,7 +138,7 @@ grid_levels:
   htf_bias_map: {1m: "15m", 5m: "15m", 15m: "1h", 1h: "4h"}
   bb_edge_enabled: true
   bb_edge_sigma: 2.5
-  cycle_net_target_usd: 2000.0    # SIZING CHANGE (2026-08-03, user) — was 50.0 (40x, not the 25x lot ratio)
+  cycle_net_target_usd: 1250.0    # SIZING CHANGE (2026-08-03, user) — was 2000.0, lowered "for now"
   cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full
   cycle_min_target_usd: 0.20     # floor; must be >0 so a hedged cycle still has a positive net-$ exit
   cycle_close_on_full_hedge: true  # cut a fully-hedged (delta-neutral) cycle to free margin
@@ -89,11 +147,50 @@ grid_levels:
   # that side and move the rest to breakeven (risk-free runner). Captures directional
   # profit the net-basket exit masks (a hedge leg drags net down → target never hits).
   bias_trail_enabled: true
-  bias_trail_activate_usd: 200.0  # SIZING CHANGE (2026-08-03, user) — was 5.0 (40x, not the 25x lot ratio)
+  # Trail measures NET CYCLE P&L (buy_pnl + sell_pnl) and, as of 2026-08-06, CLOSES THE
+  # WHOLE CYCLE rather than booking a fraction of the winning side. The positive floor
+  # (net_pnl > 0) means the cycle is net-green when it fires, so a full close banks a
+  # certain profit; the old partial book left the loser fully exposed and simultaneously
+  # made net_target harder and full_hedge unreachable.
+  #
+  # Deferred until this fraction of the cycle's TOTAL legs (buy_n + sell_n) are filled —
+  # without it a single early leg drifting to +activate would flatten a grid that never got
+  # to work. Total, not per-side: a directional move legitimately fills one side only.
+  bias_trail_min_fill_frac: 0.5
+  # bias_book_frac below is now unused by the trail (no partial book).
+  bias_trail_activate_usd: 125.0  # SIZING CHANGE (2026-08-03, user) — was 200.0, lowered "for now"
   bias_trail_giveback_pct: 40    # fire when floating retraces this % off the peak
   bias_book_frac: 0.5            # fraction of the bias side's positions to book at the trigger
   # VP-level fulcrums (vp_level_touch) — arm a straddle when price taps a VP level.
-  triggers: [hvn_inside_touch, squeeze]   # "structural" group the emitter arms (vp_level_touch disabled)
+  # 2026-08-05 (user, "remove the restrictions of any kind"): kill-switch for the
+  # DISCRETIONARY entry filters only — chop:at_poc / chop:inside_hvn /
+  # chop:uncertain_no_expansion, and fulcrum_too_far. Sizing/targets/trail/
+  # touch_arm_confirm_ticks untouched.
+  disable_entry_gates: true
+  # NOT covered by the above: the ladder-span gate (price_outside_ladder) still runs. It is
+  # geometric, not discretionary — it only rejects a ladder that cannot bracket price at all
+  # (fired 16× on 2026-08-05, e.g. price 29.6 away from fulcrum vs a 2.91 half-span → every
+  # leg on one side of market). Set true ONLY to deliberately allow one-sided grids.
+  disable_ladder_span_gate: false
+  # Price must sit within this fraction of the ladder half-span from the fulcrum to arm
+  # (2026-08-06, user). Containment alone (1.0) let price sit ON the outermost leg — magic
+  # 775052 armed with price 5.3 from a 6.00 half-span, so all 3 buys were 7-12pt overhead
+  # and the sell side straddled the market rather than the fulcrum. 0.5 = inner half only.
+  ladder_center_frac: 0.5
+  # NOTE: this key is LEGACY/UNUSED — nothing reads grid_levels.triggers on this branch.
+  # The EA's trigger_hint string is authoritative (see EmitGrid calls in the .mq5 OnTimer).
+  # Live as of 2026-08-05: hvn_inside_touch (1m/5m/15m), hvn_edge (5m/15m),
+  # lvn_displacement (5m/15m), vp_levels (5m/15m). squeeze REMOVED (user), replaced by vp_levels.
+  triggers: [hvn_inside_touch, hvn_edge, vp_level_touch, va]
+  # lvn_edge_touch (ported from jul09 2026-08-06) — arms ON an LVN edge, near-edge TPs into
+  # the next HVN. Separate setup/magic (strat 13) from `lvn_displacement`, which straddles
+  # the vacuum MID. buffer_eff = max(absolute, width x pct, price x price_pct); the
+  # PRICE-relative term is what makes the tap reachable at all — a bare 0.01 absolute armed
+  # nothing when this was first built (a 0.40 wick INTO the edge failed a <=0.01 test).
+  lvn_touch_buffer: 0.01
+  lvn_touch_buffer_pct: 0.0
+  lvn_touch_buffer_price_pct: 0.0002   # ~0.85 @ 4250
+  lvn_lookback_bars: 3
   vp_fulcrum_levels: [poc, vah, val, naked_poc, lvn]   # which VP levels are fulcrums
   vp_tol_atr_mult: 0.25      # tap "test" band = max(this·ATR, vp_tol_pct·price)
   vp_tol_pct: 0.0005         # ATR-free floor for the tap band (replay safety)
@@ -168,7 +265,9 @@ vp_cache:
   #   BTC tick = 0.1 → 1.0 = 10-tick bins
   vp_bin_size:
     BTCUSDT:  25.0          # 25$ bins (Sierra/Bookmap convention for BTC ~1300/day range = ~52 bins)
-    XAUTUSDT: 1.0           # 1$ bins (was 0.5; gives ~25 bins per day for typical XAU range)
+    XAUTUSDT: 0.4           # 0.4 = coarsest bin where the 1.5-bin smoothing floor (0.6$) still
+                            # lands below gold's ~2$ node spacing → resolves 3 distinct HVN + clean
+                            # LVNs (bin 1.0 collapsed to ONE 18$ blob with 0 LVNs). Matches final-v1.
   # Intra-day VP refresh — rebuild current day's POC/VAH/VAL/HVN/LVN every N
   # primary-TF bars. Default 5 = every 5 minutes at 1m primary TF. Set 0 to disable.
   intraday_refresh_bars: 5
@@ -225,6 +324,14 @@ risk:
   max_legs_per_cycle: 6        # max legs per cycle (total exposure cap = max_cycles × this)
   daily:
     max_dd_r: 4.0              # halt + close all + block re-entry when daily realized R ≤ -this
+
+# Combined net target (2026-08-05, user) — account-wide floating P&L summed across
+# EVERY open cycle (all magics together), ported from feat/jul09's identical
+# mechanism. Closes everything + blocks new arms once crossed; auto-resets (and
+# rebases to the current balance) the moment the account goes flat again — NOT
+# sticky for the whole day. Independent of grid_levels.cycle_net_target_usd above
+# (that still lets one cycle book early on its own). 0 = disabled.
+combined_net_target_usd: 5000.0
 
 # Dhan options trading configuration
 dhan:

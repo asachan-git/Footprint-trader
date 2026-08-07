@@ -106,6 +106,18 @@ def create_app() -> Flask:
     # freshly-computed cache. Disable via startup_check.enabled=false (not for live).
     from pipeline.startup_check import assert_ready
     assert_ready(settings)
+    # Re-adopt live grid cycles from disk BEFORE the first EA poll (2026-08-05, user).
+    # Without this a restart orphaned every open cycle: monitor_cycle found no arm record,
+    # so net_target / bias_trail / flatten all went silent while the positions stayed open
+    # at the broker with nothing managing them.
+    try:
+        import logging as _lg
+        from execution.exec_bridge import ExecBridge as _EB
+        _restored = _EB.load_persisted_state()
+        _lg.getLogger(__name__).info(f"[startup] arm state restored: {_restored}")
+    except Exception as e:
+        import logging as _lg
+        _lg.getLogger(__name__).warning(f"[startup] arm state restore failed (non-fatal): {e}")
     _backfill_sweeps(settings)
     try:
         from pipeline.feed_monitor import start as _start_gap_monitor
