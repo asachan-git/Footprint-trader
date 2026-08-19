@@ -1,0 +1,42 @@
+{
+  "_": "Reference runs for scripts/grid_scorecard.py. Numbers are USC (broker cents).",
+  "_thresholds": {
+    "min_one_sided_pct": 60.0,
+    "min_usc_per_lot": 10.0,
+    "commission_floor_usc_per_lot_per_side": -3.0
+  },
+  "runs": {
+    "2026-06-22..26": {
+      "one_sided_pct": 68.2,
+      "usc_per_lot": 51.7,
+      "grids": 287,
+      "filled_grids": 217,
+      "net_usc": 51317,
+      "source": "Vantage daily confirmations + ReportHistory xlsx, acct 26443422",
+      "note": "the only profitable run; feat/composed-strategy"
+    },
+    "2026-08-03 final-v1": {
+      "one_sided_pct": 48.0,
+      "usc_per_lot": null,
+      "grids": 25,
+      "net_usc": -13028,
+      "source": "data/cycles/cycle_outcomes_2026-08-03.jsonl, magic 774xxx",
+      "note": "negative control; 8 of 25 cycles hit max_loss"
+    }
+  },
+  "per_setup_tf_reference": {
+    "_source": "2026-06-22..26, both-sided rate among grids that filled at all",
+    "hvn_edge|5m": {"both_pct": 15.0, "usc_per_lot": 86.0},
+    "hvn|15m": {"both_pct": 19.0, "usc_per_lot": 112.0},
+    "hvn_edge|15m": {"both_pct": 25.0, "usc_per_lot": 488.0},
+    "hvn|5m": {"both_pct": 32.0, "usc_per_lot": 138.0},
+    "hvn|1m": {"both_pct": 49.0, "usc_per_lot": -72.0},
+    "_note": "hvn|1m is the only stream negative in BOTH June and July; it has never worked on any tree"
+  },
+  "final_v1_2026-08-03_per_setup_tf": {
+    "hvn_inside_touch|15m": {"both_pct": 82.0, "net_usc": -11559, "cycles": 11},
+    "hvn_inside_touch|5m": {"both_pct": 43.0, "net_usc": -851, "cycles": 7},
+    "lvn_edge_touch|15m": {"both_pct": 14.0, "net_usc": -618, "cycles": 7},
+    "_note": "15m HVN at 82% both-sided vs June's 19% is the signature the session-VP port must move"
+  }
+}
