@@ -259,7 +259,16 @@ def build_and_save(
 
         from typing import Any as _Any
         anchor: SessionAnchor = _normalize_anchor(session_cfg.get(symbol, 0))
-        bin_size: float | None = float(bin_cfg[symbol]) if symbol in bin_cfg else None
+        # Fall back to the tick-aligned DEFAULT_BIN_SIZE when the caller omits
+        # vp_bin_size — a manual or script rebuild that passes nothing otherwise
+        # builds the profile on an arbitrary bin, which shows up as a fractional
+        # POC (observed: poc=4081.76 on a 1pt-tick instrument) and shifts every
+        # zone edge the detectors compare against.
+        if symbol in bin_cfg:
+            bin_size: float | None = float(bin_cfg[symbol])
+        else:
+            from pipeline.features.volume_profile import DEFAULT_BIN_SIZE
+            bin_size = DEFAULT_BIN_SIZE.get(symbol)
         cache.setdefault(symbol, {"daily": {}, "weekly": {}, "session_start_utc": _anchor_to_storage(anchor)})  # type: ignore[union-attr]
         sym_cache: dict[str, _Any] = cache[symbol]  # type: ignore[assignment]
         sym_cache["session_start_utc"] = _anchor_to_storage(anchor)

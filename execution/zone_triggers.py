@@ -337,8 +337,14 @@ def _merge_zone_tuples(zones: list[tuple[float, float]]) -> list[tuple[float, fl
     collapse them so the grid straddles ONE fulcrum, not two near-duplicate edges."""
     if not zones:
         return zones
-    out: list[list[float]] = [list(zones[0])]
-    for lo, hi in sorted(zones):
+    ordered = sorted(zones)
+    # Seed from the LOWEST span, not zones[0]. The list arrives unsorted (rolling
+    # and cached are concatenated), so seeding from zones[0] and then walking the
+    # sorted list merges every span below it into that seed — the lowest real node
+    # gets swallowed and price can sit inside a zone that no longer exists, with
+    # nothing arming.
+    out: list[list[float]] = [list(ordered[0])]
+    for lo, hi in ordered:
         if lo <= out[-1][1]:                       # overlap or touch
             out[-1][1] = max(out[-1][1], hi)
         else:
