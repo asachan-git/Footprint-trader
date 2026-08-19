@@ -35,6 +35,7 @@ def _emit_audit(row: dict) -> None:
 LOG = logging.getLogger(__name__)
 
 _FEED_STALE_LOG_AT: dict = {}   # analysis_symbol -> last wall-clock we logged a stale-feed skip
+_EA_GUARD_LOG_AT: dict = {}     # account -> last wall-clock we logged an EA-guard warning
 
 
 def _feed_is_stale(analysis_symbol: str, grid_cfg: dict) -> float | None:
@@ -476,6 +477,27 @@ def exec_poll():
     # isolation. tf is recovered from the magic. A flatten ships in the same response
     # (saves a ~1s round-trip). Falls back to the legacy aggregate fields for an older
     # EA binary (single pool, no per-magic breakdown).
+    # EA self-report guards. Advisory only — they warn and never block execution,
+    # because a guard that halts trading on its own false positive is worse than the
+    # failure it watches. Rate-limited to once every 10 minutes per account so a
+    # 5x/sec poll cannot flood the log.
+    try:
+        from execution.ea_guard import check_ea_version, check_magic_window
+        _gk = str(account)
+        if time.time() - float(_EA_GUARD_LOG_AT.get(_gk, 0.0)) > 600:
+            _warn = check_ea_version(body.get("ea_version"))
+            _live = [int(m.get("magic")) for m in (body.get("magics") or [])
+                     if int(m.get("buys", 0)) + int(m.get("sells", 0)) > 0]
+            _warn2 = check_magic_window(_live, body.get("magic_lo"), body.get("magic_hi"))
+            if _warn or _warn2:
+                _EA_GUARD_LOG_AT[_gk] = time.time()
+            if _warn:
+                LOG.warning("[ea_guard] %s: %s", account, _warn)
+            if _warn2:
+                LOG.error("[ea_guard] %s: %s", account, _warn2)
+    except Exception:
+        pass                                  # never break the poll on a guard
+
     magics = body.get("magics")
     # analysis symbol (Bybit frame) for HVN lookups — resolve once for the refresh below
     _symmap = (settings_cfg or {}).get("execution", {}).get("symbol_map") or {}

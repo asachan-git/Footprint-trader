@@ -18,6 +18,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Aniket"
 #property version   "1.10"
+#define EA_VERSION "1.10"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -671,12 +672,24 @@ void PollAndExecute()
    // stops_pts/point let the server floor the grid step so no leg lands inside the freeze.
    double acctBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    double acctEquity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   // Self-report the EA build and the magic window it OWNS. Both are silent
+   // failure modes the server otherwise cannot see:
+   //   ea_version  — the per-leg disaster SL is cosmetic on a build older than
+   //                 1.10, because ExecModifyPending passed sl=0.0 and wiped the
+   //                 stop on every fulcrum shift. The server places the SL and
+   //                 has no way to know the terminal is throwing it away.
+   //   magic_lo/hi — InpMagicRange gates REPORTING, not execution. A stale chart
+   //                 input narrows the window, the EA stops reporting cycles the
+   //                 server believes are live, and the server then runs zero exit
+   //                 logic against them (cost ~9k unbooked on 2026-08-06).
    string pollBody = StringFormat(
       "{\"account\":\"%s\",\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f,"
       "\"positions\":%d,\"pendings\":%d,\"buys\":%d,\"sells\":%d,\"pnl\":%.2f,"
-      "\"stops_pts\":%d,\"point\":%.5f,\"balance\":%.2f,\"equity\":%.2f,\"magics\":[%s]}",
+      "\"stops_pts\":%d,\"point\":%.5f,\"balance\":%.2f,\"equity\":%.2f,"
+      "\"ea_version\":\"%s\",\"magic_lo\":%d,\"magic_hi\":%d,\"magics\":[%s]}",
       gAccount, _Symbol, bid, ask, buys + sells, CountMyPendings(), buys, sells, SumMyPnL(),
-      (int)stopsPts, point, acctBalance, acctEquity, magicsJson);
+      (int)stopsPts, point, acctBalance, acctEquity,
+      EA_VERSION, (int)InpMagic, (int)(InpMagic + InpMagicRange), magicsJson);
    string resp;
    int code = HttpPost(InpBridgeURL + "/exec/poll", pollBody, resp);
    if(code != 200) return;

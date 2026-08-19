@@ -99,6 +99,63 @@ def _check_vp(symbol: str, c: dict, vp: dict, today: datetime,
         warns.append(f"vp_cache {symbol}: latest period {latest} has no LVN zones (thin day?)")
 
 
+
+# Setups that have ever been measured on this branch. Anything else reaching the
+# emitter is a typo or an experiment that was never meant to trade live.
+_KNOWN_SETUPS = {"hvn_inside_touch", "hvn_edge", "squeeze", "hvn_displacement",
+                 "vp_levels", "lvn_displacement", "va", "vp_level_touch"}
+
+
+def _check_risk_config(settings: dict, fails: list[str], warns: list[str]) -> None:
+    """The risk floor has to be ON, and sizing has to be sane, before the server
+    accepts a single order.
+
+    These are the controls the Jun22-26 tree did not have at all: every exit in
+    monitor_cycle fires on profit, neutrality or a structural event, so with the
+    floor off a cycle that goes against the ladder has no bounded outcome. Booting
+    with disaster_sl_usd: 0 is not a configuration choice, it is the state the
+    account was blown in.
+    """
+    g = (settings.get("grid_levels") or {}) if isinstance(settings, dict) else {}
+
+    if float(g.get("disaster_sl_usd", 0) or 0) <= 0:
+        fails.append("risk: disaster_sl_usd is 0 — legs would go out with no broker stop, "
+                     "which is the pre-2026-08 state (15.7% of positions had an SL)")
+    if float(g.get("cycle_max_loss_usd", 0) or 0) <= 0:
+        fails.append("risk: cycle_max_loss_usd is 0 — no exit in monitor_cycle fires on a "
+                     "loss, so a losing cycle has no bounded outcome")
+
+    base_lot = float(g.get("base_lot", 0) or 0)
+    max_lot = float(g.get("max_base_lot_guard", 0.5) or 0.5)
+    if base_lot <= 0:
+        fails.append("risk: base_lot is 0 or unset")
+    elif base_lot > max_lot:
+        fails.append(f"risk: base_lot {base_lot} exceeds max_base_lot_guard {max_lot} — "
+                     f"the ramp to 1.5 on 2026-07-14 preceded a -126,891 day")
+
+    trail = float(g.get("bias_trail_activate_usd", 0) or 0)
+    if base_lot > 0 and trail > 0:
+        per_lot = trail / base_lot
+        if per_lot > 800:
+            warns.append(f"risk: bias_trail_activate {trail} is {per_lot:.0f} per unit of "
+                         f"base_lot; the measured Jun22-26 profile ran ~500")
+
+    frac = float(g.get("bias_book_frac", 0.5) or 0.5)
+    if not (0 < frac <= 1.0):
+        fails.append(f"risk: bias_book_frac {frac} is outside (0, 1] — the value 100 was a "
+                     f"sentinel meaning 'close the entire side', which removes the runner")
+
+    import os
+    for tf in ("1M", "5M", "15M", "1H"):
+        raw = os.environ.get(f"FB_SETUPS_{tf}")
+        if not raw:
+            continue
+        unknown = sorted(set(raw.split()) - _KNOWN_SETUPS)
+        if unknown:
+            fails.append(f"setups: FB_SETUPS_{tf} contains unknown {unknown} — an env "
+                         f"override is not version-controlled, so a typo trades silently")
+
+
 def run_preflight(settings: dict, now: float | None = None) -> dict:
     """Verify footprint + VP coverage. Returns {ok, failures, warnings, lines}."""
     c = _cfg(settings)
@@ -109,6 +166,7 @@ def run_preflight(settings: dict, now: float | None = None) -> dict:
 
     fails: list[str] = []
     warns: list[str] = []
+    _check_risk_config(settings, fails, warns)
     for sym in c["symbols"]:
         for tf in c["tfs"]:
             _check_footprint(sym, tf, c, now, fails, warns)
