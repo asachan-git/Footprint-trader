@@ -38,6 +38,23 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 #                       UTC offset is recomputed per-date so DST transitions are handled
 SessionAnchor = int | tuple[str, int]
 
+# Symbols that genuinely trade through the weekend. Everything else — gold via
+# Binance's XAUT, which keeps ticking on a thin one-sided book while the real
+# gold market is shut from Friday close to Sunday open — must have its Sat/Sun
+# session-days excluded. A weekend profile is not structure: it is a handful of
+# crypto-venue prints, and it reaches live decisions three ways — as its own
+# cached daily node, through the prior-day vacuum fallback (get_history), and
+# inside the weekly profile that hvn_edge scans alongside the daily.
+_ALWAYS_24_7 = {"BTCUSDT", "BTCUSD", "ETHUSDT"}
+
+
+def _is_weekend_key(date_key: str) -> bool:
+    """True when an IST session-day label lands on a Saturday or Sunday."""
+    try:
+        return datetime.strptime(date_key, "%Y-%m-%d").weekday() >= 5
+    except ValueError:
+        return False
+
 
 def _resolve_start_utc_dt(anchor: SessionAnchor, calendar_date: datetime) -> datetime:
     """Return a tz-aware UTC datetime for the session that anchors on `calendar_date`.
@@ -111,7 +128,8 @@ def _day_bounds(ist_date_str: str, anchor: "int | tuple[str, int] | dict | None"
     return start, start + 86400
 
 
-def _week_bounds(week_str: str, anchor: "int | tuple[str, int] | dict[str, object] | None" = 0) -> tuple[int, int]:
+def _week_bounds(week_str: str, anchor: "int | tuple[str, int] | dict[str, object] | None" = 0,
+                 always_24_7: bool = False) -> tuple[int, int]:
     """Return (start_ts, end_ts) for an ISO week string like '2026-W21'.
 
     Anchored at Monday of that ISO week. For non-UTC anchors (e.g. NY 18:00),
@@ -122,7 +140,11 @@ def _week_bounds(week_str: str, anchor: "int | tuple[str, int] | dict[str, objec
     monday = datetime.strptime(f"{year}-W{week}-1", "%G-W%V-%u")
     start_dt = _resolve_start_utc_dt(a, monday)
     start = int(start_dt.timestamp())
-    return start, start + 604800
+    # 5 weekdays, not 7 calendar days. The trailing 48h of an ISO week is the
+    # weekend, and for a session-anchored symbol those bars are thin crypto-venue
+    # trade that does not belong in the profile hvn_edge scans for a fulcrum.
+    span = 5 * 86400 if not always_24_7 else 604800
+    return start, start + span
 
 
 # ── backwards-compat shim for legacy callers passing a plain UTC hour int ────
@@ -287,9 +309,14 @@ def build_and_save(
             sym_cache["bin_size"] = bin_size
         computed = 0
 
-        for days_back in range(5):
+        skip_weekend = symbol.upper() not in _ALWAYS_24_7
+        for days_back in range(7 if skip_weekend else 5):
             ts_for_day = now_ts - days_back * 86400
             date_key = _session_day_key(ts_for_day, anchor)
+            if skip_weekend and _is_weekend_key(date_key):
+                # purge a stale pre-fix weekend entry as well as refusing to build one
+                sym_cache["daily"].pop(date_key, None)
+                continue
             if date_key in sym_cache["daily"] and days_back > 0:
                 continue
             start_ts, end_ts = _day_bounds(date_key, anchor)
@@ -303,7 +330,8 @@ def build_and_save(
             week_key = _week_key(ts_for_week)
             if week_key in sym_cache["weekly"] and weeks_back > 0:
                 continue
-            start_ts, end_ts = _week_bounds(week_key, anchor)
+            start_ts, end_ts = _week_bounds(week_key, anchor,
+                                            always_24_7=not skip_weekend)
             vp = _compute_period_vp(all_bars, start_ts, min(end_ts, now_ts), bin_size=bin_size)
             if vp:
                 sym_cache["weekly"][week_key] = vp
@@ -380,8 +408,12 @@ def get_history(symbol: str, period: str, n: int = 5) -> list[dict]:
     sym_cache = cache.get(symbol, {})
     offset = _get_offset(sym_cache)
     entries = sym_cache.get(period, {})
-    sorted_keys = sorted(entries.keys())[-n:]
-    return [{"period_key": k, **_shift_vp(entries[k], offset)} for k in sorted_keys]
+    keys = sorted(entries.keys())
+    if period == "daily" and symbol.upper() not in _ALWAYS_24_7:
+        # the prior-day vacuum fallback walks this list; a Sat/Sun profile that
+        # predates the build-time filter must not be borrowable
+        keys = [k for k in keys if not _is_weekend_key(k)]
+    return [{"period_key": k, **_shift_vp(entries[k], offset)} for k in keys[-n:]]
 
 
 def poc_sequence(symbol: str, period: str, n: int = 5) -> list[float | None]:
@@ -412,7 +444,8 @@ def period_profile(symbol: str, period: str) -> dict | None:
             day_key = _session_day_key(now_ts, anchor)
         st, en = _day_bounds(day_key, anchor)
     elif period == "weekly":
-        st, en = _week_bounds(_week_key(now_ts), anchor)
+        st, en = _week_bounds(_week_key(now_ts), anchor,
+                              always_24_7=symbol.upper() in _ALWAYS_24_7)
     else:
         return None
     end = min(en, now_ts)
