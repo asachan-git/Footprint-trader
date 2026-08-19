@@ -500,9 +500,17 @@ class ExecBridge:
             buy_n = int(cyc.get("buy_n") or 0)
             sell_n = int(cyc.get("sell_n") or 0)
             bias = ""
-            if buy_n > 0 and int(buys or 0) >= buy_n:
+            # Gate on "this side is committed", NOT on "all its legs are open right
+            # now". Legs close — a leg hitting its TP ceiling drops the count below
+            # buy_n permanently, and the original `>= buy_n` test then reads false
+            # forever, leaving the survivors with no exit but a distant TP. Once a
+            # peak has been recorded the side is committed, so keep monitoring at
+            # any leg count. The `> 0` guard stops a side with no positions at all
+            # being selected as the bias.
+            _peak_set = float(cyc.get("bias_peak") or 0.0) > 0.0
+            if buy_n > 0 and int(buys or 0) > 0 and (int(buys or 0) >= buy_n or _peak_set):
                 bias = "buy"
-            elif sell_n > 0 and int(sells or 0) >= sell_n:
+            elif sell_n > 0 and int(sells or 0) > 0 and (int(sells or 0) >= sell_n or _peak_set):
                 bias = "sell"
             if bias:
                 side_pnl = float(buy_pnl if bias == "buy" else sell_pnl)
@@ -513,7 +521,14 @@ class ExecBridge:
                 activate = float(grid_cfg.get("bias_trail_activate_usd", 5.0) or 0.0)
                 giveback = float(grid_cfg.get("bias_trail_giveback_pct", 40.0) or 0.0)
                 book_frac = float(grid_cfg.get("bias_book_frac", 0.5) or 0.5)
-                if (activate > 0 and peak >= activate
+                # side_pnl > 0 floor: give-back-off-peak has no floor at zero on its
+                # own, so a side that peaked and then ran deep negative still
+                # satisfies "retraced >= giveback% from peak" and books a LOSS as if
+                # it were a profit-lock — observed at side_pnl -1895 off a peak of
+                # 1500. Worse than the bad book: the same branch sets bias_booked,
+                # retiring the trail for the rest of the cycle. This is meant to lock
+                # in profit on a pullback, not to realize a reversal.
+                if (activate > 0 and peak >= activate and side_pnl > 0
                         and side_pnl <= peak * (1.0 - giveback / 100.0)):
                     cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic, side=bias,
                                 frac=book_frac, comment=f"FB|book|{bias}", now=t)
