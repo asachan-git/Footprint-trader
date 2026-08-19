@@ -65,9 +65,11 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
     latest = store().latest(analysis_symbol, tf)
     if latest is None or not latest.ohlc.c:
         return
-    ratio = venue_mid / float(latest.ohlc.c) if latest.ohlc.c else 1.0
+    # additive analysis->venue shift (see _rebase_to_venue): a price maps by +delta,
+    # a DISTANCE (step, buffer, bin width) is frame-invariant and maps by nothing.
+    delta = venue_mid - float(latest.ohlc.c) if latest.ohlc.c else 0.0
     old_fulcrum_venue = float(arm.get("fulcrum") or 0.0)
-    edge_raw = old_fulcrum_venue / ratio if ratio else old_fulcrum_venue
+    edge_raw = old_fulcrum_venue - delta
 
     open_state = ExecBridge.get_open(account, broker_symbol, magic=magic) or {}
     _open_buys = int((open_state.get("buys") or 0))
@@ -108,7 +110,7 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
     #   FADED  — no node brackets AND nearest edge > 2×step → premise gone → flatten+retire
     if not _frozen:
         _step_venue = float(arm.get("step") or 0.0)
-        _step_raw = _step_venue / ratio if ratio else _step_venue
+        _step_raw = _step_venue          # a distance — frame-invariant under a shift
         _drift_cap = 2.0 * _step_raw if _step_raw > 0 else (5.0)   # raw frame
 
         best_dist, best_edge = float("inf"), edge_raw
@@ -119,7 +121,7 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
                     best_dist, best_edge = d, cand
         _bracketed = any(lo <= edge_raw <= hi for lo, hi in _raw_zones)
         raw_delta = best_edge - edge_raw
-        venue_delta = round(raw_delta * ratio, 4)
+        venue_delta = round(raw_delta, 4)          # a distance — frame-invariant
 
         # Placement-window grace: don't fade-flatten a cycle armed in the last 30s — its
         # legs may not be placed/reported yet, and a mid-rebuild HVN read could be noise.
@@ -153,9 +155,9 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
                          "delta": venue_delta, "bracketed": _bracketed})
 
     # recompute TPs from the (possibly shifted) edge, with the min-distance floor
-    # (analysis frame: min_tp_dist is venue-$, un-rebase by /ratio)
+    # min_tp_dist is a DISTANCE, identical in both frames under an additive shift
     _min_tp = float(settings.get("grid_levels", {}).get("min_tp_dist", 0.0) or 0.0)
-    _min_tp_raw = _min_tp / ratio if ratio else _min_tp
+    _min_tp_raw = _min_tp
     # Reconstruct the outermost ladder legs (analysis frame) from the arm's geometry so the
     # refreshed TP clears the WHOLE ladder — matching the arm-time computation. Without this
     # the TP is measured from the edge only and can regress INSIDE the ladder (un-profitable).
@@ -163,7 +165,7 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
     _buy_n  = int(arm.get("buy_n")  or arm.get("n_per_side") or 0)
     _sell_n = int(arm.get("sell_n") or arm.get("n_per_side") or 0)
     _stp_venue = float(arm.get("step") or 0.0)
-    _stp_raw   = _stp_venue / ratio if ratio else _stp_venue
+    _stp_raw   = _stp_venue          # a distance — frame-invariant
     _top_leg = best_edge + _buy_n  * _stp_raw if (_buy_n  > 0 and _stp_raw > 0) else best_edge
     _bot_leg = best_edge - _sell_n * _stp_raw if (_sell_n > 0 and _stp_raw > 0) else best_edge
     # Unified TP rule (matches arm-time): next HVN far edge + VP refinements (Case 1: VP
@@ -182,8 +184,8 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
     # side — drop it to 0 (leave the existing TP untouched) rather than set an inside-ladder TP.
     if not (raw_tp_up   and raw_tp_up   > _top_leg):       raw_tp_up   = 0.0
     if not (raw_tp_down and 0 < raw_tp_down < _bot_leg):   raw_tp_down = 0.0
-    new_tp_up = round(raw_tp_up * ratio, 4) if raw_tp_up else 0.0
-    new_tp_down = round(raw_tp_down * ratio, 4) if raw_tp_down else 0.0
+    new_tp_up = round(raw_tp_up + delta, 4) if raw_tp_up else 0.0
+    new_tp_down = round(raw_tp_down + delta, 4) if raw_tp_down else 0.0
     old_up = float(arm.get("tp_up") or 0.0)
     old_down = float(arm.get("tp_down") or 0.0)
     if (new_tp_up and abs(new_tp_up - old_up) > 0.05) or (new_tp_down and abs(new_tp_down - old_down) > 0.05):
@@ -250,7 +252,9 @@ def _cancel_orphan_on_hvn_gone(account: str, broker_symbol: str, analysis_symbol
     venue_mid = float(quote.get("mid") or 0.0)
     if venue_mid <= 0:
         return False
-    ratio = venue_mid / float(latest.ohlc.c) if latest.ohlc.c else 1.0
+    # additive analysis->venue shift (see _rebase_to_venue): a price maps by +delta,
+    # a DISTANCE (step, buffer, bin width) is frame-invariant and maps by nothing.
+    delta = venue_mid - float(latest.ohlc.c) if latest.ohlc.c else 0.0
 
     _dvp = vp_get(analysis_symbol, "daily") or {}
     zones = [(float(z["low"]), float(z["high"])) for z in (_dvp.get("hvn_zones") or [])]
@@ -258,11 +262,11 @@ def _cancel_orphan_on_hvn_gone(account: str, broker_symbol: str, analysis_symbol
         return False   # no VP yet → don't fabricate "gone"; wait for a real profile
 
     # arm["fulcrum"] is venue-frame (matches _refresh_cycle_tps); un-rebase to analysis.
-    fulcrum_raw = float(arm.get("fulcrum") or 0.0) / ratio if ratio else 0.0
+    fulcrum_raw = (float(arm.get("fulcrum") or 0.0) - delta) if arm.get("fulcrum") else 0.0
     if fulcrum_raw <= 0:
         return False
-    # tolerance band (analysis price) — config is venue-$, un-rebase by /ratio.
-    tol = float(gcfg.get("hvn_gone_tol_usd", 0.0) or 0.0) / ratio if ratio else 0.0
+    # tolerance band — a distance, identical in both frames under an additive shift.
+    tol = float(gcfg.get("hvn_gone_tol_usd", 0.0) or 0.0)   # a distance
     in_hvn = any(lo - tol <= fulcrum_raw <= hi + tol for lo, hi in zones)
     if in_hvn:
         return False   # fulcrum HVN still present → keep the pending armed
@@ -309,8 +313,10 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict) -> 
     latest = store().latest(analysis, tf)
     if latest is None or not latest.ohlc.c:
         return
-    ratio = venue_mid / float(latest.ohlc.c) if latest.ohlc.c else 1.0
-    live_analysis = venue_mid / ratio if ratio else venue_mid
+    # additive analysis->venue shift (see _rebase_to_venue): a price maps by +delta,
+    # a DISTANCE (step, buffer, bin width) is frame-invariant and maps by nothing.
+    delta = venue_mid - float(latest.ohlc.c) if latest.ohlc.c else 0.0
+    live_analysis = venue_mid - delta
 
     trig = touch_arm_trigger(analysis, tf, live_analysis)
     if trig is None:
@@ -332,7 +338,7 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict) -> 
         return   # cycle already live on this magic
     dedup_pct = float(grid_cfg.get("emit_dedup_pct", 0.0007) or 0.0)
     dedup_tol = venue_mid * dedup_pct
-    fulcrum_venue = round(edge * ratio, 4)
+    fulcrum_venue = round(edge + delta, 4)
     if not ExecBridge.should_emit(account, broker_symbol, fulcrum_venue, dedup_tol, magic=leg_magic):
         return
 
@@ -940,18 +946,21 @@ def exec_zones():
     _prev_daily, _today_daily = vp_cache.get_prev_and_today_raw(symbol)
     daily = _prev_daily or _today_daily or vp_cache.get_raw(symbol, "daily") or {}
 
-    # Zone rebase: when MetaAPI offset is 0 (403 plan) derive the ratio from the live
+    # Zone rebase: when MetaAPI offset is 0 (403 plan) derive the shift from the live
     # EA quote vs Bybit last close so EA-drawn zones align with the rebased fulcrum.
-    _zone_ratio = 1.0
+    # ADDITIVE shift, matching _rebase_to_venue in the planner. Drawn zones and the
+    # armed fulcrum have to come out of the same transform or the chart shows an edge
+    # the grid is not actually straddling.
+    _zone_delta = 0.0
     _broker_mid = float(quote.get("mid") or 0.0)
     if _broker_mid > 0:
         _bybit_bars = _store().recent(symbol, "1m", 2)
         _bybit_close = float(_bybit_bars[-1].ohlc.c) if _bybit_bars else 0.0
         if _bybit_close > 0:
-            _zone_ratio = _broker_mid / _bybit_close
+            _zone_delta = _broker_mid - _bybit_close
 
     def _rebase_price(p: float) -> float:
-        return round(p * _zone_ratio, 5) if _zone_ratio != 1.0 else round(p, 5)
+        return round(p + _zone_delta, 5) if _zone_delta else round(p, 5)
 
     zones = []
     # Prev-D zones (completed session reference) — drawn with standard HVN/LVN colors.
@@ -992,14 +1001,14 @@ def exec_zones():
     prof = vp_cache.period_profile(symbol, "daily") or {}
     profile = [{"price": _rebase_price(float(b["price"])), "vol": b["vol"]}
                for b in prof.get("profile", [])]
-    vp_bin = round(float(prof.get("bin", 0.0)) * _zone_ratio, 5) if prof.get("bin") else 0.0
+    vp_bin = round(float(prof.get("bin", 0.0)), 5) if prof.get("bin") else 0.0
     # dashboard shows the cycle for the EA's drawn TF (body.tf). Cycles are now per-TF,
     # so without a tf we'd find nothing — default to the zone TF the EA reports.
     zone_tf = str(body.get("tf") or "")
     arm = ExecBridge.get_active_arm_for_tf(account, broker_symbol, zone_tf) or {}
 
     # ict_fvg paper-strategy overlay (entry/SL/TP, fib zone, FVGs, ChoCh) — published in
-    # the ANALYSIS frame; rebase onto the venue (ratio = venue_mid / analysis_anchor) so
+    # the ANALYSIS frame; rebase onto the venue (delta = venue_mid - analysis_anchor) so
     # the EA can draw why it triggered. Dropped if no quote / stale (>12h).
     ict_out = None
     ov = ExecBridge.get_ict_overlay(symbol)
@@ -1007,10 +1016,10 @@ def exec_zones():
     if ov and mid > 0 and float(ov.get("anchor") or 0.0) > 0:
         fresh = (not ov.get("ts")) or (time.time() - float(ov["ts"]) <= 12 * 3600)
         if fresh:
-            ratio = mid / float(ov["anchor"])
+            _ov_delta = mid - float(ov["anchor"])
             pk = ("entry", "sl", "tp", "fib_lo", "fib_hi", "fvg_low", "fvg_high",
                   "htf_fvg_low", "htf_fvg_high", "choch_level")
-            ict_out = {k: round(float(ov[k]) * ratio, 5) for k in pk if ov.get(k)}
+            ict_out = {k: round(float(ov[k]) + _ov_delta, 5) for k in pk if ov.get(k)}
             ict_out["side"] = ov.get("side", "")
             ict_out["status"] = ov.get("status", "")
 
@@ -1021,7 +1030,7 @@ def exec_zones():
     grid_cfg2 = settings.get("grid_levels") or {}
     touch_lines = []
     if bool(grid_cfg2.get("touch_arm_enabled", False)):
-        _buf = float(grid_cfg2.get("hvn_touch_buffer", 0.0) or 0.0) * _zone_ratio
+        _buf = float(grid_cfg2.get("hvn_touch_buffer", 0.0) or 0.0)
         for z in zones:
             if z["kind"] != "hvn":
                 continue
@@ -1033,7 +1042,7 @@ def exec_zones():
     # HVN → cycle map: for each HVN zone, list which active cycles are anchored inside it.
     # A cycle belongs to an HVN if its venue-frame fulcrum sits within [lo, hi] (with a
     # ±tol band equal to hvn_touch_buffer so edge-touching cycles are included).
-    _touch_buf = float((settings.get("grid_levels") or {}).get("hvn_touch_buffer", 0.0) or 0.0) * _zone_ratio
+    _touch_buf = float((settings.get("grid_levels") or {}).get("hvn_touch_buffer", 0.0) or 0.0)
     _active_cycles = ExecBridge.active_cycles_detail(account, broker_symbol)
     hvn_cycle_map = []
     for z in zones:
@@ -1219,8 +1228,8 @@ def exec_fix_tps():
         # rebase price back to analysis frame for compute_hvn_tps
         venue_mid = float(arm.get("venue_mid", 0.0) or 0.0)
         bybit_mid = float(arm.get("bybit_mid", 0.0) or 0.0)
-        ratio = (bybit_mid / venue_mid) if venue_mid > 0 and bybit_mid > 0 else 1.0
-        analysis_price = price * ratio
+        _d = (venue_mid - bybit_mid) if venue_mid > 0 and bybit_mid > 0 else 0.0
+        analysis_price = price - _d
 
         tp_up, tp_down = compute_hvn_tps(analysis_sym, analysis_price, hvn_zones)
 
@@ -1229,7 +1238,7 @@ def exec_fix_tps():
         new_tp_raw = tp_up if is_buy else tp_down
 
         # rebase back to venue frame
-        new_tp = round(new_tp_raw / ratio, 4) if ratio != 1.0 and new_tp_raw > 0 else round(new_tp_raw, 4)
+        new_tp = round(new_tp_raw + _d, 4) if new_tp_raw > 0 else 0.0
 
         if new_tp <= 0:
             skipped += 1

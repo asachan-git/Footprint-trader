@@ -428,21 +428,29 @@ def _rebase_to_venue(plan: GridPlan, analysis_anchor: float, venue_price: float)
     """
     if analysis_anchor <= 0 or venue_price <= 0:
         return plan
-    ratio = venue_price / analysis_anchor
-    if abs(ratio - 1.0) < 1e-9:
+    # ADDITIVE, not multiplicative. The venue and the analysis feed quote the same
+    # metal with a roughly constant spread between them, so the correct map is a
+    # SHIFT. A ratio distorts every distance by that ratio: at a 5.21 offset on
+    # ~4000 gold the ratio is 1.0013, which moves a 2.0 step to 2.0026 and — far
+    # worse — moves each leg by a different amount the further it sits from the
+    # anchor. The fulcrum then lands off the drawn zone edge and the ladder is
+    # subtly asymmetric around it. Distances (step) are frame-invariant under a
+    # shift and must not be scaled at all.
+    delta = venue_price - analysis_anchor
+    if abs(delta) < 1e-9:
         # in-frame caller (dashboard/sim) — identity, just stamp the anchors
         return replace(plan, analysis_anchor=round(analysis_anchor, 4),
                        venue_anchor=round(venue_price, 4), rebased=False)
     return replace(
         plan,
-        fulcrum=round(plan.fulcrum * ratio, 4),
-        step=round(plan.step * ratio, 4),
-        buy_legs=[Leg(price=round(l.price * ratio, 4), lot=l.lot) for l in plan.buy_legs],
-        sell_legs=[Leg(price=round(l.price * ratio, 4), lot=l.lot) for l in plan.sell_legs],
-        buy_tp=round(plan.buy_tp * ratio, 4),
-        sell_tp=round(plan.sell_tp * ratio, 4),
-        buy_sl=round(plan.buy_sl * ratio, 4) if plan.buy_sl else 0.0,
-        sell_sl=round(plan.sell_sl * ratio, 4) if plan.sell_sl else 0.0,
+        fulcrum=round(plan.fulcrum + delta, 4),
+        step=round(plan.step, 4),                       # a distance, not a price
+        buy_legs=[Leg(price=round(l.price + delta, 4), lot=l.lot) for l in plan.buy_legs],
+        sell_legs=[Leg(price=round(l.price + delta, 4), lot=l.lot) for l in plan.sell_legs],
+        buy_tp=round(plan.buy_tp + delta, 4) if plan.buy_tp else 0.0,
+        sell_tp=round(plan.sell_tp + delta, 4) if plan.sell_tp else 0.0,
+        buy_sl=round(plan.buy_sl + delta, 4) if plan.buy_sl else 0.0,
+        sell_sl=round(plan.sell_sl + delta, 4) if plan.sell_sl else 0.0,
         analysis_anchor=round(analysis_anchor, 4),
         venue_anchor=round(venue_price, 4),
         rebased=True,
