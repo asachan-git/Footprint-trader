@@ -23,57 +23,20 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-import requests
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from bybit.footprint_builder import FootprintBuilder
-from pipeline.state_store import store
 from pipeline.features.vp_cache import build_and_save
+# Shared backfill core (also used by the live self-heal path in pipeline/feed_monitor.py).
+from binance.backfill import backfill_window, fetch_agg_trades  # noqa: F401 (re-export for callers)
 
 IST_TZ = timezone(timedelta(hours=5, minutes=30))
-BINANCE_FUTURES_URL = "https://fapi.binance.com/fapi/v1/aggTrades"
 
 
 def _load_settings() -> dict:
     return yaml.safe_load((ROOT / "config" / "settings.yaml").read_text())
-
-
-def fetch_agg_trades(
-    symbol: str,
-    start_ms: int,
-    end_ms: int,
-    page_size: int = 1000,
-) -> list[dict]:
-    """Fetch all aggTrades for symbol between start_ms and end_ms."""
-    trades = []
-    cursor = start_ms
-    while cursor < end_ms:
-        try:
-            resp = requests.get(
-                BINANCE_FUTURES_URL,
-                params={"symbol": symbol, "startTime": cursor, "endTime": min(cursor + 3_600_000, end_ms), "limit": page_size},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            batch = resp.json()
-        except Exception as e:
-            print(f"  API error at {cursor}: {e}; retrying in 3s")
-            time.sleep(3)
-            continue
-
-        if not batch:
-            cursor += 3_600_000
-            continue
-
-        trades.extend(batch)
-        last_ts = int(batch[-1]["T"])
-        cursor = last_ts + 1
-        time.sleep(0.05)  # stay under rate limit
-
-    return trades
 
 
 def backfill(
@@ -94,55 +57,23 @@ def backfill(
     print(f"  Range:  {datetime.fromtimestamp(start_ms/1000, tz=IST_TZ).strftime('%Y-%m-%d %H:%M IST')} → now")
     print(f"  TF: {tf}, price_step: {price_step}")
 
-    s = store()
-    bars_injected = 0
-
-    def _on_bar_close(payload: dict) -> None:
-        nonlocal bars_injected
-        from pipeline.types import Bar, Level, OHLC
-        ohlc = payload["ohlc"]
-        bar = Bar(
-            bar_id=payload["bar_id"].replace(binance_symbol, store_symbol, 1),
-            symbol=store_symbol,
-            tf=payload["tf"],
-            close_ts=int(payload["close_ts"]),
-            source="binance_agg_backfill",
-            ohlc=OHLC(o=ohlc["o"], h=ohlc["h"], l=ohlc["l"], c=ohlc["c"]),
-            bid_ladder=tuple(Level(price=float(l["price"]), vol=float(l["vol"])) for l in payload.get("bid_ladder", [])),
-            ask_ladder=tuple(Level(price=float(l["price"]), vol=float(l["vol"])) for l in payload.get("ask_ladder", [])),
-            poc=payload.get("poc"),
-            delta=float(payload["delta"]) if payload.get("delta") is not None else None,
-        )
-        if s.put(bar):
-            bars_injected += 1
-
-    builder = FootprintBuilder(
-        symbol=binance_symbol,
-        tf=tf,
-        on_bar_close=_on_bar_close,
-        price_step=price_step,
-    )
-
-    # Fetch in 1-day chunks to show progress
+    # Delegate to the shared window backfill (binance/backfill.py), one day per call so the
+    # per-day progress line is preserved. Each day flushes its own partial bar; the last day's
+    # partial gets re-emitted on the next boundary anyway (store.put is idempotent), and the
+    # final call flushes the trailing bar. Note: a bar spanning a day boundary is split across
+    # two window calls — harmless, store.put dedups the shared boundary minute.
     day_ms = 86_400_000
     cursor = start_ms
-    total_trades = 0
+    bars_injected = 0
     while cursor < now_ms:
         chunk_end = min(cursor + day_ms, now_ms)
         date_label = datetime.fromtimestamp(cursor / 1000, tz=IST_TZ).strftime("%Y-%m-%d")
         print(f"  Fetching {date_label}...", end=" ", flush=True)
-        trades = fetch_agg_trades(binance_symbol, cursor, chunk_end)
-        total_trades += len(trades)
-        print(f"{len(trades)} trades")
-        for t in trades:
-            side = "Sell" if t["m"] else "Buy"
-            builder.on_tick(int(t["T"]), float(t["p"]), float(t["q"]), side)
+        n = backfill_window(binance_symbol, store_symbol, cursor, chunk_end,
+                            tf=tf, price_step=price_step)
+        bars_injected += n
+        print(f"{n} bars")
         cursor = chunk_end
-
-    # Flush any partial bar
-    builder.flush()
-
-    print(f"  Total trades processed: {total_trades:,}")
     print(f"  Bars injected: {bars_injected}")
     return bars_injected
 
