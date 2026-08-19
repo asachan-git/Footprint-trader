@@ -75,6 +75,19 @@ grid_levels:
   # the planner (displacement's candle extreme) still wins where one exists.
   # Requires EA >= v1.10: before that ExecModifyPending passed sl=0.0 and wiped the
   # stop off every leg on each fulcrum shift.
+  # ── Refuse to act on bad data ───────────────────────────────────────────────
+  # Feed-liveness gate: if the newest REAL 1m analysis bar is older than this,
+  # SUPPRESS fresh arms. A dead Binance feed means frozen zones, and nothing
+  # stopped the grid arming on them during the 2026-07-15 outage. Existing cycles
+  # are unaffected — their exits ride the EA's venue-price poll, not this feed.
+  # Only FRESH arms freeze, which is correct: you must not draw a new grid on
+  # stale zones. Set high to effectively disable.
+  feed_max_age_s: 180
+  # zone_shift outlier gate: if |venue_ref - analysis_ref| exceeds this, SKIP the
+  # arm. A blown-out basis means one feed lagged or stalled, so an absolutely
+  # priced grid built off it lands at the wrong price. Gold basis is normally
+  # ~3pt; 6.0 is about 2x that.
+  zone_shift_max_usd: 6.0
   disaster_sl_usd: 20.0
   # cycle_max_loss_usd: server-side cap on one cycle's floating loss, in account
   # currency (USC on the cent account). Checked before every profit branch. This

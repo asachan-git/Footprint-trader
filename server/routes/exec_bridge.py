@@ -34,6 +34,58 @@ def _emit_audit(row: dict) -> None:
         pass  # audit must never break execution
 LOG = logging.getLogger(__name__)
 
+_FEED_STALE_LOG_AT: dict = {}   # analysis_symbol -> last wall-clock we logged a stale-feed skip
+
+
+def _feed_is_stale(analysis_symbol: str, grid_cfg: dict) -> float | None:
+    """Age of the newest REAL 1m bar when it exceeds feed_max_age_s, else None.
+
+    Guards against arming on a DEAD analysis feed. 1m because it is the fastest
+    series and so the tightest liveness signal — if 1m has gone quiet the
+    higher-TF zones and ATR are stale too. Sentinel/forming bars are dropped so a
+    frozen placeholder cannot masquerade as a fresh one.
+
+    Only FRESH arms are suppressed. Live cycles are unaffected: their exits ride
+    the EA's venue-price poll, which is independent of this feed. Fails OPEN — a
+    hiccup in the guard must never itself freeze arming.
+    """
+    try:
+        _raw = grid_cfg.get("feed_max_age_s", 180)
+        max_age = float(180 if _raw is None else _raw)
+        if max_age <= 0:
+            return None                     # explicitly disabled
+        from pipeline.state_store import store
+        bars = [b for b in store().recent(analysis_symbol, "1m", 4)
+                if getattr(b, "close_ts", 0) and b.close_ts < 9_000_000_000]
+        if not bars:
+            return 1e9                      # no real bars at all -> maximally stale
+        age = time.time() - float(bars[-1].close_ts)
+        return age if age > max_age else None
+    except Exception:
+        return None                         # fail open
+
+
+def _zone_shift_too_far(venue_ref: float, analysis_ref: float, grid_cfg: dict) -> float | None:
+    """Absolute basis between the frames when it exceeds the configured cap.
+
+    A blown-out basis means one feed lagged or stalled, so an absolutely priced
+    grid built off it lands at the wrong price. Gold normally runs ~3pt.
+    """
+    try:
+        if venue_ref <= 0 or analysis_ref <= 0:
+            return None
+        shift = abs(venue_ref - analysis_ref)
+        cap_pct = float(grid_cfg.get("zone_shift_max_pct", 0.0) or 0.0)
+        cap = (venue_ref * cap_pct if cap_pct > 0
+               else float(grid_cfg.get("zone_shift_max_usd", 0.0) or 0.0))
+        if cap <= 0:
+            return None
+        return shift if shift > cap else None
+    except Exception:
+        return None                         # fail open
+
+
+
 
 def _auth_ok() -> bool:
     token = os.environ.get("FB_EXEC_TOKEN")
@@ -588,6 +640,22 @@ def exec_emit_grid():
     if latest is None:
         return jsonify({"ok": False, "verdict": "skip",
                         "skip_reason": f"no bars stored for {symbol} {tf}"}), 404
+
+    # Refuse to arm on data we do not trust. Both gates fail open.
+    _gcfg = (settings.get("grid_levels") or {})
+    _stale = _feed_is_stale(symbol, _gcfg)
+    if _stale is not None:
+        _now = time.time()
+        if _now - float(_FEED_STALE_LOG_AT.get(symbol, 0.0)) > 60:
+            _FEED_STALE_LOG_AT[symbol] = _now
+            LOG.warning("[feed_stale] %s newest 1m bar is %.0fs old — suppressing fresh arms",
+                        symbol, _stale)
+        return jsonify({"ok": True, "verdict": "skip",
+                        "skip_reason": f"feed_stale:{_stale:.0f}s"})
+    _shift = _zone_shift_too_far(float(quote.get("mid") or 0.0), float(latest.ohlc.c), _gcfg)
+    if _shift is not None:
+        return jsonify({"ok": True, "verdict": "skip",
+                        "skip_reason": f"zone_shift_outlier:{_shift:.2f}"})
 
     # Freeze-aware step floor: clear the broker's min-stop distance (×1.5 margin) so the
     # innermost leg can't land inside the freeze band and get silently rejected.
