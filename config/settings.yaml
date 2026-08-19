@@ -64,6 +64,22 @@ grid_levels:
   # net-target below then owns ALL profit-taking → a cycle only closes green when the
   # WHOLE basket is net ≥ target; bias_trail still rides clean winners; full_hedge cuts
   # the symmetric whipsaw (which is mathematically un-profitable at any single exit).
+  # ── Bounded loss ────────────────────────────────────────────────────────────
+  # Neither of these existed during the Jun22-26 run. Every exit in monitor_cycle
+  # fires on profit, neutrality or a structural event, so a cycle that went against
+  # the ladder had no bounded outcome. These are the floor, not a strategy stop.
+  #
+  # disaster_sl_usd: per-leg broker stop, in QUOTE units (gold: $/oz), measured from
+  # each leg's OWN entry. Sits wider than every server-side exit — it exists for the
+  # case where the server, the bridge or the terminal is gone. A structural SL from
+  # the planner (displacement's candle extreme) still wins where one exists.
+  # Requires EA >= v1.10: before that ExecModifyPending passed sl=0.0 and wiped the
+  # stop off every leg on each fulcrum shift.
+  disaster_sl_usd: 20.0
+  # cycle_max_loss_usd: server-side cap on one cycle's floating loss, in account
+  # currency (USC on the cent account). Checked before every profit branch. This
+  # number is a GUESS until recalibrated from the `trough` field in the cycle log.
+  cycle_max_loss_usd: 2500.0
   net_profit_exit_only: true
   # Structural-TP-as-ceiling: even in net_profit_exit_only, place each leg's COMPUTED
   # structural TP (HVN reversion→POC, breakout→next-HVN, VP target) on the broker order

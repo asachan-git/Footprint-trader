@@ -531,6 +531,19 @@ class ExecBridge:
         reason: str | None = None
         detail: dict = {}
 
+        # 0.9) per-cycle loss cap — the ONLY exit here that fires on a loss.
+        # 8175f57 proved no per-leg TP can be profitable on a straddle and removed
+        # every per-leg profit exit; it never replaced them with a loss exit, and
+        # nothing on this branch ever did. Every other branch below fires on profit,
+        # neutrality or a structural event, so without this a cycle that goes against
+        # the ladder has no bounded outcome — it stays open until price returns or the
+        # account cannot carry it. Checked FIRST so a losing cycle can never be held
+        # open by a profit branch evaluating later. 0 disables.
+        max_loss = float(grid_cfg.get("cycle_max_loss_usd", 0.0) or 0.0)
+        if reason is None and max_loss > 0 and pnl is not None and float(pnl) <= -abs(max_loss):
+            reason = "max_loss"
+            detail = {"cap": round(-abs(max_loss), 2), "pnl": round(float(pnl), 2)}
+
         # 1) net-$ target — the whole basket (this magic = this TF cycle) is floating
         # ≥ its effective target. Base target is per-TF (cycle_net_target_by_tf, keyed by
         # the TF recovered from the magic) with cycle_net_target_usd as fallback. The
@@ -671,10 +684,29 @@ class ExecBridge:
         cls._audit("enqueue", cmd)
         return cmd
 
+    @staticmethod
+    def _leg_sl(entry: float, side: str, disaster_usd: float) -> float:
+        """Disaster stop for ONE leg, measured from that leg's OWN entry.
+
+        Not a shared per-side level: a shared level puts the outermost leg a
+        full ladder-span from its stop while the innermost sits on top of it.
+        Per-leg keeps the risk of every leg identical, which is what makes the
+        number tunable from the `trough` field later.
+
+        This is a DISASTER stop, not a strategy stop — it sits wider than every
+        server-side exit and exists for the case where the server, the bridge or
+        the terminal is gone. 0 disables it.
+        """
+        if disaster_usd <= 0 or entry <= 0:
+            return 0.0
+        sl = entry - disaster_usd if side == "buy" else entry + disaster_usd
+        return round(sl, 4) if sl > 0 else 0.0
+
     @classmethod
     def enqueue_grid_plan(cls, account: str, broker_symbol: str, plan, *,
                           close_first: bool = True, clear_kind: str = "flatten",
-                          magic: int = 0, leg_tp: bool = True) -> list[Command]:
+                          magic: int = 0, leg_tp: bool = True,
+                          disaster_sl_usd: float = 0.0) -> list[Command]:
         """Translate a rebased neutral GridPlan into PLACE_PENDING commands.
         buy_legs → buy_stop, sell_legs → sell_stop, shared per-side TP, no SL (v1).
         Optionally prepend a clear command: clear_kind="flatten" → CLOSE_ALL (close
@@ -710,17 +742,25 @@ class ExecBridge:
             out.append(cls.enqueue(account, clear_cmd, broker_symbol, magic=magic))
         buy_tp  = getattr(plan, "buy_tp",  0.0) if leg_tp else 0.0
         sell_tp = getattr(plan, "sell_tp", 0.0) if leg_tp else 0.0
+        # A structural SL from the planner (displacement's candle extreme) always
+        # wins where one exists. Everything else — hvn_inside_touch, hvn_edge —
+        # has always gone out with sl=0.0, which is the whole reason a cycle that
+        # goes against the ladder has no bounded outcome. Fall back to a per-leg
+        # disaster stop so every leg carries one.
         buy_sl  = getattr(plan, "buy_sl",  0.0)
         sell_sl = getattr(plan, "sell_sl", 0.0)
+        disaster = float(disaster_sl_usd or 0.0)
         for i, leg in enumerate(getattr(plan, "buy_legs", []) or []):
+            leg_sl = buy_sl or cls._leg_sl(leg.price, "buy", disaster)
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="buy_stop",
-                price=leg.price, lot=leg.lot, sl=buy_sl, tp=buy_tp,
+                price=leg.price, lot=leg.lot, sl=leg_sl, tp=buy_tp,
                 comment=f"FB|{tag}|{tf_tag}|b{i + 1}", magic=magic))
         for i, leg in enumerate(getattr(plan, "sell_legs", []) or []):
+            leg_sl = sell_sl or cls._leg_sl(leg.price, "sell", disaster)
             out.append(cls.enqueue(
                 account, PLACE_PENDING, broker_symbol, order_type="sell_stop",
-                price=leg.price, lot=leg.lot, sl=sell_sl, tp=sell_tp,
+                price=leg.price, lot=leg.lot, sl=leg_sl, tp=sell_tp,
                 comment=f"FB|{tag}|{tf_tag}|s{i + 1}", magic=magic))
         return out
 

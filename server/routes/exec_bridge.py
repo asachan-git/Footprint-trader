@@ -347,9 +347,11 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict) -> 
                      "touch_armed": True})
         return
 
+    _disaster_sl = float((settings.get("grid_levels") or {}).get("disaster_sl_usd", 0.0) or 0.0)
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
                                         close_first=True, clear_kind="cancel",
-                                        magic=leg_magic, leg_tp=True)
+                                        magic=leg_magic, leg_tp=True,
+                                        disaster_sl_usd=_disaster_sl)
     _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
     node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
     node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
@@ -763,9 +765,11 @@ def exec_emit_grid():
     # Each leg carries its own structural TP (HVN far-edge or POC). Per-leg TP is the
     # sole exit mechanism — no basket net_target. leg_tp always True.
     leg_tp = True
+    _disaster_sl = float((settings.get("grid_levels") or {}).get("disaster_sl_usd", 0.0) or 0.0)
     cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
                                         close_first=close_first, clear_kind="cancel",
-                                        magic=leg_magic, leg_tp=leg_tp)
+                                        magic=leg_magic, leg_tp=leg_tp,
+                                        disaster_sl_usd=_disaster_sl)
     edge = plan.trigger_context.get("edge", "")
     _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
     node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio

@@ -17,7 +17,7 @@
 //|    POST {InpBridgeURL}/exec/ack   {account, results:[...]}        |
 //+------------------------------------------------------------------+
 #property copyright "Aniket"
-#property version   "1.03"
+#property version   "1.10"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -539,7 +539,7 @@ bool ExecModifyPending(const string cmd, int &modified, string &err)
    double minStop   = stopsPts * point;
 
    ulong tickets[];
-   double prices[], tps[];
+   double prices[], tps[], sls[];
    for(int i = 0; i < OrdersTotal(); i++)
    {
       if(!orderInfo.SelectByIndex(i)) continue;
@@ -553,6 +553,13 @@ bool ExecModifyPending(const string cmd, int &modified, string &err)
       double newPrice = NormalizeDouble(orderInfo.PriceOpen() + priceDelta, digits);
       double useTp    = (newTp > 0) ? NormalizeDouble(newTp, digits)
                                     : NormalizeDouble(orderInfo.TakeProfit(), digits);
+      // Translate the existing SL with the leg, don't drop it. OrderModify takes an
+      // ABSOLUTE sl, so passing 0.0 here (as this did) wipes the stop off every leg on
+      // every fulcrum shift and every TP refresh — a placement-time SL would survive
+      // only until the first re-anchor. Shifting by priceDelta keeps each leg's stop
+      // the same distance from its own entry.
+      double curSl    = orderInfo.StopLoss();
+      double useSl    = (curSl > 0) ? NormalizeDouble(curSl + priceDelta, digits) : 0.0;
       // freeze guard: buy_stop must be above ask+minStop; sell_stop below bid-minStop
       double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
       double bid = SymbolInfoDouble(sym, SYMBOL_BID);
@@ -560,11 +567,13 @@ bool ExecModifyPending(const string cmd, int &modified, string &err)
       if(isSell && newPrice > bid - minStop - point) continue;
       int n = ArraySize(tickets);
       ArrayResize(tickets, n+1); ArrayResize(prices, n+1); ArrayResize(tps, n+1);
+      ArrayResize(sls, n+1);
       tickets[n] = orderInfo.Ticket(); prices[n] = newPrice; tps[n] = useTp;
+      sls[n] = useSl;
    }
    for(int i = 0; i < ArraySize(tickets); i++)
    {
-      if(trade.OrderModify(tickets[i], prices[i], 0.0, tps[i], ORDER_TIME_GTC, 0)) modified++;
+      if(trade.OrderModify(tickets[i], prices[i], sls[i], tps[i], ORDER_TIME_GTC, 0)) modified++;
       else { allOk = false; err = "modify fail #" + IntegerToString((long)tickets[i]); }
    }
    return allOk;
