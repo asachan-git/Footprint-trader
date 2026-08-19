@@ -19,6 +19,27 @@ FLASK="${1:-http://127.0.0.1:5000}"
 ACCOUNT="${2:?account login required (e.g. 25230425)}"
 SYMBOL="${3:-XAUUSD+}"
 
+# ── Singleton lock, keyed by account+symbol ─────────────────────────────────────
+# Two emitters on the same account+symbol means every bar close is emitted TWICE,
+# so each setup arms twice — double the grids, double the exposure, and the second
+# arm is invisible in the logs because it looks identical to the first. This must
+# be impossible by construction, not by remembering not to do it: the watchdog
+# relaunches on a pgrep miss, and pgrep pattern-matching on a command line is not
+# a reliable exclusion.
+_key=$(echo "${ACCOUNT}_${SYMBOL}" | tr -c 'A-Za-z0-9_' '_')
+_LOCKDIR="${TMPDIR:-/tmp}/fb_emitter_${_key}.lock"
+if ! mkdir "$_LOCKDIR" 2>/dev/null; then
+    _owner=$(cat "$_LOCKDIR/pid" 2>/dev/null || echo "?")
+    if kill -0 "$_owner" 2>/dev/null; then
+        echo "[auto_exec_emit] already running for $ACCOUNT/$SYMBOL (pid $_owner) — exiting."
+        exit 0
+    fi
+    echo "[auto_exec_emit] stale lock from pid $_owner — taking it over."
+    rm -rf "$_LOCKDIR"; mkdir "$_LOCKDIR" || { echo "[auto_exec_emit] cannot lock"; exit 1; }
+fi
+echo $$ > "$_LOCKDIR/pid"
+trap 'rm -rf "$_LOCKDIR"' EXIT INT TERM
+
 # Per-TF setup lists:
 #   1m  — hvn_inside_touch only
 #   5m  — hvn_inside_touch + squeeze + hvn_displacement + hvn_edge
