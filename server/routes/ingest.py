@@ -409,17 +409,23 @@ def ingest():
                     symbol_map=(settings.get("execution") or {}).get("symbol_map", {}),
                 )
                 _vp_last_build[bar.symbol] = _time.time()
-                # Write journal for the day that just closed
-                if snapped.get("daily"):
+                # Write journal for the day that just closed. snapshot_if_boundary returns
+                # a LIST of period names (["daily"], ["daily","weekly"], …) — NOT a dict.
+                # (Old `snapped.get("daily")` / `snapped["daily"]` 500'd on every session
+                # rollover: AttributeError on the list.) The closed-day date key is derived
+                # from the PREVIOUS bar's close_ts (the day that just ended), session-anchored.
+                if isinstance(snapped, (list, tuple)) and "daily" in snapped:
                     try:
                         from pipeline.features.daily_journal import write_day_journal
-                        sess_anchor = (settings.get("vp_cache", {}).get("session_start_utc", {}) or {}).get(bar.symbol, 0)
-                        closed_date = snapped["daily"]
+                        from pipeline.features.vp_cache import _session_day_key, _normalize_anchor
+                        _vpc = settings.get("vp_cache", {}) or {}
+                        sess_anchor = (_vpc.get("session_start_utc", {}) or {}).get(bar.symbol, 0)
+                        closed_date = _session_day_key(int(prev.close_ts), _normalize_anchor(sess_anchor))
                         result = write_day_journal(bar.symbol, primary_tf, closed_date, sess_anchor)
                         if result:
                             LOG.info(f"[ingest] Daily journal written: {result.name}")
                     except Exception:
-                        pass
+                        LOG.exception("[ingest] daily journal write failed (non-fatal)")
 
     exits = _check_positions(bar, settings)
 

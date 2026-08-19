@@ -840,7 +840,12 @@ def exec_refresh_tps():
         if not tf_m:
             continue
         try:
-            _refresh_cycle_tps(account, broker_symbol, analysis_sym, tf_m, mg, settings)
+            # include_positions=True: push the refreshed TP onto FILLED legs too, not just
+            # resting pendings — so a manual /exec/refresh_tps repairs open positions that
+            # are missing their broker TP (e.g. legs placed with tp=0). Bar-close does this
+            # anyway; this makes the manual endpoint do it on demand.
+            _refresh_cycle_tps(account, broker_symbol, analysis_sym, tf_m, mg, settings,
+                               include_positions=True)
             refreshed.append(mg)
         except Exception:
             LOG.exception(f"[refresh_tps] magic={mg} error")
