@@ -482,7 +482,7 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     from pipeline.features.atr import atr_from_store
     from pipeline.features import day_type
     try:
-        from pipeline.features.vp_cache import get_prev_and_today
+        from pipeline.features.vp_cache import get_prev_and_today_raw as get_prev_and_today
         _prev_vp, _today_vp = get_prev_and_today(symbol)
         # Merge prev-D and today's zones so both are trigger candidates at all times.
         # POC/VAH/VAL: prefer today's if available (forming session reference), else prev-D.
@@ -634,7 +634,7 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     # only when there is literally no HVN out there). Refreshed every 15m as the HVN rebuilds.
     from execution.zone_triggers import hvn_or_vp_tp as _hvn_or_vp_tp
     from execution.zone_triggers import compute_hvn_tps as _compute_hvn_tps
-    from pipeline.features.vp_cache import get as _vp_get
+    from pipeline.features.vp_cache import get_raw as _vp_get
     top_leg = max((l.price for l in buy_legs),  default=fulcrum)
     bot_leg = min((l.price for l in sell_legs), default=fulcrum)
     min_tp_dist = float(grid_cfg.get("min_tp_dist", 0.0) or 0.0)

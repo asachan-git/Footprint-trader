@@ -349,8 +349,14 @@ def _get_offset(sym: dict) -> float:
     return float(sym.get("venue_price_offset") or 0.0)
 
 
-def get(symbol: str, period: str) -> dict | None:
-    """Get cached VP for symbol + period (today / this week), venue-offset applied.
+def get_offset(symbol: str) -> float:
+    """Venue price offset for `symbol` (venue price - analysis price). Public so a
+    caller that fetched RAW zones can shift them itself at the drawing boundary."""
+    return _get_offset(_load().get(symbol, {}))
+
+
+def _get_period(symbol: str, period: str) -> dict | None:
+    """The frame-agnostic lookup. Returns the stored (ANALYSIS-frame) profile.
 
     For daily: before 20:00 IST (14:30 UTC) uses prev-D VP so Asia/London sessions
     trade on a completed reference profile. At/after 20:00 IST switches to today's
@@ -360,7 +366,6 @@ def get(symbol: str, period: str) -> dict | None:
     sym = cache.get(symbol, {})
     now_ts = int(time.time())
     anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
-    offset = _get_offset(sym)
     if period == "daily":
         ist_now = datetime.fromtimestamp(now_ts, tz=_IST)
         use_prev = ist_now.hour < 20  # before 20:00 IST → use prev-D completed profile
@@ -378,28 +383,65 @@ def get(symbol: str, period: str) -> dict | None:
         vp = sym.get("weekly", {}).get(key)
     else:
         return None
-    return _shift_vp(vp, offset) if vp else None
+    return vp or None
+
+
+def get(symbol: str, period: str) -> dict | None:
+    """Cached VP in the VENUE frame — offset applied. For DRAWING and for anything
+    that compares against a broker price."""
+    vp = _get_period(symbol, period)
+    return _shift_vp(vp, get_offset(symbol)) if vp else None
+
+
+def get_raw(symbol: str, period: str) -> dict | None:
+    """Cached VP in the ANALYSIS frame — no offset. For DETECTION.
+
+    Triggers compare Binance OHLC bars against zone boundaries. Fetching those
+    boundaries through get() shifted them into the Vantage frame, so a Binance
+    bar was being tested against a Vantage-shifted edge and the offset error
+    suppressed valid touches outright. Detection must read this; only the
+    drawing boundary (/exec/zones) applies the offset."""
+    return _get_period(symbol, period)
+
+
+def get_history_raw(symbol: str, period: str, n: int = 5) -> list[dict]:
+    """get_history in the ANALYSIS frame — for the prior-day vacuum fallback."""
+    cache = _load()
+    entries = cache.get(symbol, {}).get(period, {})
+    keys = sorted(entries.keys())
+    if period == "daily" and symbol.upper() not in _ALWAYS_24_7:
+        keys = [k for k in keys if not _is_weekend_key(k)]
+    return [{"period_key": k, **entries[k]} for k in keys[-n:]]
+
+
+def get_prev_and_today_raw(symbol: str) -> tuple[dict | None, dict | None]:
+    """(prev_day_vp, today_vp) in the ANALYSIS frame — no offset.
+
+    The drawing caller applies the venue shift ONCE itself; fetching through the
+    offset-applying face and then rebasing again is a double transform, which is
+    how a drawn edge and an armed fulcrum end up in different places."""
+    return _prev_and_today(symbol)
 
 
 def get_prev_and_today(symbol: str) -> tuple[dict | None, dict | None]:
-    """Return (prev_day_vp, today_vp) for daily period, both venue-offset applied.
+    """Return (prev_day_vp, today_vp) for daily period, both venue-offset applied."""
+    prev_vp, today_vp = _prev_and_today(symbol)
+    off = get_offset(symbol)
+    return (_shift_vp(prev_vp, off) if prev_vp else None,
+            _shift_vp(today_vp, off) if today_vp else None)
 
-    Used by /exec/zones to overlay both periods: prev-D completed profile and the
-    forming today session. Either may be None if not yet cached.
-    """
+
+def _prev_and_today(symbol: str) -> tuple[dict | None, dict | None]:
+    """Stored (analysis-frame) prev-D and today profiles. Either may be None."""
     cache = _load()
     sym = cache.get(symbol, {})
     now_ts = int(time.time())
     anchor: SessionAnchor = _normalize_anchor(sym.get("session_start_utc") or 0)
-    offset = _get_offset(sym)
 
     today_key = _session_day_key(now_ts, anchor)
     prev_key = _session_day_key(now_ts - 86400, anchor)
     daily = sym.get("daily", {})
-
-    today_vp = _shift_vp(daily[today_key], offset) if today_key in daily else None
-    prev_vp = _shift_vp(daily[prev_key], offset) if prev_key in daily else None
-    return prev_vp, today_vp
+    return daily.get(prev_key), daily.get(today_key)
 
 
 def get_history(symbol: str, period: str, n: int = 5) -> list[dict]:

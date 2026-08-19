@@ -934,9 +934,11 @@ def exec_zones():
     # Fetch prev-D and today separately so we can overlay both on the chart.
     # /exec/zones always returns both: prev-D zones as "hvn"/"lvn", today's as
     # "hvn_today"/"lvn_today" so the EA can color them differently.
-    _prev_daily, _today_daily = vp_cache.get_prev_and_today(symbol)
-    # Fallback: if neither exists use the standard get() (weekly or legacy path).
-    daily = _prev_daily or _today_daily or vp_cache.get(symbol, "daily") or {}
+    # RAW (analysis frame) — the single venue shift is applied by _rebase_price
+    # below. Fetching through the offset-applying face and then rebasing again
+    # is a double transform: the drawn edge lands somewhere the fulcrum is not.
+    _prev_daily, _today_daily = vp_cache.get_prev_and_today_raw(symbol)
+    daily = _prev_daily or _today_daily or vp_cache.get_raw(symbol, "daily") or {}
 
     # Zone rebase: when MetaAPI offset is 0 (403 plan) derive the ratio from the live
     # EA quote vs Bybit last close so EA-drawn zones align with the rebased fulcrum.

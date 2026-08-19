@@ -171,7 +171,7 @@ def compute_hvn_tps(symbol: str, edge: float,
     tp_down = dn_cands[0] if dn_cands else 0.0
 
     if tp_up == 0.0 or tp_down == 0.0:
-        from pipeline.features.vp_cache import get as vp_get
+        from pipeline.features.vp_cache import get_raw as vp_get
         _dvp   = vp_get(symbol, "daily") or {}
         _vah   = float(_dvp.get("vah") or 0.0)
         _val   = float(_dvp.get("val") or 0.0)
@@ -222,7 +222,7 @@ def hvn_or_vp_tp(symbol: str, zones: list[tuple[float, float]],
     All candidates must clear the outer leg + min_tp_dist. Returns (tp_up, tp_down);
     a side is 0.0 when nothing structural sits beyond it. Pure-structural — no ATR/fib here.
     """
-    from pipeline.features.vp_cache import get as _vp_get
+    from pipeline.features.vp_cache import get_raw as _vp_get
     _dvp = _vp_get(symbol, "daily") or {}
     # VP point-levels (drop zeros / None)
     _vps = [float(_dvp.get(k) or 0.0) for k in ("vah", "val", "poc", "naked_poc")]
@@ -269,7 +269,7 @@ def _t_hvn_edge(symbol: str, current_price: float) -> Trigger | None:
     """Nearest HVN boundary edge. Node width (high-low) is the raw_range that
     sizes the grid: price reverts to the other edge or breaks to the next HVN."""
     try:
-        from pipeline.features.vp_cache import get as vp_get
+        from pipeline.features.vp_cache import get_raw as vp_get
     except Exception:
         return None
 
@@ -320,7 +320,7 @@ def _rolling_hvn(symbol: str, tf: str, bars: list[Bar]) -> list[tuple[float, flo
 def _cached_hvn(symbol: str) -> list[tuple[float, float]]:
     """HVN zones from both prev-day and today's cached daily VP."""
     try:
-        from pipeline.features.vp_cache import get as vp_get, get_prev_and_today
+        from pipeline.features.vp_cache import get_raw as vp_get, get_prev_and_today_raw as get_prev_and_today
         prev_vp, today_vp = get_prev_and_today(symbol)
         zones: list[tuple[float, float]] = []
         for vp in (prev_vp, today_vp):
@@ -355,7 +355,7 @@ def _merge_zone_tuples(zones: list[tuple[float, float]]) -> list[tuple[float, fl
 def _outside_daily_va(symbol: str, price: float) -> bool:
     """True when price sits beyond today's cached value area (above VAH / below VAL)."""
     try:
-        from pipeline.features.vp_cache import get as vp_get
+        from pipeline.features.vp_cache import get_raw as vp_get
         vp = vp_get(symbol, "daily") or {}
     except Exception:
         return False
@@ -369,9 +369,10 @@ def _prior_day_hvn(symbol: str, price: float) -> list[tuple[float, float]]:
     """Borrow HVN structure from the most recent PRIOR-DAY profile whose value area
     still brackets `price`. When price has run into a thin tail outside today's value,
     today's profile offers no node to straddle — but a previous session that traded
-    AROUND this price did build one. Venue-offset is already applied by get_history."""
+    AROUND this price did build one. ANALYSIS frame — the caller compares against
+    Binance bars, so no venue offset is applied here."""
     try:
-        from pipeline.features.vp_cache import get_history
+        from pipeline.features.vp_cache import get_history_raw as get_history
         hist = get_history(symbol, "daily", n=5)
     except Exception:
         return []
@@ -494,7 +495,7 @@ def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger |
     edge, width, side, reject_frac, conf, sess = best_trigger
 
     try:
-        from pipeline.features.vp_cache import get as vp_get
+        from pipeline.features.vp_cache import get_raw as vp_get
         _dvp_d  = vp_get(symbol, "daily") or {}
         _daily_zones = [(float(z["low"]), float(z["high"]))
                         for z in (_dvp_d.get("hvn_zones") or [])]
@@ -573,7 +574,7 @@ def touch_arm_trigger(symbol: str, tf: str, live_price: float) -> Trigger | None
 
     # TP from daily zones (same fallback chain as the close path)
     try:
-        from pipeline.features.vp_cache import get as vp_get
+        from pipeline.features.vp_cache import get_raw as vp_get
         _dvp_d = vp_get(symbol, "daily") or {}
         _daily_zones = [(float(z["low"]), float(z["high"]))
                         for z in (_dvp_d.get("hvn_zones") or [])]
@@ -1050,7 +1051,7 @@ def _t_squeeze(symbol: str, tf: str, current_price: float, atr: float,
     # release_px → tp_up; nearest HVN lo below → tp_down. VAH/VAL fallback.
     tp_up, tp_down = 0.0, 0.0
     try:
-        from pipeline.features.vp_cache import get as vp_get
+        from pipeline.features.vp_cache import get_raw as vp_get
         _dvp = vp_get(symbol, "daily") or {}
         _zones = [(float(z["low"]), float(z["high"]))
                   for z in (_dvp.get("hvn_zones") or [])]
