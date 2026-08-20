@@ -330,6 +330,18 @@ class ExecBridge:
         # Keyed by magic. The internal monitor calls re-pass the stored cyc via **cyc, so
         # `magic` arrives either as the named arg or inside meta — accept both.
         key_magic = int(magic or meta.get("magic", 0) or 0)
+        if key_magic == 0:
+            # A cycle key of 0 is never legitimate — it means a `**cyc` spread lost the
+            # magic (a restored/persisted cyc carries it only in the KEY, not the body).
+            # Writing anyway silently forks the cycle: the real magic keeps a stale record
+            # while every subsequent update lands under 0. Observed 2026-08-20 — magic
+            # 770023's bias_peak froze at 61.0 on disk while the live peak climbed past
+            # 374 under key 0, so the trail was tracking and blind at the same time.
+            import logging
+            logging.getLogger("exec_bridge").error(
+                "[set_last_arm] refusing magic=0 write for %s/%s — caller lost the magic "
+                "(tf=%s, keys=%s)", account, broker_symbol, tf, sorted(meta)[:8])
+            return
         state = dict(meta, tf=tf, magic=key_magic)
         # Carry the trail's accumulated view across a RE-ANCHOR. A fulcrum shift writes a
         # whole fresh arm record every few minutes, and it was resetting bias_peak to 0.0
@@ -454,12 +466,12 @@ class ExecBridge:
         fts = float(cyc.get("flatten_ts") or 0.0)
         if fts > 0:
             if positions == 0:
-                cls.set_last_arm(account, symbol, **{**cyc, "active": False, "flatten_ts": 0.0})
+                cls.set_last_arm(account, symbol, **{**cyc, "magic": magic, "active": False, "flatten_ts": 0.0})
                 cls.clear_emit(account, symbol, magic=magic)
             elif (t - fts) > _FLATTEN_GRACE_S:
                 # close demonstrably didn't land (past the queue's reclaim window) → re-issue once
                 cls.enqueue(account, CLOSE_ALL, symbol, comment="FB|flatten|retry", magic=magic, now=t)
-                cls.set_last_arm(account, symbol, **{**cyc, "flatten_ts": t})
+                cls.set_last_arm(account, symbol, **{**cyc, "magic": magic, "flatten_ts": t})
             return None
 
         # track high-water of open positions (basis for flatten-rest) + resting pendings
@@ -471,7 +483,7 @@ class ExecBridge:
             pend_seen = max(pend_seen, pendings)
             cyc["max_pos_seen"] = max_seen
             cyc["pend_seen"] = pend_seen
-            cls.set_last_arm(account, symbol, **cyc)
+            cls.set_last_arm(account, symbol, **{**cyc, "magic": magic})
 
         # FREEZE the VP/HVN structure on FIRST leg fill. Until a position opens the cycle
         # tracks live VP (cheap re-anchor of resting pendings); once committed, we manage
@@ -493,7 +505,7 @@ class ExecBridge:
                 if _fz:
                     cyc["frozen_zones"] = [[round(lo, 5), round(hi, 5)] for lo, hi in _fz]
                 cyc["vp_frozen"] = True
-                cls.set_last_arm(account, symbol, **cyc)
+                cls.set_last_arm(account, symbol, **{**cyc, "magic": magic})
             except Exception:
                 pass  # never break the monitor on a snapshot failure
 
@@ -513,12 +525,12 @@ class ExecBridge:
             # symbol for a new arm by either tf. The (max/pend)_seen high-water avoids
             # the placement-window race (active set before the EA reports pendings).
             if (max_seen > 0 or pend_seen > 0) and pendings == 0:
-                cls.set_last_arm(account, symbol, **{**cyc, "active": False})
+                cls.set_last_arm(account, symbol, **{**cyc, "magic": magic, "active": False})
                 cls.clear_emit(account, symbol, magic=magic)
             elif unfroze:
                 # still active with resting pendings — persist the unfreeze so live-VP
                 # refresh resumes on the resting legs / next fill.
-                cls.set_last_arm(account, symbol, **cyc)
+                cls.set_last_arm(account, symbol, **{**cyc, "magic": magic})
             return None
 
         n = int(cyc.get("n_per_side") or 0)
@@ -617,7 +629,7 @@ class ExecBridge:
                 peak = max(float(cyc.get("bias_peak") or 0.0), side_pnl)
                 if peak != float(cyc.get("bias_peak") or 0.0):
                     cyc["bias_peak"] = peak
-                    cls.set_last_arm(account, symbol, **cyc)
+                    cls.set_last_arm(account, symbol, **{**cyc, "magic": magic})
                 activate = float(grid_cfg.get("bias_trail_activate_usd", 5.0) or 0.0)
                 giveback = float(grid_cfg.get("bias_trail_giveback_pct", 40.0) or 0.0)
                 book_frac = float(grid_cfg.get("bias_book_frac", 0.5) or 0.5)
@@ -634,7 +646,7 @@ class ExecBridge:
                                 frac=book_frac, comment=f"FB|book|{bias}", now=t)
                     cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=bias,
                                 comment=f"FB|be|{bias}", now=t)
-                    cls.set_last_arm(account, symbol, **{**cyc, "bias_booked": True})
+                    cls.set_last_arm(account, symbol, **{**cyc, "magic": magic, "bias_booked": True})
                     _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
                                       "tf": tf, "magic": magic, "exit_reason": "bias_book_trail",
                                       "bias": bias, "peak": round(peak, 2),
@@ -719,7 +731,7 @@ class ExecBridge:
             return None
 
         cls.enqueue(account, CLOSE_ALL, symbol, comment=f"FB|flatten|{reason}", magic=magic, now=t)
-        cls.set_last_arm(account, symbol, **{**cyc, "flatten_ts": t})
+        cls.set_last_arm(account, symbol, **{**cyc, "magic": magic, "flatten_ts": t})
         _emit_exit_audit({"account": str(account), "broker_symbol": symbol, "tf": tf, "magic": magic,
                           "exit_reason": reason, "armed_tf": cyc.get("armed_tf", ""),
                           "positions": positions, "pendings": pendings,
@@ -977,12 +989,30 @@ class ExecBridge:
         except Exception as e:
             log.warning(f"[exec_bridge] load_persisted_state failed: {e}")
             return {"arms": 0, "emits": 0, "error": str(e)}
+        # Refuse to re-adopt a record that cannot describe a real cycle. A restart
+        # re-evaluates everything it adopts, so a dead record is replayed through
+        # monitor_cycle and writes a FRESH cycle_outcomes row every time — on
+        # 2026-08-20 that made 64 of 67 rows (96%) phantom repeats of five stale
+        # signatures, one written 24 times across seven restarts, and every
+        # conclusion drawn from that log was wrong.
+        #
+        # A live cycle always has a magic, an arm timestamp and the trigger that
+        # armed it. Missing any of those means the record predates a schema, lost
+        # its key to a magic-0 collapse, or was never a cycle at all.
+        skipped = []
         with cls._lock:
             for (account, broker_symbol, magic), state in arms.items():
+                if not magic or not float(state.get("ts") or 0) or not state.get("trigger_kind"):
+                    if state.get("active"):
+                        skipped.append((magic, state.get("ts"), state.get("trigger_kind")))
+                    continue
                 cls._last_arm[(account, broker_symbol, magic)] = state
             for (account, symbol, magic), fulcrum in emits.items():
                 if fulcrum is not None:
                     cls._last_emit[(account, symbol, magic)] = fulcrum
+        if skipped:
+            log.warning("[exec_bridge] skipped %d unusable arm record(s) — no magic/ts/"
+                        "trigger_kind: %s", len(skipped), skipped[:5])
         active = sum(1 for s in arms.values() if s.get("active"))
         log.info(f"[exec_bridge] restored {len(arms)} arm records ({active} active), "
                  f"{len(emits)} emit records from disk")
