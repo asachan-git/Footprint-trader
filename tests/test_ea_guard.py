@@ -8,15 +8,15 @@ from execution.ea_guard import check_ea_version, check_magic_window
 
 
 def test_current_build_passes():
-    assert check_ea_version("1.10") is None
     assert check_ea_version("1.11") is None
+    assert check_ea_version("1.12") is None
     assert check_ea_version("2.0") is None
 
 
 def test_stale_build_is_flagged():
     """Pre-1.10 wipes the SL on every pending modify, so the disaster stop the
     server places is discarded by the terminal without any error."""
-    msg = check_ea_version("1.03")
+    msg = check_ea_version("1.05")   # the build the main tree still compiles
     assert msg and "inert" in msg
 
 

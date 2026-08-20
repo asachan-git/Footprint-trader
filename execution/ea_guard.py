@@ -21,7 +21,7 @@ halts trading on its own false positive is worse than the failure it watches.
 """
 from __future__ import annotations
 
-MIN_EA_VERSION = (1, 10)
+MIN_EA_VERSION = (1, 11)
 
 
 def _parse(v: str) -> tuple[int, ...]:
@@ -34,7 +34,7 @@ def _parse(v: str) -> tuple[int, ...]:
 def check_ea_version(reported: str | None, minimum: tuple[int, ...] = MIN_EA_VERSION) -> str | None:
     """Warning text when the EA is older than `minimum` (or does not report)."""
     if not reported:
-        return ("EA did not report a version — assume it predates 1.10, so the per-leg "
+        return ("EA did not report a version — assume it predates 1.11, so the per-leg "
                 "disaster SL is being wiped on every pending modify. Recompile and reattach.")
     got = _parse(reported)
     if not got:
