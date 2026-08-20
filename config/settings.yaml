@@ -243,11 +243,17 @@ grid_levels:
   # both-sided). Gated rather than dropped so it can still earn its place from data.
   require_squeeze_gate_by_tf: {1m: true, 5m: true, 15m: true, 1h: true}
   # Structural kinds (hvn_inside_touch/hvn_displacement/hvn_edge) are exempt from the
-  # squeeze gate by default even on a gated TF (see grid_planner._resolve). This forces
-  # the gate back onto specific (tf, kind) pairs anyway — currently just 1m's
-  # hvn_inside_touch, per the negative-every-tree history above. hvn_displacement and
-  # hvn_edge stay exempt on every TF; not listing them here is what does that.
-  squeeze_gate_force_structural_by_tf: {1m: [hvn_inside_touch]}
+  # squeeze gate by default even on a gated TF (see grid_planner._resolve). Listing a
+  # kind here for a TF forces the gate onto it anyway. 2026-08-21: ALL triggers gated
+  # on every TF they run — every structural kind now listed for every active TF, so
+  # nothing arms without squeeze_gate passing (live-coiled, or a coil that ended within
+  # squeeze_gate_max_bars). vp_level_touch/lvn_displacement were never structural-exempt
+  # to begin with, so they're already covered by require_squeeze_gate_by_tf alone.
+  squeeze_gate_force_structural_by_tf:
+    1m: [hvn_inside_touch, hvn_displacement, hvn_edge]
+    5m: [hvn_inside_touch, hvn_displacement, hvn_edge]
+    15m: [hvn_inside_touch, hvn_displacement, hvn_edge]
+    1h: [hvn_inside_touch, hvn_displacement, hvn_edge]
   # 0 = arm ONLY while currently coiled (rank<=squeeze_bbw_pct on the live bar) — disables
   # the "recently released" fallback (a coil that ended within N bars still qualifies).
   squeeze_gate_max_bars: 6

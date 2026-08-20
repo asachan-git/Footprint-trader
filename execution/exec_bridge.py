@@ -216,6 +216,8 @@ class ExecBridge:
     _last_retry_at: dict[tuple, float] = {} # (account,symbol,magic) → ts of last retry pass
     _last_be_attempt: dict[tuple, float] = {}  # (account,symbol,magic,side) → ts of last MOVE_BE
     _be_attempt_count: dict[tuple, int] = {}   # (account,symbol,magic,side) → attempts so far
+    _be_backoff_s: dict[tuple, float] = {}     # (account,symbol,magic,side) → current backoff interval
+    _last_be_cmd_id: dict[tuple, str] = {}     # (account,symbol,magic,side) → last enqueued MOVE_BE cmd id
     _last_close_retry_at: dict[tuple, float] = {}  # (account,symbol,magic) → ts of last close retry
     _close_retry_counts: dict[tuple, int] = {}     # (account,symbol,magic,type,side) → attempts
     _pending_book_cmd: dict[tuple, str] = {}    # (account,symbol,magic,side) → in-flight CLOSE_SIDE cmd id
@@ -603,9 +605,21 @@ class ExecBridge:
         # (its own `improve` check no-ops a ticket already at BE), so it's safe to keep
         # resending: throttled to fullfill_be_retry_interval_s per side, capped at
         # fullfill_be_max_attempts so a structurally-stuck side doesn't spam forever.
+        #
+        # EXPONENTIAL BACKOFF (2026-08-21): the fixed 3s interval above spammed the same
+        # attempt ~180 times over 11 minutes on magic 770052, because ExecMoveBE's ack
+        # can't distinguish "converged, nothing left to move" from "still blocked by the
+        # freeze band" — both come back {"ok": true, "moved": 0}. A fixed short interval
+        # can't tell the difference either, so it just kept firing at full speed forever.
+        # Back off on a no-progress ack instead of guessing which case it is: doubles the
+        # wait after every moved==0, resets to the base interval the moment moved>0 shows
+        # real progress. Still eventually retries a genuinely stuck ticket (never permanently
+        # gives up short of the attempt cap) without hammering it every 3s once it's likely
+        # already done.
         if bool(grid_cfg.get("fullfill_be_enabled", True)):
             _cancel_opp = bool(grid_cfg.get("fullfill_cancel_opposite", True))
             _be_interval = float(grid_cfg.get("fullfill_be_retry_interval_s", 3.0) or 3.0)
+            _be_max_backoff = float(grid_cfg.get("fullfill_be_max_backoff_s", 60.0) or 60.0)
             _be_max_attempts = int(grid_cfg.get("fullfill_be_max_attempts", 20) or 20)
             _bn = int(cyc.get("buy_n") or 0)
             _sn = int(cyc.get("sell_n") or 0)
@@ -617,8 +631,23 @@ class ExecBridge:
                 n_attempts = cls._be_attempt_count.get(be_key, 0)
                 if n_attempts >= _be_max_attempts:
                     continue
-                if t - cls._last_be_attempt.get(be_key, 0.0) < _be_interval:
+                cur_backoff = cls._be_backoff_s.get(be_key, _be_interval)
+                if t - cls._last_be_attempt.get(be_key, 0.0) < cur_backoff:
                     continue
+                # Check the PRIOR attempt's ack (arrives async, so only visible on a later
+                # poll) before deciding the next backoff: real progress (moved>0) resets to
+                # the base interval; a no-op ack doubles it (capped), since we can't tell
+                # "converged" from "still blocked" and shouldn't hammer either case.
+                _prior_id = cls._last_be_cmd_id.get(be_key)
+                if _prior_id is not None:
+                    with cls._lock:
+                        _prior_cmd = cls._cmds.get(_prior_id)
+                    if _prior_cmd is not None and _prior_cmd.status == DONE:
+                        _moved = int((_prior_cmd.result or {}).get("moved", 0))
+                        if _moved > 0:
+                            cls._be_backoff_s[be_key] = _be_interval
+                        else:
+                            cls._be_backoff_s[be_key] = min(_be_max_backoff, cur_backoff * 2)
                 cls._last_be_attempt[be_key] = t
                 cls._be_attempt_count[be_key] = n_attempts + 1
                 if not cyc.get(f"be_done_{_side}"):
@@ -637,8 +666,9 @@ class ExecBridge:
                     # cancel opposite pendings first so they can't fill on retrace
                     cls.enqueue(account, CANCEL_PENDINGS, symbol, magic=magic,
                                 side=_opp, comment=f"FB|fullfill_cancel_opp|{_opp}", now=t)
-                cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=_side,
-                            comment=f"FB|fullfill_be|{_side}", now=t)
+                _be_cmd = cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=_side,
+                                     comment=f"FB|fullfill_be|{_side}", now=t)
+                cls._last_be_cmd_id[be_key] = _be_cmd.id
                 _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
                                   "tf": tf, "magic": magic, "exit_reason": "fullfill_be",
                                   "side": _side, "filled": _have, "need": _need,
