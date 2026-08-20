@@ -82,8 +82,14 @@ def magic_for(trigger_kind: str, tf: str) -> int:
 
 
 def tf_from_magic(magic: int) -> str:
-    """Recover the TF a magic belongs to (magic % 10). '' if not one of ours."""
-    if magic < MAGIC_BASE or magic >= MAGIC_BASE + 100:
+    """Recover the TF a magic belongs to (magic % 10). '' if not one of ours.
+
+    Range must cover the highest strat_code in _STRAT_CODE (hvn_displacement=10 → magics
+    770101-770104), not just the first 10 strategies. Was bounded at MAGIC_BASE+100, which
+    silently excluded every hvn_displacement magic — tf_from_magic("") then made
+    _refresh_cycle_tps/retry_failed_pendings skip those cycles outright. Match the EA's own
+    magic_hi=770150 poll window (ea_guard.py) so this can't drift out of sync again."""
+    if magic < MAGIC_BASE or magic >= MAGIC_BASE + 150:
         return ""
     return _CODE_TF.get(int(magic) % 10, "")
 
@@ -127,8 +133,8 @@ class Command:
             # price field carries price_delta; tp = new TP (0 = leave unchanged)
             d.update(price_delta=self.price, tp=self.tp, side=self.side)
         elif self.type == MODIFY_POSITION:
-            # tp = new TP for filled positions on `side`; SL left unchanged
-            d.update(tp=self.tp, side=self.side, comment=self.comment)
+            # tp = new TP; sl = new SL (0 = leave unchanged) for filled positions on `side`
+            d.update(tp=self.tp, sl=self.sl, side=self.side, comment=self.comment)
         return d
 
 
@@ -205,6 +211,16 @@ class ExecBridge:
     _last_arm: dict[tuple, dict] = {}       # (account, broker_symbol) → last armed grid metadata
     _open: dict[tuple, dict] = {}           # (account, broker_symbol) → {positions, pendings, ts}
     _ict_overlay: dict[str, dict] = {}      # analysis_symbol → ict_fvg setup (analysis frame)
+    _retried_cmd_ids: set[str] = set()      # PLACE_PENDING cmd ids already resubmitted once
+    _retry_counts: dict[tuple, int] = {}    # (account,symbol,magic,comment) → attempts so far
+    _last_retry_at: dict[tuple, float] = {} # (account,symbol,magic) → ts of last retry pass
+    _last_be_attempt: dict[tuple, float] = {}  # (account,symbol,magic,side) → ts of last MOVE_BE
+    _be_attempt_count: dict[tuple, int] = {}   # (account,symbol,magic,side) → attempts so far
+    _last_close_retry_at: dict[tuple, float] = {}  # (account,symbol,magic) → ts of last close retry
+    _close_retry_counts: dict[tuple, int] = {}     # (account,symbol,magic,type,side) → attempts
+    _pending_book_cmd: dict[tuple, str] = {}    # (account,symbol,magic,side) → in-flight CLOSE_SIDE cmd id
+    _last_book_attempt: dict[tuple, float] = {} # (account,symbol,magic,side) → ts of last book attempt
+    _last_candle_sl: dict[tuple, float] = {}    # (account,symbol,magic,side) → last SL we ratcheted to
     # daily P&L target tracking — keyed by account
     _daily_start_balance: dict[str, float] = {}   # account → balance at first poll of the day
     _daily_start_date: dict[str, str] = {}         # account → YYYY-MM-DD of that first poll
@@ -216,11 +232,14 @@ class ExecBridge:
     # ── daily P&L target ────────────────────────────────────────────────────────
     @classmethod
     def update_account_balance(cls, account: str, balance: float, equity: float,
-                               target_pct: float) -> dict:
-        """Track daily equity and return {hit, pnl_pct, start_balance} each poll.
+                               target_pct: float, target_usd: float = 0.0) -> dict:
+        """Track daily equity and return {hit, pnl_pct, pnl_usd, start_balance} each poll.
 
-        Resets at midnight (UTC date change). Once hit=True it stays True for the
-        day — caller should enqueue CLOSE_ALL and block new arms.
+        Hits on EITHER gate, whichever is configured >0 — an absolute $ combined-PnL
+        target (target_usd) alongside/instead of the % target. Resets at midnight (UTC
+        date change). Once hit=True it stays True for the day — caller enqueues CLOSE_ALL
+        for every active magic on each poll from here on. Does NOT block new arms; a
+        cycle that arms after the hit is flattened on its next poll, not refused upfront.
         """
         import datetime
         account = str(account)
@@ -234,16 +253,18 @@ class ExecBridge:
 
             start = cls._daily_start_balance.get(account, balance)
             if start <= 0:
-                return {"hit": False, "pnl_pct": 0.0, "start_balance": start}
+                return {"hit": False, "pnl_pct": 0.0, "pnl_usd": 0.0, "start_balance": start}
 
-            pnl_pct = (equity - start) / start * 100.0
+            pnl_usd = equity - start
+            pnl_pct = pnl_usd / start * 100.0
 
             already_hit = cls._daily_target_hit.get(account, False)
-            hit = already_hit or (target_pct > 0 and pnl_pct >= target_pct)
+            hit = already_hit or (target_pct > 0 and pnl_pct >= target_pct) \
+                              or (target_usd > 0 and pnl_usd >= target_usd)
             if hit and not already_hit:
                 cls._daily_target_hit[account] = True
 
-        return {"hit": hit, "pnl_pct": round(pnl_pct, 4),
+        return {"hit": hit, "pnl_pct": round(pnl_pct, 4), "pnl_usd": round(pnl_usd, 2),
                 "start_balance": round(start, 2), "equity": round(equity, 2)}
 
     @classmethod
@@ -356,9 +377,31 @@ class ExecBridge:
         # count all belong to the inventory, not to the fulcrum.
         with cls._lock:
             prev = cls._last_arm.get((str(account), broker_symbol, key_magic)) or {}
-            if prev and int(prev.get("max_pos_seen") or 0) > 0 and not state.get("_flat"):
-                for k in ("bias_peak", "bias_booked", "max_pos_seen",
-                          "be_done_buy", "be_done_sell", "vp_frozen", "frozen_zones"):
+            # `prev.get("active")` matters here: a fully-closed cycle always gets
+            # active=False written at close (every flatten path does this), so a NEW
+            # cycle later reusing the same magic sees prev.active=False and correctly
+            # skips carry-over even though prev.max_pos_seen is stale-nonzero from the
+            # old, unrelated episode. Only a still-open cycle being re-anchored qualifies.
+            if prev and prev.get("active") and int(prev.get("max_pos_seen") or 0) > 0 \
+                    and not state.get("_flat"):
+                # `k not in meta` used to gate this — but the emit_grid re-arm path (the
+                # ONLY path that matters here) always explicitly passes bias_peak=0.0,
+                # bias_booked=False, max_pos_seen=0 as its "fresh arm" defaults, re-anchor
+                # or not. Those keys are therefore always present in meta, so the old
+                # `k not in meta` guard never actually fired on a real re-anchor — verified
+                # live 2026-08-20 on magic 770052: prev_bias_peak=140.25/max_pos_seen=2 right
+                # before a re-anchor, then the new record showed bias_peak=0.0/max_pos_seen=0
+                # anyway. Fixed with max()/OR instead of a blind overwrite, so a genuine
+                # higher update from monitor_cycle (which only ever raises these) still wins
+                # over a stale carry-over, while a re-arm's blind zero-default never wins
+                # over a real prior peak.
+                for k in ("bias_peak", "max_pos_seen"):
+                    if k in prev:
+                        state[k] = max(float(state.get(k, 0) or 0), float(prev.get(k, 0) or 0))
+                for k in ("bias_booked", "bias_trail_done", "be_done_buy", "be_done_sell"):
+                    if k in prev:
+                        state[k] = bool(state.get(k, False)) or bool(prev.get(k, False))
+                for k in ("vp_frozen", "frozen_zones"):
                     if k in prev and k not in meta:
                         state[k] = prev[k]
             state.pop("_flat", None)
@@ -548,46 +591,79 @@ class ExecBridge:
         # filled side to BE so it can no longer lose. The cycle stays active so net_target
         # / bias_trail can still exit the filled side profitably.
         # cancel_opp=False (legacy): leave opposite pendings, only move BE (old behaviour).
-        # Fires once per side (be_done_{side} guard, CAS under lock to prevent spam).
+        #
+        # Retried, not one-shot: the EA's MOVE_BE loops every open ticket on the side, but
+        # a ticket whose own breakeven price sits inside the broker's freeze band AT THAT
+        # INSTANT is silently skipped (not an error) — its SL never gets set. The old code
+        # set be_done_{side}=True unconditionally BEFORE the EA even attempted the move, so
+        # a skipped ticket never got a second chance and stayed fully exposed forever.
+        # Observed live 2026-08-20 on magic 770052: 2 buy tickets full-filled, MOVE_BE fired
+        # once, EA moved only 1 (`moved:1`) — the other's BE fell inside the freeze band —
+        # and the survivor sat unprotected until it was -272.50. ExecMoveBE is idempotent
+        # (its own `improve` check no-ops a ticket already at BE), so it's safe to keep
+        # resending: throttled to fullfill_be_retry_interval_s per side, capped at
+        # fullfill_be_max_attempts so a structurally-stuck side doesn't spam forever.
         if bool(grid_cfg.get("fullfill_be_enabled", True)):
             _cancel_opp = bool(grid_cfg.get("fullfill_cancel_opposite", True))
+            _be_interval = float(grid_cfg.get("fullfill_be_retry_interval_s", 3.0) or 3.0)
+            _be_max_attempts = int(grid_cfg.get("fullfill_be_max_attempts", 20) or 20)
             _bn = int(cyc.get("buy_n") or 0)
             _sn = int(cyc.get("sell_n") or 0)
             for _side, _need, _have in (("buy", _bn, int(buys or 0)),
                                         ("sell", _sn, int(sells or 0))):
-                if _need > 0 and _have >= _need and not cyc.get(f"be_done_{_side}"):
-                    # CAS under lock: re-check flag so concurrent threads don't both fire.
+                if _need <= 0 or _have < _need or _have <= 0:
+                    continue
+                be_key = (str(account), symbol, int(magic), _side)
+                n_attempts = cls._be_attempt_count.get(be_key, 0)
+                if n_attempts >= _be_max_attempts:
+                    continue
+                if t - cls._last_be_attempt.get(be_key, 0.0) < _be_interval:
+                    continue
+                cls._last_be_attempt[be_key] = t
+                cls._be_attempt_count[be_key] = n_attempts + 1
+                if not cyc.get(f"be_done_{_side}"):
                     key = (str(account), symbol, int(magic))
                     with cls._lock:
                         live = cls._last_arm.get(key)
-                        if live is None or live.get(f"be_done_{_side}"):
-                            continue   # another thread already set it
-                        live[f"be_done_{_side}"] = True
-                        cyc[f"be_done_{_side}"] = True
-                    try:
-                        persist_arm(account, symbol, int(magic), live)
-                    except Exception:
-                        pass
-                    _opp = "sell" if _side == "buy" else "buy"
-                    if _cancel_opp:
-                        # cancel opposite pendings first so they can't fill on retrace
-                        cls.enqueue(account, CANCEL_PENDINGS, symbol, magic=magic,
-                                    side=_opp, comment=f"FB|fullfill_cancel_opp|{_opp}", now=t)
-                    cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=_side,
-                                comment=f"FB|fullfill_be|{_side}", now=t)
-                    _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
-                                      "tf": tf, "magic": magic, "exit_reason": "fullfill_be",
-                                      "side": _side, "filled": _have, "need": _need,
-                                      "cancel_opp": _cancel_opp,
-                                      "squeeze_ok": cyc.get("squeeze_ok"),
-                                      "squeeze_rank": cyc.get("squeeze_rank")})
+                        if live is not None and not live.get(f"be_done_{_side}"):
+                            live[f"be_done_{_side}"] = True
+                            cyc[f"be_done_{_side}"] = True
+                            try:
+                                persist_arm(account, symbol, int(magic), live)
+                            except Exception:
+                                pass
+                _opp = "sell" if _side == "buy" else "buy"
+                if _cancel_opp:
+                    # cancel opposite pendings first so they can't fill on retrace
+                    cls.enqueue(account, CANCEL_PENDINGS, symbol, magic=magic,
+                                side=_opp, comment=f"FB|fullfill_cancel_opp|{_opp}", now=t)
+                cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=_side,
+                            comment=f"FB|fullfill_be|{_side}", now=t)
+                _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
+                                  "tf": tf, "magic": magic, "exit_reason": "fullfill_be",
+                                  "side": _side, "filled": _have, "need": _need,
+                                  "cancel_opp": _cancel_opp, "attempt": n_attempts + 1,
+                                  "squeeze_ok": cyc.get("squeeze_ok"),
+                                  "squeeze_rank": cyc.get("squeeze_rank")})
 
         # net-basket exit (which a hedge leg can mask). Gate: a side has ALL its legs
         # filled (the move committed your way). Track that side's peak floating P&L; when
         # it gives back ≥ giveback% from the peak, BOOK half that side and move the rest
-        # to breakeven (risk-free runner). Fires once per cycle (bias_booked guard).
+        # to breakeven (risk-free runner). Fires once per cycle — guarded by
+        # bias_trail_done, a PRIVATE one-shot flag distinct from bias_booked. bias_booked
+        # is shared with the flatten-rest suppression block below, which RESETS it after
+        # a partial close — gating the trail on bias_booked (as this branch used to) let
+        # it re-fire 2-4s after its own book, on the SAME stored peak, at whatever price
+        # the market had moved to by then: double-fire, ~75% booked then a 2nd book at
+        # momentum price. Fixed upstream 2026-07-06 (deb8062) after it booked a LOSS on
+        # the 2nd fire (Jun-26 side_pnl -1356 after +954, 3 occurrences in 57 fires) —
+        # never ported to base-v2 (forked 2026-06-24, two weeks before this fix existed).
+        # Confirmed live 2026-08-20: every "trail fired twice/three-times within seconds
+        # on the same magic" reported this session was this exact bug, not deliberate
+        # re-arming as earlier assumed. set_last_arm replaces the record wholesale, so a
+        # fresh arm still starts clean (no explicit reset needed for bias_trail_done).
         if (bool(grid_cfg.get("bias_trail_enabled", True))
-                and not cyc.get("bias_booked")
+                and not cyc.get("bias_trail_done")
                 and buy_pnl is not None and sell_pnl is not None):
             buy_n = int(cyc.get("buy_n") or 0)
             sell_n = int(cyc.get("sell_n") or 0)
@@ -620,7 +696,25 @@ class ExecBridge:
                                                 or (_partial_ok and float(buy_pnl or 0.0) > 0))
             _sell_live = int(sells or 0) > 0 and (int(sells or 0) >= sell_n or _peak_set
                                                   or (_partial_ok and float(sell_pnl or 0.0) > 0))
-            if buy_n > 0 and _buy_live:
+            # bias_peak is a single shared scalar (not per-side) — once EITHER side has
+            # ever peaked, _peak_set is True and makes BOTH _buy_live and _sell_live
+            # eligible simultaneously. A hard buy-first order then locks bias to buy for
+            # the rest of the cycle regardless of which side is actually committed now.
+            # Observed live 2026-08-21 on magic 770012: buy peaked once early ($17.25),
+            # then sat 1/5 filled at -$158.50 while sell ran to 4/5 filled at +$223 — sell
+            # never got a peak recorded or a trail chance because buy always won the
+            # elif. When both sides are simultaneously eligible, pick whichever is MORE
+            # COMMITTED (more legs filled); tie-break on the better current P&L.
+            _buy_fill = int(buys or 0)
+            _sell_fill = int(sells or 0)
+            if buy_n > 0 and _buy_live and sell_n > 0 and _sell_live:
+                if _sell_fill > _buy_fill:
+                    bias = "sell"
+                elif _buy_fill > _sell_fill:
+                    bias = "buy"
+                else:
+                    bias = "buy" if float(buy_pnl or 0.0) >= float(sell_pnl or 0.0) else "sell"
+            elif buy_n > 0 and _buy_live:
                 bias = "buy"
             elif sell_n > 0 and _sell_live:
                 bias = "sell"
@@ -642,22 +736,60 @@ class ExecBridge:
                 # in profit on a pullback, not to realize a reversal.
                 if (activate > 0 and peak >= activate and side_pnl > 0
                         and side_pnl <= peak * (1.0 - giveback / 100.0)):
-                    cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic, side=bias,
-                                frac=book_frac, comment=f"FB|book|{bias}", now=t)
-                    cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=bias,
-                                comment=f"FB|be|{bias}", now=t)
-                    cls.set_last_arm(account, symbol, **{**cyc, "magic": magic, "bias_booked": True})
-                    _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
-                                      "tf": tf, "magic": magic, "exit_reason": "bias_book_trail",
-                                      "bias": bias, "peak": round(peak, 2),
-                                      "side_pnl": round(side_pnl, 2), "book_frac": book_frac,
-                                      "squeeze_ok": cyc.get("squeeze_ok"),
-                                      "squeeze_rank": cyc.get("squeeze_rank")})
-                    _emit_cycle_outcome(cyc, account=str(account), symbol=symbol,
-                                        magic=magic, tf=tf,
-                                        exit_reason="bias_book_trail", partial=True,
-                                        peak=round(peak, 2), pnl_at_exit=round(float(pnl or 0.0), 2),
-                                        book_frac=book_frac, buys=buys, sells=sells)
+                    # Verify before committing: don't set bias_booked / write cycle_outcomes
+                    # until the CLOSE_SIDE actually closed something. Observed live
+                    # 2026-08-20 on magic 770104: CLOSE_SIDE|buy came back
+                    # {"ok": false, "closed": 0, "error": "close fail #529338888"} — the
+                    # close never happened — but the old code committed anyway (fire-and-
+                    # forget), permanently latching bias_booked=True and writing a
+                    # cycle_outcomes row claiming +$7.5 booked that was never realized on
+                    # the broker. bias_booked being wrongly True also blocked any further
+                    # attempt on that side for the rest of the cycle.
+                    book_key = (str(account), symbol, magic, bias)
+                    pending_id = cls._pending_book_cmd.get(book_key)
+                    if pending_id:
+                        with cls._lock:
+                            pcmd = cls._cmds.get(pending_id)
+                        if pcmd is not None and pcmd.status == DONE \
+                                and int((pcmd.result or {}).get("closed", 0)) > 0:
+                            # CONFIRMED — commit now, not at enqueue time. bias_trail_done
+                            # is the private one-shot (never reset while the cycle lives);
+                            # bias_booked keeps its separate flatten-rest-suppression role.
+                            cls._pending_book_cmd.pop(book_key, None)
+                            cls.set_last_arm(account, symbol,
+                                            **{**cyc, "magic": magic, "bias_booked": True,
+                                               "bias_trail_done": True})
+                            _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
+                                              "tf": tf, "magic": magic,
+                                              "exit_reason": "bias_book_trail",
+                                              "bias": bias, "peak": round(peak, 2),
+                                              "side_pnl": round(side_pnl, 2),
+                                              "book_frac": book_frac,
+                                              "squeeze_ok": cyc.get("squeeze_ok"),
+                                              "squeeze_rank": cyc.get("squeeze_rank")})
+                            _emit_cycle_outcome(cyc, account=str(account), symbol=symbol,
+                                                magic=magic, tf=tf,
+                                                exit_reason="bias_book_trail", partial=True,
+                                                peak=round(peak, 2),
+                                                pnl_at_exit=round(float(pnl or 0.0), 2),
+                                                book_frac=book_frac, buys=buys, sells=sells)
+                            return "bias_book_trail"
+                        elif pcmd is not None and pcmd.status == FAILED:
+                            cls._pending_book_cmd.pop(book_key, None)  # clear, retry below
+                        elif pcmd is not None:
+                            return "bias_book_trail"  # still in flight — don't duplicate
+                        else:
+                            cls._pending_book_cmd.pop(book_key, None)  # lost track, retry below
+                    # No confirmed or in-flight attempt — (re)try, throttled to 3s so a
+                    # persistent rejection doesn't spam a fresh CLOSE_SIDE every poll.
+                    if t - cls._last_book_attempt.get(book_key, 0.0) >= 3.0:
+                        cls._last_book_attempt[book_key] = t
+                        close_cmd = cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic,
+                                                side=bias, frac=book_frac,
+                                                comment=f"FB|book|{bias}", now=t)
+                        cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=bias,
+                                    comment=f"FB|be|{bias}", now=t)
+                        cls._pending_book_cmd[book_key] = close_cmd.id
                     return "bias_book_trail"   # cycle continues (runner + hedge); no flatten
 
         reason: str | None = None
@@ -707,7 +839,7 @@ class ExecBridge:
         bias_booked = bool(cyc.get("bias_booked", False))
         if bias_booked and positions > 0:
             cls.set_last_arm(account, symbol, **{**cyc,
-                             "max_seen": positions, "bias_booked": False})
+                             "max_seen": positions, "bias_booked": False, "magic": magic})
         if reason is None and 0 < positions < max_seen and pendings > 0 and not bias_booked:
             tol = max(mid * 1e-4, 1e-6) if mid > 0 else 1e-6
             confirms = (tp_up > 0 and mid >= tp_up - tol) or (tp_down > 0 and 0 < mid <= tp_down + tol)
@@ -822,6 +954,110 @@ class ExecBridge:
         return cmd
 
     @staticmethod
+    def _pick_order_type(side: str, price: float, quote: dict | None) -> str:
+        """stop vs limit, decided off the live quote so a leg that landed on the wrong
+        side of the market (or inside the broker's freeze band as a stop) goes out as a
+        limit instead. margin = broker stops-level distance (set_quote's stops_dist);
+        falls back to plain stop/geometry when no quote is cached yet."""
+        q = quote or {}
+        margin = float(q.get("stops_dist") or 0.0)
+        if side == "buy":
+            ask = float(q.get("ask") or 0.0)
+            if ask <= 0:
+                return "buy_stop"
+            return "buy_stop" if price > ask + margin else "buy_limit"
+        else:
+            bid = float(q.get("bid") or 0.0)
+            if bid <= 0:
+                return "sell_stop"
+            return "sell_stop" if price < bid - margin else "sell_limit"
+
+    @classmethod
+    def retry_failed_pendings(cls, account: str, broker_symbol: str, magic: int,
+                              max_attempts: int = 5, min_interval_s: float = 3.0) -> int:
+        """Re-submit PLACE_PENDING legs that failed (broker freeze-band reject, wrong-side
+        geometry from a stale plan price, transient reject exhausted on the EA side) for an
+        ACTIVE cycle. Re-picks stop vs limit off the current quote each attempt — a leg the
+        market has since crossed goes out as the opposite order kind instead of retrying the
+        same rejected geometry. Bounded per leg (by magic+comment) so a leg that's genuinely
+        un-placeable (e.g. still inside the freeze band on both sides) doesn't retry forever.
+
+        Called from the poll path (every EA poll, ~1s) so a stuck leg is caught fast, but
+        throttled to min_interval_s per (account,symbol,magic) — retrying every single poll
+        would spam the same rejected geometry on quotes that haven't moved. Also called once
+        per refresh-tps pass (≈1/min) as a backstop for a poll-path gap."""
+        key_t = (str(account), broker_symbol, magic)
+        now = time.time()
+        last = cls._last_retry_at.get(key_t, 0.0)
+        if now - last < min_interval_s:
+            return 0
+        arm = cls.get_last_arm(account, broker_symbol, magic=magic)
+        if not arm or not arm.get("active"):
+            return 0
+        quote = cls.get_quote(account, broker_symbol)
+        if not quote:
+            return 0
+        cls._last_retry_at[key_t] = now
+        with cls._lock:
+            candidates = [c for c in cls._cmds.values()
+                          if c.account == str(account) and c.symbol == broker_symbol
+                          and c.magic == magic and c.type == PLACE_PENDING
+                          and c.status == FAILED and c.id not in cls._retried_cmd_ids]
+        retried = 0
+        for c in candidates:
+            key = (account, broker_symbol, magic, c.comment)
+            n = cls._retry_counts.get(key, 0)
+            with cls._lock:
+                cls._retried_cmd_ids.add(c.id)
+            if n >= max_attempts:
+                continue
+            cls._retry_counts[key] = n + 1
+            side = "buy" if c.order_type.startswith("buy") else "sell"
+            new_type = cls._pick_order_type(side, c.price, quote)
+            cls.enqueue(account, PLACE_PENDING, broker_symbol, order_type=new_type,
+                       price=c.price, lot=c.lot, sl=c.sl, tp=c.tp,
+                       comment=c.comment, magic=magic)
+            retried += 1
+        return retried
+
+    @classmethod
+    def retry_failed_closes(cls, account: str, broker_symbol: str, magic: int,
+                            max_attempts: int = 10, min_interval_s: float = 3.0) -> int:
+        """Re-submit CLOSE_ALL/CLOSE_SIDE commands that failed to close every ticket they
+        targeted. Observed live 2026-08-20 on magic 770012: a flatten-rest CLOSE_ALL
+        returned {"closed": 1, "error": "close fail #529568081"} — one ticket closed, one
+        didn't — and nothing ever re-attempted it. The cycle was already marked inactive by
+        that point, so (unlike retry_failed_pendings/MOVE_BE) this deliberately does NOT
+        gate on arm.active — closing out a position must finish even after the cycle's
+        bookkeeping considers it done. Re-sends the identical command (no price/type to
+        recompute for a close); the EA's close path is idempotent for a ticket that's
+        already gone (nothing left to close ≠ a failure), so a retry against a
+        since-self-resolved position is harmless."""
+        key_t = (str(account), broker_symbol, magic)
+        now = time.time()
+        if now - cls._last_close_retry_at.get(key_t, 0.0) < min_interval_s:
+            return 0
+        cls._last_close_retry_at[key_t] = now
+        with cls._lock:
+            candidates = [c for c in cls._cmds.values()
+                          if c.account == str(account) and c.symbol == broker_symbol
+                          and c.magic == magic and c.type in (CLOSE_ALL, CLOSE_SIDE)
+                          and c.status == FAILED and c.id not in cls._retried_cmd_ids]
+        retried = 0
+        for c in candidates:
+            key = (account, broker_symbol, magic, c.type, c.side)
+            n = cls._close_retry_counts.get(key, 0)
+            with cls._lock:
+                cls._retried_cmd_ids.add(c.id)
+            if n >= max_attempts:
+                continue
+            cls._close_retry_counts[key] = n + 1
+            cls.enqueue(account, c.type, broker_symbol, side=c.side, frac=c.frac,
+                       comment=c.comment, magic=magic)
+            retried += 1
+        return retried
+
+    @staticmethod
     def _leg_sl(entry: float, side: str, disaster_usd: float) -> float:
         """Disaster stop for ONE leg, measured from that leg's OWN entry.
 
@@ -870,6 +1106,12 @@ class ExecBridge:
         else:
             tag = (kind[:8] or "grid")
         tf_tag = tf_from_magic(magic) or "?"
+        # squeeze_gate always checks the cycle's OWN tf (grid_planner._resolve builds the
+        # plan for the magic's tf, and squeeze_gate(symbol, tf, ...) is called with that
+        # same tf) — so "which TF was squeeze checked on" is always tf_tag. Tag it in the
+        # comment only when this arm actually passed the gate (plan.squeeze_ok), so the
+        # order itself carries proof of the coil it armed on.
+        sq_tag = f"|sq{tf_tag}" if bool(getattr(plan, "squeeze_ok", False)) else ""
 
         out: list[Command] = []
         if close_first:
@@ -887,18 +1129,21 @@ class ExecBridge:
         buy_sl  = getattr(plan, "buy_sl",  0.0)
         sell_sl = getattr(plan, "sell_sl", 0.0)
         disaster = float(disaster_sl_usd or 0.0)
+        quote = cls.get_quote(account, broker_symbol)
         for i, leg in enumerate(getattr(plan, "buy_legs", []) or []):
             leg_sl = buy_sl or cls._leg_sl(leg.price, "buy", disaster)
+            otype = cls._pick_order_type("buy", leg.price, quote)
             out.append(cls.enqueue(
-                account, PLACE_PENDING, broker_symbol, order_type="buy_stop",
+                account, PLACE_PENDING, broker_symbol, order_type=otype,
                 price=leg.price, lot=leg.lot, sl=leg_sl, tp=buy_tp,
-                comment=f"FB|{tag}|{tf_tag}|b{i + 1}", magic=magic))
+                comment=f"FB|{tag}|{tf_tag}{sq_tag}|b{i + 1}", magic=magic))
         for i, leg in enumerate(getattr(plan, "sell_legs", []) or []):
             leg_sl = sell_sl or cls._leg_sl(leg.price, "sell", disaster)
+            otype = cls._pick_order_type("sell", leg.price, quote)
             out.append(cls.enqueue(
-                account, PLACE_PENDING, broker_symbol, order_type="sell_stop",
+                account, PLACE_PENDING, broker_symbol, order_type=otype,
                 price=leg.price, lot=leg.lot, sl=leg_sl, tp=sell_tp,
-                comment=f"FB|{tag}|{tf_tag}|s{i + 1}", magic=magic))
+                comment=f"FB|{tag}|{tf_tag}{sq_tag}|s{i + 1}", magic=magic))
         return out
 
     @classmethod
@@ -916,15 +1161,38 @@ class ExecBridge:
 
     @classmethod
     def enqueue_modify_position(cls, account: str, broker_symbol: str, magic: int,
-                                new_tp: float, side: str = "",
+                                new_tp: float = 0.0, new_sl: float = 0.0, side: str = "",
                                 comment: str = "") -> "Command":
-        """Refresh TP on FILLED positions for `magic` on `side` (SL left unchanged).
+        """Refresh TP and/or SL on FILLED positions for `magic` on `side`. 0 = leave
+        that field unchanged (the EA keeps the existing value when it sees 0).
 
         Complements enqueue_modify_pending: pending legs track the HVN via MODIFY_PENDING,
         filled legs track it via this. side: "buy", "sell", or "" (both).
         """
         return cls.enqueue(account, MODIFY_POSITION, broker_symbol,
-                           magic=magic, tp=new_tp, side=side, comment=comment)
+                           magic=magic, tp=new_tp, sl=new_sl, side=side, comment=comment)
+
+    @classmethod
+    def ratchet_candle_sl(cls, account: str, broker_symbol: str, magic: int,
+                          side: str, candidate_sl: float) -> bool:
+        """Ratchet-only check for the expansion candle-close SL trail: buy SL only ever
+        moves UP (candidate must exceed the last one we set), sell SL only ever moves
+        DOWN. Returns True (and records candidate_sl as the new high-water mark) iff the
+        caller should actually enqueue the modify; False means candidate_sl is no
+        improvement (or invalid) and nothing should be sent. Distinct from MOVE_BE/other
+        SL paths — this is its own key so it doesn't fight the breakeven/disaster-stop
+        mechanisms, all of which the EA resolves by simply taking whatever SL arrives last."""
+        if candidate_sl <= 0:
+            return False
+        key = (str(account), broker_symbol, magic, side)
+        prev = cls._last_candle_sl.get(key)
+        if prev is not None:
+            if side == "buy" and candidate_sl <= prev:
+                return False
+            if side == "sell" and candidate_sl >= prev:
+                return False
+        cls._last_candle_sl[key] = candidate_sl
+        return True
 
     # ── poll (EA pulls) ──────────────────────────────────────────────────────
     @classmethod
@@ -1037,7 +1305,25 @@ class ExecBridge:
                 if positions <= 0:
                     continue
                 existing = cls.get_last_arm(account, broker_symbol, magic=mg)
+                if existing and existing.get("active"):
+                    continue
                 if existing:
+                    # Real arm data, just marked inactive — reactivate in place rather than
+                    # blank-stub over good geometry (fulcrum/trigger_kind/TPs). This is the
+                    # reap-race leftover: a magic reaped in the same tick it was armed (see
+                    # the absent-magic reap grace fix) has a genuine record but active=False,
+                    # and previously `if existing: continue` left it permanently orphaned even
+                    # with live, profitable positions open — magic 770013 sat untracked with
+                    # +$597.75 floating from 20:00:08 until this was found, 2026-08-20.
+                    existing = dict(existing)
+                    existing.pop("magic", None)
+                    existing["active"] = True
+                    cls.set_last_arm(account, broker_symbol, magic=mg, **existing)
+                    stubbed.append(mg)
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"[exec_bridge] reconcile: reactivated inactive-but-live magic {mg} "
+                        f"(positions={positions}) for {account}/{broker_symbol}")
                     continue
                 # Orphaned live position — create a stub that marks cycle as active
                 # so monitor_cycle tracks P&L and position_open gate fires.

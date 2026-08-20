@@ -31,7 +31,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Aniket"
 #property version   "1.11"
-#define EA_VERSION "1.11"
+#define EA_VERSION "1.12"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -820,6 +820,12 @@ bool ExecModifyPosition(const string cmd, int &modified, string &err)
    bool clearSl = (newSl < 0);
    if(newTp <= 0 && newSl <= 0 && !clearTp && !clearSl) { err = "no tp or sl"; return false; }
 
+   double point        = SymbolInfoDouble(sym, SYMBOL_POINT);
+   long   stopsLevelPts = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStop       = stopsLevelPts * point;
+   double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+   double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+
    for(int i = 0; i < PositionsTotal(); i++)
    {
       if(!posInfo.SelectByIndex(i)) continue;
@@ -831,8 +837,20 @@ bool ExecModifyPosition(const string cmd, int &modified, string &err)
       double tp = clearTp ? 0.0 : ((newTp > 0) ? newTp : posInfo.TakeProfit());  // use cmd TP, clear (<0), or keep existing
       double curTp = NormalizeDouble(posInfo.TakeProfit(), digits);
       double curSl = NormalizeDouble(posInfo.StopLoss(), digits);
-      double pt    = SymbolInfoDouble(sym, SYMBOL_POINT);
+      double pt    = point;
       if(MathAbs(curTp - tp) < pt && MathAbs(curSl - sl) < pt) continue;  // no-op
+      // Freeze guard: a BUY's SL must clear bid-minStop (sit far enough below market);
+      // a SELL's SL must clear ask+minStop (far enough above). Skip quietly (not a
+      // failure) when the target SL is currently inside the freeze band — e.g. the
+      // expansion candle-close trail computing a candle extreme too close to live price.
+      // Not an error: the caller's ratchet already recorded this SL as attempted, and
+      // the position keeps its EXISTING (still-valid, never worse) stop either way; the
+      // next candle close naturally retries with a fresh candidate.
+      if(sl > 0)
+      {
+         bool blocked = isBuy ? (sl > bid - minStop) : (sl < ask + minStop);
+         if(blocked) continue;
+      }
       if(trade.PositionModify(posInfo.Ticket(), sl, tp)) modified++;
       else { allOk = false; err = "modify fail #" + IntegerToString((long)posInfo.Ticket()); }
    }

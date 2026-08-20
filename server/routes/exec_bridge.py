@@ -336,6 +336,65 @@ def _cancel_orphan_on_hvn_gone(account: str, broker_symbol: str, analysis_symbol
     return True
 
 
+def _expansion_sl_trail(account: str, broker_symbol: str, analysis_symbol: str, tf: str,
+                        magic: int, buys: int, sells: int, settings: dict) -> None:
+    """When the market has left compression (squeeze_gate reads NOT coiled — i.e. genuine
+    expansion, not just "never was coiled"), ratchet every open position's SL to the most
+    recently CLOSED candle's extreme: buy SL -> that candle's low, sell SL -> that candle's
+    high. Ratchet-only (ExecBridge.ratchet_candle_sl) — same convention as MOVE_BE and the
+    sweep-loss trail: only ever tightens, never loosens. Applies to every open position on
+    the magic regardless of which setup armed it (market-wide risk behavior, not tied to
+    the squeeze/coil setup specifically).
+
+    Only fires while squeeze_gate has enough history to have an opinion (ok=False AND
+    rank<1.0 would still fire on "just never coiled" — deliberately requires ok=False,
+    which the gate returns for BOTH "expanded after a real coil" and "never compressed at
+    all" cases; there's no cheap way to distinguish those from the gate alone, so this
+    trails on any non-compressed read, which is the conservative/safer direction for a
+    trailing STOP regardless of why it isn't coiled).
+
+    DISABLED by default 2026-08-21: "not coiled" is the market's default state (bottom-15%
+    compression is rare), so this fired almost continuously, ratcheting the SL up to nearly
+    every 5m candle's low — magic 770052 got stopped by an ordinary pullback 8.7 min after
+    arming, +$9.75, because its SL had already been trailed right under live price. The
+    "can't tell a real release from never-coiled" gap above is the root cause, not a detail.
+    Needs the trigger narrowed to an actual release event before re-enabling."""
+    if not bool((settings.get("grid_levels") or {}).get("expansion_sl_trail_enabled", False)):
+        return
+    if buys <= 0 and sells <= 0:
+        return
+    grid_cfg = (settings.get("grid_levels") or {})
+    try:
+        from execution.zone_triggers import squeeze_gate
+        ok, _rank = squeeze_gate(analysis_symbol, tf, grid_cfg)
+    except Exception:
+        return
+    if ok:
+        return   # still coiled — no expansion, nothing to trail
+    quote = ExecBridge.get_quote(account, broker_symbol) or {}
+    venue_mid = float(quote.get("mid") or 0.0)
+    if venue_mid <= 0:
+        return
+    from pipeline.state_store import store
+    latest = store().latest(analysis_symbol, tf)
+    if latest is None or not latest.ohlc.c:
+        return
+    # additive analysis->venue shift (see _rebase_to_venue): a price maps by +delta.
+    delta = venue_mid - float(latest.ohlc.c)
+    if buys > 0:
+        candidate = float(latest.ohlc.l) + delta
+        if ExecBridge.ratchet_candle_sl(account, broker_symbol, magic, "buy", candidate):
+            ExecBridge.enqueue_modify_position(account, broker_symbol, magic,
+                                               new_sl=round(candidate, 4), side="buy",
+                                               comment="FB|expansion_sl|buy")
+    if sells > 0:
+        candidate = float(latest.ohlc.h) + delta
+        if ExecBridge.ratchet_candle_sl(account, broker_symbol, magic, "sell", candidate):
+            ExecBridge.enqueue_modify_position(account, broker_symbol, magic,
+                                               new_sl=round(candidate, 4), side="sell",
+                                               comment="FB|expansion_sl|sell")
+
+
 def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict) -> None:
     """Intrabar touch-arm for ONE touch-enabled TF, called each poll. Resolves the
     HVN edge live price is tapping, runs the tick-reversal confirm, and on confirm
@@ -459,8 +518,9 @@ def exec_poll():
     equity  = body.get("equity")
     if balance is not None and equity is not None:
         target_pct = float((settings_cfg or {}).get("daily_target_pct", 0.0) or 0.0)
+        target_usd = float((settings_cfg or {}).get("daily_target_usd", 0.0) or 0.0)
         result = ExecBridge.update_account_balance(
-            account, float(balance), float(equity), target_pct)
+            account, float(balance), float(equity), target_pct, target_usd)
         if result["hit"] and sym:
             # enqueue CLOSE_ALL for every active magic and log once per trigger
             magics_body = body.get("magics") or []
@@ -469,9 +529,10 @@ def exec_poll():
             for mg in active_magics:
                 ExecBridge.enqueue(account, "CLOSE_ALL", sym, magic=mg,
                                    comment="FB|daily_target|flatten")
-            if active_magics or result["pnl_pct"] >= target_pct:
+            if active_magics or result["pnl_pct"] >= target_pct or result["pnl_usd"] >= target_usd:
                 LOG.info(f"[daily_target] account={account} pnl={result['pnl_pct']:.2f}% "
-                         f">= target={target_pct}% — closing {len(active_magics)} magic(s)")
+                         f"(${result['pnl_usd']:.2f}) >= target={target_pct}%/${target_usd} "
+                         f"— closing {len(active_magics)} magic(s)")
     # Per-magic open-state + cycle monitor. The EA sends a `magics` array — one entry
     # per (strategy×TF) pool it holds — so each TF cycle is tracked and exited in
     # isolation. tf is recovered from the magic. A flatten ships in the same response
@@ -531,6 +592,20 @@ def exec_poll():
                 # cancel that dangling pending (opt-in via grid_levels.cancel_orphan_on_hvn_gone).
                 _cancel_orphan_on_hvn_gone(account, sym, analysis_sym, tf_m, mg,
                                            b, s, int(m.get("pendings", 0)), settings_cfg or {})
+                # Fast leg-retry: internally throttled to 3s/magic, so this is a no-op
+                # on most polls but catches a freeze-band-rejected leg within ~3s instead
+                # of waiting for the 1/min refresh-tps pass.
+                n_retried = ExecBridge.retry_failed_pendings(account, sym, mg)
+                if n_retried:
+                    LOG.info(f"[exec] magic={mg} retried {n_retried} failed pending leg(s)")
+                # Same idea for a CLOSE_ALL/CLOSE_SIDE that didn't close every ticket it
+                # targeted — deliberately not gated on arm.active (see docstring), so it
+                # still fires here as long as the EA keeps reporting a residual position.
+                n_close_retried = ExecBridge.retry_failed_closes(account, sym, mg)
+                if n_close_retried:
+                    LOG.info(f"[exec] magic={mg} retried {n_close_retried} failed close command(s)")
+                _expansion_sl_trail(account, sym, analysis_sym, tf_m, mg, b, s,
+                                    settings_cfg or {})
             except Exception:
                 LOG.exception("[exec] per-magic cycle monitor error")  # never break the poll
     elif sym and ("positions" in body or "pendings" in body):
@@ -556,13 +631,17 @@ def exec_poll():
             import time as _t
             _now = _t.time()
             _reap_grace = 30.0   # s — let a freshly-armed cycle place + report its legs first
-            # Whole-account-flat signal: EA reports zero buys/sells/pendings at the top level
-            # AND an empty magics array → MT5 holds nothing for us. Unambiguous; reap WITHOUT
-            # the placement grace (no fresh arm can have legs if the EA sees zero everything).
-            _flat_all = (int(body.get("buys", 0) or 0) == 0
-                         and int(body.get("sells", 0) or 0) == 0
-                         and int(body.get("pendings", 0) or 0) == 0
-                         and not magics)
+            # NOTE: previously bypassed the grace entirely when the EA reported the whole
+            # account flat (zero buys/sells/pendings, empty magics), on the theory that "no
+            # fresh arm can have legs if the EA sees zero everything." That's false under the
+            # actual race: /exec/emit_grid and /exec/poll are separate requests on separate
+            # cadences, so the server can enqueue a brand-new arm's commands in the same
+            # instant a CONCURRENT poll still reflects the pre-arm (flat) state. Observed live
+            # 2026-08-20: magic 770013 was armed and reaped in the same tick — "reaped absent
+            # magic 770013 (flat in MT5)" landed in the same poll as its own ARM log line,
+            # deactivating the cycle before the EA had even echoed its just-placed legs back.
+            # The grace must apply unconditionally: a genuinely stale magic still clears it
+            # and gets reaped regardless of whether the account happens to be flat.
             _reported = {int(m.get("magic", 0)) for m in magics}
             for _mg in list(ExecBridge.active_fulcrums(account, sym).keys()):
                 if _mg in _reported:
@@ -570,8 +649,7 @@ def exec_poll():
                 _cyc = ExecBridge.get_last_arm(account, sym, magic=_mg) or {}
                 # Placement-window guard: skip a just-armed cycle whose EA legs haven't
                 # been reported yet (else we'd retire a fresh arm before it places).
-                # Skipped entirely when the EA reports the whole account flat.
-                if not _flat_all and (_now - float(_cyc.get("ts", 0.0) or 0.0)) < _reap_grace:
+                if (_now - float(_cyc.get("ts", 0.0) or 0.0)) < _reap_grace:
                     continue
                 if _cyc:
                     # explicit magic=_mg: persisted arms may lack a `magic` key, which would
@@ -586,7 +664,8 @@ def exec_poll():
 
     # Intrabar touch-arm — check each touch-enabled TF against live price (this is the
     # only 1s-cadence hook). Gated off unless touch_arm_enabled; never breaks the poll.
-    if sym and not ExecBridge.daily_target_hit(account):
+    # daily_target_hit only flattens (below) — it does NOT block new arms.
+    if sym:
         for _tf in ((settings_cfg or {}).get("grid_levels", {}).get("touch_arm_tfs") or []):
             try:
                 _touch_arm_tf(account, sym, _tf, settings_cfg or {})
@@ -638,10 +717,8 @@ def exec_emit_grid():
     if not account:
         return jsonify({"ok": False, "error": "missing account"}), 400
 
-    # Daily target gate — no new arms once today's P&L target is hit
-    if ExecBridge.daily_target_hit(account):
-        return jsonify({"ok": True, "verdict": "skip",
-                        "skip_reason": "daily_target_hit"})
+    # daily_target_hit flattens open/pending on the poll path — it does NOT block new
+    # arms here, so the grid keeps re-arming past a hit combined-PnL/pct target.
 
     # broker↔analysis symbol resolution (same map as /grid_levels)
     symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
@@ -940,6 +1017,12 @@ def exec_refresh_tps():
             refreshed.append(mg)
         except Exception:
             LOG.exception(f"[refresh_tps] magic={mg} error")
+        try:
+            n = ExecBridge.retry_failed_pendings(account, broker_symbol, mg)
+            if n:
+                LOG.info(f"[refresh_tps] magic={mg} retried {n} failed pending leg(s)")
+        except Exception:
+            LOG.exception(f"[refresh_tps] retry magic={mg} error")
     return jsonify({"ok": True, "account": account, "broker_symbol": broker_symbol,
                     "refreshed_magics": refreshed})
 

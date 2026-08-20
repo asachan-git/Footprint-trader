@@ -57,6 +57,16 @@ monitor:
 # Footprint-driven neutral-grid placement (/exec/emit_grid + FBExecBridge EA).
 # Planner reads these via .get() defaults — block is optional but canonical here.
 grid_levels:
+  # Expansion candle-close SL trail: DISABLED 2026-08-21. squeeze_gate's ok=False fires
+  # on "not coiled" which is the market's default state, not just a real coil-release —
+  # this ratcheted every open position's SL up to nearly every 5m candle's low almost
+  # continuously, stopping magic 770052 out on an ordinary pullback 8.7 min after arming.
+  # Needs the trigger narrowed to an actual release event before re-enabling.
+  expansion_sl_trail_enabled: false
+  # First leg on each side sits step/2 from the fulcrum instead of a full step, so
+  # b1<->s1 spans exactly one step (matching b1<->b2/s1<->s2) instead of 2x a step.
+  # Scoped to 5m/15m only.
+  half_step_first_leg_by_tf: {5m: true, 15m: true}
   base_lot: 0.25
   lot_step: 0.25
   tp_atr_mult: 1.5
@@ -129,6 +139,10 @@ grid_levels:
   # 0.0 = exact touch only (original behaviour). Edge is still the fulcrum price.
   hvn_touch_buffer: 0.5
   hvn_lookback_bars: 3          # candle-close trigger scans last N bars (restart recovery)
+  # skew_enabled: false forces every cycle symmetric (side="none") regardless of votes below —
+  # both legs equal size, no directional inventory. Kill switch for hvn_reversion_bias +
+  # htf_bias + bb_edge all at once.
+  skew_enabled: false
   # Directional skew votes (skew-only — both sides still placed, favoured side heavier):
   # HTF Bollinger bias reads the NEXT TF up's 20-SMA (5m→15m, 15m→1h…) — price above a
   # rising 20MA = bull vote, below a falling one = bear. 2.5σ "edge" votes mean-reversion
@@ -169,7 +183,7 @@ grid_levels:
   # profit the net-basket exit masks (a hedge leg drags net down → target never hits).
   bias_trail_enabled: true
   bias_trail_activate_usd: 125.0   # bias-side floating must PEAK ≥ this ($) to arm the trail
-  bias_trail_giveback_pct: 50    # fire when floating retraces this % off the peak
+  bias_trail_giveback_pct: 30    # fire when floating retraces this % off the peak
   bias_book_frac: 0.5
   # Track a PARTIALLY filled side that is already in profit. The original gate needed
   # every leg of a side open before the trail would look at it, so a side that ran
@@ -227,8 +241,16 @@ grid_levels:
   # arming and the A/B keeps collecting.
   # 1m: negative on every tree ever measured (-72 USC/lot June, -11 July, 49%
   # both-sided). Gated rather than dropped so it can still earn its place from data.
-  require_squeeze_gate_by_tf: {1m: true}
-  squeeze_gate_max_bars: 10  # how stale a just-ended coil may be and still pass the gate
+  require_squeeze_gate_by_tf: {1m: true, 5m: true, 15m: true, 1h: true}
+  # Structural kinds (hvn_inside_touch/hvn_displacement/hvn_edge) are exempt from the
+  # squeeze gate by default even on a gated TF (see grid_planner._resolve). This forces
+  # the gate back onto specific (tf, kind) pairs anyway — currently just 1m's
+  # hvn_inside_touch, per the negative-every-tree history above. hvn_displacement and
+  # hvn_edge stay exempt on every TF; not listing them here is what does that.
+  squeeze_gate_force_structural_by_tf: {1m: [hvn_inside_touch]}
+  # 0 = arm ONLY while currently coiled (rank<=squeeze_bbw_pct on the live bar) — disables
+  # the "recently released" fallback (a coil that ended within N bars still qualifies).
+  squeeze_gate_max_bars: 6
 
 # Startup preflight — server REFUSES to start unless footprint + VP data are present.
 startup_check:
@@ -339,7 +361,10 @@ risk:
 # Daily floating P&L target — close all grid positions and block new arms for the day
 # once equity rises by this % above the session-open balance.
 # 0 = disabled. Example: 1.5 = close everything once up 1.5% on the day.
-daily_target_pct: 3000.0
+daily_target_pct: 40.0
+# Combined-across-all-cycles absolute $ PnL target (equity - day-start balance). Hits on
+# EITHER this or daily_target_pct, whichever trips first. 0 = disabled.
+daily_target_usd: 5000.0
 
 # Dhan options trading configuration
 dhan:

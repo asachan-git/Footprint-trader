@@ -41,23 +41,33 @@ echo $$ > "$_LOCKDIR/pid"
 trap 'rm -rf "$_LOCKDIR"' EXIT INT TERM
 
 # Per-TF setup lists:
-#   1m  — hvn_inside_touch only
-#   5m  — hvn_inside_touch + squeeze + hvn_displacement + hvn_edge
-#   15m — hvn_inside_touch + squeeze + hvn_displacement + hvn_edge
+#   1m  — disabled (see below)
+#   5m  — hvn_inside_touch + hvn_displacement + hvn_edge + lvn_displacement
+#   15m — hvn_inside_touch + hvn_displacement + hvn_edge + lvn_displacement
+#   1h  — hvn_displacement
 # hvn_edge reads the SAME daily/weekly VP the chart draws (vp_cache.get), so it arms
 # on the HVN edge-touch you see on the chart — unlike hvn_inside_touch, which measures
 # the rolling-window VP and a stricter close-inside+wick-reject geometry.
+# squeeze dropped 2026-08-20: lost every single day it traded in the Jun22-29 study
+# (-6,670, the worst/most consistent loser measured). lvn_displacement (the code name
+# for the "lvn_edge" setup) added same day: +73.8/lot, positive both weeks it ran in the
+# 3-week study, the most consistent single-setup winner measured across all windows.
 # Override per-TF with FB_SETUPS_1M / FB_SETUPS_5M / FB_SETUPS_15M env vars.
-SETUPS_1M=(${FB_SETUPS_1M:-hvn_inside_touch})
-SETUPS_5M=(${FB_SETUPS_5M:-hvn_inside_touch squeeze hvn_displacement hvn_edge})
-SETUPS_15M=(${FB_SETUPS_15M:-hvn_inside_touch squeeze hvn_displacement hvn_edge})
+# 1m disabled by default 2026-08-20: negative on every tree ever measured (-72 USC/lot
+# June, -11 July, 49% both-sided), and the fastest/most whipsaw-prone TF for a reversion
+# setup breaking into a trend instead (-832.25 on magic 770011 was the trigger — edge=bottom
+# expected a reversion up, price broke through and kept going). Set FB_SETUPS_1M to bring
+# it back if ever wanted.
+SETUPS_1M=(${FB_SETUPS_1M:-})
+SETUPS_5M=(${FB_SETUPS_5M:-hvn_inside_touch hvn_displacement hvn_edge lvn_displacement})
+SETUPS_15M=(${FB_SETUPS_15M:-hvn_inside_touch hvn_displacement hvn_edge lvn_displacement})
 SETUPS_1H=(${FB_SETUPS_1H:-hvn_displacement})
 
 emit_loop() {
   local tf="$1" interval="$2" offset="$3"
   shift 3
   local setups=("$@")
-  echo "[emit:$tf] started — every ${interval}s (offset ${offset}s) → $SYMBOL acct $ACCOUNT setups=[${setups[*]}]"
+  echo "[emit:$tf] started — every ${interval}s (offset ${offset}s) → $SYMBOL acct $ACCOUNT setups=[${setups[*]-}]"
   while true; do
     local now next sleep_s
     now=$(date +%s)
@@ -66,7 +76,7 @@ emit_loop() {
     sleep "$sleep_s"
     local ts resp note hint
     ts=$(date '+%Y-%m-%d %H:%M:%S')
-    for hint in "${setups[@]}"; do
+    for hint in "${setups[@]+"${setups[@]}"}"; do
       resp=$(curl -s -X POST "${FLASK}/exec/emit_grid" \
         -H "Content-Type: application/json" \
         -d "{\"account\":\"${ACCOUNT}\",\"symbol\":\"${SYMBOL}\",\"tf\":\"${tf}\",\"trigger_hint\":\"${hint}\"}")
@@ -110,13 +120,13 @@ except Exception: print('?')" 2>/dev/null || echo '?')
 
 # Each TF runs an INDEPENDENT parallel cycle, isolated by strategy×TF magic.
 # Offsets keep coincident closes off the same instant (avoids thundering-herd at :00).
-emit_loop 15m 900   8  "${SETUPS_15M[@]}" &
+emit_loop 15m 900   0  "${SETUPS_15M[@]}" &
 P15=$!
-emit_loop 5m  300  12  "${SETUPS_5M[@]}" &
+emit_loop 5m  300  0  "${SETUPS_5M[@]}" &
 P5=$!
-emit_loop 1m  60    3  "${SETUPS_1M[@]}" &
+emit_loop 1m  60    0  "${SETUPS_1M[@]+"${SETUPS_1M[@]}"}" &
 P1=$!
-emit_loop 1h  3600 15  "${SETUPS_1H[@]}" &
+emit_loop 1h  3600 0  "${SETUPS_1H[@]}" &
 P1H=$!
 refresh_loop &
 PR=$!

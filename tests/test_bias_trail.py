@@ -156,3 +156,64 @@ def test_full_ladder_still_works_with_the_flag_on():
                      buy_pnl=500.0, sell_pnl=0.0) is None
     assert _poll_cfg("PART4", CFG_PARTIAL, buys=2, sells=0,
                      buy_pnl=200.0, sell_pnl=0.0) == "bias_book_trail"
+
+
+# ── double-fire (bias_trail_done vs bias_booked) ──────────────────────────────
+# Fixed upstream 2026-07-06 (deb8062), never ported to base-v2 (forked 2026-06-24,
+# two weeks earlier). The flatten-rest suppression block resets bias_booked after a
+# partial close; gating the trail on that SAME flag let it re-fire 2-4s later on the
+# stored peak, at whatever price the market had moved to — booking a LOSS on the
+# second fire in production (Jun-26: side_pnl -1356 after +954). bias_trail_done is a
+# private one-shot that must NOT be reset by the flatten-rest block, so a confirmed
+# book stays booked for the rest of the cycle regardless of what flatten-rest does to
+# bias_booked in the meantime.
+
+def _confirm_close_side(acct):
+    """Simulate the EA acking the CLOSE_SIDE that bias_trail just enqueued, so the
+    verify-before-commit path (added 2026-08-20) actually commits bias_trail_done."""
+    for cmd in ExecBridge.poll(acct):
+        if cmd["type"] == CLOSE_SIDE:
+            ExecBridge.ack([{"id": cmd["id"], "ok": True, "closed": 2}])
+
+
+def test_more_committed_side_takes_over_bias_even_after_the_other_peaked_first():
+    """bias_peak is a single shared scalar, not per-side — once EITHER side has ever
+    peaked, _peak_set makes BOTH sides eligible, and a hard buy-first order used to lock
+    bias to buy for the rest of the cycle regardless of which side is actually committed.
+    Observed live 2026-08-21 on magic 770012: buy peaked once early ($17.25) then sat
+    1/5 filled at a loss while sell ran to 4/5 filled at +$223 — sell never got tracked.
+    When both sides are eligible, the more-filled side must win, and the trail must then
+    fire on THAT side, not the stale early one."""
+    _arm("SWITCH1", buy_n=1, sell_n=5)  # buy_n=1: its single leg IS a full fill
+    # buy fills first, briefly profitable — sets the shared bias_peak
+    assert _poll("SWITCH1", buys=1, sells=0, buy_pnl=17.25, sell_pnl=0.0) is None
+    # sell now runs far more committed (4/5) and far more profitable than buy (1/5, red)
+    assert _poll("SWITCH1", buys=1, sells=4, buy_pnl=-158.5, sell_pnl=223.0) is None
+    arm = ExecBridge.get_last_arm("SWITCH1", "XAUUSD.pc", magic=770013)
+    assert arm["bias_peak"] == 223.0, "peak must track sell now, not stay stuck on buy's 17.25"
+    # sell gives back from that peak -> trail must fire ON SELL
+    result = _poll("SWITCH1", buys=1, sells=4, buy_pnl=-200.0, sell_pnl=120.0)
+    assert result == "bias_book_trail"
+    cmds = ExecBridge.poll("SWITCH1")
+    close_cmds = [c for c in cmds if c["type"] == CLOSE_SIDE]
+    assert close_cmds and close_cmds[0]["side"] == "sell"
+
+
+def test_a_confirmed_book_cannot_refire_even_if_bias_booked_gets_reset():
+    _arm("DBLFIRE1")
+    assert _poll("DBLFIRE1", buys=4, sells=0, buy_pnl=500.0, sell_pnl=0.0) is None
+    assert _poll("DBLFIRE1", buys=4, sells=0, buy_pnl=250.0, sell_pnl=0.0) == "bias_book_trail"
+    _confirm_close_side("DBLFIRE1")
+    # the commit itself only happens when monitor_cycle next observes the confirmed ack
+    assert _poll("DBLFIRE1", buys=4, sells=0, buy_pnl=250.0, sell_pnl=0.0) == "bias_book_trail"
+    arm = ExecBridge.get_last_arm("DBLFIRE1", "XAUUSD.pc", magic=770013)
+    assert arm["bias_trail_done"] is True
+    # simulate what the flatten-rest suppression block does: resets bias_booked while
+    # bias_trail_done is untouched — this is the exact state that used to re-arm the trail.
+    arm.pop("magic", None)
+    ExecBridge.set_last_arm("DBLFIRE1", "XAUUSD.pc", magic=770013,
+                            **{**arm, "bias_booked": False})
+    # a fresh, independently-satisfiable giveback on a NEW peak must still be refused —
+    # the private flag, not bias_booked, is what the trail actually checks.
+    assert _poll("DBLFIRE1", buys=3, sells=0, buy_pnl=900.0, sell_pnl=0.0) is None
+    assert _poll("DBLFIRE1", buys=3, sells=0, buy_pnl=400.0, sell_pnl=0.0) != "bias_book_trail"

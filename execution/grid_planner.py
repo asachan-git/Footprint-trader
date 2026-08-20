@@ -318,6 +318,8 @@ def _resolve_skew(trigger: Trigger, regime, cfg: dict | None = None,
       • detector context bias / regime trend / HTF-20MA bias / 2.5σ edge (weight 1 each).
     """
     cfg = cfg or {}
+    if not bool(cfg.get("skew_enabled", True)):
+        return "none", "skew disabled (skew_enabled=false)"
     votes = 0
     why: list[str] = []
 
@@ -368,8 +370,15 @@ def _ladder(n: int, base_lot: float, lot_step: float, heavy_near_mid: bool) -> l
 
 
 def _build_legs(fulcrum: float, n: int, step: float, skew: str,
-                base_lot: float, lot_step: float) -> tuple[list[Leg], list[Leg]]:
-    """fulcrum ± i·step prices. Favoured side gets the heavier/longer ladder."""
+                base_lot: float, lot_step: float,
+                half_step_first_leg: bool = False) -> tuple[list[Leg], list[Leg]]:
+    """fulcrum ± i·step prices. Favoured side gets the heavier/longer ladder.
+
+    half_step_first_leg: the first leg on each side sits step/2 from the fulcrum instead
+    of a full step — inter-leg spacing (b1-b2, s1-s2, ...) stays a full step either way,
+    only the fulcrum-to-first-leg gap halves. Without this, b1<->s1 spans 2*step (double
+    every other inter-leg gap); with it, b1<->s1 spans exactly step, matching the rest of
+    the ladder. Off by default — changes every leg price and the outer-leg TP anchor."""
     buy_n = n
     sell_n = n
     # Skew adds one extra leg + heavier ladder to the favoured side.
@@ -381,9 +390,10 @@ def _build_legs(fulcrum: float, n: int, step: float, skew: str,
     buy_lots = _ladder(buy_n, base_lot, lot_step, heavy_near_mid=(skew == "buy"))
     sell_lots = _ladder(sell_n, base_lot, lot_step, heavy_near_mid=(skew == "sell"))
 
-    buy_legs = [Leg(price=round(fulcrum + i * step, 4), lot=buy_lots[i - 1])
+    offset = (step / 2.0) if half_step_first_leg else 0.0
+    buy_legs = [Leg(price=round(fulcrum + offset + (i - 1) * step, 4), lot=buy_lots[i - 1])
                 for i in range(1, buy_n + 1)]
-    sell_legs = [Leg(price=round(fulcrum - i * step, 4), lot=sell_lots[i - 1])
+    sell_legs = [Leg(price=round(fulcrum - offset - (i - 1) * step, 4), lot=sell_lots[i - 1])
                  for i in range(1, sell_n + 1)]
     return buy_legs, sell_legs
 
@@ -595,18 +605,25 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         _structural_kinds = ("hvn_inside_touch", "hvn_displacement", "hvn_edge")
         is_structural = ((fulcrum_t is not None and fulcrum_t.kind in _structural_kinds)
                          or any(k in trigger_hint for k in _structural_kinds))
-        # Per-TF enforcement overrides the global flag AND the structural exemption.
-        # The exemption exists because a structural setup arms on a node edge rather than
-        # a coil, so gating it on volatility is normally wrong. But a TF listed here is
-        # one we have decided only earns its keep in a coiled regime — 1m has been
-        # negative on every tree measured (-72 USC/lot in June, -11 in July, 49%
-        # both-sided), so "only when vol has compressed" is the whole point of keeping it.
-        # Leaving the exemption in place would make the per-TF gate a silent no-op for
-        # hvn_inside_touch, which is the only setup 1m runs.
+        # Per-TF enforcement (require_squeeze_gate_by_tf) turns the gate on for a TF at
+        # all. Whether a STRUCTURAL kind (hvn_inside_touch/hvn_displacement/hvn_edge) is
+        # actually subject to it is separate: those arm on a node edge/touch, not on a
+        # vol coil, so gating them on volatility is normally wrong — hvn_edge reads the
+        # same daily/weekly VP the chart draws and should arm on the visible edge-touch
+        # regardless of squeeze. squeeze_gate_force_structural_by_tf names the TF-specific
+        # exceptions: 1m has been negative on every tree measured (-72 USC/lot June, -11
+        # July, 49% both-sided), so hvn_inside_touch is force-gated there specifically —
+        # "only when vol has compressed" is the whole point of keeping 1m at all. Left off
+        # any other TF's list, hvn_inside_touch/hvn_displacement/hvn_edge stay exempt
+        # everywhere else, same as a non-gated TF. Non-structural kinds (vp_level_touch,
+        # imbalance, va, cvd_div, squeeze itself) are never exempt — the per-TF flag alone
+        # governs them.
         _gate_by_tf = grid_cfg.get("require_squeeze_gate_by_tf") or {}
         _tf_gated = bool(_gate_by_tf.get(tf, False))
         _gate_on = _tf_gated or bool(grid_cfg.get("require_squeeze_gate", False))
-        if _gate_on and not sq_ok and (_tf_gated or not is_structural):
+        _force_kinds = set(grid_cfg.get("squeeze_gate_force_structural_by_tf", {}).get(tf) or [])
+        _force_structural = bool(fulcrum_t is not None and fulcrum_t.kind in _force_kinds)
+        if _gate_on and not sq_ok and (not is_structural or _force_structural):
             skip, reason = True, f"no_squeeze_gate:rank={sq_rank:.2f}"
     if skip:
         return GridPlan(verdict="skip", skip_reason=reason,
@@ -643,7 +660,10 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
                             regime=getattr(regime, "type", "unknown"),
                             atr=round(atr, 4), plan_id=plan_id)
 
-    buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
+    _half_step_by_tf = grid_cfg.get("half_step_first_leg_by_tf") or {}
+    _half_step = bool(_half_step_by_tf.get(tf, False))
+    buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step,
+                                      half_step_first_leg=_half_step)
 
     # TP = next HVN FAR EDGE beyond the outermost leg — for EVERY setup, both sides.
     # buy side  → lowest HVN high  that clears the top leg + min_tp_dist (the next node up)
