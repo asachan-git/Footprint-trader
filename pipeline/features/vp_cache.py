@@ -310,13 +310,23 @@ def build_and_save(
         computed = 0
 
         skip_weekend = symbol.upper() not in _ALWAYS_24_7
+        if skip_weekend:
+            # Sweep the WHOLE map, not just the lookback window. Purging only inside
+            # `range(7)` leaves every weekend key older than a week sitting in the file
+            # forever — the read-side filter hides them from the arm path, but the cache
+            # still carries data this code has decided is invalid, and anything reading
+            # vp_cache.json directly (an audit, a backtest, a human debugging) sees it.
+            stale = [k for k in sym_cache["daily"] if _is_weekend_key(k)]
+            for k in stale:
+                sym_cache["daily"].pop(k, None)
+            if stale:
+                LOG.info("[vp_cache] %s: purged %d stale weekend period(s): %s",
+                         symbol, len(stale), ", ".join(sorted(stale)))
         for days_back in range(7 if skip_weekend else 5):
             ts_for_day = now_ts - days_back * 86400
             date_key = _session_day_key(ts_for_day, anchor)
             if skip_weekend and _is_weekend_key(date_key):
-                # purge a stale pre-fix weekend entry as well as refusing to build one
-                sym_cache["daily"].pop(date_key, None)
-                continue
+                continue                      # never build one either
             if date_key in sym_cache["daily"] and days_back > 0:
                 continue
             start_ts, end_ts = _day_bounds(date_key, anchor)

@@ -60,3 +60,30 @@ def test_get_history_keeps_weekend_profiles_for_crypto(monkeypatch):
     monkeypatch.setattr(vc, "_load", lambda: fake)
     keys = [e["period_key"] for e in vc.get_history("BTCUSDT", "daily", n=5)]
     assert keys == ["2026-06-26", "2026-06-27", "2026-06-28"]
+
+
+def test_purge_sweeps_the_whole_map_not_just_the_lookback_window(monkeypatch, tmp_path):
+    """First implementation only purged inside range(7), so a weekend key older
+    than a week survived forever. The read filter hid it from the arm path, but
+    the file still carried data the code had decided was invalid — which is
+    exactly what a human debugging vp_cache.json would read and trust."""
+    cache = {"XAUTUSDT": {"daily": {
+        "2026-07-18": {"poc": 1.0},   # Saturday, >4 weeks old
+        "2026-07-19": {"poc": 2.0},   # Sunday
+        "2026-08-14": {"poc": 3.0},   # Friday — must survive
+    }, "weekly": {}, "session_start_utc": 22}}
+    monkeypatch.setattr(vc, "_load", lambda: cache)
+    monkeypatch.setattr(vc, "_save", lambda c: None)
+    monkeypatch.setattr(vc, "_compute_period_vp", lambda *a, **k: None)
+
+    class _S:
+        def recent(self, *a, **k):
+            return []
+    monkeypatch.setattr(vc, "store", lambda: _S(), raising=False)
+    try:
+        vc.build_and_save(["XAUTUSDT"], "1m", session_start_utc={"XAUTUSDT": 22})
+    except Exception:
+        pass                                  # only the purge behaviour is under test
+    remaining = sorted(cache["XAUTUSDT"]["daily"])
+    assert "2026-07-18" not in remaining and "2026-07-19" not in remaining
+    assert "2026-08-14" in remaining

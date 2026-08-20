@@ -224,8 +224,11 @@ startup_check:
   stale_warn_hours: 6        # WARN (not block) if newest footprint bar older than this
   min_density_pct: 0.5       # WARN if <50% of expected bars in the window (gaps)
   # symbols / tfs default to vp_cache.symbols and instrument.timeframes
-  symbols: [BTCUSDT, XAUTUSDT]   # both live (gold reopened 2026-06-22). Weekend BTC-only
-                                 # was for the gold-closed XAU-thin-VP boot block.
+  # Gold only. BTC is still ingested if its feed runs, but it is not traded on this
+  # branch, and gating boot on a symbol we do not trade means a thin or stale BTC
+  # profile blocks a gold session for no reason — the documented failure from the
+  # earlier BTC boot-block. Add BTCUSDT back here only when BTC is actually armed.
+  symbols: [XAUTUSDT]
 
 claude:
   mode: restricted           # full | restricted | off
