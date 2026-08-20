@@ -199,7 +199,7 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
         if abs(venue_delta) > 0.1:
             _kind = "fulcrum_shift" if best_dist <= _drift_cap else "fulcrum_reanchor"
             new_fulcrum_venue = round(old_fulcrum_venue + venue_delta, 4)
-            arm = {**arm, "fulcrum": new_fulcrum_venue}
+            arm = {**arm, "fulcrum": new_fulcrum_venue, "magic": magic}
             ExecBridge.set_last_arm(account, broker_symbol, **arm)
             ExecBridge.enqueue_modify_pending(account, broker_symbol, magic, price_delta=venue_delta)
             _emit_audit({"account": account, "symbol": analysis_symbol, "tf": tf,
@@ -243,7 +243,8 @@ def _refresh_cycle_tps(account: str, broker_symbol: str, analysis_symbol: str,
     old_down = float(arm.get("tp_down") or 0.0)
     if (new_tp_up and abs(new_tp_up - old_up) > 0.05) or (new_tp_down and abs(new_tp_down - old_down) > 0.05):
         ExecBridge.set_last_arm(account, broker_symbol,
-                                **{**arm, "tp_up": new_tp_up, "tp_down": new_tp_down})
+                                **{**arm, "tp_up": new_tp_up, "tp_down": new_tp_down,
+                                   "magic": magic})
         if new_tp_up:
             ExecBridge.enqueue_modify_pending(account, broker_symbol, magic,
                                               price_delta=0.0, new_tp=new_tp_up, side="buy")
@@ -493,6 +494,97 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict) -> 
              f"[edge={side} fulcrum={plan.fulcrum}], {len(cmds)} command(s)")
 
 
+def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict) -> None:
+    """Intrabar touch-arm for lvn_edge_touch — exact mirror of _touch_arm_tf, reading
+    lvn_touch_arm_trigger instead of touch_arm_trigger. Ported 2026-08-21 from 3e04db8
+    (2026-07-07 upstream, never in base-v2, which forked 2026-06-24). Kept as a
+    self-contained twin rather than parameterizing _touch_arm_tf, matching the shape
+    upstream shipped it in."""
+    from execution.grid_planner import plan_grid_levels
+    from execution.zone_triggers import lvn_touch_arm_trigger
+    grid_cfg = settings.get("grid_levels") or {}
+    if not bool(grid_cfg.get("touch_arm_enabled", False)):
+        return
+    if tf not in (grid_cfg.get("touch_arm_tfs") or []):
+        return
+
+    symbol_map = (settings.get("execution") or {}).get("symbol_map") or {}
+    broker_to_analysis = {v: k for k, v in symbol_map.items()}
+    analysis = broker_to_analysis.get(broker_symbol, broker_symbol)
+
+    quote = ExecBridge.get_quote(account, broker_symbol)
+    if not quote or not quote.get("mid"):
+        return
+    venue_mid = float(quote["mid"])
+
+    from pipeline.state_store import store
+    latest = store().latest(analysis, tf)
+    if latest is None or not latest.ohlc.c:
+        return
+    delta = venue_mid - float(latest.ohlc.c) if latest.ohlc.c else 0.0
+    live_analysis = venue_mid - delta
+
+    trig = lvn_touch_arm_trigger(analysis, tf, live_analysis)
+    if trig is None:
+        ExecBridge.clear_touch_state(account, broker_symbol, tf, kind="lvn_edge_touch")
+        return
+
+    edge = float(trig.fulcrum_price)
+    side = str(trig.context.get("edge", ""))
+    confirm_ticks = float(grid_cfg.get("touch_arm_confirm_ticks", 0.2) or 0.2)
+    if not ExecBridge.touch_arm_check(account, broker_symbol, tf, live_analysis,
+                                      edge, side, confirm_ticks, kind="lvn_edge_touch"):
+        return
+
+    leg_magic = magic_for("lvn_edge_touch", tf)
+    open_state = ExecBridge.get_open(account, broker_symbol, magic=leg_magic) or {}
+    if int(open_state.get("positions", 0) or 0) > 0 or int(open_state.get("pendings", 0) or 0) > 0:
+        return
+    dedup_pct = float(grid_cfg.get("emit_dedup_pct", 0.0007) or 0.0)
+    dedup_tol = venue_mid * dedup_pct
+    fulcrum_venue = round(edge + delta, 4)
+    if not ExecBridge.should_emit(account, broker_symbol, fulcrum_venue, dedup_tol, magic=leg_magic):
+        return
+
+    min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
+    plan = plan_grid_levels(analysis, tf, live_analysis,
+                            trigger_hint="lvn_edge_touch", settings=settings,
+                            venue_price=venue_mid, min_step_venue=min_step_venue,
+                            force_trigger=trig)
+    if plan.verdict != "arm" or plan.trigger_kind != "lvn_edge_touch":
+        _emit_audit({"account": account, "symbol": analysis, "tf": tf, "verdict": "skip",
+                     "skip_reason": f"touch_arm:{plan.skip_reason or 'no_plan'}",
+                     "touch_armed": True})
+        return
+
+    _disaster_sl = float((settings.get("grid_levels") or {}).get("disaster_sl_usd", 0.0) or 0.0)
+    cmds = ExecBridge.enqueue_grid_plan(account, broker_symbol, plan,
+                                        close_first=True, clear_kind="cancel",
+                                        magic=leg_magic, leg_tp=True,
+                                        disaster_sl_usd=_disaster_sl)
+    _ratio = (plan.venue_anchor / plan.analysis_anchor) if plan.analysis_anchor else 1.0
+    node_low = float(plan.trigger_context.get("node_low", 0.0) or 0.0) * _ratio
+    node_high = float(plan.trigger_context.get("node_high", 0.0) or 0.0) * _ratio
+    ExecBridge.set_last_arm(account, broker_symbol, tf=tf, fulcrum=plan.fulcrum, edge=side,
+                            trigger_kind=plan.trigger_kind, venue_mid=venue_mid, magic=leg_magic,
+                            n_per_side=plan.n_per_side, step=plan.step, ts=time.time(),
+                            buy_n=len(plan.buy_legs), sell_n=len(plan.sell_legs),
+                            bias_peak=0.0, bias_booked=False,
+                            be_done_buy=False, be_done_sell=False,
+                            node_low=round(node_low, 5), node_high=round(node_high, 5),
+                            active=True, armed_tf=tf, tp_up=plan.buy_tp, tp_down=plan.sell_tp,
+                            max_pos_seen=0, pend_seen=0, flatten_ts=0.0,
+                            squeeze_ok=plan.squeeze_ok, squeeze_rank=plan.squeeze_rank)
+    ExecBridge.mark_emit(account, broker_symbol, plan.fulcrum, magic=leg_magic)
+    _emit_audit({"account": account, "symbol": analysis, "broker_symbol": broker_symbol,
+                 "tf": tf, "verdict": "arm", "trigger_kind": plan.trigger_kind, "edge": side,
+                 "fulcrum": plan.fulcrum, "venue_mid": venue_mid, "touch_armed": True,
+                 "n_per_side": plan.n_per_side, "step": plan.step,
+                 "buy_tp": plan.buy_tp, "sell_tp": plan.sell_tp})
+    LOG.info(f"[exec] TOUCH-ARM(lvn) {account} {broker_symbol} {tf} → armed "
+             f"[edge={side} fulcrum={plan.fulcrum}], {len(cmds)} command(s)")
+
+
 @bp.post("/exec/poll")
 def exec_poll():
     if not _auth_ok():
@@ -671,6 +763,10 @@ def exec_poll():
                 _touch_arm_tf(account, sym, _tf, settings_cfg or {})
             except Exception:
                 LOG.exception("[exec] touch_arm error")  # never break the poll
+            try:
+                _lvn_touch_arm_tf(account, sym, _tf, settings_cfg or {})
+            except Exception:
+                LOG.exception("[exec] lvn touch_arm error")  # never break the poll
 
     commands = ExecBridge.poll(account)
     if commands:
@@ -841,7 +937,7 @@ def exec_emit_grid():
                 if abs(_venue_delta) > _modify_threshold:
                     # Update stored fulcrum
                     _new_fulcrum_venue = round(_old_fulcrum_venue + _venue_delta, 4)
-                    arm = {**arm, "fulcrum": _new_fulcrum_venue}
+                    arm = {**arm, "fulcrum": _new_fulcrum_venue, "magic": leg_magic}
                     ExecBridge.set_last_arm(account, broker_symbol, **arm)
                     # Shift pending stop orders by the same delta
                     ExecBridge.enqueue_modify_pending(account, broker_symbol, leg_magic,
@@ -879,7 +975,8 @@ def exec_emit_grid():
                 old_down = float(arm.get("tp_down") or 0.0)
                 if (new_tp_up and abs(new_tp_up - old_up) > 0.05) or (new_tp_down and abs(new_tp_down - old_down) > 0.05):
                     ExecBridge.set_last_arm(account, broker_symbol,
-                                            **{**arm, "tp_up": new_tp_up, "tp_down": new_tp_down})
+                                            **{**arm, "tp_up": new_tp_up, "tp_down": new_tp_down,
+                                               "magic": leg_magic})
                     # Update TP on remaining pending orders AND on already-filled positions
                     # (PositionModify keeps SL, swaps TP — so filled legs chase the same
                     # moving HVN target the pendings do, never stranded on a stale fill-time TP).

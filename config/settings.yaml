@@ -139,6 +139,11 @@ grid_levels:
   # 0.0 = exact touch only (original behaviour). Edge is still the fulcrum price.
   hvn_touch_buffer: 0.5
   hvn_lookback_bars: 3          # candle-close trigger scans last N bars (restart recovery)
+  # lvn_edge_touch (ported 2026-08-21 from 3e04db8): same tap-buffer/lookback knobs as
+  # hvn_inside_touch, applied to LVN zone bounds instead. 0 = exact touch only.
+  lvn_touch_buffer: 0.5
+  lvn_touch_buffer_pct: 0.0
+  lvn_lookback_bars: 3
   # skew_enabled: false forces every cycle symmetric (side="none") regardless of votes below —
   # both legs equal size, no directional inventory. Kill switch for hvn_reversion_bias +
   # htf_bias + bb_edge all at once.

@@ -71,6 +71,8 @@ _STRAT_CODE = {
     # under ONE dedicated magic so the trade report reads it as a single setup. The audit
     # still records the real detector (trigger_kind) that fired.
     "vp_levels": 9,
+    # Ported 2026-08-21 from 3e04db8 (2026-07-07 upstream, never in base-v2).
+    "lvn_edge_touch": 11,
 }
 _TF_CODE = {"1m": 1, "5m": 2, "15m": 3, "1h": 4}
 _CODE_TF = {v: k for k, v in _TF_CODE.items()}
@@ -277,18 +279,22 @@ class ExecBridge:
     @classmethod
     def touch_arm_check(cls, account: str, broker_symbol: str, tf: str,
                         live_price: float, edge: float, side: str,
-                        confirm_ticks: float, now: float | None = None) -> bool:
+                        confirm_ticks: float, now: float | None = None,
+                        kind: str = "hvn_inside_touch") -> bool:
         """Tick-reversal state machine for intrabar touch-arming. Call each poll with
         the live price and the edge it's tapping (from touch_arm_trigger). Returns True
         ONCE when price has tapped the edge AND then reverted back INSIDE the node by
         `confirm_ticks` (a mini-rejection) — the intrabar twin of "close back inside".
 
-        State per (account, symbol, tf): record the tap, then on a later poll confirm
-        if price moved back inside. A breakout (price keeps going through the edge)
-        never reverts → never confirms → no arm. State clears on confirm or when price
-        leaves the buffer entirely (tap abandoned)."""
+        State per (account, symbol, tf, kind): record the tap, then on a later poll
+        confirm if price moved back inside. `kind` keeps HVN and LVN (or any future
+        touch-arm trigger) tap-state isolated even when both run on the same TF —
+        without it a tap on one would corrupt/consume the other's pending confirm.
+        A breakout (price keeps going through the edge) never reverts → never confirms
+        → no arm. State clears on confirm or when price leaves the buffer entirely
+        (tap abandoned)."""
         t = now if now is not None else time.time()
-        key = (str(account), broker_symbol, tf)
+        key = (str(account), broker_symbol, tf, kind)
         with cls._lock:
             st = cls._touch_state.get(key)
             # reverted INSIDE = moved away from the edge toward node interior:
@@ -307,10 +313,11 @@ class ExecBridge:
             return False
 
     @classmethod
-    def clear_touch_state(cls, account: str, broker_symbol: str, tf: str) -> None:
+    def clear_touch_state(cls, account: str, broker_symbol: str, tf: str,
+                          kind: str = "hvn_inside_touch") -> None:
         """Drop a pending tap (price left the buffer without confirming)."""
         with cls._lock:
-            cls._touch_state.pop((str(account), broker_symbol, tf), None)
+            cls._touch_state.pop((str(account), broker_symbol, tf, kind), None)
 
     # ── ict_fvg chart overlay (paper strategy publishes its active setup; the EA
     #    draws it rebased onto the venue) ───────────────────────────────────────

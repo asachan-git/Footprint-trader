@@ -409,6 +409,286 @@ def _session_hvn_zones(symbol: str, tf: str, bars: list[Bar]) -> tuple[list[tupl
     return zones, sess
 
 
+# ── LVN edge-touch (ported 2026-08-21 from 3e04db8, 2026-07-07 upstream — never in
+#    base-v2, which forked 2026-06-24) ────────────────────────────────────────────
+
+def _rolling_lvn(symbol: str, tf: str, bars: list[Bar]) -> list[tuple[float, float]]:
+    """Price-tracking rolling-VP LVN zones over the ~24h window for `tf`. Mirrors
+    _rolling_hvn exactly — same VP compute call, reads lvn_zones instead of hvn_zones."""
+    win = _VP_WIN.get(tf, 96)
+    if len(bars) < win:
+        return []
+    try:
+        from pipeline.features.volume_profile import compute as vp_compute, _resolve_bin_size
+        vp = vp_compute(bars[-win:], "daily", bars[-1].ohlc.c,
+                        bin_size=_resolve_bin_size(symbol))
+        return [(float(z["low"]), float(z["high"])) for z in (vp.lvn_zones or [])]
+    except Exception:
+        return []
+
+
+def _cached_lvn(symbol: str) -> list[tuple[float, float]]:
+    """LVN zones from both prev-day and today's cached daily VP. Mirrors base-v2's
+    current _cached_hvn (simple prev+today merge, no IST-hour cutoff — that refinement
+    landed in the same upstream commit as this port but wasn't asked for here)."""
+    try:
+        from pipeline.features.vp_cache import get_prev_and_today_raw
+        prev_vp, today_vp = get_prev_and_today_raw(symbol)
+        zones: list[tuple[float, float]] = []
+        for vp in (prev_vp, today_vp):
+            if vp:
+                zones += [(float(z["low"]), float(z["high"])) for z in (vp.get("lvn_zones") or [])]
+        return zones
+    except Exception:
+        return []
+
+
+def _session_lvn_zones(symbol: str, tf: str, bars: list[Bar]) -> tuple[list[tuple[float, float]], str]:
+    """LVN zones for the current session — rolling ∪ cached, merged. Mirrors
+    _session_hvn_zones minus the vacuum fallback (that borrows HVN structure when price
+    is stranded outside range; not applicable when price is deliberately inside an LVN)."""
+    from pipeline.features.session import current_session
+    ts = bars[-1].close_ts if bars else None
+    sess = current_session(ts, symbol).session
+    zones: list[tuple[float, float]] = []
+    zones += _rolling_lvn(symbol, tf, bars)
+    zones += _cached_lvn(symbol)
+    zones = _merge_zone_tuples(zones)
+    return zones, sess
+
+
+def compute_lvn_edge_tps(symbol: str, edge: float,
+                         zones: list[tuple[float, float]],
+                         min_dist: float = 0.0,
+                         top_leg: float = 0.0,
+                         bot_leg: float = 0.0) -> tuple[float, float]:
+    """Recompute (tp_up, tp_down) for lvn_edge_touch — same zone-walk as
+    compute_hvn_tps, but targets the NEAR edge of an intermediate qualifying HVN (the
+    boundary facing back toward the LVN) instead of the far edge — a more conservative
+    target than hvn_inside_touch's "punch through the whole node" convention, since
+    there's no directional/reversion thesis here to justify assuming a full pass-through.
+    Extreme (outermost) node still targets its CENTER, same rule as compute_hvn_tps.
+    No skip_node: the fulcrum is an LVN edge, not inside an HVN, so there's no bracketing
+    node to exclude. Same VAH/VAL/LVN/POC/fib fallback cascade as compute_hvn_tps when no
+    HVN qualifies at all."""
+    up_ref  = top_leg if top_leg > 0 else edge
+    dn_ref  = bot_leg if bot_leg > 0 else edge
+
+    up_zones = sorted([(lo, hi) for lo, hi in zones if hi > up_ref + min_dist], key=lambda z: z[1])
+    dn_zones = sorted([(lo, hi) for lo, hi in zones if lo < dn_ref - min_dist], key=lambda z: -z[0])
+
+    # NEAR edge for an intermediate node (opposite of compute_hvn_tps's far edge);
+    # CENTER for the extreme (outermost) node — same magnet rule as compute_hvn_tps.
+    def _near_target(zs: list, ref: float, sign: int) -> float:
+        if not zs:
+            return 0.0
+        z = zs[0]
+        near_edge = z[0] if sign > 0 else z[1]
+        if len(zs) == 1:   # extreme node → center (fall back to near edge if mid doesn't clear)
+            center = (z[0] + z[1]) / 2.0
+            return center if sign * (center - ref) > min_dist else near_edge
+        return near_edge
+
+    tp_up   = _near_target(up_zones, up_ref, +1)
+    tp_down = _near_target(dn_zones, dn_ref, -1)
+
+    if tp_up == 0.0 or tp_down == 0.0:
+        from pipeline.features.vp_cache import get_raw as vp_get
+        _dvp   = vp_get(symbol, "daily") or {}
+        _vah   = float(_dvp.get("vah") or 0.0)
+        _val   = float(_dvp.get("val") or 0.0)
+        _poc   = float(_dvp.get("poc") or 0.0)
+        _lvns  = [(float(z["low"]), float(z["high"]))
+                  for z in (_dvp.get("lvn_zones") or [])]
+
+        if tp_up == 0.0:
+            if _vah > up_ref + min_dist:
+                tp_up = _vah
+            else:
+                lvn_above = [lo for lo, hi in _lvns if lo > up_ref + min_dist]
+                if lvn_above:
+                    tp_up = min(lvn_above)
+            if tp_up == 0.0 and _poc > up_ref + min_dist:
+                tp_up = _poc
+            if tp_up == 0.0:
+                tp_up = _fib_ext_tp(edge, zones, "up")
+
+        if tp_down == 0.0:
+            if _val > 0 and _val < dn_ref - min_dist:
+                tp_down = _val
+            else:
+                lvn_below = [hi for lo, hi in _lvns if hi < dn_ref - min_dist]
+                if lvn_below:
+                    tp_down = max(lvn_below)
+            if tp_down == 0.0 and 0 < _poc < dn_ref - min_dist:
+                tp_down = _poc
+            if tp_down == 0.0:
+                tp_down = _fib_ext_tp(edge, zones, "down")
+
+    return tp_up, tp_down
+
+
+def _t_lvn_edge_touch(symbol: str, tf: str, current_price: float) -> Trigger | None:
+    """A recent candle CLOSES INSIDE an LVN (low-volume vacuum) *and* TAPS one of its
+    edges — geometrically identical to _t_hvn_inside_touch, reading LVN zone bounds
+    instead of HVN. No fade-side/breakout-side asymmetry (no reversion thesis) — TP for
+    both directions comes from compute_lvn_edge_tps' near-edge-of-next-HVN rule.
+    Stateless / causal."""
+    import yaml as _yaml
+    from pipeline.state_store import store
+    try:
+        _cfg = _yaml.safe_load(
+            (__import__("pathlib").Path(__file__).resolve().parent.parent / "config" / "settings.yaml").read_text()
+        ) or {}
+        _gcfg = _cfg.get("grid_levels") or {}
+        _buf = float(_gcfg.get("lvn_touch_buffer", 0.0))
+        _buf_pct = float(_gcfg.get("lvn_touch_buffer_pct", 0.0))
+        _lookback = int(_gcfg.get("lvn_lookback_bars", 3))
+    except Exception:
+        _buf = 0.0
+        _buf_pct = 0.0
+        _lookback = 3
+
+    win = _VP_WIN.get(tf, 96)
+    bars = store().recent(symbol, tf, win + 5)
+    if len(bars) < 2:
+        return None
+    zones, sess = _session_lvn_zones(symbol, tf, bars)
+    if not zones:
+        return None
+
+    candidate_bars = bars[-(1 + _lookback):-1]
+    candidate_bars = list(reversed(candidate_bars))
+
+    best_trigger = None
+    for bar_idx, cur in enumerate(candidate_bars):
+        c, h, lo_p = cur.ohlc.c, cur.ohlc.h, cur.ohlc.l
+        best = None
+        for lo, hi in zones:
+            width = hi - lo
+            if width <= 0:
+                continue
+            if not (lo < c < hi):
+                continue
+            _buf_eff = max(_buf, width * _buf_pct)
+            touch_top = h >= hi - _buf_eff
+            touch_bot = lo_p <= lo + _buf_eff
+            if not (touch_top or touch_bot):
+                continue
+            if touch_top and touch_bot:
+                edge, side = (hi, "top") if abs(hi - c) <= abs(lo - c) else (lo, "bottom")
+            else:
+                edge, side = (hi, "top") if touch_top else (lo, "bottom")
+            poke = (h - hi) if side == "top" else (lo - lo_p)
+            reject_frac = max(0.0, poke) / width
+            dist = abs(edge - c)
+            if best is None or dist < best[0]:
+                best = (dist, edge, width, side, reject_frac)
+        if best is not None:
+            _dist, edge, width, side, reject_frac = best
+            conf = min(0.9, 0.55 + min(reject_frac, 0.3)) * (1.0 - bar_idx * 0.05)
+            best_trigger = (edge, width, side, reject_frac, conf, sess)
+            break
+
+    if best_trigger is None:
+        return None
+
+    edge, width, side, reject_frac, conf, sess = best_trigger
+
+    try:
+        from pipeline.features.vp_cache import get_raw as vp_get
+        _dvp_d = vp_get(symbol, "daily") or {}
+        _daily_hvn_zones = [(float(z["low"]), float(z["high"]))
+                            for z in (_dvp_d.get("hvn_zones") or [])]
+    except Exception:
+        _daily_hvn_zones = []
+    tp_up, tp_down = compute_lvn_edge_tps(symbol, edge, _daily_hvn_zones)
+
+    node_low  = (edge - width) if side == "top" else edge
+    node_high = edge if side == "top" else (edge + width)
+    return Trigger(
+        kind="lvn_edge_touch",
+        fulcrum_price=float(edge),
+        raw_range=float(width),
+        confidence=float(conf),
+        context={"bias": "none", "edge": side, "session": sess,
+                 "reject_frac": round(reject_frac, 4),
+                 "node_low": float(node_low), "node_high": float(node_high),
+                 "tp_up": float(tp_up), "tp_down": float(tp_down)},
+    )
+
+
+def lvn_touch_arm_trigger(symbol: str, tf: str, live_price: float) -> Trigger | None:
+    """INTRABAR variant of _t_lvn_edge_touch — arm on LIVE price tapping an LVN edge
+    without waiting for the candle to close. Mirrors touch_arm_trigger exactly, reading
+    LVN zone bounds instead of HVN. Caller owns the tick-reversal confirm."""
+    import yaml as _yaml
+    from pipeline.state_store import store
+    try:
+        _cfg = _yaml.safe_load(
+            (__import__("pathlib").Path(__file__).resolve().parent.parent / "config" / "settings.yaml").read_text()
+        ) or {}
+        _gcfg2 = _cfg.get("grid_levels") or {}
+        _buf = float(_gcfg2.get("lvn_touch_buffer", 0.0))
+        _buf_pct = float(_gcfg2.get("lvn_touch_buffer_pct", 0.0))
+    except Exception:
+        _buf = 0.0
+        _buf_pct = 0.0
+
+    win = _VP_WIN.get(tf, 96)
+    bars = store().recent(symbol, tf, win + 5)
+    if len(bars) < 2 or live_price <= 0:
+        return None
+    zones, sess = _session_lvn_zones(symbol, tf, bars)
+    if not zones:
+        return None
+
+    best = None
+    for lo, hi in zones:
+        width = hi - lo
+        if width <= 0:
+            continue
+        if not (lo <= live_price <= hi):
+            continue
+        _buf_eff = max(_buf, width * _buf_pct)
+        touch_top = live_price >= hi - _buf_eff
+        touch_bot = live_price <= lo + _buf_eff
+        if not (touch_top or touch_bot):
+            continue
+        if touch_top and touch_bot:
+            edge, side = (hi, "top") if abs(hi - live_price) <= abs(lo - live_price) else (lo, "bottom")
+        else:
+            edge, side = (hi, "top") if touch_top else (lo, "bottom")
+        dist = abs(edge - live_price)
+        if best is None or dist < best[0]:
+            best = (dist, edge, width, side)
+    if best is None:
+        return None
+    _dist, edge, width, side = best
+
+    try:
+        from pipeline.features.vp_cache import get_raw as vp_get
+        _dvp_d = vp_get(symbol, "daily") or {}
+        _daily_hvn_zones = [(float(z["low"]), float(z["high"]))
+                            for z in (_dvp_d.get("hvn_zones") or [])]
+    except Exception:
+        _daily_hvn_zones = []
+    tp_up, tp_down = compute_lvn_edge_tps(symbol, edge, _daily_hvn_zones)
+
+    node_low  = (edge - width) if side == "top" else edge
+    node_high = edge if side == "top" else (edge + width)
+    return Trigger(
+        kind="lvn_edge_touch",
+        fulcrum_price=float(edge),
+        raw_range=float(width),
+        confidence=0.6,
+        context={"bias": "none", "edge": side, "session": sess,
+                 "touch_armed": True,
+                 "node_low": float(node_low), "node_high": float(node_high),
+                 "tp_up": float(tp_up), "tp_down": float(tp_down)},
+    )
+
+
 def _t_hvn_inside_touch(symbol: str, tf: str, current_price: float) -> Trigger | None:
     """A recent candle CLOSES INSIDE an HVN *and* TAPS one of its edges — wick reaches
     (or comes within hvn_touch_buffer of) the boundary but body closes back inside (edge
@@ -1223,6 +1503,7 @@ def detect_all(symbol: str, tf: str, current_price: float, regime,
         _t_hvn_edge(symbol, current_price),
         _t_hvn_inside_touch(symbol, tf, current_price),
         _t_hvn_displacement(symbol, tf, current_price, daily_vp),
+        _t_lvn_edge_touch(symbol, tf, current_price),
         _t_anchor(symbol, current_price, atr, latest),
         _t_va(symbol, current_price, regime, daily_vp),
         _t_vp_level_touch(symbol, tf, current_price, daily_vp, atr, cfg),

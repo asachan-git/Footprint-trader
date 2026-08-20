@@ -42,16 +42,24 @@ trap 'rm -rf "$_LOCKDIR"' EXIT INT TERM
 
 # Per-TF setup lists:
 #   1m  — disabled (see below)
-#   5m  — hvn_inside_touch + hvn_displacement + hvn_edge + lvn_displacement
-#   15m — hvn_inside_touch + hvn_displacement + hvn_edge + lvn_displacement
+#   5m  — hvn_inside_touch + hvn_displacement + hvn_edge + lvn_displacement + lvn_edge_touch
+#   15m — hvn_inside_touch + hvn_displacement + hvn_edge + lvn_displacement + lvn_edge_touch
 #   1h  — hvn_displacement
 # hvn_edge reads the SAME daily/weekly VP the chart draws (vp_cache.get), so it arms
 # on the HVN edge-touch you see on the chart — unlike hvn_inside_touch, which measures
 # the rolling-window VP and a stricter close-inside+wick-reject geometry.
 # squeeze dropped 2026-08-20: lost every single day it traded in the Jun22-29 study
-# (-6,670, the worst/most consistent loser measured). lvn_displacement (the code name
-# for the "lvn_edge" setup) added same day: +73.8/lot, positive both weeks it ran in the
-# 3-week study, the most consistent single-setup winner measured across all windows.
+# (-6,670, the worst/most consistent loser measured).
+# lvn_displacement vs lvn_edge_touch — two DIFFERENT mechanisms, not the same setup under
+# two names. lvn_displacement (existing since before base-v2's fork): fulcrum = LVN
+# MIDPOINT, few legs planted on the LVN's own edges, bets on a fast one-way thrust out of
+# the vacuum. lvn_edge_touch (ported 2026-08-21 from 3e04db8, 2026-07-07 upstream — never
+# in base-v2, which forked 2 weeks earlier): fulcrum = LVN's OUTER EDGE, same
+# closed-inside+wick-touch geometry as hvn_inside_touch, TP targets the near edge of the
+# next HVN (conservative). The historical "+73.8/lot, most consistent single-setup
+# winner" study window (Jun22-Jul20) overlaps lvn_edge_touch's Jul-7 introduction, so
+# that figure may credit the edge-touch mechanism, not the displacement one — running
+# both in parallel (independent magics, no conflict) until there's data to prefer one.
 # Override per-TF with FB_SETUPS_1M / FB_SETUPS_5M / FB_SETUPS_15M env vars.
 # 1m disabled by default 2026-08-20: negative on every tree ever measured (-72 USC/lot
 # June, -11 July, 49% both-sided), and the fastest/most whipsaw-prone TF for a reversion
@@ -59,8 +67,8 @@ trap 'rm -rf "$_LOCKDIR"' EXIT INT TERM
 # expected a reversion up, price broke through and kept going). Set FB_SETUPS_1M to bring
 # it back if ever wanted.
 SETUPS_1M=(${FB_SETUPS_1M:-})
-SETUPS_5M=(${FB_SETUPS_5M:-hvn_inside_touch hvn_displacement hvn_edge lvn_displacement})
-SETUPS_15M=(${FB_SETUPS_15M:-hvn_inside_touch hvn_displacement hvn_edge lvn_displacement})
+SETUPS_5M=(${FB_SETUPS_5M:-hvn_inside_touch hvn_displacement hvn_edge lvn_displacement lvn_edge_touch})
+SETUPS_15M=(${FB_SETUPS_15M:-hvn_inside_touch hvn_displacement hvn_edge lvn_displacement lvn_edge_touch})
 SETUPS_1H=(${FB_SETUPS_1H:-hvn_displacement})
 
 emit_loop() {

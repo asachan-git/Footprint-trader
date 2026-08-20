@@ -291,6 +291,15 @@ def _size_grid(trigger: Trigger, regime, atr: float, swing_range: float,
         n = max(2, min(hvn_max_legs, n))
         return n, round(step, 4)
 
+    # lvn_edge_touch: same width-driven sizing as hvn_inside_touch — reuses the same
+    # hvn_max_legs/mean_rev_step_mult knobs (no separate LVN sizing config), per the
+    # "like hvn_inside_touch position management" design. Ported 2026-08-21.
+    if trigger.kind == "lvn_edge_touch":
+        step = (step_mult * atr) if atr > 0 else max(trigger.raw_range / 8.0, 1e-6)
+        n = int(round(trigger.raw_range / step)) if step > 0 else 2
+        n = max(2, min(hvn_max_legs, n))
+        return n, round(step, 4)
+
     step = step_mult * atr if atr > 0 else max(trigger.raw_range / 4.0, 1e-6)
 
     # HVN node width: ensure legs straddle the whole node, not a sliver of it.
