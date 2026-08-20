@@ -29,6 +29,8 @@ LOG = logging.getLogger(__name__)
 
 BINANCE_FUTURES_AGG_URL = "https://fapi.binance.com/fapi/v1/aggTrades"
 _HOUR_MS = 3_600_000
+# aggTrades serves only the recent ~2 days; keep a margin under the documented limit.
+_RETENTION_MS = 47 * 3_600_000
 
 
 def fetch_agg_trades(symbol: str, start_ms: int, end_ms: int,
@@ -37,6 +39,22 @@ def fetch_agg_trades(symbol: str, start_ms: int, end_ms: int,
     (Binance caps a single query's span). Returns [] on persistent error (fail-safe: a heal
     that can't fetch degrades to the pre-heal behaviour, it never raises into the caller)."""
     trades: list[dict] = []
+    # Clamp to the retention window rather than grinding through days of windows
+    # that can only 400. Without this a multi-day heal burns max_retries per hour
+    # of history — hundreds of doomed requests — and looks like a network fault
+    # in the log rather than what it is.
+    oldest = int(time.time() * 1000) - _RETENTION_MS
+    if end_ms <= oldest:
+        LOG.warning("[backfill] %s window [%d, %d) is entirely older than the aggTrades "
+                    "retention (~%dh) — cannot heal with real footprint",
+                    symbol, start_ms, end_ms, _RETENTION_MS // 3_600_000)
+        return []
+    if start_ms < oldest:
+        LOG.warning("[backfill] %s start clamped %d -> %d (aggTrades retention ~%dh); "
+                    "the earlier %.1fh of this gap cannot be healed from this endpoint",
+                    symbol, start_ms, oldest, _RETENTION_MS // 3_600_000,
+                    (oldest - start_ms) / 3_600_000)
+        start_ms = oldest
     cursor = start_ms
     while cursor < end_ms:
         window_end = min(cursor + _HOUR_MS, end_ms)
