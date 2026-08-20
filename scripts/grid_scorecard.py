@@ -94,6 +94,8 @@ def load_cycles(root: str, only_date: str | None, magic_base: int | None = None)
                     "lots": None,
                     "trough": r.get("trough"),
                     "exit_reason": r.get("exit_reason") or "",
+                    "squeeze_ok": r.get("squeeze_ok"),
+                    "squeeze_rank": r.get("squeeze_rank"),
                 })
     return out
 
@@ -121,6 +123,7 @@ def load_broker(path: str) -> list[dict]:
                 "lots": (lots_b + lots_s) or None,
                 "trough": None,
                 "exit_reason": r.get("exit_reason") or "",
+                "squeeze_ok": None, "squeeze_rank": None,
             })
     return out
 
@@ -157,6 +160,7 @@ def score(rows: list[dict]) -> dict:
     for r in rows:
         by[(r["setup"], r["tf"])].append(r)
     return {
+        "_rows": rows,
         "overall": agg(rows),
         "by_setup_tf": {f"{k[0]}|{k[1]}": agg(v)
                         for k, v in sorted(by.items(), key=lambda kv: -len(kv[1]))},
@@ -168,6 +172,55 @@ def _count(it) -> dict:
     for x in it:
         d[x] = d.get(x, 0) + 1
     return d
+
+
+def squeeze_ab(rows: list[dict]) -> dict:
+    """Bucket outcomes by whether volatility had coiled at arm time.
+
+    Only meaningful with require_squeeze_gate FALSE: with the gate enforcing, the
+    uncoiled cohort never arms and there is nothing to compare against. The planner
+    labels every arm either way, so an enforced run yields squeeze_ok=True only.
+    """
+    buckets = {"coiled": [], "uncoiled": [], "unlabelled": []}
+    for r in rows:
+        v = r.get("squeeze_ok")
+        buckets["unlabelled" if v is None else ("coiled" if v else "uncoiled")].append(r)
+    out = {}
+    for name, rs in buckets.items():
+        if not rs:
+            continue
+        live = [r for r in rs if r["shape"] != "no_fill"]
+        one = sum(1 for r in live if r["shape"] == "one_sided")
+        pnl = [r["net"] for r in rs if r["net"] is not None]
+        out[name] = {
+            "grids": len(rs),
+            "one_sided_pct": (100.0 * one / len(live)) if live else None,
+            "net": sum(pnl) if pnl else None,
+            "per_grid": (sum(pnl) / len(pnl)) if pnl else None,
+            "win_pct": (100.0 * sum(1 for x in pnl if x > 0) / len(pnl)) if pnl else None,
+        }
+    return out
+
+
+def report_squeeze(rows: list[dict]) -> None:
+    ab = squeeze_ab(rows)
+    if not ab:
+        return
+    print(f"\n── squeeze A/B ──")
+    print(f"{'cohort':13}{'grids':>7}{'1-sided%':>10}{'net':>11}{'per grid':>10}{'win%':>7}")
+    for name in ("coiled", "uncoiled", "unlabelled"):
+        a = ab.get(name)
+        if not a:
+            continue
+        print(f"{name:13}{a['grids']:7d}{_fmt(a['one_sided_pct']):>10}"
+              f"{_fmt(a['net'], 0):>11}{_fmt(a['per_grid'], 0):>10}{_fmt(a['win_pct'], 0):>7}")
+    c, u = ab.get("coiled"), ab.get("uncoiled")
+    if not (c and u):
+        print("  only one cohort present — set require_squeeze_gate: false to arm both")
+    elif min(c["grids"], u["grids"]) < 30:
+        print(f"  n too small to decide (min cohort {min(c['grids'], u['grids'])}); "
+              f"64ab472 shipped this labelling on 2026-06-21 and it was never read — "
+              f"let it run before flipping the gate")
 
 
 def _fmt(x, nd=1, dash="—"):
@@ -194,6 +247,7 @@ def report(res: dict, baseline: dict | None) -> bool:
         print("exit reasons: " + "  ".join(f"{k}={v}" for k, v in o["exits"].items()))
     if o["median_trough"] is not None:
         print(f"median trough: {o['median_trough']:,.0f}")
+    report_squeeze(res.get("_rows") or [])
 
     print("\n── gate ──")
     if o["one_sided_pct"] is None:

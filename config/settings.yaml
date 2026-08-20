@@ -205,7 +205,14 @@ grid_levels:
   # each tagged squeeze_ok in the arm + exit audits (data/exec_emit.jsonl) so outcomes can
   # be bucketed squeeze-pass vs squeeze-fail. Flip to true to ENFORCE (skip uncoiled) once
   # the data favours the gate. The label is stamped either way.
-  require_squeeze_gate: true
+  # OBSERVE mode, deliberately. true ENFORCES the gate, so only coiled grids ever
+  # arm and the squeeze cohort is the only one with outcomes — there is nothing to
+  # compare it against. false arms both and the planner labels every arm with
+  # squeeze_ok/squeeze_rank, which lands in the cycle-outcome row. Flip to true only
+  # once scripts/grid_scorecard.py --squeeze shows the coiled cohort actually wins.
+  # This is what 64ab472 built the labelling for on 2026-06-21; the labels were
+  # written for five weeks and never read, and the gate was flipped four times on feel.
+  require_squeeze_gate: false
   squeeze_gate_max_bars: 10  # how stale a just-ended coil may be and still pass the gate
 
 # Startup preflight — server REFUSES to start unless footprint + VP data are present.

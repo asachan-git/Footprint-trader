@@ -31,6 +31,10 @@ BINANCE_FUTURES_AGG_URL = "https://fapi.binance.com/fapi/v1/aggTrades"
 _HOUR_MS = 3_600_000
 # aggTrades serves only the recent ~2 days; keep a margin under the documented limit.
 _RETENTION_MS = 47 * 3_600_000
+# 429/418 get a much longer retry budget than a real error: being throttled is the
+# server pacing us, not a fault, and skipping the window would leave a hole.
+_THROTTLE_RETRIES = 8
+_PACE_S = 0.35        # 0.05 was too hot for a multi-hour heal and drew 429s
 
 
 def fetch_agg_trades(symbol: str, start_ms: int, end_ms: int,
@@ -70,12 +74,27 @@ def fetch_agg_trades(symbol: str, start_ms: int, end_ms: int,
                 batch = resp.json()
                 break
             except Exception as e:
-                if attempt == max_retries - 1:
+                # A 429 is not a failure, it is the server asking us to slow down.
+                # Retrying it three times two seconds apart and then SKIPPING the
+                # window silently punches a hole in the heal — the exact thing this
+                # module exists to prevent. Back off exponentially and honour
+                # Retry-After, with a much longer budget for throttling than for a
+                # genuine error.
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                throttled = status in (418, 429)
+                budget = _THROTTLE_RETRIES if throttled else max_retries
+                if attempt >= budget - 1:
                     LOG.warning(f"[backfill] aggTrades fetch failed at {cursor} "
-                                f"({symbol}) after {max_retries} tries: {e}")
+                                f"({symbol}) after {attempt + 1} tries: {e}")
                     batch = None
                 else:
-                    time.sleep(2)
+                    if throttled:
+                        hdr = getattr(getattr(e, "response", None), "headers", {}) or {}
+                        wait = float(hdr.get("Retry-After") or 0) or min(60.0, 2.0 * (2 ** attempt))
+                        LOG.info("[backfill] throttled (%s) — sleeping %.0fs", status, wait)
+                    else:
+                        wait = 2.0
+                    time.sleep(wait)
         if batch is None:
             # Skip this sub-window rather than abort the whole heal.
             cursor = window_end
@@ -88,7 +107,7 @@ def fetch_agg_trades(symbol: str, start_ms: int, end_ms: int,
         # Advance past the last trade; if a full page landed inside the sub-window, keep
         # paging from last_ts+1 so we don't drop trades beyond the 1000-row page.
         cursor = max(last_ts + 1, cursor + 1) if last_ts < window_end else window_end
-        time.sleep(0.05)  # stay under the rate limit
+        time.sleep(_PACE_S)   # stay under the weight limit (aggTrades limit=1000 is weight 20)
     return trades
 
 
