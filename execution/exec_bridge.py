@@ -331,7 +331,25 @@ class ExecBridge:
         # `magic` arrives either as the named arg or inside meta — accept both.
         key_magic = int(magic or meta.get("magic", 0) or 0)
         state = dict(meta, tf=tf, magic=key_magic)
+        # Carry the trail's accumulated view across a RE-ANCHOR. A fulcrum shift writes a
+        # whole fresh arm record every few minutes, and it was resetting bias_peak to 0.0
+        # while the FILLED legs from the previous fulcrum were still open — so the trail's
+        # memory of "how good did this get" was erased on a timer. Observed live
+        # 2026-08-20 on magic 770052: hvn_edge 5m re-anchored at 17:10 and 17:30, the
+        # position reached 800+ USC against a 125 threshold, and nothing ever booked
+        # because each re-arm zeroed the peak before it could be given back.
+        #
+        # Reset is only correct when the cycle is genuinely FLAT and starting over. While
+        # it holds positions, the peak, the one-shot book guard and the high-water position
+        # count all belong to the inventory, not to the fulcrum.
         with cls._lock:
+            prev = cls._last_arm.get((str(account), broker_symbol, key_magic)) or {}
+            if prev and int(prev.get("max_pos_seen") or 0) > 0 and not state.get("_flat"):
+                for k in ("bias_peak", "bias_booked", "max_pos_seen",
+                          "be_done_buy", "be_done_sell", "vp_frozen", "frozen_zones"):
+                    if k in prev and k not in meta:
+                        state[k] = prev[k]
+            state.pop("_flat", None)
             cls._last_arm[(str(account), broker_symbol, key_magic)] = state
         try:
             persist_arm(account, broker_symbol, key_magic, state)
