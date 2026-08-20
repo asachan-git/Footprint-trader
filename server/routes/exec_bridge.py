@@ -930,12 +930,13 @@ def exec_refresh_tps():
         if not tf_m:
             continue
         try:
-            # include_positions=True: push the refreshed TP onto FILLED legs too, not just
-            # resting pendings — so a manual /exec/refresh_tps repairs open positions that
-            # are missing their broker TP (e.g. legs placed with tp=0). Bar-close does this
-            # anyway; this makes the manual endpoint do it on demand.
-            _refresh_cycle_tps(account, broker_symbol, analysis_sym, tf_m, mg, settings,
-                               include_positions=True)
+            # NOTE: 99d4787 passed include_positions=True here, but that kwarg belongs to a
+            # LATER signature of _refresh_cycle_tps. On this tree the function already emits
+            # MODIFY_POSITION for filled legs unconditionally (see its docstring), so the
+            # argument is both redundant and a TypeError — which the bare `except` below
+            # swallowed into a log line, leaving the emitter's per-minute refresh silently
+            # dead while looking like it ran ("re-targeted 0 active cycle(s)").
+            _refresh_cycle_tps(account, broker_symbol, analysis_sym, tf_m, mg, settings)
             refreshed.append(mg)
         except Exception:
             LOG.exception(f"[refresh_tps] magic={mg} error")
