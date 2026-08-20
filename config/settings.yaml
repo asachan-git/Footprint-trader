@@ -57,8 +57,8 @@ monitor:
 # Footprint-driven neutral-grid placement (/exec/emit_grid + FBExecBridge EA).
 # Planner reads these via .get() defaults — block is optional but canonical here.
 grid_levels:
-  base_lot: 0.01
-  lot_step: 0.01
+  base_lot: 0.25
+  lot_step: 0.25
   tp_atr_mult: 1.5
   hvn_max_legs: 6
   # Per-TF leg cap (overrides hvn_max_legs for the matching TF). Fast TFs run a tighter
@@ -106,12 +106,12 @@ grid_levels:
   zone_shift_max_usd: 6.0
   # Boot guard: refuse to start if base_lot exceeds this. Sizing drifted 0.25 ->
   # 0.5 -> 0.75 -> 1.0 -> 1.5 over three weeks, each step defensible on the day.
-  max_base_lot_guard: 0.02
+  max_base_lot_guard: 0.3
   disaster_sl_usd: 20.0
   # cycle_max_loss_usd: server-side cap on one cycle's floating loss, in account
   # currency (USC on the cent account). Checked before every profit branch. This
   # number is a GUESS until recalibrated from the `trough` field in the cycle log.
-  cycle_max_loss_usd: 100.0
+  cycle_max_loss_usd: 2500.0
   net_profit_exit_only: true
   # Structural-TP-as-ceiling: even in net_profit_exit_only, place each leg's COMPUTED
   # structural TP (HVN reversion→POC, breakout→next-HVN, VP target) on the broker order
@@ -140,14 +140,14 @@ grid_levels:
   htf_bias_map: {1m: "15m", 5m: "15m", 15m: "1h", 1h: "4h"}
   bb_edge_enabled: true
   bb_edge_sigma: 2.5
-  cycle_net_target_usd: 20.0      # base net floating-$ target; tune on demo (micro-lot swings are small)
+  cycle_net_target_usd: 500.0      # base net floating-$ target; tune on demo (micro-lot swings are small)
   # Per-TF override of the base net-$ target. The cycle's TF is recovered from its magic
   # (magic % 10), so each parallel TF pool can carry its own profit target — fast TFs book
   # small swings, slow TFs hold for larger moves. Any TF absent here falls back to
   # cycle_net_target_usd above. Keys are TF strings ("1m","5m","15m","1h").
-  cycle_net_target_by_tf: {1m: 40.0, 5m: 80.0, 15m: 160.0, 1h: 320.0}
+  cycle_net_target_by_tf: {1m: 1000.0, 5m: 2000.0, 15m: 4000.0, 1h: 8000.0}
   cycle_hedge_decay_pct: 33      # effective target decays this % as the basket hedges to full
-  cycle_min_target_usd: 0.01     # floor; must be >0 so a hedged cycle still has a positive net-$ exit
+  cycle_min_target_usd: 0.25     # floor; must be >0 so a hedged cycle still has a positive net-$ exit
   cycle_close_on_full_hedge: true  # cut a fully-hedged (delta-neutral) cycle to free margin
   # Orphan-pending sweep: a never-filled pending leg anchored on a fulcrum HVN that has
   # since DISAPPEARED from the live VP gets cancelled — but ONLY once the cycle's other
@@ -168,7 +168,7 @@ grid_levels:
   # that side and move the rest to breakeven (risk-free runner). Captures directional
   # profit the net-basket exit masks (a hedge leg drags net down → target never hits).
   bias_trail_enabled: true
-  bias_trail_activate_usd: 5.0   # bias-side floating must PEAK ≥ this ($) to arm the trail
+  bias_trail_activate_usd: 125.0   # bias-side floating must PEAK ≥ this ($) to arm the trail
   bias_trail_giveback_pct: 50    # fire when floating retraces this % off the peak
   bias_book_frac: 0.5
   # Track a PARTIALLY filled side that is already in profit. The original gate needed
@@ -303,7 +303,7 @@ execution:
   risk_per_trade_pct: 0.0025    # 0.25% of equity per trade
   max_lots: 1.0                 # hard cap regardless of risk math
   default_lots:                 # fallback when risk math fails (no SL, etc.)
-    "XAUUSD.pc": 0.01            # live USC cent acct base lot
+    "XAUUSD.pc": 0.25            # live USC cent acct base lot
     "XAUUSD+": 0.01              # demo fallback
     "BTCUSD": 0.001
   metaapi_timeout_s: 30
