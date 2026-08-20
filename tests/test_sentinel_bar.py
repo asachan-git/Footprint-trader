@@ -72,3 +72,19 @@ def test_atr_ignores_a_sentinel_bar(monkeypatch):
     got = atr_mod.atr_from_store("XAUTUSDT", "1m", period=14)
     clean = atr_mod.atr(real[-15:], period=14)
     assert abs(got - clean) < 1e-6, "a sentinel bar must not reach the true-range"
+
+
+def test_deserializer_tolerates_a_field_this_build_does_not_know():
+    """Footprint files are append-only and shared across branches. Level.cnt was
+    added 2026-07-07; every older tree then crashed on load with a bare TypeError
+    and could not boot at all. A newer writer plus an older reader must degrade,
+    not brick the store."""
+    from pipeline.state_store import _level
+    lvl = _level({"price": 4000.0, "vol": 1.5, "cnt": 9.0, "some_future_field": "x"})
+    assert lvl.price == 4000.0 and lvl.vol == 1.5
+    assert getattr(lvl, "cnt", 0.0) == 9.0
+
+
+def test_deserializer_defaults_a_field_an_older_file_lacks():
+    from pipeline.state_store import _level
+    assert _level({"price": 4000.0, "vol": 1.5}).cnt == 0.0

@@ -29,6 +29,20 @@ def _serialize(bar: Bar) -> str:
     return json.dumps(d, separators=(",", ":"))
 
 
+_LEVEL_FIELDS = {"price", "vol", "cnt"}
+
+
+def _level(lvl: dict) -> "Level":
+    """Build a Level, DROPPING keys this build does not know.
+
+    A newer writer plus an older reader must degrade, not brick the store. The
+    footprint files are append-only and shared across branches, so a field added
+    on one branch (Level.cnt, 2026-07-07) made every older tree crash on load
+    with a bare TypeError — the server could not boot at all. Unknown keys are
+    dropped rather than raising; missing known keys keep their defaults."""
+    return Level(**{k: v for k, v in lvl.items() if k in _LEVEL_FIELDS})
+
+
 def _deserialize(line: str) -> Bar:
     d = json.loads(line)
     return Bar(
@@ -38,8 +52,8 @@ def _deserialize(line: str) -> Bar:
         close_ts=d["close_ts"],
         source=d["source"],
         ohlc=OHLC(**d["ohlc"]),
-        bid_ladder=tuple(Level(**lvl) for lvl in d["bid_ladder"]),
-        ask_ladder=tuple(Level(**lvl) for lvl in d["ask_ladder"]),
+        bid_ladder=tuple(_level(lvl) for lvl in d["bid_ladder"]),
+        ask_ladder=tuple(_level(lvl) for lvl in d["ask_ladder"]),
         poc=d.get("poc"),
         delta=d.get("delta"),
     )
