@@ -595,7 +595,18 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
         _structural_kinds = ("hvn_inside_touch", "hvn_displacement", "hvn_edge")
         is_structural = ((fulcrum_t is not None and fulcrum_t.kind in _structural_kinds)
                          or any(k in trigger_hint for k in _structural_kinds))
-        if bool(grid_cfg.get("require_squeeze_gate", False)) and not sq_ok and not is_structural:
+        # Per-TF enforcement overrides the global flag AND the structural exemption.
+        # The exemption exists because a structural setup arms on a node edge rather than
+        # a coil, so gating it on volatility is normally wrong. But a TF listed here is
+        # one we have decided only earns its keep in a coiled regime — 1m has been
+        # negative on every tree measured (-72 USC/lot in June, -11 in July, 49%
+        # both-sided), so "only when vol has compressed" is the whole point of keeping it.
+        # Leaving the exemption in place would make the per-TF gate a silent no-op for
+        # hvn_inside_touch, which is the only setup 1m runs.
+        _gate_by_tf = grid_cfg.get("require_squeeze_gate_by_tf") or {}
+        _tf_gated = bool(_gate_by_tf.get(tf, False))
+        _gate_on = _tf_gated or bool(grid_cfg.get("require_squeeze_gate", False))
+        if _gate_on and not sq_ok and (_tf_gated or not is_structural):
             skip, reason = True, f"no_squeeze_gate:rank={sq_rank:.2f}"
     if skip:
         return GridPlan(verdict="skip", skip_reason=reason,

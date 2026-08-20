@@ -213,6 +213,13 @@ grid_levels:
   # This is what 64ab472 built the labelling for on 2026-06-21; the labels were
   # written for five weeks and never read, and the gate was flipped four times on feel.
   require_squeeze_gate: false
+  # Per-TF enforcement. A TF listed true arms ONLY on a coil, and that overrides the
+  # structural exemption too — otherwise the gate is a no-op for hvn_inside_touch, the
+  # only setup 1m runs. Everything else stays in observe mode so both cohorts keep
+  # arming and the A/B keeps collecting.
+  # 1m: negative on every tree ever measured (-72 USC/lot June, -11 July, 49%
+  # both-sided). Gated rather than dropped so it can still earn its place from data.
+  require_squeeze_gate_by_tf: {1m: true}
   squeeze_gate_max_bars: 10  # how stale a just-ended coil may be and still pass the gate
 
 # Startup preflight — server REFUSES to start unless footprint + VP data are present.
