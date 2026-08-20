@@ -170,7 +170,15 @@ grid_levels:
   bias_trail_enabled: true
   bias_trail_activate_usd: 5.0   # bias-side floating must PEAK ≥ this ($) to arm the trail
   bias_trail_giveback_pct: 50    # fire when floating retraces this % off the peak
-  bias_book_frac: 0.5            # fraction of the bias side's positions to book at the trigger
+  bias_book_frac: 0.5
+  # Track a PARTIALLY filled side that is already in profit. The original gate needed
+  # every leg of a side open before the trail would look at it, so a side that ran
+  # profitable without filling its last leg recorded no peak and could never arm.
+  # Observed live 2026-08-20 (magic 770052): buy_n=2, buys=1, +12.6..+31.3 USC reached
+  # at the high against a 5.0 threshold, bias_peak stayed 0.0, profit given back.
+  # At 0.01 lots with 2-3 legs a side, partial fills are the normal case.
+  # true = track any profitable side; false = historical full-ladder-only behaviour.
+  bias_trail_track_partial: true            # fraction of the bias side's positions to book at the trigger
   # Intrabar touch-arm: arm the straddle the moment LIVE price taps an HVN edge and ticks
   # back inside (mini-rejection), without waiting for the candle to close. Checked every EA
   # poll (~1s). Filters breakouts via the tick-reversal confirm. Close-driven emit still

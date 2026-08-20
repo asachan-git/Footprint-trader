@@ -570,9 +570,29 @@ class ExecBridge:
             # any leg count. The `> 0` guard stops a side with no positions at all
             # being selected as the bias.
             _peak_set = float(cyc.get("bias_peak") or 0.0) > 0.0
-            if buy_n > 0 and int(buys or 0) > 0 and (int(buys or 0) >= buy_n or _peak_set):
+            # bias_trail_track_partial: also track a side that is only PARTIALLY filled
+            # but already in profit. The original gate (d32794c) required ALL legs of a
+            # side open — "the move committed that way" — and 3ad9740's _peak_set escape
+            # only keeps a trail alive AFTER a peak exists; it cannot start one. So a side
+            # that ran profitable without filling its last leg was invisible: no peak was
+            # ever recorded, so nothing could ever arm.
+            #
+            # Observed live 2026-08-20 on magic 770052: buy_n=2, buys=1, and the buy side
+            # reached +12.6 to +31.3 USC at the session high against a 5.0 activate
+            # threshold. bias_peak stayed 0.0 the whole time and the profit was given back.
+            # At base_lot 0.01 with 2-3 legs a side, partial fills are the NORMAL case, so
+            # this blind spot is far more consequential here than at the June sizing.
+            #
+            # Gated because it cuts both ways: tracking partials books sooner, which may
+            # clip runners. Off = historical behaviour, on = track any profitable side.
+            _partial_ok = bool(grid_cfg.get("bias_trail_track_partial", False))
+            _buy_live = int(buys or 0) > 0 and (int(buys or 0) >= buy_n or _peak_set
+                                                or (_partial_ok and float(buy_pnl or 0.0) > 0))
+            _sell_live = int(sells or 0) > 0 and (int(sells or 0) >= sell_n or _peak_set
+                                                  or (_partial_ok and float(sell_pnl or 0.0) > 0))
+            if buy_n > 0 and _buy_live:
                 bias = "buy"
-            elif sell_n > 0 and int(sells or 0) > 0 and (int(sells or 0) >= sell_n or _peak_set):
+            elif sell_n > 0 and _sell_live:
                 bias = "sell"
             if bias:
                 side_pnl = float(buy_pnl if bias == "buy" else sell_pnl)

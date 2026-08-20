@@ -107,3 +107,52 @@ def test_trail_still_available_after_a_rejected_loss_book():
     _poll("TRAIL8", buys=4, sells=0, buy_pnl=1500.0, sell_pnl=0.0)
     _poll("TRAIL8", buys=4, sells=0, buy_pnl=-1895.0, sell_pnl=0.0)
     assert _poll("TRAIL8", buys=4, sells=0, buy_pnl=600.0, sell_pnl=0.0) == "bias_book_trail"
+
+
+# ── partial-fill tracking (bias_trail_track_partial) ─────────────────────────
+# The gap this closes was found live, not by a test: magic 770052 on 2026-08-20
+# had buy_n=2 with 1 leg filled, reached +12.6..+31.3 USC at the session high
+# against a 5.0 activate threshold, and bias_peak never left 0.0 — the trail
+# block was skipped entirely because no side was "fully filled".
+
+CFG_PARTIAL = {"grid_levels": {**CFG["grid_levels"], "bias_trail_track_partial": True}}
+CFG_STRICT = {"grid_levels": {**CFG["grid_levels"], "bias_trail_track_partial": False}}
+
+
+def _poll_cfg(acct, cfg, *, buys, sells, buy_pnl, sell_pnl, magic=770013):
+    return ExecBridge.monitor_cycle(acct, "XAUUSD.pc", cfg, pnl=buy_pnl + sell_pnl,
+                                    buys=buys, sells=sells, tf="15m", magic=magic,
+                                    buy_pnl=buy_pnl, sell_pnl=sell_pnl)
+
+
+def test_partial_side_in_profit_is_tracked_when_enabled():
+    """1 of 2 legs filled, side in profit, then a 50%+ giveback must book."""
+    _arm("PART1", buy_n=2, sell_n=2)
+    assert _poll_cfg("PART1", CFG_PARTIAL, buys=1, sells=0,
+                     buy_pnl=500.0, sell_pnl=0.0) is None          # peak recorded
+    assert _poll_cfg("PART1", CFG_PARTIAL, buys=1, sells=0,
+                     buy_pnl=200.0, sell_pnl=0.0) == "bias_book_trail"
+
+
+def test_partial_side_is_invisible_when_disabled():
+    """Historical behaviour: the trail never sees a partially filled winner."""
+    _arm("PART2", buy_n=2, sell_n=2)
+    assert _poll_cfg("PART2", CFG_STRICT, buys=1, sells=0,
+                     buy_pnl=500.0, sell_pnl=0.0) is None
+    assert _poll_cfg("PART2", CFG_STRICT, buys=1, sells=0,
+                     buy_pnl=200.0, sell_pnl=0.0) is None          # still nothing
+
+
+def test_partial_side_at_a_loss_is_not_tracked():
+    """Only a side in PROFIT qualifies — a losing partial must not arm a trail."""
+    _arm("PART3", buy_n=2, sell_n=2)
+    assert _poll_cfg("PART3", CFG_PARTIAL, buys=1, sells=0,
+                     buy_pnl=-500.0, sell_pnl=0.0) is None
+
+
+def test_full_ladder_still_works_with_the_flag_on():
+    _arm("PART4", buy_n=2, sell_n=2)
+    assert _poll_cfg("PART4", CFG_PARTIAL, buys=2, sells=0,
+                     buy_pnl=500.0, sell_pnl=0.0) is None
+    assert _poll_cfg("PART4", CFG_PARTIAL, buys=2, sells=0,
+                     buy_pnl=200.0, sell_pnl=0.0) == "bias_book_trail"
