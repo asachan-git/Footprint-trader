@@ -787,6 +787,14 @@ class ExecBridge:
                         # cancel opposite pendings first so they can't fill on retrace
                         cls.enqueue(account, CANCEL_PENDINGS, symbol, magic=magic,
                                     side=_opp, comment=f"FB|fullfill_cancel_opp|{_opp}", now=t)
+                        # ORPHAN GUARD (2026-09-27, backtest): opposite legs that ALREADY
+                        # filled are left with no pendings behind them, so flatten-rest can
+                        # never fire and nothing else manages them — replay showed single
+                        # hedge legs held for weeks. Close them together with the cancel.
+                        _opp_open = int((sells if _opp == "sell" else buys) or 0)
+                        if _opp_open > 0 and bool(grid_cfg.get("fullfill_close_opposite_filled", True)):
+                            cls.enqueue(account, CLOSE_SIDE, symbol, magic=magic, side=_opp,
+                                        frac=1.0, comment=f"FB|fullfill_close_opp|{_opp}", now=t)
                     cls.enqueue(account, MOVE_BE, symbol, magic=magic, side=_side,
                                 comment=f"FB|fullfill_be|{_side}", now=t)
                     _emit_exit_audit({"account": str(account), "broker_symbol": symbol,
@@ -795,6 +803,23 @@ class ExecBridge:
                                       "cancel_opp": _cancel_opp,
                                       "squeeze_ok": cyc.get("squeeze_ok"),
                                       "squeeze_rank": cyc.get("squeeze_rank")})
+
+        # DISASTER CAP (2026-09-27): server-side per-cycle loss bound, sized in points per
+        # base lot so it scales with base_lot. Wide on purpose — replay: caps under ~100pt
+        # cut cycles that recover; 140pt only trims the tail. 0 disables.
+        _cap_pts = float(grid_cfg.get("cycle_max_loss_pts", 0.0) or 0.0)
+        if _cap_pts > 0 and pnl is not None:
+            _cap_usd = _cap_pts * float(grid_cfg.get("base_lot", 0.01) or 0.01) * 100.0
+            if float(pnl) <= -_cap_usd:
+                cls.enqueue(account, CLOSE_ALL, symbol, comment="FB|flatten|max_loss", magic=magic, now=t)
+                cls.set_last_arm(account, symbol, magic=magic, **{**cyc, "flatten_ts": t})
+                _emit_exit_audit({"account": str(account), "broker_symbol": symbol, "tf": tf,
+                                  "magic": magic, "exit_reason": "max_loss", "pnl": pnl,
+                                  "cap_usd": _cap_usd})
+                _emit_cycle_outcome(cyc, account=str(account), symbol=symbol, magic=magic, tf=tf,
+                                    exit_reason="max_loss", pnl_at_exit=pnl, venue_mid=mid,
+                                    positions=positions, pendings=pendings, buys=buys, sells=sells)
+                return "max_loss"
 
         # net-basket exit (which a single-side view can mask). Gate: the WHOLE CYCLE's
         # net floating P&L (buy_pnl + sell_pnl), not a single side's fill fraction —

@@ -107,8 +107,16 @@ grid_levels:
   # giveback) + net_target/full_hedge manage exits. The committed side is NOT stopped
   # (grid-recovery thesis). Profit-trailing SL (candle_sweep ratchet, hvn_edge cont) is a
   # separate mechanism and unaffected.
-  fullfill_be_enabled: false
-  fullfill_cancel_opposite: false
+  # 2026-09-27 (replay May–Sep, see backtest/README_grid_replay.md): the single rule that
+  # turned the 15m hvn_inside_touch grid from PF 1.17 to PF 1.78 and made every month
+  # positive. When one side fills ALL its legs: cancel the opposite pendings, CLOSE any
+  # opposite legs that already filled (orphan guard), move the committed side to BE.
+  fullfill_be_enabled: true
+  fullfill_cancel_opposite: true
+  fullfill_close_opposite_filled: true
+  # Server-side per-cycle disaster cap in POINTS per base lot (140pt × 0.01 lot = $140).
+  # Wide by design: tighter caps cut cycles that go on to recover. 0 = off.
+  cycle_max_loss_pts: 140
   # Deferred structural SL (>50% of a side filled → SL at node edge). OFF — did not exist
   # at 9590331. false = committed side can't be stopped out; net_target/full_hedge own the exit.
   defer_sl_on_half_fill: false
@@ -173,7 +181,7 @@ grid_levels:
   # disabled over ~1500 mods/hr). Account is now direct MT5 — throttle kept as a safety
   # margin, not because MT5 polices mod-rate the same way. 60 = re-track at most once/min
   # per side. 0 = no throttle.
-  modify_cooldown_s: 0
+  modify_cooldown_s: 60   # 2026-09-27: never 0 — order-rate throttle (account was flagged at ~1500 mods/hr)
   # HVN ZONE STABILIZATION (hysteresis on _session_hvn_zones output, zone_triggers.
   # _stabilize_zones). Rolling-VP recomputes are stateless → edges jitter and borderline
   # nodes flicker in/out, which downstream became fulcrum shifts / TP modifies / false
@@ -255,18 +263,18 @@ grid_levels:
   # To disable a kind without removing it: set enabled: false.
   triggers:
     - kind: hvn_inside_touch
-      tfs: [1m, 3m, 5m, 10m, 15m]   # 3m/10m added 2026-07-20 for the TF-efficiency run; 1m gated by htf_expansion_gate below
+      tfs: [15m]   # 2026-09-27: 15m only — the one cell positive in both July and August live data; replay-validated
       touch_only: true           # arm on candle close (bar-close emit)
     - kind: hvn_edge
       tfs: [3m, 5m, 10m, 15m]    # breakout-retest: prior close outside HVN + bar tap + rejection close
-      enabled: true             # ON 2026-07-20: re-measure on the TF-efficiency run (was OFF — worst live strat, PF 0.37/0.70; re-enabled to gather fresh data across all TFs)
+      enabled: false             # OFF 2026-09-27: negative in July live (−45.8k), not in the replay-validated set
     - kind: candle_sweep
       tfs: [3m, 5m, 10m, 15m]
-      enabled: true              # ON — data run (clean July: 5m PF 0.73, 15m 0.93 — re-measuring)
+      enabled: false              # OFF 2026-09-27: negative in July live (−53.1k), not in the replay-validated set
     - kind: lvn_edge_touch
       tfs: [1m, 3m, 5m, 10m, 15m]
       touch_only: true           # arm via intrabar price tap only, same as hvn_inside_touch
-      enabled: true             # ON 2026-07-20: clean July had 15m PF 1.40 (BEST in book); prior -18.7k was 1m/5m. Re-measuring per TF.
+      enabled: false             # OFF 2026-09-27: 15m flipped sign Jul (+24k) → Aug (−24k); re-test in replay before re-enabling
     - kind: hvn_displacement
       tfs: [5m, 15m]             # A→B displacement: prev candle opens in HVN-A, closes in HVN-B (bar-close arm, strat 10 → magic 7701xx)
       enabled: false            # OFF 2026-07-14: 0 cycles on 07-13 (unproven). Clean Jun-22-style setup = hvn_inside_touch + candle_sweep only.
