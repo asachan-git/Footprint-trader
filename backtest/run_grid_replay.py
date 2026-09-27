@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Replay the 15m hvn_inside_touch grid over data/footprint/XAUTUSDT_{15m,5m}.jsonl.
+"""Replay the 15m grid strategies over data/footprint/XAUTUSDT_{15m,5m}.jsonl.
 
-    python backtest/run_grid_replay.py                 # baseline vs proposed + ablations
+    python backtest/run_grid_replay.py                 # hvn: baseline vs proposed + ablations
+    python backtest/run_grid_replay.py --multi         # hvn, lvn, hvn_edge, sweep + portfolio
     python backtest/run_grid_replay.py --from 2026-05-07 --to 2026-08-01
 
 Writes backtest/results/grid_replay.json and prints a table. Money is USD at
@@ -57,13 +58,18 @@ def load(tf: str) -> pd.DataFrame:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--from", dest="t0"); ap.add_argument("--to", dest="t1")
+    ap.add_argument("--multi", action="store_true", help="run all four 15m setups and the combined portfolio")
     a = ap.parse_args()
     T = lambda s: int(pd.Timestamp(s, tz="UTC").timestamp()) if s else None
     OUT.mkdir(parents=True, exist_ok=True)
     b15, b5 = load("15m"), load("5m")
     cache = OUT / "pre15.pkl"
-    pre = pickle.load(open(cache, "rb")) if cache.exists() else precompute(b15)
+    pre = pickle.load(open(cache, "rb")) if cache.exists() else None
+    if pre is None or len(pre) < 5:          # older cache without LVN zones / POC
+        pre = precompute(b15)
     pickle.dump(pre, open(cache, "wb"))
+    if a.multi:
+        return run_multi(b15, b5, pre, T(a.t0), T(a.t1))
     res = {}
     for name, cfg in SCENARIOS.items():
         cyc, eq = run(b15, b5, pre, cfg, T(a.t0), T(a.t1))
@@ -74,6 +80,28 @@ def main():
         print(f"{name:52s} net {s['net']:9.1f}  PF {s['pf']:5.2f}  win {s['win']:5.1f}%  "
               f"worst {s['worst']:8.1f}  maxDD {s['max_dd']:8.1f}  cycles {s['cycles']}")
     json.dump(res, open(OUT / "grid_replay.json", "w"), indent=1, default=float)
+
+
+STRATS = ["hvn", "lvn", "hvn_edge", "sweep"]
+
+
+def run_multi(b15, b5, pre, t0, t1):
+    """Each setup gets its own cycle slot (own magic), as live. Portfolio = summed equity."""
+    res, curves = {}, []
+    for strat in STRATS:
+        for rule, cfg in (("baseline", {}), ("proposed", PROPOSED)):
+            cyc, eq = run(b15, b5, pre, {**cfg, "strat": strat}, t0, t1)
+            s, _ = summarize(cyc, eq)
+            res[f"{strat} | {rule}"] = s
+            if rule == "proposed":
+                curves.append(pd.Series({t: v for t, v in eq}))
+            print(f"{strat:9s} {rule:9s} net {s['net']:9.1f}  PF {s['pf']:5.2f}  worst {s['worst']:8.1f}  "
+                  f"maxDD {s['max_dd']:8.1f}  cycles {s['cycles']}")
+    idx = sorted(set().union(*[c.index for c in curves]))
+    tot = sum(c.reindex(idx).ffill().fillna(0) for c in curves)
+    res["portfolio | proposed"] = dict(net=round(float(tot.iloc[-1]), 1), max_dd=round(float((tot - tot.cummax()).min()), 1))
+    print("portfolio (proposed)", res["portfolio | proposed"])
+    json.dump(res, open(OUT / "grid_replay_multi.json", "w"), indent=1, default=float)
 
 
 if __name__ == "__main__":

@@ -266,15 +266,17 @@ grid_levels:
       tfs: [15m]   # 2026-09-27: 15m only — the one cell positive in both July and August live data; replay-validated
       touch_only: true           # arm on candle close (bar-close emit)
     - kind: hvn_edge
-      tfs: [3m, 5m, 10m, 15m]    # breakout-retest: prior close outside HVN + bar tap + rejection close
-      enabled: false             # OFF 2026-09-27: negative in July live (−45.8k), not in the replay-validated set
+      tfs: [15m]                 # breakout-retest: prior close outside HVN + bar tap + rejection close
+      enabled: true              # DEMO 2026-09-27: 15m replay May–Sep PF 1.59 (+7.2k, worst −211) under fullfill+orphan+cap.
+                                 # July live was −45.8k across 3m–15m on the old exits — confirm on demo before live.
     - kind: candle_sweep
       tfs: [3m, 5m, 10m, 15m]
-      enabled: false              # OFF 2026-09-27: negative in July live (−53.1k), not in the replay-validated set
+      enabled: false              # OFF 2026-09-27: negative in July live (−53.1k); replay 15m PF 1.27 only — weakest edge
     - kind: lvn_edge_touch
-      tfs: [1m, 3m, 5m, 10m, 15m]
+      tfs: [15m]
       touch_only: true           # arm via intrabar price tap only, same as hvn_inside_touch
-      enabled: false             # OFF 2026-09-27: 15m flipped sign Jul (+24k) → Aug (−24k); re-test in replay before re-enabling
+      enabled: true              # DEMO 2026-09-27: 15m replay May–Sep PF 2.05 (+6.6k, worst −165, best DD in the book)
+                                 # under fullfill+orphan+cap. Live 15m flipped Jul +24k → Aug −24k on the old exits.
     - kind: hvn_displacement
       tfs: [5m, 15m]             # A→B displacement: prev candle opens in HVN-A, closes in HVN-B (bar-close arm, strat 10 → magic 7701xx)
       enabled: false            # OFF 2026-07-14: 0 cycles on 07-13 (unproven). Clean Jun-22-style setup = hvn_inside_touch + candle_sweep only.

@@ -47,19 +47,22 @@ def precompute(b15: pd.DataFrame, win=96):
     """Rolling HVN zones, ATR14 and BB width slope per 15m bar (as of that bar's close)."""
     bars = [to_bar(r, '15m') for r in b15.itertuples()]
     zones, atr, bbs = [], [], []
+    lvns, pocs = [], []
     tr = np.maximum(b15.h - b15.l, np.maximum((b15.h - b15.c.shift()).abs(), (b15.l - b15.c.shift()).abs()))
     atr_s = tr.rolling(14).mean().values
     sd = b15.c.rolling(20).std(); w = 4 * sd
     slope = (w / w.shift(3) - 1).values
     for i in range(len(bars)):
         if i < win:
-            zones.append([]); continue
+            zones.append([]); lvns.append([]); pocs.append(None); continue
         try:
             vp = vp_compute(bars[i - win + 1:i + 1], 'daily', bars[i].ohlc.c, bin_size=0.4)
             zones.append([(float(z['low']), float(z['high'])) for z in (vp.hvn_zones or [])])
+            lvns.append([(float(z['low']), float(z['high'])) for z in (vp.lvn_zones or [])])
+            pocs.append(vp.poc)
         except Exception:
-            zones.append([])
-    return zones, atr_s, slope
+            zones.append([]); lvns.append([]); pocs.append(None)
+    return zones, atr_s, slope, lvns, pocs
 
 
 def news_block(ts):
@@ -104,6 +107,126 @@ def tps(edge, node, zones, top_leg, bot_leg, atr, mult):
     return tp_up, tp_dn
 
 
+def filter_lvn(lvns, hvns):
+    out = []
+    for lo, hi in lvns:
+        if any(a <= lo and hi <= b for a, b in hvns):
+            continue
+        clo, chi = lo, hi
+        for a, b in hvns:
+            if chi <= a or clo >= b: continue
+            if clo < b <= chi and clo >= a: clo = b
+            elif clo <= a < chi and chi <= b: chi = a
+        if chi - clo > 0: out.append((clo, chi))
+    return out
+
+
+def lvn_tps(edge, hvns, top_leg, bot_leg, atr, mult):
+    up = sorted([(lo, hi) for lo, hi in hvns if hi > top_leg], key=lambda z: z[1])
+    dn = sorted([(lo, hi) for lo, hi in hvns if lo < bot_leg], key=lambda z: -z[0])
+    def near(zs, ref, sg):
+        if not zs: return None
+        z = zs[0]; ne = z[0] if sg > 0 else z[1]
+        if len(zs) == 1:
+            c = (z[0] + z[1]) / 2
+            return c if sg * (c - ref) > 0 else ne
+        return ne
+    u = near(up, top_leg, 1); d = near(dn, bot_leg, -1)
+    return (u if u and u > top_leg else top_leg + mult * atr), (d if d and d < bot_leg else bot_leg - mult * atr)
+
+
+def plan(strat, i, b15, pre, cfg):
+    """Return dict(buy_anchor, sell_anchor, n, step, skew, tpu, tpd, sl_buy, sl_sell, fulcrum) or None."""
+    zones_all, atr_s, slope, lvns_all, pocs = pre
+    r = b15.iloc[i]; z = zones_all[i]; atr = atr_s[i]
+    if not (atr > 0): return None
+    step = cfg['step_mult'] * atr
+    if strat == 'hvn':
+        if not z: return None
+        tg = trigger(r, z, cfg)
+        if tg is None: return None
+        _, edge, wdt, side, nlo, nhi = tg
+        n = max(2, min(cfg['max_legs'], int(round(wdt / step))))
+        skew = ('sell' if side == 'top' else 'buy') if cfg['skew'] else 'none'
+        d = dict(fulcrum=edge, buy_anchor=edge + step, sell_anchor=edge - step, n=n, step=step, skew=skew,
+                 node=(nlo, nhi), sl_buy=None, sl_sell=None)
+        d['tpfn'] = lambda top, bot: tps(edge, (nlo, nhi), z, top, bot, atr, cfg['tp_atr_mult'])
+        poc = pocs[i]
+        if cfg.get('poc_fade_tp') and poc:
+            base = d['tpfn']
+            def tpf(top, bot, base=base):
+                u, dn = base(top, bot)
+                if side == 'top' and poc < bot: dn = poc
+                if side == 'bottom' and poc > top: u = poc
+                return u, dn
+            d['tpfn'] = tpf
+        return d
+    if strat == 'lvn':
+        L = filter_lvn(lvns_all[i], z)
+        if not L: return None
+        be_p = abs(r.c) * 0.0002
+        best = None
+        for lo, hi in L:
+            w = hi - lo
+            if w <= 0: continue
+            b = max(0.01, be_p)
+            tt = r.h >= hi - b and r.l <= hi + b
+            tb = r.l <= lo + b and r.h >= lo - b
+            if not (tt or tb): continue
+            if tt and tb:
+                edge = hi if abs(hi - r.c) <= abs(lo - r.c) else lo
+            else:
+                edge = hi if tt else lo
+            dd = abs(edge - r.c)
+            if best is None or dd < best[0]: best = (dd, edge, w)
+        if best is None: return None
+        _, edge, w = best
+        n = max(2, min(cfg['max_legs'], int(round(w / step))))
+        d = dict(fulcrum=edge, buy_anchor=edge + step, sell_anchor=edge - step, n=n, step=step, skew='none',
+                 sl_buy=None, sl_sell=None)
+        d['tpfn'] = lambda top, bot: lvn_tps(edge, z, top, bot, atr, cfg['tp_atr_mult'])
+        return d
+    if strat == 'hvn_edge':
+        if not z or i < 6: return None
+        lb = 5; buf = 0.05
+        best = None
+        for lo, hi in z:
+            w = hi - lo
+            if w <= 0: continue
+            top_t = (r.l <= hi + buf) and (r.l >= lo - buf) and (r.c > hi)
+            bot_t = (r.h >= lo - buf) and (r.h <= hi + buf) and (r.c < lo)
+            if not (top_t or bot_t): continue
+            bias = 'buy' if top_t else 'sell'; edge = hi if top_t else lo
+            prev = b15.iloc[max(0, i - lb):i]
+            ok = (prev.c > hi).any() if bias == 'buy' else (prev.c < lo).any()
+            if not ok: continue
+            dist = abs((r.l if top_t else r.h) - edge)
+            conf = 0.75 * (1 - min(1, dist / buf))
+            if best is None or conf > best[0]: best = (conf, bias, edge, w)
+        if best is None: return None
+        _, bias, edge, w = best
+        n = max(2, cfg['max_legs'])
+        skew = bias if cfg['skew'] else 'none'
+        d = dict(fulcrum=edge, buy_anchor=edge + step, sell_anchor=edge - step, n=n, step=step, skew=skew,
+                 sl_buy=None, sl_sell=None)
+        d['tpfn'] = lambda top, bot: (top + cfg['tp_atr_mult'] * atr, bot - cfg['tp_atr_mult'] * atr)
+        return d
+    if strat == 'sweep':
+        if i < 1: return None
+        p = b15.iloc[i - 1]
+        bull = r.l < p.l and r.c > p.h
+        bear = r.h > p.h and r.c < p.l
+        if not (bull or bear): return None
+        hl = r.h - r.l
+        if hl < 3.0: return None
+        n = max(2, min(cfg['max_legs'], int(round(hl / step))))
+        d = dict(fulcrum=(r.h + r.l) / 2, buy_anchor=r.h, sell_anchor=r.l, n=n, step=step, skew='none',
+                 sl_buy=r.l, sl_sell=r.h)
+        d['tpfn'] = lambda top, bot: (top + cfg['tp_atr_mult'] * atr, bot - cfg['tp_atr_mult'] * atr)
+        return d
+    return None
+
+
 @dataclass
 class Leg:
     side: str; price: float; lot: float
@@ -131,7 +254,7 @@ def cost(leg, cfg):
 
 
 def run(b15, b5, pre, cfg, t0=None, t1=None):
-    zones_all, atr_s, slope = pre
+    zones_all, atr_s, slope = pre[0], pre[1], pre[2]
     cfg = {**BASE, **cfg}
     bpt = cfg['base_lot'] * 100               # $ per point for one base lot
     b5ts = b5.ts.values
@@ -143,31 +266,29 @@ def run(b15, b5, pre, cfg, t0=None, t1=None):
         r = b15.iloc[i]
         if (t0 and r.ts < t0) or (t1 and r.ts >= t1):
             i += 1; continue
-        z = zones_all[i]; atr = atr_s[i]
-        if not z or not (atr > 0) or (cfg['news'] and news_block(r.ts)):
+        if cfg['news'] and news_block(r.ts):
             i += 1; continue
-        tg = trigger(r, z, cfg)
-        if tg is None:
+        P = plan(cfg.get('strat', 'hvn'), i, b15, pre, cfg)
+        if P is None:
             i += 1; continue
-        _, edge, wdt, side, nlo, nhi = tg
-        step = cfg['step_mult'] * atr
-        n = max(2, min(cfg['max_legs'], int(round(wdt / step))))
-        skew = ('sell' if side == 'top' else 'buy') if cfg['skew'] else 'none'
+        n, step, skew = P['n'], P['step'], P['skew']
         lm = 1.0
         if cfg['bb_tilt'] and not np.isnan(slope[i]):
             lm = 1.25 if 0 < slope[i] <= 0.25 else (0.75 if slope[i] < -0.10 else 1.0)
         legs = []
-        for s, cnt in (('buy', n + (skew == 'buy')), ('sell', n + (skew == 'sell'))):
+        for s_, cnt in (('buy', n + (skew == 'buy')), ('sell', n + (skew == 'sell'))):
             for k in range(1, cnt + 1):
                 lot = min(cfg['max_lots'], cfg['base_lot'] + (k - 1) * cfg['lot_step']) * lm
-                px = edge + k * step if s == 'buy' else edge - k * step
-                legs.append(Leg(s, px, lot))
+                px = P['buy_anchor'] + (k - 1) * step if s_ == 'buy' else P['sell_anchor'] - (k - 1) * step
+                lg = Leg(s_, px, lot)
+                lg.init_sl = None if cfg.get('sweep_nosl') else (P['sl_buy'] if s_ == 'buy' else P['sl_sell'])
+                legs.append(lg)
         top = max(l.price for l in legs if l.side == 'buy'); bot = min(l.price for l in legs if l.side == 'sell')
-        tpu, tpd = tps(edge, (nlo, nhi), z, top, bot, atr, cfg['tp_atr_mult'])
+        tpu, tpd = P['tpfn'](top, bot)
         if cfg['leg_tp']:
             for l in legs:
                 l.tp = tpu if l.side == 'buy' else tpd
-        cyc = Cycle(int(r.ts), edge, n, step, skew, legs, cfg['target'], cfg['trail_act'], lm)
+        cyc = Cycle(int(r.ts), P['fulcrum'], n, step, skew, legs, cfg['target'], cfg['trail_act'], lm)
         # ---- execute on 5m bars after the 15m close ----
         j = int(np.searchsorted(b5ts, r.ts, side='right'))
         done = False
@@ -252,6 +373,8 @@ def walk(cyc, a, b, cfg, bpt, ts):
         if kind == 'fill':
             if l.filled: continue
             l.filled = True; l.entry = px
+            if getattr(l, 'init_sl', None) is not None and l.sl is None:
+                l.sl = l.init_sl
             if cfg['opp_cap'] is not None:
                 apply_opp_cap(cyc, cfg)
             if cfg['cancel_opp_on_full']:
@@ -261,7 +384,7 @@ def walk(cyc, a, b, cfg, bpt, ts):
                         if x.side != l.side and not x.filled: x.cancelled = True
                         if x.side != l.side and x.filled and not x.closed and cfg.get('close_opp_filled', True):
                             close_leg(cyc, x, px, cfg)   # don't leave an orphan hedge leg
-                        if x.side == l.side and x.filled and not x.closed and x.sl is None:
+                        if x.side == l.side and x.filled and not x.closed and (x.sl is None or (x.side == 'buy') == (x.sl < x.entry)):
                             x.sl = x.entry      # fullfill_be: committed side to break-even
         elif kind in ('tp', 'sl'):
             close_leg(cyc, l, px, cfg)

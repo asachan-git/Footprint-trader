@@ -1,8 +1,9 @@
-# Grid replay — 15m hvn_inside_touch, May 7 → Sep 24 2026
+# Grid replay — 15m grid setups, May 7 → Sep 24 2026
 
 `backtest/grid_replay.py` replays the grid on `data/footprint/XAUTUSDT_15m.jsonl`
 (signals + volume profile) and `XAUTUSDT_5m.jsonl` (fills and exits).
-`backtest/run_grid_replay.py` runs baseline, proposed and every ablation.
+`backtest/run_grid_replay.py` runs baseline, proposed and every ablation for hvn_inside_touch;
+`--multi` runs all four 15m setups and the combined portfolio.
 
 ## What is modelled
 
@@ -63,6 +64,47 @@ Any opposite legs that had already filled are left with nothing resting behind
 them, so flatten-rest can never fire. In replay such legs were held for weeks, and
 one blocked the strategy from May 12 onward. The patch closes them together with
 the cancel (`fullfill_close_opposite_filled: true`).
+
+## Other setups (`--multi`)
+
+Each setup runs in its own cycle slot, like its own magic live. Entry rules follow
+`execution/zone_triggers.py`:
+
+- **lvn_edge_touch:** LVN zones trimmed by HVN context, touch within 0.02% of price.
+  TP at the near edge of the next HVN.
+- **hvn_edge:** bar taps an HVN edge (0.05 buffer) and closes outside, with a prior
+  close outside within 5 bars. n = 5, skew toward the breakout.
+- **candle_sweep:** sweeps the previous bar's high or low and closes beyond the other
+  side, with a range of at least 3.0. Legs start at the candle extremes, with the SL
+  at the opposite extreme.
+
+| Setup | Exits | Net | PF | Max DD | Worst cycle | Cycles |
+|---|---|---|---|---|---|---|
+| hvn_inside_touch | baseline | +1,872 | 1.16 | −1,377 | −505 | 854 |
+| hvn_inside_touch | proposed | +6,352 | 1.77 | −484 | −200 | 1,062 |
+| lvn_edge_touch | baseline | +3,178 | 1.33 | −658 | −371 | 1,101 |
+| lvn_edge_touch | proposed | **+6,564** | **2.05** | **−468** | **−165** | 1,524 |
+| hvn_edge | baseline | +6,080 | 1.48 | −1,133 | −893 | 590 |
+| hvn_edge | proposed | +7,228 | 1.59 | −693 | −211 | 648 |
+| candle_sweep | baseline | +718 | 1.14 | −744 | −295 | 502 |
+| candle_sweep | proposed | +1,052 | 1.27 | −531 | −154 | 520 |
+
+Portfolio (summed equity):
+
+| Portfolio | Net | Max DD | Worst day | May–Jul | Aug–Sep |
+|---|---|---|---|---|---|
+| Four setups, proposed | +21,196 | −725 | −393 | +16,381 | +4,815 |
+| Four setups, baseline | +11,849 | −1,772 | −900 | +11,014 | +835 |
+| Without candle_sweep, proposed | +20,143 | −593 | −453 | +15,830 | +4,313 |
+| Four setups, proposed, 2× costs | +14,535 | −1,066 | | | |
+| Four setups, proposed, H→L path | +16,974 | −775 | | | |
+
+- Daily P&L correlation between setups is 0.03–0.25, so the drawdowns barely stack.
+- Up to four cycles can be open at once. Size the account for that.
+- candle_sweep is the weakest (+431 at 2× costs), so it stays off.
+- July live had hvn_edge at −45.8k across 3m–15m on the old exits. The replay does
+  not model its reversion-side SL or continuation trail. Run lvn_edge_touch and
+  hvn_edge on demo at 15m before live.
 
 ## Limits
 
