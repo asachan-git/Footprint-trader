@@ -741,6 +741,13 @@ class ExecBridge:
             if (max_seen > 0 or pend_seen > 0) and pendings == 0:
                 cls.set_last_arm(account, symbol, magic=magic, **{**cyc, "active": False})
                 cls.clear_emit(account, symbol, magic=magic)
+                # Cycles that end leg by leg (per-leg TP, BE stops after fullfill/book)
+                # never pass through a CLOSE_ALL, so they used to leave NO outcome row —
+                # invisible to the cycle log and to backtest/compare_demo.py.
+                if max_seen > 0:
+                    _emit_cycle_outcome(cyc, account=str(account), symbol=symbol, magic=magic,
+                                        tf=tf, exit_reason="all_closed", pnl_at_exit=pnl,
+                                        positions=0, pendings=0, buys=buys, sells=sells)
             elif unfroze:
                 # still active with resting pendings — persist the unfreeze so live-VP
                 # refresh resumes on the resting legs / next fill.
@@ -809,7 +816,11 @@ class ExecBridge:
         # cut cycles that recover; 140pt only trims the tail. 0 disables.
         _cap_pts = float(grid_cfg.get("cycle_max_loss_pts", 0.0) or 0.0)
         if _cap_pts > 0 and pnl is not None:
-            _cap_usd = _cap_pts * float(grid_cfg.get("base_lot", 0.01) or 0.01) * 100.0
+            # native account currency: pts × base_lot × contract_size × ccy-per-USD
+            # (1 on a USD account, 100 on a USC cent account — P&L arrives in USC there).
+            _cap_usd = (_cap_pts * float(grid_cfg.get("base_lot", 0.01) or 0.01)
+                        * float(grid_cfg.get("contract_size", 100.0) or 100.0)
+                        * float(grid_cfg.get("account_ccy_per_usd", 1.0) or 1.0))
             if float(pnl) <= -_cap_usd:
                 cls.enqueue(account, CLOSE_ALL, symbol, comment="FB|flatten|max_loss", magic=magic, now=t)
                 cls.set_last_arm(account, symbol, magic=magic, **{**cyc, "flatten_ts": t})
@@ -929,8 +940,23 @@ class ExecBridge:
         # trail books green/small-red, flatten fires red/deep-red 2-4s later).
         bias_booked = bool(cyc.get("bias_booked", False))
         if bias_booked and 0 < positions < max_seen:
-            cls.set_last_arm(account, symbol, magic=magic, **{**cyc,
-                             "max_seen": positions, "bias_booked": False})
+            # FIX (2026-09-27, tests/execution/test_monitor_cycle_exits.py): this used to
+            # write "max_seen", a key nothing reads — the high-water lives in
+            # "max_pos_seen". So the reset never happened: one poll after the book landed,
+            # bias_booked was False but max_pos_seen still held the pre-book count, and
+            # flatten-rest fired "leg_closed_other" on the planned partial close.
+            cyc["max_pos_seen"] = positions
+            cyc["bias_booked"] = False
+            max_seen = positions
+            cls.set_last_arm(account, symbol, magic=magic, **cyc)
+        # A committed (full-filled) cycle has had its opposite pendings cancelled, so any
+        # later drop in positions is the orphan close or a BE stop — never a leg TP with
+        # a ladder resting behind it. Skipping here also closes the race where the orphan
+        # CLOSE_SIDE lands a poll before the CANCEL_PENDINGS is reflected in `pendings`.
+        _committed = bool(cyc.get("be_done_buy") or cyc.get("be_done_sell")) and \
+            bool(grid_cfg.get("fullfill_cancel_opposite", True))
+        if _committed:
+            bias_booked = True   # reuse the suppression below for this poll
         if reason is None and 0 < positions < max_seen and pendings > 0 and not bias_booked:
             tol = max(mid * 1e-4, 1e-6) if mid > 0 else 1e-6
             confirms = (tp_up > 0 and mid >= tp_up - tol) or (tp_down > 0 and 0 < mid <= tp_down + tol)

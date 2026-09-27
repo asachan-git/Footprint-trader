@@ -117,6 +117,11 @@ grid_levels:
   # Server-side per-cycle disaster cap in POINTS per base lot (140pt × 0.01 lot = $140).
   # Wide by design: tighter caps cut cycles that go on to recover. 0 = off.
   cycle_max_loss_pts: 140
+  # Units for cycle_max_loss_pts → native currency: pts × base_lot × contract_size × account_ccy_per_usd.
+  # USD account (XAUUSD+): 1. USC cent account (XAUUSD.pc): 100 — confirm the cent contract
+  # size on the broker spec before going live; every other $ threshold here is native too.
+  contract_size: 100          # oz per lot, XAUUSD
+  account_ccy_per_usd: 1      # 100 on the USC cent account
   # Deferred structural SL (>50% of a side filled → SL at node edge). OFF — did not exist
   # at 9590331. false = committed side can't be stopped out; net_target/full_hedge own the exit.
   defer_sl_on_half_fill: false
@@ -471,7 +476,10 @@ risk:
 # Daily floating P&L target — close all grid positions and block new arms for the day
 # once equity rises by this % above the session-open balance.
 # 0 = disabled. Example: 1.5 = close everything once up 1.5% on the day.
-daily_target_pct: 100.0
+# 2026-09-27: OFF. It measures ACCOUNT equity vs session-open balance, so deposits and
+# manual trades trip it (10 Aug live: a 50,000 USC deposit fired it). Per-cycle exits
+# and cycle_max_loss_pts own risk now. Keep the EA's InpEquityTarget at 0 for the same reason.
+daily_target_pct: 0.0
 
 # Dhan options trading configuration
 dhan:
