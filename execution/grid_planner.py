@@ -414,21 +414,29 @@ def _resolve_skew(trigger: Trigger, regime, cfg: dict | None = None,
 
 # ── legs ────────────────────────────────────────────────────────────────────
 
-def _ladder(n: int, base_lot: float, lot_step: float, heavy_near_mid: bool) -> list[float]:
+def _ladder(n: int, base_lot: float, lot_step: float, heavy_near_mid: bool,
+            max_lot: float = 0.0) -> list[float]:
     """LINEAR_REVERSED (heavy near mid) or LINEAR (light near mid), matching the
-    EA's ResolveLotForIndex semantics. Index 1 = nearest the fulcrum."""
+    EA's ResolveLotForIndex semantics. Index 1 = nearest the fulcrum.
+    max_lot > 0 caps every leg (grid_levels.max_lots) — the config documented this cap
+    but nothing applied it, so a 5-leg side ran 0.01…0.05 (+0.06 skew leg) instead of
+    the 0.04 ceiling the replay was tested with."""
     lots = []
     for i in range(1, n + 1):
         if heavy_near_mid:
             raw = base_lot + (n - i) * lot_step
         else:
             raw = base_lot + (i - 1) * lot_step
-        lots.append(round(max(base_lot, raw), 2))
+        lot = max(base_lot, raw)
+        if max_lot > 0:
+            lot = min(lot, max_lot)
+        lots.append(round(lot, 2))
     return lots
 
 
 def _build_legs(fulcrum: float, n: int, step: float, skew: str,
-                base_lot: float, lot_step: float) -> tuple[list[Leg], list[Leg]]:
+                base_lot: float, lot_step: float,
+                max_lot: float = 0.0) -> tuple[list[Leg], list[Leg]]:
     """fulcrum ± i·step prices. Favoured side gets the heavier/longer ladder."""
     buy_n = n
     sell_n = n
@@ -441,8 +449,8 @@ def _build_legs(fulcrum: float, n: int, step: float, skew: str,
     # Both sides increase with distance from fulcrum (light near mid, heavy far).
     # The bias side still gets the extra leg and wider total exposure via skew;
     # accumulating more size as price moves deeper is better than front-loading the first fill.
-    buy_lots = _ladder(buy_n, base_lot, lot_step, heavy_near_mid=False)
-    sell_lots = _ladder(sell_n, base_lot, lot_step, heavy_near_mid=False)
+    buy_lots = _ladder(buy_n, base_lot, lot_step, heavy_near_mid=False, max_lot=max_lot)
+    sell_lots = _ladder(sell_n, base_lot, lot_step, heavy_near_mid=False, max_lot=max_lot)
 
     buy_legs = [Leg(price=round(fulcrum + i * step, 4), lot=buy_lots[i - 1])
                 for i in range(1, buy_n + 1)]
@@ -538,6 +546,7 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     grid_cfg = (settings.get("grid_levels") or {}) if isinstance(settings, dict) else {}
     base_lot = float(grid_cfg.get("base_lot", 0.01))
     lot_step = float(grid_cfg.get("lot_step", 0.01))
+    max_lot = float(grid_cfg.get("max_lots", 0.0) or 0.0)
     tp_mult = float(grid_cfg.get("tp_atr_mult", 1.5))
     # Per-TF leg cap: a fast TF should run a tighter ladder than a slow one. The cycle's
     # TF is known here, so hvn_max_legs_by_tf (keyed "1m"/"5m"/"15m"/"1h") overrides the
@@ -716,15 +725,15 @@ def plan_grid_levels(symbol: str, tf: str, current_price: float,
     if fulcrum_t.kind == "candle_sweep":
         _ch = float((fulcrum_t.context or {}).get("candle_high", 0.0))
         _cl = float((fulcrum_t.context or {}).get("candle_low",  0.0))
-        _buy_lots  = _ladder(n, base_lot, lot_step, heavy_near_mid=False)
-        _sell_lots = _ladder(n, base_lot, lot_step, heavy_near_mid=False)
+        _buy_lots  = _ladder(n, base_lot, lot_step, heavy_near_mid=False, max_lot=max_lot)
+        _sell_lots = _ladder(n, base_lot, lot_step, heavy_near_mid=False, max_lot=max_lot)
         # First leg AT candle edge (i=0), subsequent legs spreading outward.
         buy_legs  = [Leg(price=round(_ch + i * step, 4), lot=_buy_lots[i])
                      for i in range(0, n)]
         sell_legs = [Leg(price=round(_cl - i * step, 4), lot=_sell_lots[i])
                      for i in range(0, n)]
     else:
-        buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step)
+        buy_legs, sell_legs = _build_legs(fulcrum, n, step, skew, base_lot, lot_step, max_lot)
 
     # TP cascade — BTC Jun22 regime + min_tp_dist guard. STRUCTURE over ATR:
     #   1) base    = outer leg ± tp_atr_mult·ATR, snapped to the nearest strong structural

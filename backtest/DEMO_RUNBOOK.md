@@ -9,8 +9,12 @@ replay of the same dates. Go live only if the bridge behaves like the replay.
    the full-fill orphan guard, the disaster cap and the flatten-rest races).
 2. Demo account in **USD** on `XAUUSD+` (the symbol map already points there),
    `account_ccy_per_usd: 1`. No manual trades on this account, no deposits mid-run.
-3. `base_lot: 0.01`, `lot_step: 0.01`, `max_lots: 0.04` — the replay's units (1 pt = $1
-   for leg 1). Check the first grid in MT5: legs must read 0.01 / 0.02 / 0.03 / 0.04.
+3. `base_lot: 0.1`, `lot_step: 0.1`, `max_lots: 0.4` — the replay's ladder ×10 (1 pt = $10
+   for leg 1), with every $ threshold scaled ×10 to match. Check the first grid in MT5: legs
+   must read 0.1 / 0.2 / 0.3 / 0.4 (0.4 again for a 5th or skew leg). A full 5-leg side is
+   1.4 lots; three setups can hold up to 4.2 lots at once.
+   Run `python backtest/arm_smoke.py --from <date> --to <date>` first: it drives the live
+   arm path on recorded bars and prints arms per day, legs and the lot ladder per setup.
 4. Triggers: `hvn_inside_touch`, `lvn_edge_touch`, `hvn_edge` on `[15m]` only;
    `candle_sweep` off. `daily_target_pct: 0`, EA `InpEquityTarget = 0`.
 5. Leave the server recording `data/footprint/XAUTUSDT_{15m,5m}.jsonl` — the replay
@@ -21,8 +25,8 @@ replay of the same dates. Go live only if the bridge behaves like the replay.
 - `data/exec_emit.jsonl` exit rows: `fullfill_be` should be followed by `CLOSE_SIDE`
   `FB|fullfill_close_opp|…` whenever the opposite side had fills; no `leg_closed_other`
   within a few seconds of a `fullfill_be` or `bias_book_trail` on the same magic.
-- No cycle below −140 pts at base lot (−$140 at 0.01). A `max_loss` exit is fine;
-  a cycle past it is a bug.
+- No cycle below −140 pts at base lot (−$1,400 at 0.1). A `max_loss` exit is fine;
+  a cycle past it by more than slippage is a bug.
 - `data/cycles/cycle_outcomes_*.jsonl` — every filled cycle now ends with a final row
   (including `all_closed` for cycles that close leg by leg).
 

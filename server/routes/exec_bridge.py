@@ -656,6 +656,11 @@ def _touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
         # TP/bias-trail state are never touched. No same-fulcrum dedup here: this isn't
         # "re-arming the same level", it's replacing the side that just closed.
         flat_side = "sell" if buy_live else "buy"
+        # COMMITTED CYCLE (2026-09-28): once a side has full-filled, fullfill cancelled and
+        # closed the other side on purpose. Backfilling it here would rebuild the two-sided
+        # exposure fullfill exists to remove, so a committed cycle never side-re-arms.
+        if _cyc.get("be_done_buy") or _cyc.get("be_done_sell"):
+            return
         min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
         # RE-ANCHOR TO ORIGINAL FULCRUM (2026-07-10, user): the backfilled side must straddle
         # the SAME center as the still-live side, else the two ladders bracket different prices
@@ -879,6 +884,11 @@ def _lvn_touch_arm_tf(account: str, broker_symbol: str, tf: str, settings: dict,
 
     if (buy_live or sell_live) and _cyc.get("active"):
         flat_side = "sell" if buy_live else "buy"
+        # COMMITTED CYCLE (2026-09-28): once a side has full-filled, fullfill cancelled and
+        # closed the other side on purpose. Backfilling it here would rebuild the two-sided
+        # exposure fullfill exists to remove, so a committed cycle never side-re-arms.
+        if _cyc.get("be_done_buy") or _cyc.get("be_done_sell"):
+            return
         min_step_venue = float(quote.get("stops_dist", 0.0) or 0.0) * 1.5
         # RE-ANCHOR to original fulcrum (same fix as hvn_inside_touch side-rearm) — keep the
         # backfilled side symmetric with the still-live side; ladder-span gate skips if too far.
