@@ -1600,6 +1600,12 @@ def exec_emit_grid():
         if _trigger_entry(_gl_cfg, _hint_single) is None:
             return jsonify({"ok": True, "verdict": "skip",
                             "skip_reason": f"{_hint_single}:not_in_triggers"})
+        # TF gate (2026-09-28): the kind must also be enabled on THIS tf. The emitter's
+        # default loops post hvn_inside_touch on 1m/3m/5m/10m too; without this gate those
+        # armed cycles on TFs the config (and the replay) never enabled.
+        if tf not in _trigger_tfs(_gl_cfg, _hint_single):
+            return jsonify({"ok": True, "verdict": "skip",
+                            "skip_reason": f"{_hint_single}:{tf}_not_in_tfs"})
 
     # Daily target gate — no new arms once today's P&L target is hit
     if ExecBridge.daily_target_hit(account):
