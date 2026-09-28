@@ -51,7 +51,8 @@ from backtest.run_grid_replay import load  # noqa: E402
 from execution.exec_bridge import ExecBridge, PLACE_PENDING, magic_for  # noqa: E402
 from pipeline.types import Bar, Level, OHLC  # noqa: E402
 
-ACC, SYM, ANALYSIS = "smoke", "XAUUSD+", "XAUTUSDT"
+ACC, ANALYSIS = "smoke", "XAUTUSDT"
+SYM = "XAUUSD.pc"   # replaced by config's symbol_map[XAUTUSDT] in main()
 KINDS = ["hvn_inside_touch", "lvn_edge_touch", "candle_sweep", "hvn_edge"]
 
 
@@ -70,7 +71,9 @@ def main(argv=None):
     ap.add_argument("--settings", default=str(ROOT / "config" / "settings.yaml"))
     a = ap.parse_args(argv)
     settings = yaml.safe_load(open(a.settings))
-    settings.setdefault("execution", {}).setdefault("symbol_map", {})[ANALYSIS] = SYM
+    global SYM
+    SYM = ((settings.get("execution") or {}).get("symbol_map") or {}).get(ANALYSIS, SYM)
+    print(f"broker symbol {SYM}")
 
     audits = []
     route._emit_audit = lambda row: audits.append(row)

@@ -47,7 +47,8 @@ grid_levels:
   # 2026-09-28: scaled ×10 from the replay-tested 0.01 / 0.01 / 0.04. Every native-currency
   # threshold below (net targets, trail activation, min target) is scaled ×10 with it so the
   # exits behave in POINTS exactly as replayed; cycle_max_loss_pts scales itself off base_lot.
-  # At 0.1 on a USD account leg 1 = $10/pt; a full 5-leg side = 1.4 lots; 3 setups ≤ 4.2 lots.
+  # On XAUUSD.pc (USC cent): leg 1 at 0.1 = 10 USC/pt ($0.10); a full 5-leg side = 1.4 lots =
+  # 140 USC/pt; 3 setups ≤ 4.2 lots. Per-cycle cap 140 pts = 1,400 USC ($14).
   base_lot: 0.1           # smallest leg lot; ladder scales up by lot_step per leg
   lot_step: 0.1            # lot increment per leg (leg_i = base + i×step, capped at max_lots)
   max_lots: 0.4           # hard cap per leg (enforced in grid_planner._ladder since 2026-09-28)
@@ -122,10 +123,15 @@ grid_levels:
   # Wide by design: tighter caps cut cycles that go on to recover. 0 = off.
   cycle_max_loss_pts: 140
   # Units for cycle_max_loss_pts → native currency: pts × base_lot × contract_size × account_ccy_per_usd.
-  # USD account (XAUUSD+): 1. USC cent account (XAUUSD.pc): 100 — confirm the cent contract
-  # size on the broker spec before going live; every other $ threshold here is native too.
-  contract_size: 100          # oz per lot, XAUUSD
-  account_ccy_per_usd: 1      # 100 on the USC cent account
+  # The product contract_size × account_ccy_per_usd = native currency per point per 1.00 lot.
+  # XAUUSD.pc (Vantage USC cent, account 24678823): MEASURED 100 USC per point per lot on
+  # 2,183 closed August positions (commission 6 USC per lot round trip) → a cent "lot" is
+  # 1 oz in USD terms. That is the SAME 100-per-point-per-lot as a standard USD account on
+  # XAUUSD+ (100 oz × $1), so every threshold in this file acts at the same POINT distances
+  # on either account; only the currency differs (USC vs USD).
+  # XAUUSD+ (USD standard): contract_size 100, account_ccy_per_usd 1.
+  contract_size: 1            # XAUUSD.pc: 1 oz per lot in USD terms
+  account_ccy_per_usd: 100    # XAUUSD.pc: P&L arrives in USC
   # Deferred structural SL (>50% of a side filled → SL at node edge). OFF — did not exist
   # at 9590331. false = committed side can't be stopped out; net_target/full_hedge own the exit.
   defer_sl_on_half_fill: false
@@ -436,7 +442,7 @@ execution:
   broker_utc_offset_hours: 3      # Vantage server time = UTC+3 (EET); used to shift CVD arrow timestamps
   tradable_symbols: [XAUTUSDT, BTCUSDT]
   symbol_map:
-    XAUTUSDT: "XAUUSD+"          # DEMO account (2026-07-20 test run). Live USC cent used XAUUSD.pc.
+    XAUTUSDT: "XAUUSD.pc"        # 2026-09-28: Vantage USC cent account (XAUUSD.pc). Was XAUUSD+ (USD demo).
     BTCUSDT:  "BTCUSD"
   # Risk-adjusted sizing: lots = (balance × risk_per_trade_pct) / (SL_distance × contract_size)
   # Set risk_per_trade_pct = 0 to disable; falls back to default_lots.

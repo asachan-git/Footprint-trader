@@ -7,10 +7,13 @@ replay of the same dates. Go live only if the bridge behaves like the replay.
 
 1. Pull `feat/combined-v1`. Run `pytest tests -q` (all green; 17 of the tests cover
    the full-fill orphan guard, the disaster cap and the flatten-rest races).
-2. Demo account in **USD** on `XAUUSD+` (the symbol map already points there),
-   `account_ccy_per_usd: 1`. No manual trades on this account, no deposits mid-run.
-3. `base_lot: 0.1`, `lot_step: 0.1`, `max_lots: 0.4` — the replay's ladder ×10 (1 pt = $10
-   for leg 1), with every $ threshold scaled ×10 to match. Check the first grid in MT5: legs
+2. Vantage **USC cent** account on `XAUUSD.pc` (the symbol map points there;
+   `contract_size: 1`, `account_ccy_per_usd: 100`). Attach the EA to an XAUUSD.pc chart.
+   No manual trades on this account, no deposits mid-run.
+   For a USD demo on `XAUUSD+` instead: symbol map `XAUUSD+`, `contract_size: 100`,
+   `account_ccy_per_usd: 1` — every other number stays the same.
+3. `base_lot: 0.1`, `lot_step: 0.1`, `max_lots: 0.4` — the replay's ladder ×10 (1 pt =
+   10 USC for leg 1 on XAUUSD.pc), with every money threshold scaled ×10 to match. Check the first grid in MT5: legs
    must read 0.1 / 0.2 / 0.3 / 0.4 (0.4 again for a 5th or skew leg). A full 5-leg side is
    1.4 lots; three setups can hold up to 4.2 lots at once.
    Run `python backtest/arm_smoke.py --from <date> --to <date>` first: it drives the live
@@ -25,7 +28,7 @@ replay of the same dates. Go live only if the bridge behaves like the replay.
 - `data/exec_emit.jsonl` exit rows: `fullfill_be` should be followed by `CLOSE_SIDE`
   `FB|fullfill_close_opp|…` whenever the opposite side had fills; no `leg_closed_other`
   within a few seconds of a `fullfill_be` or `bias_book_trail` on the same magic.
-- No cycle below −140 pts at base lot (−$1,400 at 0.1). A `max_loss` exit is fine;
+- No cycle below −140 pts at base lot (−1,400 USC at 0.1). A `max_loss` exit is fine;
   a cycle past it by more than slippage is a bug.
 - `data/cycles/cycle_outcomes_*.jsonl` — every filled cycle now ends with a final row
   (including `all_closed` for cycles that close leg by leg).
@@ -56,10 +59,9 @@ PF, match rate, correlation of matched cycles, same-exit rate and the largest ga
 A setup that fails a gate stays on demo. Go live with hvn_inside_touch and
 lvn_edge_touch first; hvn_edge only after its own gates pass.
 
-## Cent account (live)
+## Units on XAUUSD.pc
 
-P&L arrives in USC there. Before switching, confirm the XAUUSD.pc contract size in
-the MT5 symbol spec, set `account_ccy_per_usd: 100`, and scale every other
-native-currency threshold (`cycle_net_target_by_tf`, `bias_trail_activate_usd`,
-`cycle_min_target_usd`) by the same factor, or the targets will be 100× tighter than
-what was tested.
+August's statement for account 24678823 shows 100 USC per point per 1.00 lot on XAUUSD.pc
+(2,183 positions) and 6 USC commission per lot round trip. That is numerically the same as
+a USD account on XAUUSD+ (100 oz × $1), so all thresholds act at the same point distances
+as the replay and `compare_demo.py` needs no extra conversion — only the currency is USC.
