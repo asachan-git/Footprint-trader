@@ -47,11 +47,15 @@ else
   python3 -m server.app > logs/flask.log 2>&1 &
   PIDS+=($!)
 fi
-for _ in $(seq 1 30); do
+# Startup is slow: the server loads every data/footprint/*.jsonl into memory (hundreds of
+# MB) and rebuilds the VP cache before it listens. Wait up to FLASK_WAIT_S (default 900 s).
+_wait="${FLASK_WAIT_S:-900}"
+for i in $(seq 1 "$_wait"); do
   curl -s --max-time 2 "${FLASK_URL}/health" >/dev/null && break
+  (( i % 30 == 0 )) && echo "[combined-v1] waiting for Flask (${i}s) — last log: $(tail -n 1 logs/flask.log 2>/dev/null | cut -c1-120)"
   sleep 1
 done
-curl -s --max-time 2 "${FLASK_URL}/health" >/dev/null || { echo "[combined-v1] Flask did not come up — see logs/flask.log"; cleanup; exit 1; }
+curl -s --max-time 2 "${FLASK_URL}/health" >/dev/null || { echo "[combined-v1] Flask did not come up in ${_wait}s — see logs/flask.log"; cleanup; exit 1; }
 echo "[combined-v1] Flask up at ${FLASK_URL}"
 
 echo "[combined-v1] starting XAUT feed..."
